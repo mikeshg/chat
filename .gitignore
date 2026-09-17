@@ -14,3 +14,4 @@ app/src-tauri/gen/**/build/
 app/src-tauri/gen/**/local.properties
 .devin/
 scripts/.e2e-state.json
+scripts/shot-*.png

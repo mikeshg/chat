@@ -90,14 +90,17 @@ export function prependMessages(list: MessageView[], older: MessageView[]): Mess
   return [...older.filter((m) => !seen.has(m.id)), ...list];
 }
 
-/** ack 到达：用服务端消息替换乐观副本 */
+/** ack 到达：用服务端消息替换乐观副本（message 回显可能先于 ack，需按 id 去重） */
 export function resolveAck(
   list: MessageView[],
   clientMsgId: string | null,
   real: MessageView,
 ): MessageView[] {
-  const replaced = clientMsgId
+  const mapped = clientMsgId
     ? list.map((m) => (m.id === `client:${clientMsgId}` ? real : m))
     : list;
-  return upsertMessage(replaced, real);
+  const seen = new Set<string>();
+  return mapped
+    .filter((m) => !seen.has(m.id) && (seen.add(m.id), true))
+    .sort((a, b) => a.seq - b.seq);
 }
