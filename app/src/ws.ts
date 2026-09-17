@@ -1,6 +1,6 @@
 import { convs, friends as friendsApi } from "./api";
 import { getState, setState, upsertMessage, resolveAck } from "./store";
-import type { MessageView, WsOut } from "./types";
+import type { AttachmentView, MessageView, WsOut } from "./types";
 import { wsBase } from "./api";
 
 let ws: WebSocket | null = null;
@@ -183,7 +183,7 @@ export function wsSend(obj: unknown) {
   if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
 
-export function sendChat(convId: string, content: string) {
+export function sendChat(convId: string, content: string, attachment?: AttachmentView) {
   const clientMsgId = crypto.randomUUID();
   const s = getState();
   const optimistic: MessageView = {
@@ -193,7 +193,9 @@ export function sendChat(convId: string, content: string) {
     sender_id: s.me!.id,
     sender_username: s.me!.username,
     sender_name: s.me!.display_name,
-    content,
+    content: content || (attachment ? (attachment.mime.startsWith("image/") ? "[图片]" : `[文件] ${attachment.file_name}`) : ""),
+    kind: attachment ? (attachment.mime.startsWith("image/") ? "image" : "file") : "text",
+    attachment: attachment ?? null,
     created_at: new Date().toISOString(),
   };
   setState({
@@ -207,6 +209,7 @@ export function sendChat(convId: string, content: string) {
     conversation_id: convId,
     client_msg_id: clientMsgId,
     content,
+    attachment_id: attachment?.id,
   });
 }
 

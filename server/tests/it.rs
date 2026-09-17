@@ -63,7 +63,10 @@ async fn spawn() -> String {
         bind: "127.0.0.1".into(),
         port: 0,
         app_dist: None,
+        files_dir: std::env::temp_dir().join("chat-it-files").to_string_lossy().into(),
+        upload_max_bytes: 25 * 1024 * 1024,
     };
+    std::fs::create_dir_all(&cfg.files_dir).unwrap();
     let state = AppState::new(pool, cfg.clone());
     let app = build_router(state, &cfg);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

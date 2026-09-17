@@ -24,6 +24,10 @@ services:
       JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me}
       PORT: 8080
       APP_DIST: /app/dist
+      FILES_DIR: /data/files
+      UPLOAD_MAX_MB: ${UPLOAD_MAX_MB:-25}
+    volumes:
+      - chat-files:/data/files
     ports:
       - "8080:8080"
     depends_on:
@@ -32,3 +36,4 @@ services:
 
 volumes:
   pgdata:
+  chat-files:

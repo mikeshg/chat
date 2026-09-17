@@ -37,6 +37,7 @@ pub async fn run() {
         .init();
 
     let cfg = Config::from_env();
+    std::fs::create_dir_all(&cfg.files_dir).expect("create files dir failed");
     let pool = db::connect(&cfg.database_url).await;
     sqlx::migrate!("./migrations")
         .run(&pool)

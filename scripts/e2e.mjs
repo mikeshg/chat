@@ -204,6 +204,48 @@ async function phase1() {
     ok('pagination before_seq', p1.json.messages.every((m) => m.seq < 3) && p1.json.messages.length >= 2);
   }
 
+  // --- 文件/图片消息 ---
+  {
+    const up = async (blob, name, type) => {
+      const fd = new FormData();
+      fd.append('conversation_id', A.dmId);
+      fd.append('file', new Blob([blob], { type }), name);
+      const r = await fetch(`${BASE}/files`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${A.access_token}` },
+        body: fd,
+      });
+      return { status: r.status, json: await r.json().catch(() => null) };
+    };
+    // 文本文件
+    const f1 = await up('hello file', 'note.txt', 'text/plain');
+    ok('upload file', f1.status === 200 && f1.json.size === 10, `got ${f1.status}`);
+    wsa.send({ type: 'send_message', conversation_id: A.dmId, client_msg_id: 'f1', content: '', attachment_id: f1.json.id });
+    const fm = await wsa.waitType('message', (x) => x.message.attachment?.id === f1.json.id);
+    ok('file msg broadcast w/ attachment', fm.message.kind === 'file' && fm.message.attachment.file_name === 'note.txt', JSON.stringify(fm.message.kind));
+    ok('placeholder content', fm.message.content === '[文件] note.txt', fm.message.content);
+    const dl = await fetch(`${BASE}/files/${f1.json.id}`);
+    ok('download file', dl.status === 200 && (await dl.text()) === 'hello file');
+    // 图片 → kind=image
+    const png = Uint8Array.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,0,0,0,0]);
+    const f2 = await up(png, 'p.png', 'image/png');
+    wsa.send({ type: 'send_message', conversation_id: A.dmId, client_msg_id: 'f2', content: '', attachment_id: f2.json.id });
+    const im = await wsa.waitType('message', (x) => x.message.attachment?.id === f2.json.id);
+    ok('image kind derived from mime', im.message.kind === 'image' && im.message.content === '[图片]', JSON.stringify(im.message.kind));
+    // B 复用 A 的附件 → 拒
+    wsb2.send({ type: 'send_message', conversation_id: B.dmId, client_msg_id: 'f3', content: '', attachment_id: f1.json.id });
+    try {
+      const e = await wsb2.waitType('error', () => true, 5000);
+      ok('attachment reuse rejected', !!e);
+    } catch { ok('attachment reuse rejected', false, 'no error frame'); }
+    // 非成员上传 → 拒
+    const fd2 = new FormData();
+    fd2.append('conversation_id', A.dmId);
+    fd2.append('file', new Blob(['x']), 'x.txt');
+    const bad = await fetch(`${BASE}/files`, { method: 'POST', headers: { authorization: `Bearer ${C.access_token}` }, body: fd2 });
+    ok('non-member upload rejected', bad.status === 403 || bad.status === 404, `got ${bad.status}`);
+  }
+
   // --- 群主退群→转让 → 解散 ---
   await api(A.access_token, 'DELETE', `/conversations/${gid}/members/me`);
   {

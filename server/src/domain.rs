@@ -1,5 +1,5 @@
 use crate::error::AppResult;
-use crate::model::MessageView;
+use crate::model::{AttachmentView, MessageView};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
@@ -66,6 +66,8 @@ pub async fn append_message(
     conv: Uuid,
     sender: Uuid,
     content: &str,
+    kind: &str,
+    attachment: Option<AttachmentView>,
 ) -> AppResult<MessageView> {
     let seq = sqlx::query_scalar::<_, i64>(
         "UPDATE conversations SET last_seq = last_seq + 1 WHERE id = $1 RETURNING last_seq",
@@ -74,15 +76,18 @@ pub async fn append_message(
     .fetch_one(&mut **tx)
     .await?;
 
+    let att_id = attachment.as_ref().map(|a| a.id);
     let msg = sqlx::query_as::<_, MessageRow>(
-        "INSERT INTO messages (conversation_id, seq, sender_id, content)
-         VALUES ($1, $2, $3, $4)
-         RETURNING id, conversation_id, seq, sender_id, content, created_at",
+        "INSERT INTO messages (conversation_id, seq, sender_id, content, kind, attachment_id)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id, conversation_id, seq, sender_id, content, kind, attachment_id, created_at",
     )
     .bind(conv)
     .bind(seq)
     .bind(sender)
     .bind(content)
+    .bind(kind)
+    .bind(att_id)
     .fetch_one(&mut **tx)
     .await?;
 
@@ -101,6 +106,8 @@ pub async fn append_message(
         sender_username,
         sender_name,
         content: msg.content,
+        kind: msg.kind,
+        attachment,
         created_at: msg.created_at,
     })
 }
@@ -112,10 +119,12 @@ pub struct MessageRow {
     pub seq: i64,
     pub sender_id: Uuid,
     pub content: String,
+    pub kind: String,
+    pub attachment_id: Option<Uuid>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// 带发送者展示信息的消息行（JOIN users）
+/// 带发送者展示信息的消息行（JOIN users + LEFT JOIN attachments）
 #[derive(sqlx::FromRow)]
 pub struct MsgViewRow {
     pub id: Uuid,
@@ -125,10 +134,26 @@ pub struct MsgViewRow {
     pub sender_username: String,
     pub sender_name: String,
     pub content: String,
+    pub kind: String,
+    pub att_id: Option<Uuid>,
+    pub att_name: Option<String>,
+    pub att_mime: Option<String>,
+    pub att_size: Option<i64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl MsgViewRow {
+    /// 共享 select 列清单（三个查询点 + ws sync 共用，避免漂移）
+    pub const SELECT: &'static str =
+        "m.id, m.conversation_id, m.seq, m.sender_id,
+         u.username::text AS sender_username, u.display_name AS sender_name,
+         m.content, m.kind,
+         a.id AS att_id, a.file_name AS att_name, a.mime AS att_mime, a.size AS att_size,
+         m.created_at";
+    pub const JOIN: &'static str =
+        "FROM messages m JOIN users u ON u.id = m.sender_id
+         LEFT JOIN attachments a ON a.id = m.attachment_id";
+
     pub fn into_view(self) -> MessageView {
         MessageView {
             id: self.id,
@@ -138,6 +163,13 @@ impl MsgViewRow {
             sender_username: self.sender_username,
             sender_name: self.sender_name,
             content: self.content,
+            kind: self.kind,
+            attachment: self.att_id.map(|id| AttachmentView {
+                id,
+                file_name: self.att_name.unwrap_or_default(),
+                mime: self.att_mime.unwrap_or_default(),
+                size: self.att_size.unwrap_or_default(),
+            }),
             created_at: self.created_at,
         }
     }

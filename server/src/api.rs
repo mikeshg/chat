@@ -5,8 +5,9 @@ use crate::model::*;
 use crate::state::SharedState;
 use crate::ws;
 use axum::{
-    extract::{ConnectInfo, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    extract::{ConnectInfo, Multipart, Path, Query, State},
+    http::{header, HeaderMap, StatusCode},
+    response::IntoResponse,
     routing::{delete, get, post},
     Json, Router,
 };
@@ -43,6 +44,8 @@ pub fn router() -> Router<SharedState> {
         .route("/conversations/{id}/members/me", delete(leave_conversation))
         .route("/conversations/{id}/members/{uid}", delete(kick_member))
         .route("/conversations/{id}/transfer", post(transfer_ownership))
+        .route("/files", post(upload_file))
+        .route("/files/{id}", get(download_file))
         .route("/ws/ticket", get(ws_ticket))
         .route("/ws", get(ws::ws_handler))
 }
@@ -507,6 +510,7 @@ struct ConvRow {
     m_sender_username: Option<String>,
     m_sender_name: Option<String>,
     m_content: Option<String>,
+    m_kind: Option<String>,
     m_created_at: Option<DateTime<Utc>>,
 }
 
@@ -523,7 +527,7 @@ async fn list_conversations(
                 p.last_seen_at AS peer_last_seen,
                 lm.id AS m_id, lm.seq AS m_seq, lm.sender_id AS m_sender_id,
                 su.username::text AS m_sender_username, su.display_name AS m_sender_name,
-                lm.content AS m_content, lm.created_at AS m_created_at
+                lm.content AS m_content, lm.kind AS m_kind, lm.created_at AS m_created_at
            FROM memberships m
            JOIN conversations c ON c.id = m.conversation_id
            LEFT JOIN LATERAL (
@@ -533,7 +537,7 @@ async fn list_conversations(
                 LIMIT 1
            ) p ON c.type = 'dm'
            LEFT JOIN LATERAL (
-               SELECT id, seq, sender_id, content, created_at FROM messages
+               SELECT id, seq, sender_id, content, kind, created_at FROM messages
                 WHERE conversation_id = c.id ORDER BY seq DESC LIMIT 1
            ) lm ON true
            LEFT JOIN users su ON su.id = lm.sender_id
@@ -561,6 +565,8 @@ async fn list_conversations(
                 sender_username: r.m_sender_username.unwrap_or_default(),
                 sender_name: r.m_sender_name.unwrap_or_default(),
                 content: r.m_content.unwrap_or_default(),
+                kind: r.m_kind.unwrap_or_else(|| "text".into()),
+                attachment: None,
                 created_at: r.m_created_at.unwrap_or_else(Utc::now),
             });
             ConversationView {
@@ -737,12 +743,12 @@ async fn list_messages(
 
     let messages: Vec<MessageView> = if let Some(after) = q.after_seq {
         sqlx::query_as::<_, domain::MsgViewRow>(
-            "SELECT m.id, m.conversation_id, m.seq, m.sender_id,
-                    u.username::text AS sender_username, u.display_name AS sender_name,
-                    m.content, m.created_at
-               FROM messages m JOIN users u ON u.id = m.sender_id
-              WHERE m.conversation_id = $1 AND m.seq > $2
-              ORDER BY m.seq ASC LIMIT $3",
+            &format!(
+                "SELECT {} {} WHERE m.conversation_id = $1 AND m.seq > $2
+                   ORDER BY m.seq ASC LIMIT $3",
+                domain::MsgViewRow::SELECT,
+                domain::MsgViewRow::JOIN
+            ),
         )
         .bind(conv)
         .bind(after)
@@ -755,12 +761,12 @@ async fn list_messages(
     } else {
         let mut rows = if let Some(before) = q.before_seq {
             sqlx::query_as::<_, domain::MsgViewRow>(
-                "SELECT m.id, m.conversation_id, m.seq, m.sender_id,
-                        u.username::text AS sender_username, u.display_name AS sender_name,
-                        m.content, m.created_at
-                   FROM messages m JOIN users u ON u.id = m.sender_id
-                  WHERE m.conversation_id = $1 AND m.seq < $2
-                  ORDER BY m.seq DESC LIMIT $3",
+                &format!(
+                    "SELECT {} {} WHERE m.conversation_id = $1 AND m.seq < $2
+                       ORDER BY m.seq DESC LIMIT $3",
+                    domain::MsgViewRow::SELECT,
+                    domain::MsgViewRow::JOIN
+                ),
             )
             .bind(conv)
             .bind(before)
@@ -769,12 +775,12 @@ async fn list_messages(
             .await?
         } else {
             sqlx::query_as::<_, domain::MsgViewRow>(
-                "SELECT m.id, m.conversation_id, m.seq, m.sender_id,
-                        u.username::text AS sender_username, u.display_name AS sender_name,
-                        m.content, m.created_at
-                   FROM messages m JOIN users u ON u.id = m.sender_id
-                  WHERE m.conversation_id = $1
-                  ORDER BY m.seq DESC LIMIT $2",
+                &format!(
+                    "SELECT {} {} WHERE m.conversation_id = $1
+                       ORDER BY m.seq DESC LIMIT $2",
+                    domain::MsgViewRow::SELECT,
+                    domain::MsgViewRow::JOIN
+                ),
             )
             .bind(conv)
             .bind(limit)
@@ -974,6 +980,130 @@ async fn dissolve_conversation(
         .await?;
     notify(&st, &members, "conversations");
     Ok(StatusCode::NO_CONTENT)
+}
+
+
+// ---------- 文件上传/下载 ----------
+
+fn pct_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{:02X}", b),
+        })
+        .collect()
+}
+
+/// multipart: conversation_id 字段 + file 字段。上传者必须是会话成员。
+async fn upload_file(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    mut mp: Multipart,
+) -> AppResult<Json<AttachmentView>> {
+    let uid = uid_of(&headers, &st)?;
+    let mut conv: Option<Uuid> = None;
+    let mut file_name = "file".to_string();
+    let mut mime = "application/octet-stream".to_string();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut got_file = false;
+
+    while let Some(mut field) = mp
+        .next_field()
+        .await
+        .map_err(|e| AppError::bad_request(format!("bad multipart: {e}")))?
+    {
+        match field.name() {
+            Some("conversation_id") => {
+                let v = field
+                    .text()
+                    .await
+                    .map_err(|_| AppError::bad_request("bad conversation_id"))?;
+                conv = Some(
+                    Uuid::parse_str(v.trim())
+                        .map_err(|_| AppError::bad_request("bad conversation_id"))?,
+                );
+            }
+            Some("file") => {
+                if let Some(n) = field.file_name() {
+                    file_name = n.to_string();
+                }
+                if let Some(ct) = field.content_type() {
+                    mime = ct.to_string();
+                }
+                got_file = true;
+                while let Some(chunk) = field
+                    .chunk()
+                    .await
+                    .map_err(|e| AppError::bad_request(format!("read error: {e}")))?
+                {
+                    buf.extend_from_slice(&chunk);
+                    if buf.len() > st.cfg.upload_max_bytes {
+                        return Err(AppError::bad_request("file too large"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let conv = conv.ok_or_else(|| AppError::bad_request("missing conversation_id"))?;
+    if !got_file || buf.is_empty() {
+        return Err(AppError::bad_request("missing file"));
+    }
+    require_member(&st, conv, uid).await?;
+
+    let id = Uuid::new_v4();
+    let path = format!("{}/{}", st.cfg.files_dir, id);
+    tokio::fs::write(&path, &buf)
+        .await
+        .map_err(|e| AppError::internal(format!("store file: {e}")))?;
+    let size = buf.len() as i64;
+    sqlx::query(
+        "INSERT INTO attachments (id, uploader_id, conv_id, file_name, mime, size, storage_path)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(id)
+    .bind(uid)
+    .bind(conv)
+    .bind(&file_name)
+    .bind(&mime)
+    .bind(size)
+    .bind(&path)
+    .execute(&st.pool)
+    .await?;
+    Ok(Json(AttachmentView {
+        id,
+        file_name,
+        mime,
+        size,
+    }))
+}
+
+/// 按 UUID 直链下载（能力 URL：id 不可猜测，仅会话内可见）。
+async fn download_file(
+    State(st): State<SharedState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<impl IntoResponse> {
+    let (file_name, mime, path) = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT file_name, mime, storage_path FROM attachments WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&st.pool)
+    .await?
+    .ok_or_else(|| AppError::not_found("file not found"))?;
+    let data = tokio::fs::read(&path)
+        .await
+        .map_err(|_| AppError::not_found("file not found"))?;
+    let dispo = format!("inline; filename*=UTF-8''{}", pct_encode(&file_name));
+    Ok((
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::CONTENT_DISPOSITION, dispo),
+            (header::CACHE_CONTROL, "private, max-age=31536000, immutable".into()),
+        ],
+        data,
+    ))
 }
 
 // ---------- ws ticket ----------

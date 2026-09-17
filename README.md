@@ -9,6 +9,7 @@
 - 私聊：加好友自动建 DM；删好友后 DM 变只读
 - 群聊：只能拉自己的好友；群主可改名/踢人/转让/解散；群主退群自动转让给最早加入成员
 - 消息：持久化历史、每会话递增 seq、离线重连按 seq 补发（`sync`）
+- 附件：图片/文件消息（multipart 上传 → WS `attachment_id` 发送），图片气泡内联预览、文件卡片下载
 - 实时：WebSocket（一次性 ticket 鉴权）、多设备同时在线、在线状态、正在输入、未读数、已读同步
 - 部署：`docker compose up -d` 一条命令（Postgres + 服务端托管前端，单端口 8080）
 
@@ -19,7 +20,7 @@ docker compose up -d          # WSL/任意有 Docker 的环境
 # 浏览器打开 http://localhost:8080
 ```
 
-环境变量：`DATABASE_URL`、`JWT_SECRET`（生产必须改）、`PORT`、`BIND`、`APP_DIST`。
+环境变量：`DATABASE_URL`、`JWT_SECRET`（生产必须改）、`PORT`、`BIND`、`APP_DIST`、`FILES_DIR`（附件存储目录，compose 挂 `chat-files` 卷）、`UPLOAD_MAX_MB`（单文件上限，默认 25）。
 
 ## 开发
 

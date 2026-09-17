@@ -44,3 +44,9 @@
 ## 8. 多设备在线模型
 
 `AppState.conns: user_id → {conn_id → sender}`。同一账号多连接并存；presence 只在「首连/末断」时翻转广播；read_sync 把已读状态推给同账号其他设备（清角标）。
+
+## 9. 附件：文件系统存储 + 能力 URL
+
+**决策**：附件二进制存服务端文件系统（`FILES_DIR`），元数据在 `attachments` 表（uploader/conv/mime/size/path）；消息经 `messages.kind` + `attachment_id` 引用；下载走 `GET /v1/files/{id}` 不鉴权。
+
+**理由**：`GET /v1/files/{uuid}` 必须能用于 `<img>`/`<a>`（无法带 Authorization 头）；UUID 不可枚举，链接只在会话内流转——能力 URL 模型与主流 IM 的 CDN 链接一致。上传时校验「上传者是目标会话成员」+ 发送时校验「附件属本人、绑本会话、未被复用」，闭合权限边界。风险与升级路径：链接外泄即失密 → 公网部署可换签名 URL 或短时效 ticket。本地测试库与运行库共用 `chat_test`/`chat` 与 `./data/files`。

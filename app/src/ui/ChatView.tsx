@@ -1,8 +1,21 @@
 import { useEffect, useRef, useState } from "react";
-import { convs } from "../api";
+import { convs, files } from "../api";
 import { convTitle, getState, prependMessages, setState, useApp } from "../store";
+import type { MessageView } from "../types";
 import { sendChat, sendTyping } from "../ws";
 import GroupInfo from "./GroupInfo";
+
+function fmtSize(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/** 附件消息的 content 是服务端占位文本时不再重复渲染 */
+function showText(m: MessageView): boolean {
+  if (!m.attachment) return true;
+  return m.content !== "[图片]" && m.content !== `[文件] ${m.attachment.file_name}`;
+}
 
 export default function ChatView() {
   const s = useApp();
@@ -12,6 +25,8 @@ export default function ChatView() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickBottom = useRef(true);
   const lastTypingSent = useRef(0);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const [uploading, setUploading] = useState(false);
 
   const conv = s.conversations.find((c) => c.id === s.activeConv) ?? null;
   const msgs = conv ? (s.messages[conv.id] ?? []) : [];
@@ -92,6 +107,22 @@ export default function ChatView() {
     stickBottom.current = true;
   };
 
+  const onFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    e.target.value = "";
+    if (!f || readonly) return;
+    setUploading(true);
+    try {
+      const att = await files.upload(conv.id, f);
+      sendChat(conv.id, "", att);
+      stickBottom.current = true;
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "上传失败");
+    } finally {
+      setUploading(false);
+    }
+  };
+
   const onInput = (v: string) => {
     setText(v);
     const now = Date.now();
@@ -143,7 +174,31 @@ export default function ChatView() {
                   {!mine && conv.kind === "group" && (
                     <div className="msg-sender">{m.sender_name}</div>
                   )}
-                  <div className={`bubble ${pending ? "pending" : ""}`}>{m.content}</div>
+                  <div className={`bubble ${pending ? "pending" : ""}`}>
+                    {m.attachment && m.kind === "image" && (
+                      <img
+                        className="msg-img"
+                        src={files.url(m.attachment.id)}
+                        alt={m.attachment.file_name}
+                        onClick={() => window.open(files.url(m.attachment!.id))}
+                      />
+                    )}
+                    {m.attachment && m.kind === "file" && (
+                      <a
+                        className="msg-file"
+                        href={files.url(m.attachment.id)}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        <span className="file-ic">📄</span>
+                        <span className="file-meta">
+                          <b>{m.attachment.file_name}</b>
+                          <i>{fmtSize(m.attachment.size)}</i>
+                        </span>
+                      </a>
+                    )}
+                    {showText(m) && m.content}
+                  </div>
                 </div>
               </div>
             </div>
@@ -157,6 +212,15 @@ export default function ChatView() {
           <div className="readonly-hint">对方已不是你的好友，会话只读</div>
         ) : (
           <>
+            <input ref={fileInput} type="file" hidden onChange={onFile} />
+            <button
+              className="icon-btn attach-btn"
+              title="发送图片/文件"
+              onClick={() => fileInput.current?.click()}
+              disabled={uploading}
+            >
+              {uploading ? "…" : "📎"}
+            </button>
             <textarea
               value={text}
               placeholder="输入消息，Enter 发送，Shift+Enter 换行"

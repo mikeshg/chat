@@ -1,6 +1,6 @@
 use crate::domain;
 use crate::error::AppResult;
-use crate::model::{UserPublic, WsIn, WsOut, WsTicketQuery};
+use crate::model::{AttachmentView, UserPublic, WsIn, WsOut, WsTicketQuery};
 use crate::state::SharedState;
 use axum::{
     extract::{
@@ -128,7 +128,21 @@ async fn on_text(st: &SharedState, uid: Uuid, tx: &mpsc::UnboundedSender<String>
             conversation_id,
             client_msg_id,
             content,
-        }) => send_message(st, uid, tx, conversation_id, client_msg_id, &content).await,
+            kind,
+            attachment_id,
+        }) => {
+            send_message(
+                st,
+                uid,
+                tx,
+                conversation_id,
+                client_msg_id,
+                &content,
+                kind,
+                attachment_id,
+            )
+            .await
+        }
         Ok(WsIn::Typing { conversation_id }) => typing(st, uid, conversation_id).await,
         Ok(WsIn::Read {
             conversation_id,
@@ -157,11 +171,63 @@ async fn send_message(
     conv: Uuid,
     client_msg_id: Option<String>,
     content: &str,
+    _kind: Option<String>,
+    attachment_id: Option<Uuid>,
 ) -> WsResult {
     let content = content.trim();
-    if content.is_empty() || content.chars().count() > 4000 {
+    if content.chars().count() > 4000 {
+        return Err(("bad_message", "message too long (max 4000 chars)"));
+    }
+    // 附件归属校验：必须是本人上传、绑定到本会话、且未被其他消息使用
+    let attachment = if let Some(att_id) = attachment_id {
+        let row = sqlx::query_as::<_, (Uuid, String, String, i64, Uuid)>(
+            "SELECT id, file_name, mime, size, conv_id FROM attachments
+             WHERE id = $1 AND uploader_id = $2",
+        )
+        .bind(att_id)
+        .bind(uid)
+        .fetch_optional(&st.pool)
+        .await
+        .map_err(|_| ("internal", "db error"))?
+        .ok_or(("not_found", "attachment not found"))?;
+        if row.4 != conv {
+            return Err(("bad_attachment", "attachment belongs to another conversation"));
+        }
+        let used = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE attachment_id = $1)",
+        )
+        .bind(att_id)
+        .fetch_one(&st.pool)
+        .await
+        .map_err(|_| ("internal", "db error"))?;
+        if used {
+            return Err(("bad_attachment", "attachment already sent"));
+        }
+        Some(AttachmentView {
+            id: row.0,
+            file_name: row.1,
+            mime: row.2,
+            size: row.3,
+        })
+    } else {
+        None
+    };
+    if attachment.is_none() && content.is_empty() {
         return Err(("bad_message", "message must be 1-4000 chars"));
     }
+    let kind: &str = match &attachment {
+        Some(a) if a.mime.starts_with("image/") => "image",
+        Some(_) => "file",
+        None => "text",
+    };
+    let content: String = if content.is_empty() {
+        match kind {
+            "image" => "[图片]".into(),
+            _ => format!("[文件] {}", attachment.as_ref().unwrap().file_name),
+        }
+    } else {
+        content.to_string()
+    };
     domain::membership(&st.pool, conv, uid)
         .await
         .map_err(|_| ("internal", "db error"))?
@@ -192,7 +258,7 @@ async fn send_message(
         .begin()
         .await
         .map_err(|_| ("internal", "db error"))?;
-    let msg = domain::append_message(&mut db_tx, conv, uid, content)
+    let msg = domain::append_message(&mut db_tx, conv, uid, &content, kind, attachment)
         .await
         .map_err(|_| ("internal", "db error"))?;
     db_tx.commit().await.map_err(|_| ("internal", "db error"))?;
@@ -268,14 +334,12 @@ async fn sync(
         .await
         .map_err(|_| ("internal", "db error"))?
         .ok_or(("forbidden", "not a member"))?;
-    let rows = sqlx::query_as::<_, domain::MsgViewRow>(
-        "SELECT m.id, m.conversation_id, m.seq, m.sender_id,
-                u.username::text AS sender_username, u.display_name AS sender_name,
-                m.content, m.created_at
-           FROM messages m JOIN users u ON u.id = m.sender_id
-          WHERE m.conversation_id = $1 AND m.seq > $2
+    let rows = sqlx::query_as::<_, domain::MsgViewRow>(&format!(
+        "SELECT {} {} WHERE m.conversation_id = $1 AND m.seq > $2
           ORDER BY m.seq ASC LIMIT 500",
-    )
+        domain::MsgViewRow::SELECT,
+        domain::MsgViewRow::JOIN
+    ))
     .bind(conv)
     .bind(last_seq)
     .fetch_all(&st.pool)

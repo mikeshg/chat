@@ -1,4 +1,5 @@
 import type {
+  AttachmentView,
   AuthResponse,
   ConversationDetail,
   ConversationView,
@@ -166,4 +167,31 @@ export const convs = {
   transfer: (id: string, uid: string) =>
     post(`/conversations/${id}/transfer`, { user_id: uid }),
   ticket: () => get<{ ticket: string; expires_in: number }>("/ws/ticket"),
+};
+
+// ---------- files ----------
+export const files = {
+  /** 附件下载/预览地址（能力 URL，可直接用于 <img>/<a>） */
+  url: (id: string) => `${getServer()}/v1/files/${id}`,
+  upload: async (conversationId: string, file: File): Promise<AttachmentView> => {
+    const fd = new FormData();
+    fd.append("conversation_id", conversationId);
+    fd.append("file", file, file.name);
+    const at = localStorage.getItem(LS_ACCESS);
+    const res = await fetch(`${getServer()}/v1/files`, {
+      method: "POST",
+      headers: at ? { authorization: `Bearer ${at}` } : {},
+      body: fd,
+    });
+    if (res.status === 401 && (await tryRefresh())) return files.upload(conversationId, file);
+    if (!res.ok) {
+      const text = await res.text();
+      let msg = text;
+      try {
+        msg = JSON.parse(text).error ?? text;
+      } catch {}
+      throw new ApiError(res.status, msg);
+    }
+    return res.json() as Promise<AttachmentView>;
+  },
 };

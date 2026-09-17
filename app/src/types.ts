@@ -32,6 +32,13 @@ export interface MemberView {
   joined_at: string;
 }
 
+export interface AttachmentView {
+  id: string;
+  file_name: string;
+  mime: string;
+  size: number;
+}
+
 export interface MessageView {
   id: string;
   conversation_id: string;
@@ -40,6 +47,8 @@ export interface MessageView {
   sender_username: string;
   sender_name: string;
   content: string;
+  kind: string; // "text" | "image" | "file"
+  attachment: AttachmentView | null;
   created_at: string;
 }
 

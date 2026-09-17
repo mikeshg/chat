@@ -97,6 +97,14 @@ pub struct MemberView {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct AttachmentView {
+    pub id: Uuid,
+    pub file_name: String,
+    pub mime: String,
+    pub size: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct MessageView {
     pub id: Uuid,
     pub conversation_id: Uuid,
@@ -105,6 +113,8 @@ pub struct MessageView {
     pub sender_username: String,
     pub sender_name: String,
     pub content: String,
+    pub kind: String, // "text" | "image" | "file"
+    pub attachment: Option<AttachmentView>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -173,6 +183,10 @@ pub enum WsIn {
         conversation_id: Uuid,
         client_msg_id: Option<String>,
         content: String,
+        #[serde(default)]
+        kind: Option<String>,
+        #[serde(default)]
+        attachment_id: Option<Uuid>,
     },
     Typing {
         conversation_id: Uuid,

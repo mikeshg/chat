@@ -4,3 +4,4 @@ app/dist
 server/target
 .git
 .devin
+data/
