@@ -36,6 +36,11 @@ pnpm install && pnpm dev
 
 ```bash
 pnpm test    # cargo test：auth/好友流/会话权限/seq/WS/群规则 集成测试（需 db 容器）
+
+# E2E 冒烟：直接打运行中的部署（默认 http://localhost:8080）
+node scripts/e2e.mjs          # phase1：完整用户旅程（30 项断言）
+docker compose down && docker compose up -d --wait
+node scripts/e2e.mjs phase2   # phase2：验证数据持久化
 ```
 
 ## 客户端打包
