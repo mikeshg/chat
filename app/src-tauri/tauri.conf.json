@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Chat",
+  "version": "0.1.0",
+  "identifier": "com.chat.app",
+  "build": {
+    "frontendDist": "../dist",
+    "beforeBuildCommand": "node_modules\\.bin\\tsc.cmd -b && node_modules\\.bin\\vite.cmd build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Chat",
+        "width": 1080,
+        "height": 720,
+        "minWidth": 760,
+        "minHeight": 520
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' http: https: ws: wss:; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.png", "icons/icon.ico"],
+    "shortDescription": "LAN-first chat"
+  }
+}

@@ -1,0 +1,15 @@
+node_modules
+dist
+target
+src-tauri/target
+*.tsbuildinfo
+.env
+.env.local
+shared/*.ts
+!shared/README.md
+
+# Android/Tauri 生成物的构建输出（gen 源码保留）
+app/src-tauri/gen/**/.gradle/
+app/src-tauri/gen/**/build/
+app/src-tauri/gen/**/local.properties
+.devin/

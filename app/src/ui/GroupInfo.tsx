@@ -1,0 +1,172 @@
+import { useEffect, useState } from "react";
+import { convs } from "../api";
+import { setState, useApp } from "../store";
+import type { ConversationDetail, ConversationView } from "../types";
+
+export default function GroupInfo({
+  conv,
+  onClose,
+}: {
+  conv: ConversationView;
+  onClose: () => void;
+}) {
+  const s = useApp();
+  const [detail, setDetail] = useState<ConversationDetail | null>(null);
+  const [renaming, setRenaming] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [picked, setPicked] = useState<Set<string>>(new Set());
+
+  const isOwner = detail?.owner_id === s.me?.id;
+  const memberIds = new Set(detail?.members.map((m) => m.user.id));
+  const invitable = s.friends.filter((f) => !memberIds.has(f.user.id));
+
+  const reload = async () => {
+    const [d, l] = await Promise.all([convs.detail(conv.id), convs.list()]);
+    setDetail(d);
+    setState({ conversations: l });
+  };
+  useEffect(() => {
+    reload().catch(console.warn);
+  }, [conv.id]);
+
+  const act = (p: Promise<unknown>) =>
+    p.then(reload).catch((e) => alert(e instanceof Error ? e.message : "操作失败"));
+
+  const leave = async () => {
+    if (!confirm(isOwner ? "你是群主，退出后将自动转让；确定退出？" : "退出该群？")) return;
+    await convs.leave(conv.id);
+    await act(Promise.resolve());
+    setState({ activeConv: null });
+    onClose();
+  };
+
+  return (
+    <aside className="group-info">
+      <div className="gi-head">
+        <h3>群聊信息</h3>
+        <button className="icon-btn" onClick={onClose}>
+          ✕
+        </button>
+      </div>
+      {detail && (
+        <>
+          <div className="gi-name">
+            {renaming ? (
+              <div className="row">
+                <input value={newName} onChange={(e) => setNewName(e.target.value)} />
+                <button
+                  className="primary"
+                  onClick={() =>
+                    act(convs.rename(conv.id, newName.trim())).then(() => setRenaming(false))
+                  }
+                >
+                  保存
+                </button>
+              </div>
+            ) : (
+              <>
+                <b>{detail.name ?? "群聊"}</b>
+                {isOwner && (
+                  <button
+                    onClick={() => {
+                      setNewName(detail.name ?? "");
+                      setRenaming(true);
+                    }}
+                  >
+                    改名
+                  </button>
+                )}
+              </>
+            )}
+          </div>
+
+          <div className="gi-members">
+            <div className="row between">
+              <h4>成员（{detail.members.length}）</h4>
+              <button onClick={() => setAdding(!adding)}>拉好友</button>
+            </div>
+            {adding && (
+              <div className="gi-add">
+                {invitable.length === 0 && <div className="muted">没有可邀请的好友</div>}
+                {invitable.map((f) => (
+                  <label className="row pick" key={f.user.id}>
+                    <input
+                      type="checkbox"
+                      checked={picked.has(f.user.id)}
+                      onChange={() => {
+                        const n = new Set(picked);
+                        if (n.has(f.user.id)) n.delete(f.user.id);
+                        else n.add(f.user.id);
+                        setPicked(n);
+                      }}
+                    />
+                    <span>{f.user.display_name}</span>
+                  </label>
+                ))}
+                {invitable.length > 0 && (
+                  <button
+                    className="primary"
+                    onClick={() =>
+                      act(convs.addMembers(conv.id, [...picked])).then(() => {
+                        setAdding(false);
+                        setPicked(new Set());
+                      })
+                    }
+                  >
+                    邀请（{picked.size}）
+                  </button>
+                )}
+              </div>
+            )}
+            {detail.members.map((m) => (
+              <div className="row" key={m.user.id}>
+                <div className="avatar sm">
+                  {m.user.display_name[0]?.toUpperCase()}
+                  {s.online[m.user.id] && <i className="online-dot" />}
+                </div>
+                <div className="grow">
+                  {m.user.display_name}
+                  {m.role === "owner" && <span className="tag">群主</span>}
+                </div>
+                {isOwner && m.user.id !== s.me?.id && (
+                  <>
+                    <button onClick={() => act(convs.transfer(conv.id, m.user.id))}>
+                      转让群主
+                    </button>
+                    <button
+                      className="danger"
+                      onClick={() => act(convs.kick(conv.id, m.user.id))}
+                    >
+                      移出
+                    </button>
+                  </>
+                )}
+              </div>
+            ))}
+          </div>
+
+          <div className="gi-actions">
+            <button className="danger" onClick={leave}>
+              退出群聊
+            </button>
+            {isOwner && (
+              <button
+                className="danger"
+                onClick={() => {
+                  if (confirm("解散后所有成员将被移出，消息记录保留但不可再发言。确定？"))
+                    act(convs.dissolve(conv.id)).then(() => {
+                      setState({ activeConv: null });
+                      onClose();
+                    });
+                }}
+              >
+                解散群聊
+              </button>
+            )}
+          </div>
+        </>
+      )}
+    </aside>
+  );
+}

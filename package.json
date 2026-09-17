@@ -1,0 +1,10 @@
+{
+  "name": "chat",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm -F app dev",
+    "build": "pnpm -F app build",
+    "server": "cargo run --manifest-path server/Cargo.toml",
+    "test": "cargo test --manifest-path server/Cargo.toml"
+  }
+}
