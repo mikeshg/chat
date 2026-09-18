@@ -1,4 +1,6 @@
 import type {
+  AdminOverview,
+  AdminUserView,
   AttachmentView,
   AuthResponse,
   ConversationDetail,
@@ -202,4 +204,19 @@ export const files = {
     }
     return res.json() as Promise<AttachmentView>;
   },
+};
+
+// ---------- admin ----------
+export const admin = {
+  overview: () => get<AdminOverview>("/admin/overview"),
+  users: (q = "", offset = 0) =>
+    get<AdminUserView[]>(
+      `/admin/users?offset=${offset}${q ? `&q=${encodeURIComponent(q)}` : ""}`,
+    ),
+  disable: (id: string) => post(`/admin/users/${id}/disable`),
+  enable: (id: string) => post(`/admin/users/${id}/enable`),
+  setRole: (id: string, role: "admin" | "user") =>
+    post(`/admin/users/${id}/role`, { role }),
+  resetPassword: (id: string, password: string) =>
+    post(`/admin/users/${id}/password`, { password }),
 };

@@ -3,6 +3,7 @@ export interface UserPublic {
   id: string;
   username: string;
   display_name: string;
+  role: "admin" | "user";
   last_seen_at: string | null;
 }
 
@@ -97,4 +98,30 @@ export type WsOut =
   | { type: "read_sync"; conversation_id: string; seq: number }
   | { type: "sync_messages"; conversation_id: string; messages: MessageView[] }
   | { type: "invalidate"; what: string }
+  | { type: "force_logout"; reason: string }
   | { type: "error"; code: string; message: string };
+
+// ---------- 后台管理 ----------
+export interface AdminOverview {
+  user_count: number;
+  admin_count: number;
+  disabled_count: number;
+  message_count: number;
+  dm_count: number;
+  group_count: number;
+  attachment_count: number;
+  attachment_bytes: number;
+  online_users: number;
+  online_conns: number;
+}
+
+export interface AdminUserView {
+  id: string;
+  username: string;
+  display_name: string;
+  role: "admin" | "user";
+  disabled_at: string | null;
+  last_seen_at: string | null;
+  created_at: string;
+  online: boolean;
+}

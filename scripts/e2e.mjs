@@ -303,6 +303,47 @@ async function phase1() {
   }
   wsa.close(); wsb2.close();
 
+  // --- 管理员后台 ---
+  {
+    const r = await api(A.access_token, 'GET', '/admin/overview');
+    ok('non-admin gets 403 on admin api', r.status === 403);
+    const r2 = await api(A.access_token, 'GET', '/admin/users');
+    ok('non-admin gets 403 on admin users', r2.status === 403);
+  }
+  // 完整 admin 流程需要管理员凭据（环境变量门控，库里首个注册者即管理员）
+  if (process.env.E2E_ADMIN_USER && process.env.E2E_ADMIN_PASS) {
+    const la = await api(null, 'POST', '/auth/login', {
+      username: process.env.E2E_ADMIN_USER,
+      password: process.env.E2E_ADMIN_PASS,
+    });
+    ok('admin login', la.status === 200 && la.json.user.role === 'admin', `got ${la.status}`);
+    const at = la.json.access_token;
+    const ov = await api(at, 'GET', '/admin/overview');
+    ok('admin overview', ov.status === 200 && ov.json.user_count >= 3, JSON.stringify(ov.json).slice(0, 120));
+    const ul = await api(at, 'GET', `/admin/users?q=${B.username}`);
+    ok('admin user search', ul.status === 200 && ul.json.length === 1);
+    // 禁用 B：B 在线时收 force_logout → REST/登录全拒
+    const wsb3 = new Ws();
+    await wsb3.connect(B.access_token);
+    const dis = await api(at, 'POST', `/admin/users/${B.user.id}/disable`);
+    ok('disable user', dis.status === 204);
+    try {
+      const f = await wsb3.waitType('force_logout', () => true, 5000);
+      ok('kicked via force_logout frame', f.reason === 'disabled');
+    } catch { ok('kicked via force_logout frame', false, 'no frame'); }
+    const dm = await api(B.access_token, 'GET', '/users/me');
+    ok('disabled user rejected on REST', dm.status === 403);
+    const dl = await api(null, 'POST', '/auth/login', { username: B.username, password: B.password });
+    ok('disabled user cannot login', dl.status === 403);
+    const en = await api(at, 'POST', `/admin/users/${B.user.id}/enable`);
+    ok('enable user', en.status === 204);
+    const em = await api(B.access_token, 'GET', '/users/me');
+    ok('enabled user restored', em.status === 200);
+    wsb3.close();
+  } else {
+    console.log('  (skip admin-flow asserts: set E2E_ADMIN_USER/E2E_ADMIN_PASS to enable)');
+  }
+
   writeFileSync(STATE, JSON.stringify({ A, B, C, dmId: A.dmId }, null, 2));
   console.log(`state saved -> ${STATE}`);
 }

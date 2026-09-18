@@ -49,10 +49,17 @@ pub fn router() -> Router<SharedState> {
         .route("/files/{id}", get(download_file))
         .route("/ws/ticket", get(ws_ticket))
         .route("/ws", get(ws::ws_handler))
+        // ---------- 后台管理（admin only） ----------
+        .route("/admin/overview", get(admin_overview))
+        .route("/admin/users", get(admin_users))
+        .route("/admin/users/{id}/disable", post(admin_disable))
+        .route("/admin/users/{id}/enable", post(admin_enable))
+        .route("/admin/users/{id}/role", post(admin_set_role))
+        .route("/admin/users/{id}/password", post(admin_reset_password))
 }
 
-fn uid_of(headers: &HeaderMap, st: &SharedState) -> AppResult<Uuid> {
-    auth::bearer_uid(headers, &st.cfg)
+async fn uid_of(headers: &HeaderMap, st: &SharedState) -> AppResult<Uuid> {
+    Ok(auth::require_user(st, headers).await?.id)
 }
 
 fn notify(st: &SharedState, uids: &[Uuid], what: &'static str) {
@@ -123,8 +130,10 @@ async fn register(
 
     let hash = auth::hash_password(&req.password)?;
     let row = sqlx::query_as::<_, UserRow>(
-        "INSERT INTO users (username, display_name, password_hash)
-         VALUES ($1, $2, $3) RETURNING *",
+        "INSERT INTO users (username, display_name, password_hash, role)
+         SELECT $1, $2, $3,
+                CASE WHEN NOT EXISTS(SELECT 1 FROM users) THEN 'admin' ELSE 'user' END
+         RETURNING *",
     )
     .bind(username)
     .bind(&display_name)
@@ -159,6 +168,9 @@ async fn login(
     if !auth::verify_password(&row.password_hash, &req.password) {
         return Err(AppError::unauthorized("invalid credentials"));
     }
+    if row.disabled_at.is_some() {
+        return Err(AppError::forbidden("账号已被禁用"));
+    }
     let user = UserPublic::from(&row);
     Ok(Json(
         auth::issue_tokens(&st.pool, &st.cfg, &user, None).await?,
@@ -191,6 +203,9 @@ async fn refresh(
         .bind(user_id)
         .fetch_one(&st.pool)
         .await?;
+    if row.disabled_at.is_some() {
+        return Err(AppError::forbidden("账号已被禁用"));
+    }
     let user = UserPublic::from(&row);
     Ok(Json(
         auth::issue_tokens(&st.pool, &st.cfg, &user, None).await?,
@@ -214,7 +229,7 @@ async fn logout(
 // ---------- users ----------
 
 async fn get_me(State(st): State<SharedState>, headers: HeaderMap) -> AppResult<Json<UserPublic>> {
-    let uid = uid_of(&headers, &st)?;
+    let uid = uid_of(&headers, &st).await?;
     let row = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE id = $1")
         .bind(uid)
         .fetch_one(&st.pool)
@@ -227,7 +242,7 @@ async fn update_me(
     headers: HeaderMap,
     Json(req): Json<UpdateMeReq>,
 ) -> AppResult<Json<UserPublic>> {
-    let uid = uid_of(&headers, &st)?;
+    let uid = uid_of(&headers, &st).await?;
     let name = req.display_name.trim();
     if name.is_empty() || name.len() > 50 {
         return Err(AppError::bad_request("display_name must be 1-50 chars"));
@@ -253,7 +268,7 @@ async fn search_user(
     headers: HeaderMap,
     Query(q): Query<SearchQuery>,
 ) -> AppResult<Json<Vec<UserPublic>>> {
-    let uid = uid_of(&headers, &st)?;
+    let uid = uid_of(&headers, &st).await?;
     let needle = q.q.trim();
     if needle.is_empty() {
         return Ok(Json(vec![]));
@@ -264,7 +279,8 @@ async fn search_user(
         .replace('_', "\\_");
     let rows = sqlx::query_as::<_, UserRow>(
         "SELECT * FROM users
-          WHERE id <> $1 AND (username ILIKE '%' || $2 || '%' ESCAPE '\\'
+          WHERE id <> $1 AND disabled_at IS NULL
+            AND (username ILIKE '%' || $2 || '%' ESCAPE '\\'
                               OR display_name ILIKE '%' || $2 || '%' ESCAPE '\\')
           ORDER BY (username = $3 OR display_name = $3) DESC, username
           LIMIT 20",
@@ -284,6 +300,7 @@ struct FriendRow {
     id: Uuid,
     username: String,
     display_name: String,
+    role: String,
     last_seen_at: Option<DateTime<Utc>>,
     since: DateTime<Utc>,
 }
@@ -292,9 +309,9 @@ async fn list_friends(
     State(st): State<SharedState>,
     headers: HeaderMap,
 ) -> AppResult<Json<Vec<FriendView>>> {
-    let uid = uid_of(&headers, &st)?;
+    let uid = uid_of(&headers, &st).await?;
     let rows = sqlx::query_as::<_, FriendRow>(
-        "SELECT u.id, u.username::text AS username, u.display_name, u.last_seen_at,
+        "SELECT u.id, u.username::text AS username, u.display_name, u.role, u.last_seen_at,
                 f.created_at AS since
            FROM friendships f
            JOIN users u ON u.id = CASE WHEN f.user_a = $1 THEN f.user_b ELSE f.user_a END
@@ -311,6 +328,7 @@ async fn list_friends(
                     id: r.id,
                     username: r.username,
                     display_name: r.display_name,
+                    role: r.role,
                     last_seen_at: r.last_seen_at,
                 },
                 since: r.since,
@@ -324,7 +342,7 @@ async fn delete_friend(
     headers: HeaderMap,
     Path(friend_id): Path<Uuid>,
 ) -> AppResult<StatusCode> {
-    let uid = uid_of(&headers, &st)?;
+    let uid = uid_of(&headers, &st).await?;
     let (lo, hi) = domain::canonical_pair(uid, friend_id);
     let res = sqlx::query("DELETE FROM friendships WHERE user_a = $1 AND user_b = $2")
         .bind(lo)
@@ -347,6 +365,7 @@ struct ReqRow {
     cp_id: Uuid,
     cp_username: String,
     cp_display: String,
+    cp_role: String,
     cp_last_seen: Option<DateTime<Utc>>,
 }
 
@@ -354,11 +373,11 @@ async fn list_requests(
     State(st): State<SharedState>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    let uid = uid_of(&headers, &st)?;
+    let uid = uid_of(&headers, &st).await?;
     let incoming = sqlx::query_as::<_, ReqRow>(
         "SELECT r.id, r.message, r.created_at,
                 u.id AS cp_id, u.username::text AS cp_username, u.display_name AS cp_display,
-                u.last_seen_at AS cp_last_seen
+                u.role AS cp_role, u.last_seen_at AS cp_last_seen
            FROM friend_requests r JOIN users u ON u.id = r.from_user
           WHERE r.to_user = $1 AND r.status = 'pending'
           ORDER BY r.created_at DESC",
@@ -369,7 +388,7 @@ async fn list_requests(
     let outgoing = sqlx::query_as::<_, ReqRow>(
         "SELECT r.id, r.message, r.created_at,
                 u.id AS cp_id, u.username::text AS cp_username, u.display_name AS cp_display,
-                u.last_seen_at AS cp_last_seen
+                u.role AS cp_role, u.last_seen_at AS cp_last_seen
            FROM friend_requests r JOIN users u ON u.id = r.to_user
           WHERE r.from_user = $1 AND r.status = 'pending'
           ORDER BY r.created_at DESC",
@@ -386,6 +405,7 @@ async fn list_requests(
                     id: r.cp_id,
                     username: r.cp_username,
                     display_name: r.cp_display,
+                    role: r.cp_role,
                     last_seen_at: r.cp_last_seen,
                 },
                 message: r.message,
@@ -405,8 +425,10 @@ async fn create_request(
     headers: HeaderMap,
     Json(req): Json<FriendReqCreate>,
 ) -> AppResult<Json<Value>> {
-    let uid = uid_of(&headers, &st)?;
-    let to = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE username = $1")
+    let uid = uid_of(&headers, &st).await?;
+    let to = sqlx::query_as::<_, UserRow>(
+        "SELECT * FROM users WHERE username = $1 AND disabled_at IS NULL",
+    )
         .bind(req.username.trim())
         .fetch_optional(&st.pool)
         .await?
@@ -487,7 +509,7 @@ async fn accept_request(
     headers: HeaderMap,
     Path(req_id): Path<Uuid>,
 ) -> AppResult<Json<Value>> {
-    let uid = uid_of(&headers, &st)?;
+    let uid = uid_of(&headers, &st).await?;
     let to_user = sqlx::query_scalar::<_, Uuid>(
         "SELECT to_user FROM friend_requests WHERE id = $1 AND status = 'pending'",
     )
@@ -512,7 +534,7 @@ async fn decline_request(
     headers: HeaderMap,
     Path(req_id): Path<Uuid>,
 ) -> AppResult<StatusCode> {
-    let uid = uid_of(&headers, &st)?;
+    let uid = uid_of(&headers, &st).await?;
     let res = sqlx::query(
         "UPDATE friend_requests SET status = 'declined', resolved_at = now()
          WHERE id = $1 AND to_user = $2 AND status = 'pending'",
@@ -543,6 +565,7 @@ struct ConvRow {
     peer_id: Option<Uuid>,
     peer_username: Option<String>,
     peer_display: Option<String>,
+    peer_role: Option<String>,
     peer_last_seen: Option<DateTime<Utc>>,
     m_id: Option<Uuid>,
     m_seq: Option<i64>,
@@ -558,7 +581,7 @@ async fn list_conversations(
     State(st): State<SharedState>,
     headers: HeaderMap,
 ) -> AppResult<Json<Vec<ConversationView>>> {
-    let uid = uid_of(&headers, &st)?;
+    let uid = uid_of(&headers, &st).await?;
     let rows = sqlx::query_as::<_, ConvRow>(
         "SELECT c.id, c.type AS kind, c.name, c.owner_id, c.last_seq, c.created_at,
                 (c.last_seq - m.last_read_seq) AS unread_count,
@@ -567,14 +590,14 @@ async fn list_conversations(
                           AND mmsg.seq > m.last_read_seq) AS has_mention,
                 (SELECT count(*) FROM memberships mc WHERE mc.conversation_id = c.id) AS member_count,
                 p.id AS peer_id, p.username::text AS peer_username, p.display_name AS peer_display,
-                p.last_seen_at AS peer_last_seen,
+                p.role AS peer_role, p.last_seen_at AS peer_last_seen,
                 lm.id AS m_id, lm.seq AS m_seq, lm.sender_id AS m_sender_id,
                 su.username::text AS m_sender_username, su.display_name AS m_sender_name,
                 lm.content AS m_content, lm.kind AS m_kind, lm.created_at AS m_created_at
            FROM memberships m
            JOIN conversations c ON c.id = m.conversation_id
            LEFT JOIN LATERAL (
-               SELECT u.id, u.username, u.display_name, u.last_seen_at
+               SELECT u.id, u.username, u.display_name, u.role, u.last_seen_at
                  FROM memberships mm JOIN users u ON u.id = mm.user_id
                 WHERE mm.conversation_id = c.id AND mm.user_id <> $1
                 LIMIT 1
@@ -598,6 +621,7 @@ async fn list_conversations(
                 id,
                 username: r.peer_username.unwrap_or_default(),
                 display_name: r.peer_display.unwrap_or_default(),
+                role: r.peer_role.unwrap_or_else(|| "user".into()),
                 last_seen_at: r.peer_last_seen,
             });
             let last_message = r.m_id.map(|id| MessageView {
@@ -636,7 +660,7 @@ async fn create_group(
     headers: HeaderMap,
     Json(req): Json<GroupCreateReq>,
 ) -> AppResult<Json<ConversationDetail>> {
-    let uid = uid_of(&headers, &st)?;
+    let uid = uid_of(&headers, &st).await?;
     let ids: Vec<Uuid> = {
         let mut v: Vec<Uuid> = req.member_ids.into_iter().filter(|i| *i != uid).collect();
         v.sort();
@@ -721,12 +745,13 @@ async fn conversation_detail(st: &SharedState, conv: Uuid) -> AppResult<Conversa
             Uuid,
             String,
             String,
+            String,
             Option<DateTime<Utc>>,
             String,
             DateTime<Utc>,
         ),
     >(
-        "SELECT u.id, u.username::text, u.display_name, u.last_seen_at, m.role, m.joined_at
+        "SELECT u.id, u.username::text, u.display_name, u.role, u.last_seen_at, m.role, m.joined_at
            FROM memberships m JOIN users u ON u.id = m.user_id
           WHERE m.conversation_id = $1 ORDER BY m.joined_at",
     )
@@ -744,15 +769,18 @@ async fn conversation_detail(st: &SharedState, conv: Uuid) -> AppResult<Conversa
         members: members
             .into_iter()
             .map(
-                |(id, username, display_name, last_seen_at, role, joined_at)| MemberView {
-                    user: UserPublic {
-                        id,
-                        username,
-                        display_name,
-                        last_seen_at,
-                    },
-                    role,
-                    joined_at,
+                |(id, username, display_name, urole, last_seen_at, role, joined_at)| {
+                    MemberView {
+                        user: UserPublic {
+                            id,
+                            username,
+                            display_name,
+                            role: urole,
+                            last_seen_at,
+                        },
+                        role,
+                        joined_at,
+                    }
                 },
             )
             .collect(),
@@ -764,7 +792,7 @@ async fn get_conversation(
     headers: HeaderMap,
     Path(conv): Path<Uuid>,
 ) -> AppResult<Json<ConversationDetail>> {
-    let uid = uid_of(&headers, &st)?;
+    let uid = uid_of(&headers, &st).await?;
     require_member(&st, conv, uid).await?;
     conversation_detail(&st, conv).await.map(Json)
 }
@@ -782,7 +810,7 @@ async fn list_messages(
     Path(conv): Path<Uuid>,
     Query(q): Query<MsgQuery>,
 ) -> AppResult<Json<MessagesPage>> {
-    let uid = uid_of(&headers, &st)?;
+    let uid = uid_of(&headers, &st).await?;
     require_member(&st, conv, uid).await?;
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
 
@@ -860,7 +888,7 @@ async fn search_messages(
     Path(conv): Path<Uuid>,
     Query(q): Query<MsgSearchQuery>,
 ) -> AppResult<Json<Vec<MessageView>>> {
-    let uid = uid_of(&headers, &st)?;
+    let uid = uid_of(&headers, &st).await?;
     require_member(&st, conv, uid).await?;
     let needle = q.q.trim();
     if needle.is_empty() {
@@ -894,7 +922,7 @@ async fn add_members(
     Path(conv): Path<Uuid>,
     Json(req): Json<AddMembersReq>,
 ) -> AppResult<StatusCode> {
-    let uid = uid_of(&headers, &st)?;
+    let uid = uid_of(&headers, &st).await?;
     require_member(&st, conv, uid).await?;
     if domain::conv_kind(&st.pool, conv).await?.as_deref() != Some("group") {
         return Err(AppError::bad_request(
@@ -948,7 +976,7 @@ async fn leave_conversation(
     headers: HeaderMap,
     Path(conv): Path<Uuid>,
 ) -> AppResult<StatusCode> {
-    let uid = uid_of(&headers, &st)?;
+    let uid = uid_of(&headers, &st).await?;
     let info = require_member(&st, conv, uid).await?;
     if domain::conv_kind(&st.pool, conv).await?.as_deref() != Some("group") {
         return Err(AppError::bad_request("cannot leave a direct conversation"));
@@ -1010,7 +1038,7 @@ async fn kick_member(
     headers: HeaderMap,
     Path((conv, target)): Path<(Uuid, Uuid)>,
 ) -> AppResult<StatusCode> {
-    let uid = uid_of(&headers, &st)?;
+    let uid = uid_of(&headers, &st).await?;
     if uid == target {
         return Err(AppError::bad_request("use leave endpoint for yourself"));
     }
@@ -1040,7 +1068,7 @@ async fn rename_conversation(
     Path(conv): Path<Uuid>,
     Json(req): Json<RenameReq>,
 ) -> AppResult<StatusCode> {
-    let uid = uid_of(&headers, &st)?;
+    let uid = uid_of(&headers, &st).await?;
     let me = require_member(&st, conv, uid).await?;
     if me.role != "owner" {
         return Err(AppError::forbidden("only the owner can rename"));
@@ -1064,7 +1092,7 @@ async fn dissolve_conversation(
     headers: HeaderMap,
     Path(conv): Path<Uuid>,
 ) -> AppResult<StatusCode> {
-    let uid = uid_of(&headers, &st)?;
+    let uid = uid_of(&headers, &st).await?;
     let me = require_member(&st, conv, uid).await?;
     if me.role != "owner" {
         return Err(AppError::forbidden("only the owner can dissolve"));
@@ -1098,7 +1126,7 @@ async fn upload_file(
     headers: HeaderMap,
     mut mp: Multipart,
 ) -> AppResult<Json<AttachmentView>> {
-    let uid = uid_of(&headers, &st)?;
+    let uid = uid_of(&headers, &st).await?;
     let mut conv: Option<Uuid> = None;
     let mut file_name = "file".to_string();
     let mut mime = "application/octet-stream".to_string();
@@ -1216,7 +1244,7 @@ async fn ws_ticket(
     State(st): State<SharedState>,
     headers: HeaderMap,
 ) -> AppResult<Json<TicketRes>> {
-    let uid = uid_of(&headers, &st)?;
+    let uid = uid_of(&headers, &st).await?;
     let ticket = st.issue_ticket(uid);
     Ok(Json(TicketRes {
         ticket,
@@ -1235,7 +1263,7 @@ async fn transfer_ownership(
     Path(conv): Path<Uuid>,
     Json(req): Json<TransferReq>,
 ) -> AppResult<StatusCode> {
-    let uid = uid_of(&headers, &st)?;
+    let uid = uid_of(&headers, &st).await?;
     if uid == req.user_id {
         return Err(AppError::bad_request("already the owner"));
     }
@@ -1272,5 +1300,216 @@ async fn transfer_ownership(
 
     let members = domain::member_ids(&st.pool, conv).await?;
     notify(&st, &members, "conversations");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------- 后台管理（仅 admin，账号级角色，与会话内 owner 无关） ----------
+
+/// 撤销某用户全部有效 refresh token（禁用/改密时用）
+async fn revoke_all_refresh(st: &SharedState, uid: Uuid) -> AppResult<()> {
+    sqlx::query(
+        "UPDATE refresh_tokens SET revoked_at = now()
+         WHERE user_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(uid)
+    .execute(&st.pool)
+    .await?;
+    Ok(())
+}
+
+async fn admin_overview(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+) -> AppResult<Json<AdminOverview>> {
+    auth::require_admin(&st, &headers).await?;
+    let (user_count, admin_count, disabled_count) = sqlx::query_as::<_, (i64, i64, i64)>(
+        "SELECT count(*),
+                count(*) FILTER (WHERE role = 'admin'),
+                count(*) FILTER (WHERE disabled_at IS NOT NULL)
+           FROM users",
+    )
+    .fetch_one(&st.pool)
+    .await?;
+    let (dm_count, group_count) = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT count(*) FILTER (WHERE type = 'dm'),
+                count(*) FILTER (WHERE type = 'group')
+           FROM conversations",
+    )
+    .fetch_one(&st.pool)
+    .await?;
+    let message_count =
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM messages")
+            .fetch_one(&st.pool)
+            .await?;
+    let (attachment_count, attachment_bytes) = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT count(*), COALESCE(sum(size), 0)::bigint FROM attachments",
+    )
+    .fetch_one(&st.pool)
+    .await?;
+    let online_users = st
+        .conns
+        .iter()
+        .filter(|e| !e.value().is_empty())
+        .count() as i64;
+    let online_conns = st.conns.iter().map(|e| e.value().len() as i64).sum();
+    Ok(Json(AdminOverview {
+        user_count,
+        admin_count,
+        disabled_count,
+        message_count,
+        dm_count,
+        group_count,
+        attachment_count,
+        attachment_bytes,
+        online_users,
+        online_conns,
+    }))
+}
+
+const ADMIN_PAGE: i64 = 50;
+
+async fn admin_users(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Query(q): Query<AdminUsersQuery>,
+) -> AppResult<Json<Vec<AdminUserView>>> {
+    auth::require_admin(&st, &headers).await?;
+    let rows = if let Some(needle) = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let esc = needle
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        sqlx::query_as::<_, UserRow>(
+            "SELECT * FROM users
+              WHERE username ILIKE '%' || $1 || '%' ESCAPE '\\'
+                 OR display_name ILIKE '%' || $1 || '%' ESCAPE '\\'
+              ORDER BY created_at LIMIT $2 OFFSET $3",
+        )
+        .bind(esc)
+        .bind(ADMIN_PAGE)
+        .bind(q.offset.max(0))
+        .fetch_all(&st.pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, UserRow>(
+            "SELECT * FROM users ORDER BY created_at LIMIT $1 OFFSET $2",
+        )
+        .bind(ADMIN_PAGE)
+        .bind(q.offset.max(0))
+        .fetch_all(&st.pool)
+        .await?
+    };
+    Ok(Json(
+        rows.iter()
+            .map(|u| AdminUserView {
+                id: u.id,
+                username: u.username.clone(),
+                display_name: u.display_name.clone(),
+                role: u.role.clone(),
+                disabled_at: u.disabled_at,
+                last_seen_at: u.last_seen_at,
+                created_at: u.created_at,
+                online: st.is_online(u.id),
+            })
+            .collect(),
+    ))
+}
+
+/// 禁用：置标记 → 撤销 refresh token → 踢下线（force_logout 帧 + 断连）
+async fn admin_disable(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(target): Path<Uuid>,
+) -> AppResult<StatusCode> {
+    auth::require_admin(&st, &headers).await?;
+    let role = sqlx::query_scalar::<_, String>("SELECT role FROM users WHERE id = $1")
+        .bind(target)
+        .fetch_optional(&st.pool)
+        .await?
+        .ok_or_else(|| AppError::not_found("user not found"))?;
+    if role == "admin" {
+        return Err(AppError::bad_request("管理员账号不可禁用"));
+    }
+    sqlx::query("UPDATE users SET disabled_at = now() WHERE id = $1")
+        .bind(target)
+        .execute(&st.pool)
+        .await?;
+    revoke_all_refresh(&st, target).await?;
+    st.kick_user(target, "disabled");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn admin_enable(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(target): Path<Uuid>,
+) -> AppResult<StatusCode> {
+    auth::require_admin(&st, &headers).await?;
+    sqlx::query("UPDATE users SET disabled_at = NULL WHERE id = $1")
+        .bind(target)
+        .execute(&st.pool)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 任命/撤销管理员。末位保护：最后一个管理员不可被撤销。
+async fn admin_set_role(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(target): Path<Uuid>,
+    Json(req): Json<SetRoleReq>,
+) -> AppResult<StatusCode> {
+    auth::require_admin(&st, &headers).await?;
+    if req.role != "admin" && req.role != "user" {
+        return Err(AppError::bad_request("role must be admin or user"));
+    }
+    let cur = sqlx::query_scalar::<_, String>("SELECT role FROM users WHERE id = $1")
+        .bind(target)
+        .fetch_optional(&st.pool)
+        .await?
+        .ok_or_else(|| AppError::not_found("user not found"))?;
+    if req.role == "user" && cur == "admin" {
+        let admins =
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users WHERE role = 'admin'")
+                .fetch_one(&st.pool)
+                .await?;
+        if admins <= 1 {
+            return Err(AppError::bad_request("至少保留一名管理员"));
+        }
+    }
+    sqlx::query("UPDATE users SET role = $2 WHERE id = $1")
+        .bind(target)
+        .bind(&req.role)
+        .execute(&st.pool)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 重置他人密码：改哈希 → 撤 refresh → 踢下线强制重登
+async fn admin_reset_password(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(target): Path<Uuid>,
+    Json(req): Json<ResetPasswordReq>,
+) -> AppResult<StatusCode> {
+    auth::require_admin(&st, &headers).await?;
+    if !(6..=72).contains(&req.password.len()) {
+        return Err(AppError::bad_request("password must be 6-72 chars"));
+    }
+    let exists = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)")
+        .bind(target)
+        .fetch_one(&st.pool)
+        .await?;
+    if !exists {
+        return Err(AppError::not_found("user not found"));
+    }
+    let hash = auth::hash_password(&req.password)?;
+    sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
+        .bind(target)
+        .bind(&hash)
+        .execute(&st.pool)
+        .await?;
+    revoke_all_refresh(&st, target).await?;
+    st.kick_user(target, "password_reset");
     Ok(StatusCode::NO_CONTENT)
 }

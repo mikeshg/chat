@@ -1,4 +1,4 @@
-import { convs, friends as friendsApi } from "./api";
+import { convs, friends as friendsApi, clearSession } from "./api";
 import { getState, setState, upsertMessage, resolveAck } from "./store";
 import type { AttachmentView, MessageView, WsOut } from "./types";
 import { wsBase } from "./api";
@@ -133,6 +133,17 @@ function dispatch(f: WsOut) {
     case "invalidate":
       void refreshByWhat(f.what);
       break;
+    case "force_logout": {
+      // 被管理员禁用/重置密码：记录原因 → 停连接 → 回登录页
+      sessionStorage.setItem(
+        "chat_kick_reason",
+        f.reason === "disabled" ? "账号已被禁用，请联系管理员" : "密码已被管理员重置，请重新登录",
+      );
+      stopWs();
+      clearSession();
+      window.dispatchEvent(new Event("chat:logout"));
+      break;
+    }
     case "error":
       console.warn("ws error", f.code, f.message);
       break;

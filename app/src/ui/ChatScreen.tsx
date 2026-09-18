@@ -5,6 +5,7 @@ import ConvList from "./ConvList";
 import ChatView from "./ChatView";
 import ContactsPanel from "./ContactsPanel";
 import MePanel from "./MePanel";
+import AdminPanel from "./AdminPanel";
 
 export default function ChatScreen() {
   const s = useApp();
@@ -56,6 +57,15 @@ export default function ChatScreen() {
         >
           我
         </button>
+        {s.me?.role === "admin" && (
+          <button
+            className={`rail-btn ${s.tab === "admin" ? "on" : ""}`}
+            onClick={() => setState({ tab: "admin" })}
+            title="后台管理"
+          >
+            管理
+          </button>
+        )}
         <div className="rail-foot">
           <span className={`dot ${s.wsReady ? "on" : ""}`} title={s.wsReady ? "已连接" : "未连接"} />
         </div>
@@ -69,6 +79,7 @@ export default function ChatScreen() {
       )}
       {s.tab === "contacts" && <ContactsPanel />}
       {s.tab === "me" && <MePanel />}
+      {s.tab === "admin" && s.me?.role === "admin" && <AdminPanel />}
     </div>
   );
 }

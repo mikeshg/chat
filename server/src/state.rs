@@ -51,6 +51,21 @@ impl AppState {
         self.conns.get(&uid).map(|m| !m.is_empty()).unwrap_or(false)
     }
 
+    /// 踢下线：先给该用户所有连接发 force_logout 帧，再移除其 conn 表项。
+    /// 发送端被丢弃后 writer task 结束、socket 关闭，走正常断线清理（广播离线）。
+    pub fn kick_user(&self, uid: Uuid, reason: &str) {
+        if let Some((_, m)) = self.conns.remove(&uid) {
+            let frame = serde_json::json!({
+                "type": "force_logout",
+                "reason": reason,
+            })
+            .to_string();
+            for s in m.iter() {
+                let _ = s.send(frame.clone());
+            }
+        }
+    }
+
     pub fn conn_count(&self, uid: Uuid) -> usize {
         self.conns.get(&uid).map(|m| m.len()).unwrap_or(0)
     }

@@ -28,6 +28,17 @@ pub async fn ws_handler(
     if issued.elapsed() > Duration::from_secs(30) {
         return Err(crate::error::AppError::unauthorized("ticket expired"));
     }
+    // ticket 签发后被禁用的缝隙：升级前再确认一次
+    let disabled = sqlx::query_scalar::<_, bool>(
+        "SELECT disabled_at IS NOT NULL FROM users WHERE id = $1",
+    )
+    .bind(uid)
+    .fetch_one(&st.pool)
+    .await
+    .unwrap_or(true);
+    if disabled {
+        return Err(crate::error::AppError::forbidden("账号已被禁用"));
+    }
     Ok(ws.on_upgrade(move |socket| handle(socket, st, uid)))
 }
 
@@ -401,16 +412,17 @@ async fn user_public(
     st: &SharedState,
     uid: Uuid,
 ) -> Result<UserPublic, (&'static str, &'static str)> {
-    sqlx::query_as::<_, (String, String, Option<chrono::DateTime<Utc>>)>(
-        "SELECT username::text, display_name, last_seen_at FROM users WHERE id = $1",
+    sqlx::query_as::<_, (String, String, String, Option<chrono::DateTime<Utc>>)>(
+        "SELECT username::text, display_name, role, last_seen_at FROM users WHERE id = $1",
     )
     .bind(uid)
     .fetch_one(&st.pool)
     .await
-    .map(|(username, display_name, last_seen_at)| UserPublic {
+    .map(|(username, display_name, role, last_seen_at)| UserPublic {
         id: uid,
         username,
         display_name,
+        role,
         last_seen_at,
     })
     .map_err(|_| ("internal", "db error"))

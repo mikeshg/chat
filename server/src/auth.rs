@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::error::{AppError, AppResult};
-use crate::model::{AuthResponse, UserPublic};
+use crate::model::{AuthResponse, UserPublic, UserRow};
+use crate::state::SharedState;
 use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
@@ -88,6 +89,29 @@ pub fn bearer_uid(headers: &HeaderMap, cfg: &Config) -> AppResult<Uuid> {
         .strip_prefix("Bearer ")
         .ok_or_else(|| AppError::unauthorized("expected bearer token"))?;
     verify_access(token, &cfg.jwt_secret)
+}
+
+/// 解析 token 并取出用户行；账号被禁用立即拒绝（禁用即时生效）
+pub async fn require_user(st: &SharedState, headers: &HeaderMap) -> AppResult<UserRow> {
+    let uid = bearer_uid(headers, &st.cfg)?;
+    let user = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE id = $1")
+        .bind(uid)
+        .fetch_optional(&st.pool)
+        .await?
+        .ok_or_else(|| AppError::unauthorized("user not found"))?;
+    if user.disabled_at.is_some() {
+        return Err(AppError::forbidden("账号已被禁用"));
+    }
+    Ok(user)
+}
+
+/// 管理员门禁：先过 require_user，再校验账号角色
+pub async fn require_admin(st: &SharedState, headers: &HeaderMap) -> AppResult<UserRow> {
+    let user = require_user(st, headers).await?;
+    if user.role != "admin" {
+        return Err(AppError::forbidden("需要管理员权限"));
+    }
+    Ok(user)
 }
 
 /// 签发 access + refresh 令牌并落库

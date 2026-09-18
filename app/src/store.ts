@@ -20,7 +20,7 @@ export interface AppState {
   friends: FriendView[];
   requests: RequestsView;
   wsReady: boolean;
-  tab: "chats" | "contacts" | "me";
+  tab: "chats" | "contacts" | "me" | "admin";
 }
 
 let state: AppState = {

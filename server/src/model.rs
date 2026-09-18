@@ -8,6 +8,8 @@ pub struct UserRow {
     pub username: String,
     pub display_name: String,
     pub password_hash: String,
+    pub role: String, // "admin" | "user"（账号级，与会话内 memberships.role 无关）
+    pub disabled_at: Option<DateTime<Utc>>,
     pub last_seen_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
@@ -17,6 +19,7 @@ pub struct UserPublic {
     pub id: Uuid,
     pub username: String,
     pub display_name: String,
+    pub role: String,
     pub last_seen_at: Option<DateTime<Utc>>,
 }
 
@@ -26,6 +29,7 @@ impl From<&UserRow> for UserPublic {
             id: u.id,
             username: u.username.clone(),
             display_name: u.display_name.clone(),
+            role: u.role.clone(),
             last_seen_at: u.last_seen_at,
         }
     }
@@ -240,4 +244,49 @@ pub enum WsOut {
         code: &'static str,
         message: String,
     },
+}
+
+// ---------- 后台管理（仅 admin） ----------
+
+#[derive(Debug, Serialize)]
+pub struct AdminOverview {
+    pub user_count: i64,
+    pub admin_count: i64,
+    pub disabled_count: i64,
+    pub message_count: i64,
+    pub dm_count: i64,
+    pub group_count: i64,
+    pub attachment_count: i64,
+    pub attachment_bytes: i64,
+    pub online_users: i64,
+    pub online_conns: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminUserView {
+    pub id: Uuid,
+    pub username: String,
+    pub display_name: String,
+    pub role: String,
+    pub disabled_at: Option<DateTime<Utc>>,
+    pub last_seen_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub online: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminUsersQuery {
+    pub q: Option<String>,
+    #[serde(default)]
+    pub offset: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetRoleReq {
+    pub role: String, // "admin" | "user"
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResetPasswordReq {
+    pub password: String,
 }

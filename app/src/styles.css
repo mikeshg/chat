@@ -312,3 +312,43 @@ input:focus, textarea:focus { border-color: var(--green); }
 .pf-chip i { color: var(--muted); font-style: normal; }
 .pf-chip b { cursor: pointer; color: var(--muted); font-weight: normal; }
 .pf-chip b:hover { color: var(--danger); }
+
+/* ---------- 后台管理 ---------- */
+.admin-panel h2 { margin-bottom: 12px; }
+.ad-cards { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }
+.ad-stat {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 12px 18px; min-width: 110px; display: flex; flex-direction: column; gap: 2px;
+}
+.ad-stat b { font-size: 20px; }
+.ad-stat span { font-size: 12px; color: var(--muted); }
+.ad-toolbar { display: flex; gap: 8px; margin-bottom: 10px; }
+.ad-toolbar input { flex: 1; }
+.ad-table { display: flex; flex-direction: column; }
+.ad-row {
+  display: grid; grid-template-columns: 2fr 1.4fr 1.2fr 1.2fr 2fr;
+  gap: 8px; align-items: center; padding: 8px 4px;
+  border-bottom: 1px solid var(--line); font-size: 13px;
+}
+.ad-row.ad-head { color: var(--muted); font-size: 12px; border-bottom: 1px solid var(--line); }
+.ad-user { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.ad-avatar {
+  width: 30px; height: 30px; border-radius: 50%; background: var(--accent);
+  color: #fff; display: inline-flex; align-items: center; justify-content: center;
+  font-style: normal; font-size: 13px; flex-shrink: 0;
+}
+.ad-user b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ad-user small { color: var(--muted); }
+.ad-flags { display: flex; flex-wrap: wrap; gap: 4px; }
+.ad-badge {
+  font-style: normal; font-size: 11px; padding: 1px 8px; border-radius: 10px;
+  background: var(--bg); border: 1px solid var(--line); color: var(--muted);
+}
+.ad-badge.ad-admin { color: var(--accent); border-color: var(--accent); }
+.ad-badge.ad-off { color: var(--danger, #d33); border-color: var(--danger, #d33); }
+.ad-badge.ad-on { color: #1a7f37; border-color: #1a7f37; }
+.ad-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.ad-actions button { font-size: 12px; padding: 3px 10px; }
+.ad-actions .danger { color: var(--danger, #d33); border-color: var(--danger, #d33); }
+.ad-empty { text-align: center; padding: 20px; }
+.ad-pager { display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 10px; }

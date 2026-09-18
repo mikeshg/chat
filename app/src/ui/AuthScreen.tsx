@@ -9,7 +9,12 @@ export default function AuthScreen() {
   const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
   const [server, setServerUrl] = useState(getServer());
-  const [err, setErr] = useState("");
+  const [err, setErr] = useState(() => {
+    // 被踢下线（禁用/改密）的提示只显示一次
+    const r = sessionStorage.getItem("chat_kick_reason");
+    if (r) sessionStorage.removeItem("chat_kick_reason");
+    return r ?? "";
+  });
   const [busy, setBusy] = useState(false);
 
   const submit = async (e: React.FormEvent) => {

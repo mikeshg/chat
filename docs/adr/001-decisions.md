@@ -56,3 +56,9 @@
 **决策**：提及独立表 `message_mentions(message_id, user_id)`，发送时在服务端按群成员用户名解析 `@token`（去重、不含发送者、仅群聊）；`MessageView.mentions` 带 user_id 列表；`ConversationView.has_mention` = 存在 seq > last_read_seq 的 @我 记录，已读后自然消除。会话内搜索 `GET /conversations/{id}/messages/search?q=` 走 ILIKE 子串（通配符转义），复用 MsgViewRow 的 SELECT/JOIN。
 
 **理由**：提及必须服务端解析——客户端自行猜测用户名会与改名/权限脱节；独立表比解析 content 更可查询（has_mention 一条 EXISTS 搞定）。搜索用 ILIKE 而非全文索引：消息量小、零运维成本，量上来再换 `tsvector` 或外部引擎。
+
+## 11. 账号角色：首注册者引导 + 禁用即踢
+
+**决策**：`users.role`（admin/user）+ `users.disabled_at`。最早注册用户自动成为管理员（Gitea 式零配置引导），之后管理员在后台互相任命/撤销；**末位保护**——最后一个管理员不可撤销；管理员账号不可被禁用。禁用 = 置标记 + 撤销全部 refresh token + `force_logout` 帧踢下线 + 每请求 `require_user` 查用户行拒绝（即时生效，不等 access token 过期）。
+
+**理由**：自部署产品不想引入"谁是第一个 admin"的配置项；角色判断走 DB 而非 JWT claim——admin 撤销/禁用必须即时生效，JWT 15 分钟 TTL 内仍放行不可接受，代价是每请求一次主键查询（本规模可忽略）。踢人经 `conns` 表发 `force_logout` 帧后移除发送端：客户端收到即主动断开回登录页，服务端写路径同时被掐断。已知取舍：并发首注册理论上可产双 admin（无害）；`UserPublic.role` 对所有人可见（谁是管理员非秘密）。
