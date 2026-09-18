@@ -77,7 +77,17 @@ function dispatch(f: WsOut) {
       break;
     }
     case "presence":
-      setState({ online: { ...s.online, [f.user_id]: f.online } });
+      setState({
+        online: { ...s.online, [f.user_id]: f.online },
+        // 同步 DM 会话里 peer 的 last_seen_at（聊天头「最后在线」）
+        conversations: f.last_seen_at
+          ? s.conversations.map((c) =>
+              c.peer?.id === f.user_id
+                ? { ...c, peer: { ...c.peer, last_seen_at: f.last_seen_at } }
+                : c,
+            )
+          : s.conversations,
+      });
       break;
     case "message":
       onMessage(f.message);

@@ -117,7 +117,9 @@ async fn handle(socket: WebSocket, st: SharedState, uid: Uuid) {
             online: false,
             last_seen_at: Some(now),
         });
-        st.send_to_users(&watchers, &p);
+        // 用最新关系快照广播下线（连接期间好友/群成员可能已变化）
+        let watchers_now = st.watchers(uid).await.unwrap_or_default();
+        st.send_to_users(&watchers_now, &p);
     }
 }
 

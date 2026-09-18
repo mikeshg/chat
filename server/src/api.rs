@@ -60,6 +60,25 @@ fn notify(st: &SharedState, uids: &[Uuid], what: &'static str) {
     st.send_to_users(uids, &payload);
 }
 
+
+/// 关系建立后补发 presence：to 立刻看到 from 的真实在线状态
+async fn push_presence(st: &SharedState, from: Uuid, to: Uuid) {
+    let seen = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+        "SELECT last_seen_at FROM users WHERE id = $1",
+    )
+    .bind(from)
+    .fetch_one(&st.pool)
+    .await
+    .ok()
+    .flatten();
+    if let Ok(p) = serde_json::to_string(&WsOut::Presence {
+        user_id: from,
+        online: st.is_online(from),
+        last_seen_at: seen,
+    }) {
+        st.send_to_user(to, &p);
+    }
+}
 /// IP 滑动窗口限流（注册/登录）：20 次 / 5 分钟
 fn rate_limit(st: &SharedState, key: String) -> AppResult<()> {
     const LIMIT: usize = 20;
@@ -480,6 +499,9 @@ async fn accept_request(
         return Err(AppError::forbidden("only the recipient can accept"));
     }
     let (a, b) = accept_internal(&st, req_id).await?;
+    // 新好友互推当前在线状态（否则要等下一次重连）
+    push_presence(&st, a, b).await;
+    push_presence(&st, b, a).await;
     Ok(Json(
         json!({ "status": "accepted", "user_a": a, "user_b": b }),
     ))
@@ -909,6 +931,15 @@ async fn add_members(
     .await?;
     let all = domain::member_ids(&st.pool, conv).await?;
     notify(&st, &all, "conversations");
+    // 新成员与既有成员互推在线状态
+    for nid in &ids {
+        for m in &all {
+            if m != nid {
+                push_presence(&st, *nid, *m).await;
+                push_presence(&st, *m, *nid).await;
+            }
+        }
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
