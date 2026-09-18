@@ -132,7 +132,7 @@ export const auth = {
   },
   me: () => get<UserPublic>("/users/me"),
   updateMe: (display_name: string) => patch<UserPublic>("/users/me", { display_name }),
-  searchUser: (q: string) => get<UserPublic>(`/users/search?q=${encodeURIComponent(q)}`),
+  searchUser: (q: string) => get<UserPublic[]>(`/users/search?q=${encodeURIComponent(q)}`),
 };
 
 // ---------- friends ----------

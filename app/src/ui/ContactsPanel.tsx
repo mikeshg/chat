@@ -1,12 +1,13 @@
 import { useState } from "react";
-import { ApiError, auth, friends } from "../api";
+import { auth, friends } from "../api";
 import { setState, useApp } from "../store";
 import type { UserPublic } from "../types";
 
 export default function ContactsPanel() {
   const s = useApp();
   const [q, setQ] = useState("");
-  const [found, setFound] = useState<UserPublic | null>(null);
+  const [results, setResults] = useState<UserPublic[] | null>(null);
+  const [picked, setPicked] = useState<UserPublic | null>(null);
   const [msg, setMsg] = useState("");
   const [hint, setHint] = useState("");
 
@@ -16,22 +17,26 @@ export default function ContactsPanel() {
   };
 
   const search = async () => {
-    setFound(null);
+    setResults(null);
+    setPicked(null);
     setHint("");
     if (!q.trim()) return;
     try {
-      setFound(await auth.searchUser(q.trim()));
-    } catch (e) {
-      setHint(e instanceof ApiError && e.status === 404 ? "没有这个用户" : "搜索失败");
+      const r = await auth.searchUser(q.trim());
+      setResults(r);
+      if (r.length === 0) setHint("没有匹配的用户");
+    } catch {
+      setHint("搜索失败");
     }
   };
 
   const sendReq = async () => {
-    if (!found) return;
+    if (!picked) return;
     try {
-      await friends.sendRequest(found.username, msg);
+      await friends.sendRequest(picked.username, msg);
       setHint("已发送好友请求");
-      setFound(null);
+      setPicked(null);
+      setResults(null);
       setQ("");
       setMsg("");
       void reload();
@@ -59,30 +64,39 @@ export default function ContactsPanel() {
         <h3>添加好友</h3>
         <div className="row">
           <input
-            placeholder="输入用户名精确搜索"
+            placeholder="搜索用户名或昵称"
             value={q}
             onChange={(e) => setQ(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && search()}
           />
           <button onClick={search}>搜索</button>
         </div>
-        {found && (
-          <div className="row found">
-            <div className="avatar">{found.display_name[0]?.toUpperCase()}</div>
+        {results?.map((u) => (
+          <div className="row found" key={u.id}>
+            <div className="avatar">{u.display_name[0]?.toUpperCase()}</div>
             <div className="grow">
-              <div>{found.display_name}</div>
-              <div className="muted">@{found.username}</div>
+              <div>{u.display_name}</div>
+              <div className="muted">@{u.username}</div>
             </div>
-            <input
-              placeholder="验证消息（可选）"
-              value={msg}
-              onChange={(e) => setMsg(e.target.value)}
-            />
-            <button className="primary" onClick={sendReq}>
-              加好友
-            </button>
+            {picked?.id === u.id ? (
+              <>
+                <input
+                  placeholder="验证消息（可选）"
+                  value={msg}
+                  onChange={(e) => setMsg(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && sendReq()}
+                />
+                <button className="primary" onClick={sendReq}>
+                  发送
+                </button>
+              </>
+            ) : (
+              <button className="primary" onClick={() => setPicked(u)}>
+                加好友
+              </button>
+            )}
           </div>
-        )}
+        ))}
         {hint && <div className="muted">{hint}</div>}
       </section>
 

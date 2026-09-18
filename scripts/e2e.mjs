@@ -105,6 +105,12 @@ async function phase1() {
     ok('DM conversation auto-created', !!dm);
     A.dmId = dm.id; B.dmId = dm.id;
   }
+  {
+    const r = await api(A.access_token, 'GET', `/users/search?q=${B.username.slice(0, 6)}`);
+    ok('user search partial match', r.status === 200 && r.json.some((u) => u.id === B.user.id), `got ${r.status}`);
+    const r2 = await api(A.access_token, 'GET', `/users/search?q=${encodeURIComponent(B.user.display_name)}`);
+    ok('user search by display_name', r2.json.some((u) => u.id === B.user.id));
+  }
 
   // --- 非好友隔离 ---
   {

@@ -225,21 +225,37 @@ async fn update_me(
 
 #[derive(Deserialize)]
 struct SearchQuery {
-    username: String,
+    q: String,
 }
 
+/// 用户搜索：username/display_name 模糊匹配（不含自己），精确命中排前
 async fn search_user(
     State(st): State<SharedState>,
     headers: HeaderMap,
     Query(q): Query<SearchQuery>,
-) -> AppResult<Json<UserPublic>> {
-    let _ = uid_of(&headers, &st)?;
-    let row = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE username = $1")
-        .bind(q.username.trim())
-        .fetch_optional(&st.pool)
-        .await?
-        .ok_or_else(|| AppError::not_found("user not found"))?;
-    Ok(Json(UserPublic::from(&row)))
+) -> AppResult<Json<Vec<UserPublic>>> {
+    let uid = uid_of(&headers, &st)?;
+    let needle = q.q.trim();
+    if needle.is_empty() {
+        return Ok(Json(vec![]));
+    }
+        let esc = needle
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let rows = sqlx::query_as::<_, UserRow>(
+        "SELECT * FROM users
+          WHERE id <> $1 AND (username ILIKE '%' || $2 || '%' ESCAPE '\\'
+                              OR display_name ILIKE '%' || $2 || '%' ESCAPE '\\')
+          ORDER BY (username = $3 OR display_name = $3) DESC, username
+          LIMIT 20",
+    )
+    .bind(uid)
+    .bind(esc)
+    .bind(needle)
+    .fetch_all(&st.pool)
+    .await?;
+    Ok(Json(rows.iter().map(UserPublic::from).collect()))
 }
 
 // ---------- friends ----------
