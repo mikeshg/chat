@@ -296,3 +296,18 @@ input:focus, textarea:focus { border-color: var(--green); }
 }
 .ctx-item { padding: 8px 14px; border-radius: 5px; cursor: pointer; font-size: 13px; }
 .ctx-item:hover { background: var(--bg); }
+
+/* ---------- 待发附件区 ---------- */
+.pending-files {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  padding: 4px 2px; max-height: 76px; overflow-y: auto;
+}
+.pf-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 14px;
+  padding: 4px 10px; font-size: 12px; max-width: 220px;
+}
+.pf-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 120px; }
+.pf-chip i { color: var(--muted); font-style: normal; }
+.pf-chip b { cursor: pointer; color: var(--muted); font-weight: normal; }
+.pf-chip b:hover { color: var(--danger); }

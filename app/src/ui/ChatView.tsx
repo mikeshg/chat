@@ -59,7 +59,6 @@ export default function ChatView() {
   const stickBottom = useRef(true);
   const lastTypingSent = useRef(0);
   const fileInput = useRef<HTMLInputElement>(null);
-  const [uploading, setUploading] = useState(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const [members, setMembers] = useState<MemberView[]>([]);
   const [ac, setAc] = useState<{ start: number; prefix: string } | null>(null);
@@ -74,6 +73,8 @@ export default function ChatView() {
     y: number;
     att: AttachmentView;
   } | null>(null);
+  const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  const [sending, setSending] = useState(false);
 
   const conv = s.conversations.find((c) => c.id === s.activeConv) ?? null;
   const msgs = conv ? (s.messages[conv.id] ?? []) : [];
@@ -162,13 +163,33 @@ export default function ChatView() {
     }
   };
 
-  const send = () => {
+  const send = async () => {
     const t = text.trim();
-    if (!t || readonly) return;
-    sendChat(conv.id, t);
-    setText("");
-    setAc(null);
-    stickBottom.current = true;
+    if ((!t && pendingFiles.length === 0) || readonly || sending) return;
+    setSending(true);
+    try {
+      // 先上传待发附件，文字随最后一个附件消息一起发
+      const atts: AttachmentView[] = [];
+      for (const f of pendingFiles) {
+        atts.push(await files.upload(conv.id, f));
+      }
+      atts.forEach((att, i) =>
+        sendChat(conv.id, i === atts.length - 1 ? t : "", att),
+      );
+      if (atts.length === 0 && t) sendChat(conv.id, t);
+      setText("");
+      setPendingFiles([]);
+      setAc(null);
+      stickBottom.current = true;
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "发送失败");
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const addPending = (list: Iterable<File>) => {
+    setPendingFiles((p) => [...p, ...Array.from(list)]);
   };
 
   // @补全候选：群成员中用户名前缀/昵称包含匹配，排除自己
@@ -246,19 +267,19 @@ export default function ChatView() {
     setCtxMenu({ x: e.clientX, y: e.clientY, att });
   };
 
-  const onFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const f = e.target.files?.[0];
+  const onFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const fl = e.target.files;
     e.target.value = "";
-    if (!f || readonly) return;
-    setUploading(true);
-    try {
-      const att = await files.upload(conv.id, f);
-      sendChat(conv.id, "", att);
-      stickBottom.current = true;
-    } catch (err) {
-      alert(err instanceof Error ? err.message : "上传失败");
-    } finally {
-      setUploading(false);
+    if (!fl?.length || readonly) return;
+    addPending(fl);
+  };
+
+  // 外面复制的文件/截图直接粘贴进待发区
+  const onPaste = (e: React.ClipboardEvent) => {
+    const fl = e.clipboardData?.files;
+    if (fl && fl.length > 0) {
+      e.preventDefault();
+      if (!readonly) addPending(fl);
     }
   };
 
@@ -400,14 +421,13 @@ export default function ChatView() {
           <div className="readonly-hint">对方已不是你的好友，会话只读</div>
         ) : (
           <>
-            <input ref={fileInput} type="file" hidden onChange={onFile} />
+            <input ref={fileInput} type="file" hidden multiple onChange={onFile} />
             <button
               className="icon-btn attach-btn"
-              title="发送图片/文件"
+              title="发送图片/文件（也可直接粘贴）"
               onClick={() => fileInput.current?.click()}
-              disabled={uploading}
             >
-              {uploading ? "…" : "📎"}
+              📎
             </button>
             {acList.length > 0 && (
               <div className="ac-list">
@@ -426,11 +446,30 @@ export default function ChatView() {
                 ))}
               </div>
             )}
+            {pendingFiles.length > 0 && (
+              <div className="pending-files">
+                {pendingFiles.map((f, i) => (
+                  <span key={i} className="pf-chip" title={f.name}>
+                    {f.type.startsWith("image/") ? "🖼" : "📄"}
+                    <span className="pf-name">{f.name}</span>
+                    <i>{fmtSize(f.size)}</i>
+                    <b
+                      onClick={() =>
+                        setPendingFiles((p) => p.filter((_, j) => j !== i))
+                      }
+                    >
+                      ✕
+                    </b>
+                  </span>
+                ))}
+              </div>
+            )}
             <textarea
               ref={taRef}
               value={text}
               placeholder="输入消息，Enter 发送，Shift+Enter 换行"
               onChange={(e) => onInput(e.target.value)}
+              onPaste={onPaste}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
@@ -444,8 +483,12 @@ export default function ChatView() {
               }}
               rows={3}
             />
-            <button className="primary send-btn" onClick={send} disabled={!text.trim()}>
-              发送
+            <button
+              className="primary send-btn"
+              onClick={send}
+              disabled={sending || (!text.trim() && pendingFiles.length === 0)}
+            >
+              {sending ? "发送中…" : "发送"}
             </button>
           </>
         )}
