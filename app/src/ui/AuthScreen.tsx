@@ -35,21 +35,14 @@ export default function AuthScreen() {
   return (
     <div className="auth-wrap">
       <form className="auth-card" onSubmit={submit}>
-        <h1 className="auth-title">Chat</h1>
-        <div className="auth-tabs">
+        <div className="auth-head">
+          <h1 className="auth-title">Chat</h1>
           <button
             type="button"
-            className={mode === "login" ? "on" : ""}
-            onClick={() => setMode("login")}
+            className="auth-switch"
+            onClick={() => setMode(mode === "login" ? "register" : "login")}
           >
-            登录
-          </button>
-          <button
-            type="button"
-            className={mode === "register" ? "on" : ""}
-            onClick={() => setMode("register")}
-          >
-            注册
+            {mode === "login" ? "注册 →" : "← 登录"}
           </button>
         </div>
         <input
