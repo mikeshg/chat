@@ -79,7 +79,8 @@ cd gen/android && ./gradlew assembleDebug \
 
 ## 局域网访问
 
-- 原生跑 `cargo run`：直接监听 `0.0.0.0:8080`，同网段设备访问 `http://<本机IP>:8080`。
+- **同一台机器只跑一个服务端实例**：多实例共享数据库但 WS 连接表各自独立，跨实例的消息只能落库、推不到对端（表现为"必须刷新才看到新消息"）。开发调试也统一用 docker。
+- 原生跑 `cargo run`（仅临时调试用）：直接监听 `0.0.0.0:8080`，同网段设备访问 `http://<本机IP>:8080`。用时先停掉 docker server。
 - WSL2 里的 `docker compose up`：发布端口只到 Windows localhost。要暴露到局域网需管理员跑一次：
   `netsh interface portproxy add v4tov4 listenport=8080 listenaddress=0.0.0.0 connectport=8080 connectaddress=127.0.0.1`
   （真实部署到 Linux 服务器无此问题，`0.0.0.0` 直接生效）
