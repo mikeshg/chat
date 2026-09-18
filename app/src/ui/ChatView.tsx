@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { convs, files } from "../api";
 import { convTitle, getState, prependMessages, setState, useApp } from "../store";
-import type { MemberView, MessageView } from "../types";
+import type { AttachmentView, MemberView, MessageView } from "../types";
 import { sendChat, sendTyping } from "../ws";
 import GroupInfo from "./GroupInfo";
 
@@ -30,6 +30,26 @@ function renderContent(text: string) {
   );
 }
 
+/** 可按文本预览的附件（mime 或扩展名判断） */
+function isTextLike(a: AttachmentView): boolean {
+  return (
+    a.mime.startsWith("text/") ||
+    /\.(txt|md|log|json|js|jsx|ts|tsx|py|rs|csv|ya?ml|xml|html?|css|sh|bat|ps1|c|h|cpp|java|go|toml|ini|cfg|sql)$/i.test(
+      a.file_name,
+    )
+  );
+}
+
+/** 触发客户端下载（借助 Content-Disposition: attachment） */
+function downloadAttachment(a: AttachmentView) {
+  const el = document.createElement("a");
+  el.href = files.url(a.id, true);
+  el.download = a.file_name;
+  document.body.appendChild(el);
+  el.click();
+  el.remove();
+}
+
 export default function ChatView() {
   const s = useApp();
   const [text, setText] = useState("");
@@ -47,6 +67,13 @@ export default function ChatView() {
   const [searchQ, setSearchQ] = useState("");
   const [searchRes, setSearchRes] = useState<MessageView[] | null>(null);
   const [flashId, setFlashId] = useState<string | null>(null);
+  const [preview, setPreview] = useState<AttachmentView | null>(null);
+  const [previewText, setPreviewText] = useState<string | null>(null);
+  const [ctxMenu, setCtxMenu] = useState<{
+    x: number;
+    y: number;
+    att: AttachmentView;
+  } | null>(null);
 
   const conv = s.conversations.find((c) => c.id === s.activeConv) ?? null;
   const msgs = conv ? (s.messages[conv.id] ?? []) : [];
@@ -203,6 +230,22 @@ export default function ChatView() {
     setTimeout(() => setFlashId(null), 2600);
   };
 
+  const openPreview = (att: AttachmentView) => {
+    setPreview(att);
+    setPreviewText(null);
+    if (isTextLike(att)) {
+      fetch(files.url(att.id))
+        .then((r) => r.text())
+        .then((t) => setPreviewText(t.slice(0, 300_000)))
+        .catch(() => setPreviewText("（加载失败）"));
+    }
+  };
+
+  const onAttMenu = (e: React.MouseEvent, att: AttachmentView) => {
+    e.preventDefault();
+    setCtxMenu({ x: e.clientX, y: e.clientY, att });
+  };
+
   const onFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
     e.target.value = "";
@@ -325,22 +368,22 @@ export default function ChatView() {
                         className="msg-img"
                         src={files.url(m.attachment.id)}
                         alt={m.attachment.file_name}
-                        onClick={() => window.open(files.url(m.attachment!.id))}
+                        onClick={() => openPreview(m.attachment!)}
+                        onContextMenu={(e) => onAttMenu(e, m.attachment!)}
                       />
                     )}
                     {m.attachment && m.kind === "file" && (
-                      <a
+                      <div
                         className="msg-file"
-                        href={files.url(m.attachment.id)}
-                        target="_blank"
-                        rel="noreferrer"
+                        onClick={() => openPreview(m.attachment!)}
+                        onContextMenu={(e) => onAttMenu(e, m.attachment!)}
                       >
                         <span className="file-ic">📄</span>
                         <span className="file-meta">
                           <b>{m.attachment.file_name}</b>
                           <i>{fmtSize(m.attachment.size)}</i>
                         </span>
-                      </a>
+                      </div>
                     )}
                     {showText(m) && renderContent(m.content)}
                   </div>
@@ -409,6 +452,78 @@ export default function ChatView() {
       </footer>
       {showInfo && conv.kind === "group" && (
         <GroupInfo conv={conv} onClose={() => setShowInfo(false)} />
+      )}
+
+      {/* 附件预览 */}
+      {preview && (
+        <div className="modal-mask" onClick={() => setPreview(null)}>
+          <div className="pv-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="pv-head">
+              <span className="pv-name" title={preview.file_name}>
+                {preview.file_name}
+              </span>
+              <span className="muted">{fmtSize(preview.size)}</span>
+              <button onClick={() => downloadAttachment(preview)}>下载</button>
+              <button className="icon-btn" onClick={() => setPreview(null)}>
+                ✕
+              </button>
+            </div>
+            <div className="pv-body">
+              {preview.mime.startsWith("image/") && (
+                <img src={files.url(preview.id)} alt={preview.file_name} />
+              )}
+              {isTextLike(preview) && !preview.mime.startsWith("image/") && (
+                <pre>{previewText ?? "加载中…"}</pre>
+              )}
+              {preview.mime === "application/pdf" && (
+                <iframe src={files.url(preview.id)} title={preview.file_name} />
+              )}
+              {preview.mime.startsWith("audio/") && (
+                <audio controls src={files.url(preview.id)} />
+              )}
+              {preview.mime.startsWith("video/") && (
+                <video controls src={files.url(preview.id)} />
+              )}
+              {!preview.mime.startsWith("image/") &&
+                !preview.mime.startsWith("audio/") &&
+                !preview.mime.startsWith("video/") &&
+                preview.mime !== "application/pdf" &&
+                !isTextLike(preview) && (
+                  <div className="pv-unsupported">暂不支持预览此格式，请下载后查看</div>
+                )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 附件右键菜单 */}
+      {ctxMenu && (
+        <div
+          className="ctx-mask"
+          onClick={() => setCtxMenu(null)}
+          onContextMenu={(e) => e.preventDefault()}
+        >
+          <div className="ctx-menu" style={{ left: ctxMenu.x, top: ctxMenu.y }}>
+            <div
+              className="ctx-item"
+              onClick={() => {
+                openPreview(ctxMenu.att);
+                setCtxMenu(null);
+              }}
+            >
+              预览
+            </div>
+            <div
+              className="ctx-item"
+              onClick={() => {
+                downloadAttachment(ctxMenu.att);
+                setCtxMenu(null);
+              }}
+            >
+              下载
+            </div>
+          </div>
+        </div>
       )}
     </main>
   );

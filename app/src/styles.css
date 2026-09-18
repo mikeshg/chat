@@ -260,3 +260,39 @@ input:focus, textarea:focus { border-color: var(--green); }
 .ac-item:hover { background: var(--bg); }
 .ac-name { color: #576b95; }
 .ac-disp { color: var(--muted); }
+
+/* ---------- 附件预览 / 右键菜单 ---------- */
+.msg-file { cursor: pointer; }
+.pv-modal {
+  width: min(720px, 92vw); height: min(560px, 86vh);
+  background: var(--panel); border-radius: 10px;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.pv-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 14px; border-bottom: 1px solid var(--line);
+}
+.pv-name {
+  flex: 1; font-weight: 600; font-size: 14px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pv-body { flex: 1; overflow: auto; display: grid; place-items: center; padding: 12px; }
+.pv-body img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.pv-body pre {
+  width: 100%; height: 100%; overflow: auto; margin: 0;
+  font: 12px/1.5 ui-monospace, Consolas, monospace;
+  white-space: pre-wrap; word-break: break-all; text-align: left;
+}
+.pv-body iframe { width: 100%; height: 100%; border: none; }
+.pv-body video { max-width: 100%; max-height: 100%; }
+.pv-unsupported { color: var(--muted); }
+
+.ctx-mask { position: fixed; inset: 0; z-index: 200; }
+.ctx-menu {
+  position: fixed; min-width: 96px;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+  padding: 4px; z-index: 201;
+}
+.ctx-item { padding: 8px 14px; border-radius: 5px; cursor: pointer; font-size: 13px; }
+.ctx-item:hover { background: var(--bg); }

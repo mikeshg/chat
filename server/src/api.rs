@@ -1177,9 +1177,15 @@ async fn upload_file(
 }
 
 /// 按 UUID 直链下载（能力 URL：id 不可猜测，仅会话内可见）。
+#[derive(Deserialize)]
+struct FileQuery {
+    dl: Option<u8>,
+}
+
 async fn download_file(
     State(st): State<SharedState>,
     Path(id): Path<Uuid>,
+    Query(q): Query<FileQuery>,
 ) -> AppResult<impl IntoResponse> {
     let (file_name, mime, path) = sqlx::query_as::<_, (String, String, String)>(
         "SELECT file_name, mime, storage_path FROM attachments WHERE id = $1",
@@ -1191,7 +1197,9 @@ async fn download_file(
     let data = tokio::fs::read(&path)
         .await
         .map_err(|_| AppError::not_found("file not found"))?;
-    let dispo = format!("inline; filename*=UTF-8''{}", pct_encode(&file_name));
+    // dl=1 → attachment 触发浏览器/客户端下载；默认 inline 供预览
+    let mode = if q.dl == Some(1) { "attachment" } else { "inline" };
+    let dispo = format!("{}; filename*=UTF-8''{}", mode, pct_encode(&file_name));
     Ok((
         [
             (header::CONTENT_TYPE, mime),

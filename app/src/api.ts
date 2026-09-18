@@ -178,8 +178,9 @@ export const convs = {
 
 // ---------- files ----------
 export const files = {
-  /** 附件下载/预览地址（能力 URL，可直接用于 <img>/<a>） */
-  url: (id: string) => `${getServer()}/v1/files/${id}`,
+  /** 附件地址（能力 URL）：dl=true 强制下载，默认 inline 供预览/<img>/<a> */
+  url: (id: string, dl = false) =>
+    `${getServer()}/v1/files/${id}${dl ? "?dl=1" : ""}`,
   upload: async (conversationId: string, file: File): Promise<AttachmentView> => {
     const fd = new FormData();
     fd.append("conversation_id", conversationId);
