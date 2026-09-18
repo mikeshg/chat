@@ -132,7 +132,11 @@ export const auth = {
   },
   me: () => get<UserPublic>("/users/me"),
   updateMe: (display_name: string) => patch<UserPublic>("/users/me", { display_name }),
-  searchUser: (q: string) => get<UserPublic[]>(`/users/search?q=${encodeURIComponent(q)}`),
+  searchUser: async (q: string) => {
+    const r = await get<unknown>(`/users/search?q=${encodeURIComponent(q)}`);
+    // 兼容旧服务端返回单对象的形态
+    return Array.isArray(r) ? (r as UserPublic[]) : r ? [r as UserPublic] : [];
+  },
 };
 
 // ---------- friends ----------
