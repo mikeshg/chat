@@ -68,6 +68,7 @@ pub async fn append_message(
     content: &str,
     kind: &str,
     attachment: Option<AttachmentView>,
+    mentions: &[Uuid],
 ) -> AppResult<MessageView> {
     let seq = sqlx::query_scalar::<_, i64>(
         "UPDATE conversations SET last_seq = last_seq + 1 WHERE id = $1 RETURNING last_seq",
@@ -98,6 +99,16 @@ pub async fn append_message(
     .fetch_one(&mut **tx)
     .await?;
 
+    for uid in mentions {
+        sqlx::query(
+            "INSERT INTO message_mentions (message_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(msg.id)
+        .bind(uid)
+        .execute(&mut **tx)
+        .await?;
+    }
+
     Ok(MessageView {
         id: msg.id,
         conversation_id: msg.conversation_id,
@@ -108,6 +119,7 @@ pub async fn append_message(
         content: msg.content,
         kind: msg.kind,
         attachment,
+        mentions: mentions.to_vec(),
         created_at: msg.created_at,
     })
 }
@@ -139,6 +151,7 @@ pub struct MsgViewRow {
     pub att_name: Option<String>,
     pub att_mime: Option<String>,
     pub att_size: Option<i64>,
+    pub mentions: Option<Vec<Uuid>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -149,10 +162,15 @@ impl MsgViewRow {
          u.username::text AS sender_username, u.display_name AS sender_name,
          m.content, m.kind,
          a.id AS att_id, a.file_name AS att_name, a.mime AS att_mime, a.size AS att_size,
+         mmx.mentions,
          m.created_at";
     pub const JOIN: &'static str =
         "FROM messages m JOIN users u ON u.id = m.sender_id
-         LEFT JOIN attachments a ON a.id = m.attachment_id";
+         LEFT JOIN attachments a ON a.id = m.attachment_id
+         LEFT JOIN LATERAL (
+             SELECT array_agg(user_id) AS mentions FROM message_mentions
+             WHERE message_id = m.id
+         ) mmx ON true";
 
     pub fn into_view(self) -> MessageView {
         MessageView {
@@ -170,6 +188,7 @@ impl MsgViewRow {
                 mime: self.att_mime.unwrap_or_default(),
                 size: self.att_size.unwrap_or_default(),
             }),
+            mentions: self.mentions.unwrap_or_default(),
             created_at: self.created_at,
         }
     }

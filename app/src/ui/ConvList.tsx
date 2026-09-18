@@ -35,7 +35,7 @@ export default function ConvList() {
       sendRead(id, c.last_seq);
       setState({
         conversations: s.conversations.map((x) =>
-          x.id === id ? { ...x, unread_count: 0 } : x,
+          x.id === id ? { ...x, unread_count: 0, has_mention: false } : x,
         ),
       });
     }
@@ -80,6 +80,9 @@ export default function ConvList() {
               <div className="conv-mid">
                 <div className="conv-title">{title}</div>
                 <div className="conv-sub">
+                  {c.has_mention && c.unread_count > 0 && (
+                    <span className="mention-tag">[有人@我]</span>
+                  )}
                   {typingFresh
                     ? "对方正在输入…"
                     : c.last_message

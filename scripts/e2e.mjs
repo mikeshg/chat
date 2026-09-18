@@ -175,6 +175,37 @@ async function phase1() {
     ok('A receives group message from B', gm.message.content === 'hello grp' && gm.message.sender_id === B.user.id);
   }
 
+  // --- @提及 ---
+  wsa.send({ type: 'send_message', conversation_id: gid, client_msg_id: 'mt1', content: `hi @${B.username} 看下` });
+  {
+    const mm = await wsb.waitType('message', (m) => m.message.conversation_id === gid && m.message.content.includes('@'));
+    ok('mention parsed to B id', mm.message.mentions.includes(B.user.id), JSON.stringify(mm.message.mentions));
+  }
+  {
+    const convs = await api(B.access_token, 'GET', '/conversations');
+    const grp = convs.json.find((c) => c.id === gid);
+    ok('B has_mention flag', grp.has_mention === true, `got ${grp?.has_mention}`);
+    wsb.send({ type: 'read', conversation_id: gid, seq: grp.last_seq });
+    await wsb.waitType('read_sync', () => true, 4000).catch(() => {});
+    const convs2 = await api(B.access_token, 'GET', '/conversations');
+    ok('has_mention clears after read', convs2.json.find((c) => c.id === gid)?.has_mention === false);
+  }
+  {
+    const h = await api(A.access_token, 'GET', `/conversations/${gid}/messages?limit=10`);
+    const mmsg = h.json.messages.find((m) => m.content.includes('@'));
+    ok('mentions persisted in history', mmsg?.mentions?.includes(B.user.id), JSON.stringify(mmsg?.mentions));
+  }
+
+  // --- 会话内消息搜索 ---
+  {
+    const r = await api(A.access_token, 'GET', `/conversations/${gid}/messages/search?q=grp`);
+    ok('search finds message', r.status === 200 && r.json.some((m) => m.content === 'hello grp'), `got ${r.status}`);
+    const r2 = await api(A.access_token, 'GET', `/conversations/${gid}/messages/search?q=${encodeURIComponent('@' + B.username)}`);
+    ok('search finds mention text', r2.json.some((m) => m.mentions.includes(B.user.id)));
+    const bad = await api(C.access_token, 'GET', `/conversations/${gid}/messages/search?q=grp`);
+    ok('non-member search rejected', bad.status === 403 || bad.status === 404, `got ${bad.status}`);
+  }
+
   // --- 离线补发 ---
   wsb.close();
   await new Promise((r) => setTimeout(r, 300));

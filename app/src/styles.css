@@ -218,3 +218,42 @@ input:focus, textarea:focus { border-color: var(--green); }
   .conv-list { width: 100%; border-right: none; }
   .chat-view:not(.empty) { position: fixed; inset: 56px 0 0 0; z-index: 20; background: var(--bg); }
 }
+
+/* ---------- @提及 / 搜索 ---------- */
+.mt { color: #576b95; font-weight: 500; }
+.msg-row.mine .mt { color: #2b5f8e; }
+.bubble.mentioned { background: #fff7e0; border: 1px solid #f0d78c; }
+.bubble.flash { animation: flashbg 2.2s ease; }
+@keyframes flashbg {
+  0%, 60% { box-shadow: 0 0 0 3px rgba(240, 177, 60, 0.55); }
+  100% { box-shadow: none; }
+}
+.mention-tag { color: #fa5151; font-weight: 500; margin-right: 2px; }
+
+.search-panel {
+  border-bottom: 1px solid var(--line); background: var(--panel);
+  padding: 8px 12px; display: flex; flex-direction: column; gap: 6px;
+  max-height: 45%;
+}
+.search-panel input { width: 100%; }
+.search-res { overflow-y: auto; }
+.sr-item {
+  display: flex; gap: 8px; align-items: baseline; padding: 7px 6px;
+  border-radius: 6px; cursor: pointer; font-size: 13px;
+}
+.sr-item:hover { background: var(--bg); }
+.sr-sender { color: var(--muted); flex-shrink: 0; max-width: 90px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sr-content { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sr-time { color: var(--muted); font-size: 11px; flex-shrink: 0; }
+
+.composer { position: relative; }
+.ac-list {
+  position: absolute; bottom: 100%; left: 52px; margin-bottom: 6px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.12); min-width: 180px; max-height: 240px;
+  overflow-y: auto; z-index: 30;
+}
+.ac-item { display: flex; gap: 8px; padding: 9px 12px; cursor: pointer; font-size: 13px; }
+.ac-item:hover { background: var(--bg); }
+.ac-name { color: #576b95; }
+.ac-disp { color: var(--muted); }

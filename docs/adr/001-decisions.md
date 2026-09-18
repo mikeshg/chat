@@ -50,3 +50,9 @@
 **决策**：附件二进制存服务端文件系统（`FILES_DIR`），元数据在 `attachments` 表（uploader/conv/mime/size/path）；消息经 `messages.kind` + `attachment_id` 引用；下载走 `GET /v1/files/{id}` 不鉴权。
 
 **理由**：`GET /v1/files/{uuid}` 必须能用于 `<img>`/`<a>`（无法带 Authorization 头）；UUID 不可枚举，链接只在会话内流转——能力 URL 模型与主流 IM 的 CDN 链接一致。上传时校验「上传者是目标会话成员」+ 发送时校验「附件属本人、绑本会话、未被复用」，闭合权限边界。风险与升级路径：链接外泄即失密 → 公网部署可换签名 URL 或短时效 ticket。本地测试库与运行库共用 `chat_test`/`chat` 与 `./data/files`。
+
+## 10. @提及持久化 + 会话内搜索
+
+**决策**：提及独立表 `message_mentions(message_id, user_id)`，发送时在服务端按群成员用户名解析 `@token`（去重、不含发送者、仅群聊）；`MessageView.mentions` 带 user_id 列表；`ConversationView.has_mention` = 存在 seq > last_read_seq 的 @我 记录，已读后自然消除。会话内搜索 `GET /conversations/{id}/messages/search?q=` 走 ILIKE 子串（通配符转义），复用 MsgViewRow 的 SELECT/JOIN。
+
+**理由**：提及必须服务端解析——客户端自行猜测用户名会与改名/权限脱节；独立表比解析 content 更可查询（has_mention 一条 EXISTS 搞定）。搜索用 ILIKE 而非全文索引：消息量小、零运维成本，量上来再换 `tsvector` 或外部引擎。

@@ -5,6 +5,7 @@ import type {
   ConversationView,
   FriendView,
   MessagesPage,
+  MessageView,
   RequestsView,
   UserPublic,
 } from "./types";
@@ -156,6 +157,8 @@ export const convs = {
     p.set("limit", String(opts?.limit ?? 50));
     return get<MessagesPage>(`/conversations/${id}/messages?${p}`);
   },
+  search: (id: string, q: string) =>
+    get<MessageView[]>(`/conversations/${id}/messages/search?q=${encodeURIComponent(q)}`),
   createGroup: (name: string, member_ids: string[]) =>
     post<ConversationDetail>("/conversations/group", { name, member_ids }),
   addMembers: (id: string, user_ids: string[]) =>

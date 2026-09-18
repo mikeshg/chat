@@ -115,6 +115,7 @@ pub struct MessageView {
     pub content: String,
     pub kind: String, // "text" | "image" | "file"
     pub attachment: Option<AttachmentView>,
+    pub mentions: Vec<Uuid>, // 被 @ 的用户 id（群聊）
     pub created_at: DateTime<Utc>,
 }
 
@@ -128,6 +129,7 @@ pub struct ConversationView {
     pub member_count: i64,
     pub last_seq: i64,
     pub unread_count: i64,
+    pub has_mention: bool, // 有未读的 @我 消息
     pub last_message: Option<MessageView>,
     pub created_at: DateTime<Utc>,
 }

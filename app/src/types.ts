@@ -49,6 +49,7 @@ export interface MessageView {
   content: string;
   kind: string; // "text" | "image" | "file"
   attachment: AttachmentView | null;
+  mentions: string[]; // 被 @ 的用户 id（群聊）
   created_at: string;
 }
 
@@ -61,6 +62,7 @@ export interface ConversationView {
   member_count: number;
   last_seq: number;
   unread_count: number;
+  has_mention: boolean; // 有未读的 @我
   last_message: MessageView | null;
   created_at: string;
 }

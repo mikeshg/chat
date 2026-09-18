@@ -233,13 +233,13 @@ async fn send_message(
         .map_err(|_| ("internal", "db error"))?
         .ok_or(("forbidden", "not a member of this conversation"))?;
 
-    // DM：好友关系解除后只读
-    if domain::conv_kind(&st.pool, conv)
+    let ctype = domain::conv_kind(&st.pool, conv)
         .await
         .map_err(|_| ("internal", "db error"))?
-        .as_deref()
-        == Some("dm")
-    {
+        .unwrap_or_default();
+
+    // DM：好友关系解除后只读
+    if ctype == "dm" {
         let others = domain::member_ids(&st.pool, conv)
             .await
             .map_err(|_| ("internal", "db error"))?;
@@ -253,12 +253,27 @@ async fn send_message(
         }
     }
 
+    // @提及：仅群聊解析，匹配成员用户名，去重且不含发送者
+    let mentions: Vec<Uuid> = if ctype == "group" {
+        let members = sqlx::query_as::<_, (Uuid, String)>(
+            "SELECT m.user_id, u.username::text FROM memberships m
+             JOIN users u ON u.id = m.user_id WHERE m.conversation_id = $1",
+        )
+        .bind(conv)
+        .fetch_all(&st.pool)
+        .await
+        .map_err(|_| ("internal", "db error"))?;
+        parse_mentions(&content, &members, uid)
+    } else {
+        Vec::new()
+    };
+
     let mut db_tx = st
         .pool
         .begin()
         .await
         .map_err(|_| ("internal", "db error"))?;
-    let msg = domain::append_message(&mut db_tx, conv, uid, &content, kind, attachment)
+    let msg = domain::append_message(&mut db_tx, conv, uid, &content, kind, attachment, &mentions)
         .await
         .map_err(|_| ("internal", "db error"))?;
     db_tx.commit().await.map_err(|_| ("internal", "db error"))?;
@@ -350,6 +365,34 @@ async fn sync(
         messages: rows.into_iter().map(|r| r.into_view()).collect(),
     }));
     Ok(())
+}
+
+/// 从消息内容提取 @username，匹配群成员（去重、不含发送者）
+fn parse_mentions(content: &str, members: &[(Uuid, String)], sender: Uuid) -> Vec<Uuid> {
+    let mut out = Vec::new();
+    let b = content.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'@' {
+            let start = i + 1;
+            let mut end = start;
+            while end < b.len() && (b[end].is_ascii_alphanumeric() || b[end] == b'_') {
+                end += 1;
+            }
+            if end > start {
+                let name = &content[start..end];
+                if let Some((uid, _)) = members.iter().find(|(_, u)| u == name) {
+                    if *uid != sender && !out.contains(uid) {
+                        out.push(*uid);
+                    }
+                }
+            }
+            i = end.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 async fn user_public(

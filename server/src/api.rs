@@ -40,6 +40,7 @@ pub fn router() -> Router<SharedState> {
                 .delete(dissolve_conversation),
         )
         .route("/conversations/{id}/messages", get(list_messages))
+        .route("/conversations/{id}/messages/search", get(search_messages))
         .route("/conversations/{id}/members", post(add_members))
         .route("/conversations/{id}/members/me", delete(leave_conversation))
         .route("/conversations/{id}/members/{uid}", delete(kick_member))
@@ -499,6 +500,7 @@ struct ConvRow {
     last_seq: i64,
     created_at: DateTime<Utc>,
     unread_count: i64,
+    has_mention: bool,
     member_count: i64,
     peer_id: Option<Uuid>,
     peer_username: Option<String>,
@@ -522,6 +524,9 @@ async fn list_conversations(
     let rows = sqlx::query_as::<_, ConvRow>(
         "SELECT c.id, c.type AS kind, c.name, c.owner_id, c.last_seq, c.created_at,
                 (c.last_seq - m.last_read_seq) AS unread_count,
+                EXISTS(SELECT 1 FROM message_mentions mm JOIN messages mmsg ON mmsg.id = mm.message_id
+                        WHERE mm.user_id = $1 AND mmsg.conversation_id = c.id
+                          AND mmsg.seq > m.last_read_seq) AS has_mention,
                 (SELECT count(*) FROM memberships mc WHERE mc.conversation_id = c.id) AS member_count,
                 p.id AS peer_id, p.username::text AS peer_username, p.display_name AS peer_display,
                 p.last_seen_at AS peer_last_seen,
@@ -567,6 +572,7 @@ async fn list_conversations(
                 content: r.m_content.unwrap_or_default(),
                 kind: r.m_kind.unwrap_or_else(|| "text".into()),
                 attachment: None,
+                mentions: Vec::new(),
                 created_at: r.m_created_at.unwrap_or_else(Utc::now),
             });
             ConversationView {
@@ -578,6 +584,7 @@ async fn list_conversations(
                 member_count: r.member_count,
                 last_seq: r.last_seq,
                 unread_count: r.unread_count,
+                has_mention: r.has_mention,
                 last_message,
                 created_at: r.created_at,
             }
@@ -799,6 +806,48 @@ async fn list_messages(
         messages.len() as i64 == limit && messages.first().map(|m| m.seq > 1).unwrap_or(false)
     };
     Ok(Json(MessagesPage { messages, has_more }))
+}
+
+
+#[derive(Deserialize)]
+struct MsgSearchQuery {
+    q: String,
+    limit: Option<i64>,
+}
+
+/// 会话内消息搜索：content ILIKE 子串匹配（转义通配符），按 seq 倒序
+async fn search_messages(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(conv): Path<Uuid>,
+    Query(q): Query<MsgSearchQuery>,
+) -> AppResult<Json<Vec<MessageView>>> {
+    let uid = uid_of(&headers, &st)?;
+    require_member(&st, conv, uid).await?;
+    let needle = q.q.trim();
+    if needle.is_empty() {
+        return Ok(Json(vec![]));
+    }
+    let limit = q.limit.unwrap_or(50).clamp(1, 100);
+    let esc = needle
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let rows = sqlx::query_as::<_, domain::MsgViewRow>(&format!(
+        "SELECT {} {} WHERE m.conversation_id = $1
+           AND m.content ILIKE '%' || $2 || '%' ESCAPE '\\'
+         ORDER BY m.seq DESC LIMIT $3",
+        domain::MsgViewRow::SELECT,
+        domain::MsgViewRow::JOIN
+    ))
+    .bind(conv)
+    .bind(esc)
+    .bind(limit)
+    .fetch_all(&st.pool)
+    .await?;
+    Ok(Json(
+        rows.into_iter().map(domain::MsgViewRow::into_view).collect(),
+    ))
 }
 
 async fn add_members(

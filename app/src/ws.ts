@@ -116,7 +116,7 @@ function dispatch(f: WsOut) {
     case "read_sync":
       setState({
         conversations: s.conversations.map((c) =>
-          c.id === f.conversation_id ? { ...c, unread_count: 0 } : c,
+          c.id === f.conversation_id ? { ...c, unread_count: 0, has_mention: false } : c,
         ),
       });
       break;
@@ -146,6 +146,9 @@ function onMessage(m: MessageView) {
               last_message: m,
               last_seq: Math.max(c.last_seq, m.seq),
               unread_count: mine || isActive ? c.unread_count : c.unread_count + 1,
+              has_mention:
+                c.has_mention ||
+                (!mine && !isActive && s.me != null && m.mentions.includes(s.me.id)),
             }
           : c,
       )
@@ -196,6 +199,7 @@ export function sendChat(convId: string, content: string, attachment?: Attachmen
     content: content || (attachment ? (attachment.mime.startsWith("image/") ? "[图片]" : `[文件] ${attachment.file_name}`) : ""),
     kind: attachment ? (attachment.mime.startsWith("image/") ? "image" : "file") : "text",
     attachment: attachment ?? null,
+    mentions: [],
     created_at: new Date().toISOString(),
   };
   setState({
