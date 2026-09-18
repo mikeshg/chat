@@ -422,13 +422,6 @@ export default function ChatView() {
         ) : (
           <>
             <input ref={fileInput} type="file" hidden multiple onChange={onFile} />
-            <button
-              className="icon-btn attach-btn"
-              title="发送图片/文件（也可直接粘贴）"
-              onClick={() => fileInput.current?.click()}
-            >
-              📎
-            </button>
             {acList.length > 0 && (
               <div className="ac-list">
                 {acList.map((x) => (
@@ -464,32 +457,41 @@ export default function ChatView() {
                 ))}
               </div>
             )}
-            <textarea
-              ref={taRef}
-              value={text}
-              placeholder="输入消息，Enter 发送，Shift+Enter 换行"
-              onChange={(e) => onInput(e.target.value)}
-              onPaste={onPaste}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  if (acList.length > 0) {
-                    pickAc(acList[0].user.username);
-                  } else {
-                    send();
+            <div className="composer-row">
+              <button
+                className="icon-btn attach-btn"
+                title="发送图片/文件（也可直接粘贴）"
+                onClick={() => fileInput.current?.click()}
+              >
+                📎
+              </button>
+              <textarea
+                ref={taRef}
+                value={text}
+                placeholder="输入消息，Enter 发送，Shift+Enter 换行"
+                onChange={(e) => onInput(e.target.value)}
+                onPaste={onPaste}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    if (acList.length > 0) {
+                      pickAc(acList[0].user.username);
+                    } else {
+                      send();
+                    }
                   }
-                }
-                if (e.key === "Escape") setAc(null);
-              }}
-              rows={3}
-            />
-            <button
-              className="primary send-btn"
-              onClick={send}
-              disabled={sending || (!text.trim() && pendingFiles.length === 0)}
-            >
-              {sending ? "发送中…" : "发送"}
-            </button>
+                  if (e.key === "Escape") setAc(null);
+                }}
+                rows={3}
+              />
+              <button
+                className="primary send-btn"
+                onClick={send}
+                disabled={sending || (!text.trim() && pendingFiles.length === 0)}
+              >
+                {sending ? "发送中…" : "发送"}
+              </button>
+            </div>
           </>
         )}
       </footer>

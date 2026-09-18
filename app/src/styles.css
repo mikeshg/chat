@@ -164,8 +164,9 @@ input:focus, textarea:focus { border-color: var(--green); }
 .attach-btn { height: 36px; align-self: flex-end; }
 .composer {
   border-top: 1px solid var(--line); background: var(--panel);
-  padding: 10px 12px; display: flex; gap: 8px; align-items: flex-end; flex-shrink: 0;
+  padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; flex-shrink: 0;
 }
+.composer-row { display: flex; gap: 8px; align-items: flex-end; }
 .composer textarea { flex: 1; resize: none; }
 .send-btn { height: 36px; }
 .readonly-hint { flex: 1; text-align: center; color: var(--muted); padding: 10px; }
