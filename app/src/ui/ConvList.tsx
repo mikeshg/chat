@@ -12,6 +12,7 @@ import {
 } from "../store";
 import type { ConversationView, PrefUpdate } from "../types";
 import { openConversation } from "../ws";
+import { convPreview } from "./convPreview";
 import NewGroupModal from "./NewGroupModal";
 
 function fmtTime(iso?: string | null): string {
@@ -152,6 +153,13 @@ export default function ConvList() {
           const typing = s.typing[c.id];
           const typingFresh = typing && Date.now() - typing.ts < 5000;
           const muted = isMuted(c);
+          // V2 P1-3：副标题预览（typing > 草稿 > 最新消息）
+          const pv = convPreview(c, {
+            draft: s.drafts[c.id],
+            active: s.activeConv === c.id,
+            typing: !!typingFresh,
+            meId: s.me?.id,
+          });
           return (
             <div
               key={c.id}
@@ -175,11 +183,8 @@ export default function ConvList() {
                   {c.has_mention && c.unread_count > 0 && (
                     <span className="mention-tag">[有人@我]</span>
                   )}
-                  {typingFresh
-                    ? "对方正在输入…"
-                    : c.last_message
-                      ? `${c.kind === "group" && c.last_message.sender_id !== s.me?.id ? c.last_message.sender_name + "：" : ""}${c.last_message.content}`
-                      : "暂无消息"}
+                  {pv.kind === "draft" && <span className="draft-tag">[草稿]</span>}
+                  {pv.text}
                 </div>
               </div>
               <div className="conv-right">

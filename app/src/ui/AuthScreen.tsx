@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { auth, getServer, saveSession, setServer } from "../api";
+import { readDrafts } from "../drafts";
 import { setState } from "../store";
 import { startWs } from "../ws";
 
@@ -28,7 +29,7 @@ export default function AuthScreen() {
           ? await auth.login(username.trim(), password)
           : await auth.register(username.trim(), password, displayName.trim() || undefined);
       saveSession(r);
-      setState({ me: r.user });
+      setState({ me: r.user, drafts: readDrafts(localStorage, r.user.id) });
       void startWs();
     } catch (ex) {
       setErr(ex instanceof Error ? ex.message : "请求失败");

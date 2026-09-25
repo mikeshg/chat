@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from "react";
+import { writeDrafts } from "./drafts";
 import type {
   ConversationPref,
   ConversationView,
@@ -41,6 +42,8 @@ export interface AppState {
   reactionPending: Record<string, boolean>;
   /** 应用内通知栈（新消息提示，自动过期） */
   toasts: Toast[];
+  /** conv_id -> 输入框草稿（V2 P1-3；持久化到 localStorage，按用户隔离） */
+  drafts: Record<string, string>;
 }
 
 let state: AppState = {
@@ -60,6 +63,7 @@ let state: AppState = {
   editingMessage: null,
   reactionPending: {},
   toasts: [],
+  drafts: {},
 };
 
 const listeners = new Set<() => void>();
@@ -219,6 +223,32 @@ export function pushToast(t: Omit<Toast, "id" | "ts">) {
 
 export function dismissToast(id: string) {
   setState((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }));
+}
+
+// ---------- 会话草稿（V2 P1-3） ----------
+
+let draftTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** 更新某会话草稿；空串删除该键。localStorage 写入防抖 300ms */
+export function setDraft(convId: string, text: string) {
+  setState((s) => {
+    const drafts = { ...s.drafts };
+    if (text) drafts[convId] = text;
+    else delete drafts[convId];
+    return { drafts };
+  });
+  if (draftTimer != null) clearTimeout(draftTimer);
+  draftTimer = setTimeout(flushDrafts, 300);
+}
+
+/** 立即把当前草稿表落盘（pagehide 时调用，堵住防抖窗口丢草稿） */
+export function flushDrafts() {
+  if (draftTimer != null) {
+    clearTimeout(draftTimer);
+    draftTimer = null;
+  }
+  const { me, drafts } = getState();
+  if (me && typeof localStorage !== "undefined") writeDrafts(localStorage, me.id, drafts);
 }
 
 /** 置顶优先：置顶块内按 pinned_at DESC，其余按原活动时间 DESC，id 兜底保序 */
