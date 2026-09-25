@@ -282,6 +282,8 @@ export interface AdminUserView {
   last_seen_at: string | null;
   created_at: string;
   online: boolean;
+  avatar_version?: number;
+  has_avatar?: boolean;
 }
 
 // ---------- V2 P1-2 注册开关 + 邀请码 ----------

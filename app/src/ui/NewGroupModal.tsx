@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { convs } from "../api";
 import { setState, useApp } from "../store";
+import Avatar from "./Avatar";
 
 export default function NewGroupModal({ onClose }: { onClose: () => void }) {
   const s = useApp();
@@ -52,7 +53,7 @@ export default function NewGroupModal({ onClose }: { onClose: () => void }) {
                 checked={picked.has(f.user.id)}
                 onChange={() => toggle(f.user.id)}
               />
-              <div className="avatar sm">{f.user.display_name[0]?.toUpperCase()}</div>
+              <Avatar userId={f.user.id} name={f.user.display_name} avatarVersion={f.user.avatar_version} hasAvatar={f.user.has_avatar} size="sm" />
               <span>{f.user.display_name}</span>
             </label>
           ))}

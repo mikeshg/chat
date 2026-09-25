@@ -3,6 +3,7 @@ import { admin } from "../api";
 import { useApp } from "../store";
 import type { AdminOverview, AdminUserView } from "../types";
 import AdminSettings from "./AdminSettings";
+import Avatar from "./Avatar";
 
 const PAGE = 50;
 
@@ -104,7 +105,7 @@ export default function AdminPanel() {
           {users.map((u) => (
             <div key={u.id} className="ad-row">
               <span className="ad-user">
-                <i className="ad-avatar">{u.display_name[0]?.toUpperCase()}</i>
+                <Avatar className="ad-avatar" userId={u.id} name={u.display_name} avatarVersion={u.avatar_version} hasAvatar={u.has_avatar} size="sm" />
                 <span>
                   <b>{u.display_name}</b>
                   <small>@{u.username}</small>

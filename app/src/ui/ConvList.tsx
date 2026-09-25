@@ -14,6 +14,7 @@ import type { ConversationView, PrefUpdate } from "../types";
 import { openConversation } from "../ws";
 import { convPreview } from "./convPreview";
 import NewGroupModal from "./NewGroupModal";
+import Avatar from "./Avatar";
 
 function fmtTime(iso?: string | null): string {
   if (!iso) return "";
@@ -167,10 +168,21 @@ export default function ConvList() {
               onClick={() => openConversation(c.id)}
               onContextMenu={(e) => openMenu(e, c)}
             >
-              <div className="avatar">
-                {convAvatarText(c)}
-                {peerOnline && <i className="online-dot" />}
-              </div>
+              {c.kind === "dm" && c.peer ? (
+                <Avatar
+                  userId={c.peer.id}
+                  name={c.peer.display_name}
+                  avatarVersion={c.peer.avatar_version}
+                  hasAvatar={c.peer.has_avatar}
+                >
+                  {peerOnline && <i className="online-dot" />}
+                </Avatar>
+              ) : (
+                <div className="avatar">
+                  {convAvatarText(c)}
+                  {peerOnline && <i className="online-dot" />}
+                </div>
+              )}
               <div className="conv-mid">
                 <div className="conv-title">
                   {isPinned(c) && <span className="conv-flag" title="已置顶">📌</span>}

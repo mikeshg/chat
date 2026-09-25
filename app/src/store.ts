@@ -44,6 +44,14 @@ export interface AppState {
   toasts: Toast[];
   /** conv_id -> 输入框草稿（V2 P1-3；持久化到 localStorage，按用户隔离） */
   drafts: Record<string, string>;
+  /** user_id -> 已知最新头像版本。只增不减；404 回落时把 has 记为 false。 */
+  avatars: Record<string, AvatarInfo>;
+}
+
+/** 头像缓存条目：版本较大的那组才有效。 */
+export interface AvatarInfo {
+  version: number;
+  has: boolean;
 }
 
 let state: AppState = {
@@ -64,6 +72,7 @@ let state: AppState = {
   reactionPending: {},
   toasts: [],
   drafts: {},
+  avatars: {},
 };
 
 const listeners = new Set<() => void>();
@@ -74,7 +83,10 @@ export function getState() {
 
 export function setState(patch: Partial<AppState> | ((s: AppState) => Partial<AppState>)) {
   const p = typeof patch === "function" ? patch(state) : patch;
-  state = { ...state, ...p };
+  const me = p.me === undefined ? state.me : p.me;
+  const avatars = p.avatars ?? state.avatars;
+  const absorbed = me === state.me ? avatars : absorbAvatarUsers(avatars, [me]);
+  state = { ...state, ...p, ...(absorbed === avatars ? {} : { avatars: absorbed }) };
   listeners.forEach((l) => l());
 }
 
@@ -94,6 +106,64 @@ export function useApp(): AppState {
 export function convTitle(c: ConversationView, meId?: string): string {
   if (c.kind === "group") return c.name ?? `群聊(${c.member_count})`;
   return c.peer?.display_name ?? c.name ?? "会话";
+}
+
+/** 把一批 UserPublic 合并进头像表，只接受更大的版本。 */
+export function absorbAvatarUsers(
+  avatars: Record<string, AvatarInfo>,
+  users: Array<UserPublic | null | undefined>,
+): Record<string, AvatarInfo> {
+  let next = avatars;
+  for (const user of users) {
+    if (!user?.id) continue;
+    const merged = mergeAvatar(next[user.id], {
+      version: user.avatar_version ?? 0,
+      has: !!user.has_avatar,
+    });
+    if (next[user.id]?.version === merged.version && next[user.id]?.has === merged.has) continue;
+    if (next === avatars) next = { ...avatars };
+    next[user.id] = merged;
+  }
+  return next;
+}
+
+/** 只接受更大的版本；同版本允许更新 has（例如同一次刷新把有无写实）。 */
+export function mergeAvatar(
+  current: AvatarInfo | undefined,
+  incoming: AvatarInfo,
+): AvatarInfo {
+  if (!current || incoming.version > current.version) return incoming;
+  if (incoming.version === current.version) return { version: current.version, has: incoming.has };
+  return current;
+}
+
+/** 消息行：消息自带版本与 store 里的值取较大的那组。 */
+export function senderAvatar(
+  stored: AvatarInfo | undefined,
+  version: number | undefined,
+  has: boolean | undefined,
+): AvatarInfo {
+  return mergeAvatar(stored, { version: version ?? 0, has: !!has });
+}
+
+/** 从任意 UserPublic（本人、好友、会话 peer、群成员）合并进 avatars。 */
+export function noteUserAvatar(user: UserPublic | null | undefined): void {
+  if (!user?.id) return;
+  setState((s) => {
+    const next = mergeAvatar(s.avatars[user.id], {
+      version: user.avatar_version ?? 0,
+      has: !!user.has_avatar,
+    });
+    if (s.avatars[user.id]?.version === next.version && s.avatars[user.id]?.has === next.has) return {};
+    return { avatars: { ...s.avatars, [user.id]: next } };
+  });
+}
+
+/** 图片 404：该版本记为无头像，避免反复请求。 */
+export function noteAvatarMiss(userId: string, version: number): void {
+  setState((s) => ({
+    avatars: { ...s.avatars, [userId]: mergeAvatar(s.avatars[userId], { version, has: false }) },
+  }));
 }
 
 export function convAvatarText(c: ConversationView): string {

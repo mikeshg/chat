@@ -5,6 +5,7 @@ import { stopWs } from "../ws";
 import NotifySettings from "./NotifySettings";
 import ThemeSetting from "./ThemeSetting";
 import SecuritySettings from "./SecuritySettings";
+import AvatarSetting from "./AvatarSetting";
 
 export default function MePanel() {
   const s = useApp();
@@ -31,8 +32,8 @@ export default function MePanel() {
     <main className="contacts">
       <h2>我</h2>
       <section className="card">
-        <div className="row">
-          <div className="avatar lg">{s.me?.display_name[0]?.toUpperCase()}</div>
+        <div className="row me-head">
+          <AvatarSetting />
           <div className="grow">
             <div>
               <b>{s.me?.display_name}</b>

@@ -6,6 +6,7 @@ import ChatView from "./ChatView";
 import ContactsPanel from "./ContactsPanel";
 import MePanel from "./MePanel";
 import AdminPanel from "./AdminPanel";
+import Avatar from "./Avatar";
 
 export default function ChatScreen() {
   const s = useApp();
@@ -20,9 +21,14 @@ export default function ChatScreen() {
   return (
     <div className="shell">
       <nav className="rail">
-        <div className="rail-avatar" title={s.me?.display_name}>
-          {(s.me?.display_name ?? "?")[0]?.toUpperCase()}
-        </div>
+        <Avatar
+          className="rail-avatar"
+          userId={s.me?.id}
+          name={s.me?.display_name}
+          avatarVersion={s.me?.avatar_version}
+          hasAvatar={s.me?.has_avatar}
+          title={s.me?.display_name}
+        />
         <button
           className={`rail-btn ${s.tab === "chats" ? "on" : ""}`}
           onClick={() => setState({ tab: "chats" })}

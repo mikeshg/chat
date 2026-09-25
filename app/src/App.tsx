@@ -29,6 +29,7 @@ export default function App() {
         wsReady: false,
         toasts: [],
         drafts: {},
+        avatars: {},
       });
     };
     window.addEventListener("chat:logout", onLogout);

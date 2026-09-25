@@ -9,6 +9,7 @@ import {
 } from "./api";
 import { notifyIncoming } from "./notify";
 import {
+  absorbAvatarUsers,
   applyLiveMessage,
   applyPrefUpdate,
   applyRefreshed,
@@ -98,9 +99,23 @@ export async function refreshCatalogs(): Promise<void> {
   ]);
   if (gen !== catalogGen || sess !== session()) return;
   setState((s) => {
-    let next = { ...s, conversations: mergeConversationLists(s.conversations, conversations), friends, requests };
+    let next = {
+      ...s,
+      conversations: mergeConversationLists(s.conversations, conversations),
+      friends,
+      requests,
+      avatars: absorbAvatarUsers(s.avatars, [
+        s.me,
+        ...conversations.map((c) => c.peer),
+        ...friends.map((f) => f.user),
+        ...requests.incoming.map((r) => r.user),
+        ...requests.outgoing.map((r) => r.user),
+      ]),
+    };
     for (const c of conversations) {
-      if (c.last_message && s.messages[c.id]) next = { ...next, ...applyRefreshed(next, c.id, [c.last_message]) };
+      if (c.last_message && s.messages[c.id]) {
+        next = { ...next, ...applyRefreshed(next, c.id, [c.last_message]) };
+      }
     }
     return next;
   });

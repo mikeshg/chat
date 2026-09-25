@@ -529,6 +529,8 @@ pub struct AdminUserView {
     pub last_seen_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub online: bool,
+    pub avatar_version: i32,
+    pub has_avatar: bool,
 }
 
 #[derive(Debug, Deserialize)]
