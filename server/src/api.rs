@@ -1927,6 +1927,7 @@ async fn upload_file(
     let mut got_file = false;
     let mut too_large = false;
     let mut over_quota = false;
+    let mut duration_raw: Option<String> = None;
 
     while let Some(mut field) = mp
         .next_field()
@@ -1942,6 +1943,15 @@ async fn upload_file(
                 conv = Some(
                     Uuid::parse_str(v.trim())
                         .map_err(|_| AppError::bad_request("bad conversation_id"))?,
+                );
+            }
+            Some("duration_ms") => {
+                // 先记下原文，等 MIME 齐了再校验，避免非法时长把文件写进磁盘。
+                duration_raw = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|_| AppError::bad_request("bad duration_ms"))?,
                 );
             }
             Some("file") => {
@@ -1988,6 +1998,18 @@ async fn upload_file(
         return Err(AppError::bad_request("missing file"));
     }
     require_member(&st, conv, uid).await?;
+    let duration_ms = match duration_raw {
+        Some(raw) => {
+            // 语音时长只接受音频附件；普通文件即使漏传字段也不写成语音。
+            if !mime_base(&mime).starts_with("audio/") {
+                return Err(AppError::bad_request(
+                    "duration_ms is only allowed for audio",
+                ));
+            }
+            Some(parse_duration_ms(raw.trim())?)
+        }
+        None => None,
+    };
 
     let id = Uuid::new_v4();
     // 只存文件名。FILES_DIR 换位置时仍能拼回来；旧的绝对路径在下载时照旧使用。
@@ -2029,8 +2051,9 @@ async fn upload_file(
     }
     sqlx::query(
         "INSERT INTO attachments
-             (id, uploader_id, conv_id, file_name, mime, size, storage_path, width, height, thumb_path)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+             (id, uploader_id, conv_id, file_name, mime, size, storage_path, width, height, thumb_path,
+              duration_ms)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(id)
     .bind(uid)
@@ -2042,9 +2065,9 @@ async fn upload_file(
     .bind(width)
     .bind(height)
     .bind(&thumb_path)
+    .bind(duration_ms)
     .execute(&st.pool)
     .await?;
-    // 语音时长（P2-3）由对应任务在上传时写入
     Ok(Json(AttachmentView {
         id,
         file_name,
@@ -2053,8 +2076,27 @@ async fn upload_file(
         width,
         height,
         has_thumb: thumb_path.is_some(),
-        duration_ms: None,
+        duration_ms,
     }))
+}
+
+/// 语音时长：仅整数，1–300000 毫秒（5 分钟）。空串、小数、越界都拒绝。
+fn parse_duration_ms(raw: &str) -> Result<i32, AppError> {
+    let n: i32 = raw
+        .parse()
+        .map_err(|_| AppError::bad_request("bad duration_ms"))?;
+    if !(1..=300_000).contains(&n) {
+        return Err(AppError::bad_request("duration_ms must be 1-300000"));
+    }
+    Ok(n)
+}
+
+fn mime_base(mime: &str) -> String {
+    mime.split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
 }
 
 /// 按 UUID 直链下载（能力 URL：id 不可猜测，仅会话内可见）。

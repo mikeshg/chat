@@ -195,7 +195,11 @@ export function replyPreview(m: MessageView) {
     seq: m.seq,
     sender_name: m.sender_name,
     excerpt: m.deleted_at ? "" : m.attachment
-      ? m.kind === "image" ? "[图片]" : `[文件] ${m.attachment.file_name}`
+      ? m.kind === "image"
+        ? "[图片]"
+        : m.kind === "audio" || m.attachment.duration_ms != null
+          ? "[语音]"
+          : `[文件] ${m.attachment.file_name}`
       : Array.from(m.content).slice(0, 120).join(""),
     kind: m.kind,
     deleted: !!m.deleted_at,

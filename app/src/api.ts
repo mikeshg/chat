@@ -340,10 +340,15 @@ export const files = {
     const q = p.toString();
     return `${getServer()}/v1/files/${id}${q ? `?${q}` : ""}`;
   },
-  upload: async (conversationId: string, file: File): Promise<AttachmentView> => {
+  upload: async (
+    conversationId: string,
+    file: File,
+    opts?: { durationMs?: number },
+  ): Promise<AttachmentView> => {
     const fd = new FormData();
     fd.append("conversation_id", conversationId);
     fd.append("file", file, file.name);
+    if (opts?.durationMs != null) fd.append("duration_ms", String(opts.durationMs));
     return call<AttachmentView>("/files", { method: "POST", body: fd });
   },
 };

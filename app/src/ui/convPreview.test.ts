@@ -76,4 +76,15 @@ describe("会话列表副标题预览", () => {
     const dm = conv({ last_message: msg() });
     expect(convPreview(dm, { ...base })).toEqual({ kind: "message", text: "最后一条消息" });
   });
+
+  it("语音消息预览为 [语音]，不露出文件名", () => {
+    const c = conv({
+      last_message: msg({
+        kind: "audio",
+        content: "[语音]",
+        attachment: { id: "a", file_name: "voice.webm", mime: "audio/webm", size: 1, duration_ms: 3000 },
+      }),
+    });
+    expect(convPreview(c, { ...base })).toEqual({ kind: "message", text: "[语音]" });
+  });
 });

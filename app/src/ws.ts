@@ -439,7 +439,9 @@ function onMessage(m: MessageView) {
     const excerpt = m.attachment
       ? m.kind === "image"
         ? "[图片]"
-        : `[文件] ${m.attachment.file_name}`
+        : m.kind === "audio" || m.attachment.duration_ms != null
+          ? "[语音]"
+          : `[文件] ${m.attachment.file_name}`
       : m.content.slice(0, 80);
     const tag = cur.me && m.mentions.includes(cur.me.id) ? "[有人@我] " : "";
     pushToast({
@@ -511,11 +513,19 @@ export function sendChat(
     content:
       content ||
       (attachment
-        ? attachment.mime.startsWith("image/")
-          ? "[图片]"
-          : `[文件] ${attachment.file_name}`
+        ? attachment.duration_ms != null
+          ? "[语音]"
+          : attachment.mime.startsWith("image/")
+            ? "[图片]"
+            : `[文件] ${attachment.file_name}`
         : ""),
-    kind: attachment ? (attachment.mime.startsWith("image/") ? "image" : "file") : "text",
+    kind: attachment
+      ? attachment.duration_ms != null
+        ? "audio"
+        : attachment.mime.startsWith("image/")
+          ? "image"
+          : "file"
+      : "text",
     attachment: attachment ?? null,
     mentions: [],
     reply_to_id: replyTo?.id ?? null,

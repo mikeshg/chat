@@ -14,11 +14,13 @@ import {
 import type { AttachmentView, MemberView, MessageView, ReplyPreview } from "../types";
 import { sendChat, sendTyping } from "../ws";
 import RichText from "../richText";
+import AudioBubble from "./AudioBubble";
 import GroupInfo from "./GroupInfo";
 import NewPollModal from "./NewPollModal";
 import PollCard from "./PollCard";
 import { imageBubbleSize } from "./mediaFormat";
 import Avatar from "./Avatar";
+import VoiceRecorder from "./VoiceRecorder";
 
 function fmtSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -29,7 +31,11 @@ function fmtSize(n: number): string {
 /** 附件消息的 content 是服务端占位文本时不再重复渲染 */
 function showText(m: MessageView): boolean {
   if (!m.attachment) return true;
-  return m.content !== "[图片]" && m.content !== `[文件] ${m.attachment.file_name}`;
+  return (
+    m.content !== "[图片]" &&
+    m.content !== "[语音]" &&
+    m.content !== `[文件] ${m.attachment.file_name}`
+  );
 }
 
 /** 可按文本预览的附件（mime 或扩展名判断） */
@@ -80,6 +86,7 @@ const QUICK_EMOJI = ["👍", "❤️", "😂", "😮", "😢", "🙏", "🎉", "
 function kindLabel(kind: string): string {
   if (kind === "image") return "[图片]";
   if (kind === "file") return "[文件]";
+  if (kind === "audio") return "[语音]";
   if (kind === "poll") return "[投票]";
   return "";
 }
@@ -769,6 +776,9 @@ export default function ChatView() {
                             onContextMenu={(e) => onAttMenu(e, m.attachment!)}
                           />
                         )}
+                        {m.attachment && m.kind === "audio" && (
+                          <AudioBubble att={m.attachment} />
+                        )}
                         {m.attachment && m.kind === "file" && (
                           <div
                             className="msg-file"
@@ -909,6 +919,11 @@ export default function ChatView() {
               >
                 📎
               </button>
+              <VoiceRecorder
+                convId={conv.id}
+                disabled={sending || mutBusy}
+                onError={setMutErr}
+              />
               {conv.kind === "group" && (
                 <button
                   className="icon-btn"
