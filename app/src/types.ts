@@ -282,6 +282,14 @@ export interface AdminUserView {
   last_seen_at: string | null;
   created_at: string;
   online: boolean;
+  /** 该用户附件已用存储（V2 P2-1；旧服务端缺省） */
+  storage_bytes?: number;
+}
+
+/** GET /users/me/storage（V2 P2-1）：quota_bytes 为 null/缺省表示不限额 */
+export interface StorageView {
+  used_bytes: number;
+  quota_bytes: number | null;
 }
 
 // ---------- V2 P1-2 注册开关 + 邀请码 ----------
@@ -295,6 +303,8 @@ export interface ServerInfo {
 /** GET/PUT /admin/settings */
 export interface AdminSettings {
   registration_mode: RegistrationMode;
+  /** 每用户附件存储上限（MB，0 = 不限；旧服务端缺省） */
+  storage_quota_mb?: number;
 }
 
 export interface InviteView {

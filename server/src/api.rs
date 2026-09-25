@@ -32,6 +32,7 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
         .route("/auth/refresh", post(refresh))
         .route("/auth/logout", post(logout))
         .route("/users/me", get(get_me).patch(update_me))
+        .route("/users/me/storage", get(my_storage))
         .route("/users/me/password", post(crate::sessions::change_password))
         .route("/users/me/sessions", get(crate::sessions::list_sessions))
         .route(
@@ -439,6 +440,20 @@ async fn get_me(State(st): State<SharedState>, headers: HeaderMap) -> AppResult<
         .fetch_one(&st.pool)
         .await?;
     Ok(Json(UserPublic::from(&row)))
+}
+
+/// GET /users/me/storage（V2 P2-1）：本人附件用量与配额；quota_bytes 为 null 表示不限
+async fn my_storage(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+) -> AppResult<Json<StorageView>> {
+    let uid = uid_of(&headers, &st).await?;
+    let quota_mb = settings::load(&st.pool).await?.storage_quota_mb;
+    let used = domain::storage_used(&st.pool, uid).await?;
+    Ok(Json(StorageView {
+        used_bytes: used,
+        quota_bytes: (quota_mb > 0).then_some(quota_mb * 1024 * 1024),
+    }))
 }
 
 async fn update_me(
@@ -1666,6 +1681,15 @@ fn pct_encode(s: &str) -> String {
         .collect()
 }
 
+/// 413 配额提示：已用按 0.1 MB 精度展示
+fn quota_message(used_bytes: i64, quota_mb: i64) -> String {
+    format!(
+        "存储空间已满（已用 {:.1} MB / 上限 {} MB）",
+        used_bytes as f64 / 1024.0 / 1024.0,
+        quota_mb
+    )
+}
+
 /// multipart: conversation_id 字段 + file 字段。上传者必须是会话成员。
 async fn upload_file(
     State(st): State<SharedState>,
@@ -1673,12 +1697,21 @@ async fn upload_file(
     mut mp: Multipart,
 ) -> AppResult<Json<AttachmentView>> {
     let uid = uid_of(&headers, &st).await?;
+    // 存储配额（V2 P2-1）：读取中按累计字节早拒，最终以实际写入字节为准。
+    // ponytail: 并发上传可略超配额（无锁读-改）；如需严格上限，按 uploader_id 加锁串行化上传。
+    let quota_mb = settings::load(&st.pool).await?.storage_quota_mb;
+    let quota_bytes = (quota_mb > 0).then(|| quota_mb * 1024 * 1024);
+    let used_bytes = match quota_bytes {
+        Some(_) => domain::storage_used(&st.pool, uid).await?,
+        None => 0,
+    };
     let mut conv: Option<Uuid> = None;
     let mut file_name = "file".to_string();
     let mut mime = "application/octet-stream".to_string();
     let mut buf: Vec<u8> = Vec::new();
     let mut got_file = false;
     let mut too_large = false;
+    let mut over_quota = false;
 
     while let Some(mut field) = mp
         .next_field()
@@ -1709,13 +1742,18 @@ async fn upload_file(
                     .await
                     .map_err(|e| AppError::bad_request(format!("read error: {e}")))?
                 {
-                    if too_large {
-                        continue; // 排空剩余 body，保证 400 响应能送达
+                    if too_large || over_quota {
+                        continue; // 排空剩余 body，保证错误响应能送达
                     }
                     buf.extend_from_slice(&chunk);
                     if buf.len() > st.cfg.upload_max_bytes {
                         too_large = true;
                         buf.clear();
+                    } else if let Some(qb) = quota_bytes {
+                        if used_bytes + buf.len() as i64 > qb {
+                            over_quota = true;
+                            buf.clear();
+                        }
                     }
                 }
             }
@@ -1724,6 +1762,11 @@ async fn upload_file(
     }
     if too_large {
         return Err(AppError::bad_request("file too large"));
+    }
+    if over_quota {
+        return Err(AppError::payload_too_large(quota_message(
+            used_bytes, quota_mb,
+        )));
     }
     let conv = conv.ok_or_else(|| AppError::bad_request("missing conversation_id"))?;
     if !got_file || buf.is_empty() {
@@ -1739,9 +1782,40 @@ async fn upload_file(
         .await
         .map_err(|e| AppError::internal(format!("store file: {e}")))?;
     let size = buf.len() as i64;
+
+    // 图片解码/缩略图（V2 P2-1）：CPU 密集放 blocking 池；解码失败只记日志、照常入库
+    let meta = {
+        let mime2 = mime.clone();
+        tokio::task::spawn_blocking(move || crate::media::inspect_image(&mime2, &buf))
+            .await
+            .ok()
+            .flatten()
+    };
+    if meta.is_none()
+        && matches!(
+            mime.as_str(),
+            "image/jpeg" | "image/png" | "image/webp" | "image/gif"
+        )
+    {
+        tracing::warn!(mime = %mime, "image decode failed, stored without dims/thumb");
+    }
+    let (width, height) = meta
+        .as_ref()
+        .map(|m| (Some(m.width), Some(m.height)))
+        .unwrap_or((None, None));
+    // 缩略图与原图同目录：存储名加 .thumb.jpg 后缀
+    let mut thumb_path = None;
+    if let Some(jpg) = meta.as_ref().and_then(|m| m.thumb_jpeg.as_ref()) {
+        let tp = format!("{stored}.thumb.jpg");
+        match tokio::fs::write(stored_file_path(&st.cfg.files_dir, &tp), jpg).await {
+            Ok(()) => thumb_path = Some(tp),
+            Err(e) => tracing::warn!(error = %e, "write thumb failed"),
+        }
+    }
     sqlx::query(
-        "INSERT INTO attachments (id, uploader_id, conv_id, file_name, mime, size, storage_path)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        "INSERT INTO attachments
+             (id, uploader_id, conv_id, file_name, mime, size, storage_path, width, height, thumb_path)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(id)
     .bind(uid)
@@ -1750,17 +1824,20 @@ async fn upload_file(
     .bind(&mime)
     .bind(size)
     .bind(&stored)
+    .bind(width)
+    .bind(height)
+    .bind(&thumb_path)
     .execute(&st.pool)
     .await?;
-    // 尺寸/缩略图（P2-1）与语音时长（P2-3）由各自任务在上传时写入
+    // 语音时长（P2-3）由对应任务在上传时写入
     Ok(Json(AttachmentView {
         id,
         file_name,
         mime,
         size,
-        width: None,
-        height: None,
-        has_thumb: false,
+        width,
+        height,
+        has_thumb: thumb_path.is_some(),
         duration_ms: None,
     }))
 }
@@ -1769,6 +1846,7 @@ async fn upload_file(
 #[derive(Deserialize)]
 struct FileQuery {
     dl: Option<u8>,
+    thumb: Option<u8>,
 }
 
 /// 允许 inline 预览的 MIME 白名单：仅渲染型媒体。SVG 可携带脚本，必须排除；
@@ -1791,13 +1869,37 @@ async fn download_file(
     Path(id): Path<Uuid>,
     Query(q): Query<FileQuery>,
 ) -> AppResult<impl IntoResponse> {
-    let (file_name, mime, stored) = sqlx::query_as::<_, (String, String, String)>(
-        "SELECT file_name, mime, storage_path FROM attachments WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(&st.pool)
-    .await?
-    .ok_or_else(|| AppError::not_found("file not found"))?;
+    let (file_name, mime, stored, thumb_stored) =
+        sqlx::query_as::<_, (String, String, String, Option<String>)>(
+            "SELECT file_name, mime, storage_path, thumb_path FROM attachments WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&st.pool)
+        .await?
+        .ok_or_else(|| AppError::not_found("file not found"))?;
+    // ?thumb=1：有缩略图返回 JPEG 缩略图（缓存头与原图一致）；没有/读取失败回退原图。dl=1 忽略 thumb。
+    if q.thumb == Some(1) && q.dl != Some(1) {
+        if let Some(tp) = &thumb_stored {
+            if let Ok(data) = tokio::fs::read(stored_file_path(&st.cfg.files_dir, tp)).await {
+                let dispo = format!(
+                    "inline; filename*=UTF-8''{}",
+                    pct_encode(&format!("{file_name}.thumb.jpg"))
+                );
+                return Ok((
+                    [
+                        (header::CONTENT_TYPE, "image/jpeg".to_string()),
+                        (header::CONTENT_DISPOSITION, dispo),
+                        (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+                        (
+                            header::CACHE_CONTROL,
+                            "private, max-age=31536000, immutable".into(),
+                        ),
+                    ],
+                    data,
+                ));
+            }
+        }
+    }
     let data = tokio::fs::read(stored_file_path(&st.cfg.files_dir, &stored))
         .await
         .map_err(|_| AppError::not_found("file not found"))?;
@@ -2006,6 +2108,19 @@ async fn admin_users(
             .fetch_all(&st.pool)
             .await?
     };
+    // 每人附件已用存储（V2 P2-1）：按 storage_path 去重，转发副本不重复计
+    let ids: Vec<Uuid> = rows.iter().map(|u| u.id).collect();
+    let usage: std::collections::HashMap<Uuid, i64> = sqlx::query_as::<_, (Uuid, i64)>(
+        "SELECT uploader_id, SUM(size)::bigint
+           FROM (SELECT DISTINCT uploader_id, storage_path, size
+                   FROM attachments WHERE uploader_id = ANY($1)) d
+          GROUP BY uploader_id",
+    )
+    .bind(&ids)
+    .fetch_all(&st.pool)
+    .await?
+    .into_iter()
+    .collect();
     Ok(Json(
         rows.iter()
             .map(|u| AdminUserView {
@@ -2017,6 +2132,7 @@ async fn admin_users(
                 last_seen_at: u.last_seen_at,
                 created_at: u.created_at,
                 online: st.is_online(u.id),
+                storage_bytes: usage.get(&u.id).copied().unwrap_or(0),
             })
             .collect(),
     ))

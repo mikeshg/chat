@@ -5,6 +5,7 @@ import { stopWs } from "../ws";
 import NotifySettings from "./NotifySettings";
 import ThemeSetting from "./ThemeSetting";
 import SecuritySettings from "./SecuritySettings";
+import StorageUsage from "./StorageUsage";
 
 export default function MePanel() {
   const s = useApp();
@@ -55,6 +56,7 @@ export default function MePanel() {
       </section>
 
       <NotifySettings />
+      <StorageUsage />
       <ThemeSetting />
       <SecuritySettings />
 

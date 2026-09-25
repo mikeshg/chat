@@ -99,6 +99,7 @@ export default function AdminPanel() {
             <span>角色/状态</span>
             <span>注册时间</span>
             <span>最后在线</span>
+            <span>存储</span>
             <span>操作</span>
           </div>
           {users.map((u) => (
@@ -120,6 +121,8 @@ export default function AdminPanel() {
               </span>
               <span className="muted">{fmtTime(u.created_at)}</span>
               <span className="muted">{u.online ? "现在" : fmtTime(u.last_seen_at)}</span>
+              {/* V2 P2-1：该用户附件已用存储（按 storage_path 去重） */}
+              <span className="muted">{fmtBytes(u.storage_bytes ?? 0)}</span>
               <span className="ad-actions">
                 {u.id !== s.me?.id && (
                   <>

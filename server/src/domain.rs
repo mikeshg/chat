@@ -1177,6 +1177,19 @@ async fn finish_edit(
     })
 }
 
+/// 用户已用附件存储（V2 P2-1）：其上传的附件按 storage_path 去重求和，
+/// 转发产生的副本共享同一 storage_path，不重复计。
+pub async fn storage_used(pool: &PgPool, uid: Uuid) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(SUM(size), 0)::bigint
+           FROM (SELECT DISTINCT storage_path, size
+                   FROM attachments WHERE uploader_id = $1) d",
+    )
+    .bind(uid)
+    .fetch_one(pool)
+    .await
+}
+
 pub struct Deleted {
     pub conversation_id: Uuid,
     /// 墓碑完整读模型行：广播/响应方按成员逐一再 into_view
@@ -1258,16 +1271,17 @@ async fn delete_in_tx(
         .await?;
 
     // 附件：删行使下载立即 404。历史重复引用可能共享同一 storage_path，
-    // 仍有其他有效 attachment 引用时不得删物理文件。
+    // 仍有其他有效 attachment 引用时不得删物理文件（转发副本共享 storage_path
+    // 与 thumb_path，同一引用计数规则覆盖两者，不会误删）。
     let mut orphan_files = Vec::new();
     if let Some(att) = m.attachment_id {
-        let path = sqlx::query_scalar::<_, String>(
-            "DELETE FROM attachments WHERE id = $1 RETURNING storage_path",
+        let row = sqlx::query_as::<_, (String, Option<String>)>(
+            "DELETE FROM attachments WHERE id = $1 RETURNING storage_path, thumb_path",
         )
         .bind(att)
         .fetch_optional(&mut **tx)
         .await?;
-        if let Some(path) = path {
+        if let Some((path, thumb)) = row {
             let still_used = sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(SELECT 1 FROM attachments WHERE storage_path = $1)",
             )
@@ -1276,6 +1290,10 @@ async fn delete_in_tx(
             .await?;
             if !still_used {
                 orphan_files.push(path);
+                // 清理原文件时同名的缩略图一并删（共享 storage_path 时上面已跳过）
+                if let Some(t) = thumb {
+                    orphan_files.push(t);
+                }
             }
         }
     }

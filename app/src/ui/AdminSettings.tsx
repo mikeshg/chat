@@ -28,6 +28,9 @@ export default function AdminSettings() {
   const [err, setErr] = useState("");
   const [saved, setSaved] = useState(false);
   const [switching, setSwitching] = useState(false);
+  // V2 P2-1：每用户存储配额（MB 输入框字符串；0 = 不限）
+  const [quota, setQuota] = useState("0");
+  const [quotaSaving, setQuotaSaving] = useState(false);
   // 创建表单
   const [maxUses, setMaxUses] = useState<number | null>(1);
   const [expHours, setExpHours] = useState<number | null>(24 * 7);
@@ -40,6 +43,7 @@ export default function AdminSettings() {
     try {
       const [s, list] = await Promise.all([admin.settings(), admin.invites()]);
       setMode(s.registration_mode);
+      setQuota(String(s.storage_quota_mb ?? 0));
       setInvites(list);
       setErr("");
     } catch (e) {
@@ -65,6 +69,28 @@ export default function AdminSettings() {
       setErr(e instanceof Error ? e.message : "保存失败");
     } finally {
       setSwitching(false);
+    }
+  };
+
+  // 存储配额：0-1048576 整数，0 = 不限；服务端也会再校验并返回文案
+  const saveQuota = async () => {
+    const q = Number(quota);
+    if (!Number.isInteger(q) || q < 0 || q > 1048576) {
+      setErr("配额必须是 0-1048576 的整数（0 = 不限）");
+      return;
+    }
+    setQuotaSaving(true);
+    setErr("");
+    setSaved(false);
+    try {
+      const s = await admin.updateSettings({ storage_quota_mb: q });
+      setQuota(String(s.storage_quota_mb ?? 0));
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "保存失败");
+    } finally {
+      setQuotaSaving(false);
     }
   };
 
@@ -138,6 +164,28 @@ export default function AdminSettings() {
         ))}
         {switching && <span className="muted">保存中…</span>}
         {saved && <span className="muted ad-saved">已保存</span>}
+      </div>
+
+      <h3>存储配额</h3>
+      <div className="row ad-quota">
+        <input
+          className="ad-quota-input"
+          type="number"
+          min={0}
+          max={1048576}
+          step={1}
+          value={quota}
+          disabled={quotaSaving}
+          onChange={(e) => setQuota(e.target.value)}
+        />
+        <span className="muted">MB / 用户（0 = 不限，上限 1048576）</span>
+        <button
+          className="primary"
+          disabled={quotaSaving}
+          onClick={() => void saveQuota()}
+        >
+          {quotaSaving ? "保存中…" : "保存配额"}
+        </button>
       </div>
 
       <h3>邀请码</h3>

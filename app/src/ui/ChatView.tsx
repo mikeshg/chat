@@ -17,6 +17,7 @@ import RichText from "../richText";
 import GroupInfo from "./GroupInfo";
 import NewPollModal from "./NewPollModal";
 import PollCard from "./PollCard";
+import { imageBubbleSize } from "./mediaFormat";
 
 function fmtSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -90,11 +91,19 @@ function withinEditWindow(m: MessageView): boolean {
 /** 触发客户端下载（借助 Content-Disposition: attachment） */
 function downloadAttachment(a: AttachmentView) {
   const el = document.createElement("a");
-  el.href = files.url(a.id, true);
+  el.href = files.url(a.id, { dl: true });
   el.download = a.file_name;
   document.body.appendChild(el);
   el.click();
   el.remove();
+}
+
+/** 图片气泡占位尺寸（V2 P2-1）：按原始宽高比预留，加载前不跳版；无尺寸回退 CSS 上限 */
+function imgDim(att: AttachmentView): React.CSSProperties | undefined {
+  if (att.width == null || att.height == null) return undefined;
+  const d = imageBubbleSize(att.width, att.height);
+  if (d.width === 0) return undefined;
+  return { width: d.width, height: d.height };
 }
 
 export default function ChatView() {
@@ -132,6 +141,8 @@ export default function ChatView() {
   const [emojiPick, setEmojiPick] = useState<string | null>(null);
   const [msgMenu, setMsgMenu] = useState<{ x: number; y: number; m: MessageView } | null>(null);
   const [mutErr, setMutErr] = useState<string | null>(null);
+  // 发送（含上传附件）失败的服务端文案，显示在附件条处（V2 P2-1：413 配额提示走这里）
+  const [sendErr, setSendErr] = useState<string | null>(null);
   const [mutBusy, setMutBusy] = useState(false);
   // 投票：创建弹窗开关 + 每条消息的操作 busy 态
   const [showPoll, setShowPoll] = useState(false);
@@ -411,6 +422,7 @@ export default function ChatView() {
     }
     if (!t && pendingFiles.length === 0) return;
     setSending(true);
+    setSendErr(null);
     try {
       // 先上传待发附件，文字随最后一个附件消息一起发
       const atts: AttachmentView[] = [];
@@ -429,7 +441,8 @@ export default function ChatView() {
       setState({ replyingTo: null });
       stickBottom.current = true;
     } catch (err) {
-      alert(err instanceof Error ? err.message : "发送失败");
+      // 保留服务端文案（如 413 配额提示）；待发附件不清，便于重试
+      setSendErr(err instanceof Error ? err.message : "发送失败");
     } finally {
       setSending(false);
     }
@@ -531,10 +544,11 @@ export default function ChatView() {
   };
 
   const onFile = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const fl = e.target.files;
+    // files 是活的 FileList：必须先拷成数组再清 value，否则清空后列表跟着归零
+    const picked = Array.from(e.target.files ?? []);
     e.target.value = "";
-    if (!fl?.length || readonly) return;
-    addPending(fl);
+    if (!picked.length || readonly) return;
+    addPending(picked);
   };
 
   // 外面复制的文件/截图直接粘贴进待发区
@@ -737,8 +751,11 @@ export default function ChatView() {
                         {m.attachment && m.kind === "image" && (
                           <img
                             className="msg-img"
-                            src={files.url(m.attachment.id)}
+                            src={files.url(m.attachment.id, {
+                              thumb: !!m.attachment.has_thumb,
+                            })}
                             alt={m.attachment.file_name}
+                            style={imgDim(m.attachment)}
                             onClick={() => openPreview(m.attachment!)}
                             onContextMenu={(e) => onAttMenu(e, m.attachment!)}
                           />
@@ -874,6 +891,7 @@ export default function ChatView() {
                 ))}
               </div>
             )}
+            {sendErr && <div className="pf-err">{sendErr}</div>}
             <div className="composer-row">
               <button
                 className="icon-btn attach-btn"

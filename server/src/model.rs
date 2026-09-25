@@ -529,6 +529,15 @@ pub struct AdminUserView {
     pub last_seen_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub online: bool,
+    /// 该用户附件已用存储（按 storage_path 去重）
+    pub storage_bytes: i64,
+}
+
+/// GET /users/me/storage（V2 P2-1）：quota_bytes 为 null 表示不限额
+#[derive(Debug, Serialize)]
+pub struct StorageView {
+    pub used_bytes: i64,
+    pub quota_bytes: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -18,6 +18,7 @@ import type {
   RequestsView,
   SessionView,
   ServerInfo,
+  StorageView,
   UserPublic,
 } from "./types";
 
@@ -231,6 +232,8 @@ export const auth = {
   revokeSession: (id: string) => del<void>(`/users/me/sessions/${id}`),
   /** 退出其他所有设备 */
   revokeOtherSessions: () => post<void>("/users/me/sessions/revoke-others"),
+  /** 本人附件用量与配额（V2 P2-1） */
+  storage: () => get<StorageView>("/users/me/storage"),
   searchUser: async (q: string) => {
     const r = await get<unknown>(`/users/search?q=${encodeURIComponent(q)}`);
     // 兼容旧服务端返回单对象的形态
@@ -321,9 +324,14 @@ export const polls = {
 
 // ---------- files ----------
 export const files = {
-  /** 附件地址（能力 URL）：dl=true 强制下载，默认 inline 供预览/<img>/<a> */
-  url: (id: string, dl = false) =>
-    `${getServer()}/v1/files/${id}${dl ? "?dl=1" : ""}`,
+  /** 附件地址（能力 URL）：dl=true 强制下载；thumb=true 取 JPEG 缩略图（有则返回），默认 inline */
+  url: (id: string, opts?: { dl?: boolean; thumb?: boolean }) => {
+    const p = new URLSearchParams();
+    if (opts?.dl) p.set("dl", "1");
+    else if (opts?.thumb) p.set("thumb", "1");
+    const q = p.toString();
+    return `${getServer()}/v1/files/${id}${q ? `?${q}` : ""}`;
+  },
   upload: async (conversationId: string, file: File): Promise<AttachmentView> => {
     const fd = new FormData();
     fd.append("conversation_id", conversationId);
