@@ -252,6 +252,22 @@ function scheduleReconnect(gen: number) {
   }, delay);
 }
 
+/** force_logout reason → 登录页提示文案（V2 P1-5：新增改密/移出设备两类原因） */
+export function kickReasonText(reason: string): string {
+  switch (reason) {
+    case "disabled":
+      return "账号已被禁用，请联系管理员";
+    case "password_reset":
+      return "密码已被管理员重置，请重新登录";
+    case "password_changed":
+      return "密码已在其他设备修改，请重新登录";
+    case "session_revoked":
+      return "该设备已被移出登录，请重新登录";
+    default:
+      return "登录已失效，请重新登录";
+  }
+}
+
 function dispatch(f: WsOut) {
   const s = getState();
   switch (f.type) {
@@ -356,11 +372,8 @@ function dispatch(f: WsOut) {
       void refreshByWhat(f.what);
       break;
     case "force_logout": {
-      // 被管理员禁用/重置密码：记录原因 → 停连接 → 回登录页
-      sessionStorage.setItem(
-        "chat_kick_reason",
-        f.reason === "disabled" ? "账号已被禁用，请联系管理员" : "密码已被管理员重置，请重新登录",
-      );
+      // 被踢下线（禁用/重置密码/改密/移出设备）：记录原因 → 停连接 → 回登录页
+      sessionStorage.setItem("chat_kick_reason", kickReasonText(f.reason));
       stopWs();
       clearSession();
       window.dispatchEvent(new Event("chat:logout"));

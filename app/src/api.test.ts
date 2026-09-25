@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { auth, clearSession, convs, saveSession, setServer } from "./api";
+import { auth, browserDeviceLabel, clearSession, convs, deviceLabel, saveSession, setServer } from "./api";
 import type { AuthResponse } from "./types";
 
 const login = (name: string): AuthResponse => ({ access_token: `${name}-access`, refresh_token: `${name}-refresh`, access_expires_in: 900, user: { id: name, username: name, display_name: name, role: "user", last_seen_at: null } });
@@ -61,5 +61,49 @@ describe("session-owned HTTP requests", () => {
     expect(await next).toEqual(login("new").user);
     expect(await parallel).toEqual(login("new").user);
     expect(refreshTokens).toEqual(["old-refresh", "new-refresh"]);
+  });
+});
+
+// ===== V2 P1-5 =====
+describe("device labels", () => {
+  const UA = {
+    chrome: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    edge: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+    safari: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    firefox: "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    android: "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+  };
+  it.each([
+    [UA.chrome, "Chrome · Windows"],
+    [UA.edge, "Edge · Windows"],
+    [UA.safari, "Safari · macOS"],
+    [UA.firefox, "Firefox · Linux"],
+    [UA.android, "Chrome · Android"],
+    ["", "浏览器 · 未知系统"],
+  ])("browserDeviceLabel(%j) → %s", (ua, want) => {
+    expect(browserDeviceLabel(ua)).toBe(want);
+  });
+
+  it("uses Tauri labels inside the shell", () => {
+    vi.stubGlobal("navigator", { userAgent: UA.chrome });
+    vi.stubGlobal("__TAURI_INTERNALS__", {});
+    expect(deviceLabel()).toBe("Chat 桌面端 (Windows)");
+    vi.stubGlobal("navigator", { userAgent: UA.android });
+    expect(deviceLabel()).toBe("Chat Android");
+  });
+
+  it("falls back to UA parsing outside Tauri", () => {
+    vi.stubGlobal("navigator", { userAgent: UA.safari });
+    expect(deviceLabel()).toBe("Safari · macOS");
+  });
+
+  it("login/register carry the generated device_label", async () => {
+    vi.stubGlobal("navigator", { userAgent: UA.chrome });
+    const fetcher = vi.fn(async (_url: string, _init?: RequestInit) => Response.json(login("u")));
+    vi.stubGlobal("fetch", fetcher);
+    await auth.login("u", "secret123");
+    expect(JSON.parse(String(fetcher.mock.calls[0][1]?.body)).device_label).toBe("Chrome · Windows");
+    await auth.register("u", "secret123");
+    expect(JSON.parse(String(fetcher.mock.calls[1][1]?.body)).device_label).toBe("Chrome · Windows");
   });
 });

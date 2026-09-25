@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearSession, saveSession } from "./api";
 import { getState, setState } from "./store";
 import type { ConversationView, MessageView } from "./types";
-import { sendChat, startWs, stopWs } from "./ws";
+import { kickReasonText, sendChat, startWs, stopWs } from "./ws";
 
 const me = { id: "me", username: "me", display_name: "Me", role: "user" as const, last_seen_at: null };
 const message = (seq: number, mentions: string[] = []): MessageView => ({ id: `m${seq}`, seq, conversation_id: "c", sender_id: "other", sender_username: "other", sender_name: "Other", content: "hello", kind: "text", attachment: null, mentions, created_at: "2026-01-01T00:00:00Z" });
@@ -95,5 +95,18 @@ describe("WebSocket delivery", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(getState().messages.c).toEqual([message(1)]);
     expect(getState().historyLoaded.c).toBe(true);
+  });
+});
+
+// ===== V2 P1-5 =====
+describe("force_logout reason copy", () => {
+  it.each([
+    ["disabled", "账号已被禁用，请联系管理员"],
+    ["password_reset", "密码已被管理员重置，请重新登录"],
+    ["password_changed", "密码已在其他设备修改，请重新登录"],
+    ["session_revoked", "该设备已被移出登录，请重新登录"],
+    ["unknown_reason", "登录已失效，请重新登录"],
+  ])("kickReasonText(%j) → %s", (reason, want) => {
+    expect(kickReasonText(reason)).toBe(want);
   });
 });

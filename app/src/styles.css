@@ -626,3 +626,16 @@ button.ctx-item:hover { background: var(--bg); }
     --bubble-mine: #95ec69;
   }
 }
+/* ===== V2 P1-5 ===== */
+.sess-row { align-items: flex-start; }
+.sess-info { min-width: 0; }
+.sess-head { display: flex; align-items: center; gap: 6px; }
+.sess-current {
+  color: var(--green); border: 1px solid var(--green); border-radius: 4px;
+  font-size: 10px; padding: 0 4px; flex-shrink: 0;
+}
+.sess-ua {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  max-width: 100%; margin-top: 2px;
+}
+.ok-hint { color: var(--green); font-size: 12px; }

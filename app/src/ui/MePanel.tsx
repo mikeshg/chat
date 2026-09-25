@@ -4,6 +4,7 @@ import { setState, useApp } from "../store";
 import { stopWs } from "../ws";
 import NotifySettings from "./NotifySettings";
 import ThemeSetting from "./ThemeSetting";
+import SecuritySettings from "./SecuritySettings";
 
 export default function MePanel() {
   const s = useApp();
@@ -55,6 +56,7 @@ export default function MePanel() {
 
       <NotifySettings />
       <ThemeSetting />
+      <SecuritySettings />
 
       <section className="card">
         <h3>连接</h3>

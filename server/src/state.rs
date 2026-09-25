@@ -15,13 +15,20 @@ pub enum ConnMsg {
     Shutdown(String),
 }
 
-/// user_id -> (conn_id -> 出站事件发送端)
-pub type ConnMap = DashMap<Uuid, DashMap<Uuid, mpsc::UnboundedSender<ConnMsg>>>;
+/// 单条在线连接：出站事件发送端 + 所属登录会话（老连接可为 None）
+pub struct Conn {
+    pub tx: mpsc::UnboundedSender<ConnMsg>,
+    pub sid: Option<Uuid>,
+}
 
-/// 一次性 WS ticket 的内容：签发时的用户与凭据版本
+/// user_id -> (conn_id -> 连接)
+pub type ConnMap = DashMap<Uuid, DashMap<Uuid, Conn>>;
+
+/// 一次性 WS ticket 的内容：签发时的用户、凭据版本与登录会话
 pub struct TicketGrant {
     pub uid: Uuid,
     pub session_version: i64,
+    pub sid: Option<Uuid>,
     pub issued: Instant,
 }
 
@@ -65,11 +72,12 @@ impl AppState {
         uid: Uuid,
         conn_id: Uuid,
         tx: mpsc::UnboundedSender<ConnMsg>,
+        sid: Option<Uuid>,
     ) -> Option<u64> {
         let first = {
             let bucket = self.conns.entry(uid).or_default();
             let first = bucket.is_empty();
-            bucket.insert(conn_id, tx);
+            bucket.insert(conn_id, Conn { tx, sid });
             first
         };
         first.then(|| self.bump_epoch(uid))
@@ -99,7 +107,7 @@ impl AppState {
     pub fn send_to_user(&self, uid: Uuid, payload: &str) {
         if let Some(m) = self.conns.get(&uid) {
             for s in m.iter() {
-                let _ = s.send(ConnMsg::Frame(payload.to_string()));
+                let _ = s.tx.send(ConnMsg::Frame(payload.to_string()));
             }
         }
     }
@@ -127,11 +135,73 @@ impl AppState {
         })
         .to_string();
         let mut had = false;
-        for sender in bucket.iter() {
+        for conn in bucket.iter() {
             had = true;
-            let _ = sender.send(ConnMsg::Shutdown(frame.clone()));
+            let _ = conn.tx.send(ConnMsg::Shutdown(frame.clone()));
         }
         had.then(|| self.bump_epoch(uid))
+    }
+
+    /// 踢掉满足条件的连接（先收 force_logout 帧再断开）。
+    /// 返回 Some(epoch) 仅当踢完后该用户已无连接（在线 → 离线），由调用方广播离线；
+    /// 仍有其他连接在线时返回 None，绝不能广播离线。
+    fn kick_matching(
+        &self,
+        uid: Uuid,
+        reason: &str,
+        keep: impl Fn(Option<Uuid>) -> bool,
+    ) -> Option<u64> {
+        let frame = serde_json::json!({
+            "type": "force_logout",
+            "reason": reason,
+        })
+        .to_string();
+        let mut kicked = false;
+        let emptied = {
+            let bucket = self.conns.get_mut(&uid)?;
+            let ids: Vec<Uuid> = bucket
+                .iter()
+                .filter(|e| !keep(e.sid))
+                .map(|e| *e.key())
+                .collect();
+            for id in ids {
+                if let Some((_, conn)) = bucket.remove(&id) {
+                    kicked = true;
+                    let _ = conn.tx.send(ConnMsg::Shutdown(frame.clone()));
+                }
+            }
+            kicked && bucket.is_empty()
+        };
+        if !emptied {
+            return None;
+        }
+        // 与 unregister_conn 同样的二次确认：可能恰好有新连接注册进来
+        let still_empty = self.conns.get(&uid).is_some_and(|b| b.is_empty());
+        if !still_empty {
+            return None;
+        }
+        let epoch = self.bump_epoch(uid);
+        self.conns.remove_if(&uid, |_, conns| conns.is_empty());
+        Some(epoch)
+    }
+
+    /// 踢掉某个登录会话的全部连接（设备被移出）
+    pub fn kick_session(&self, uid: Uuid, sid: Uuid, reason: &str) -> Option<u64> {
+        self.kick_matching(uid, reason, |s| s != Some(sid))
+    }
+
+    /// 踢掉除 keep 以外登录会话的全部连接（改密/一键退出其他设备）。
+    /// keep=None（老 token 发起的请求）：只踢带 sid 的连接，无 sid 的老连接保留，
+    /// 由 session_version 变化在下一帧自然断开。
+    pub fn kick_other_sessions(&self, uid: Uuid, keep: Option<Uuid>, reason: &str) -> Option<u64> {
+        self.kick_matching(uid, reason, |s| s == keep)
+    }
+
+    /// 某个登录会话当前是否有在线连接（设备列表的 online 点）
+    pub fn session_online(&self, uid: Uuid, sid: Uuid) -> bool {
+        self.conns
+            .get(&uid)
+            .is_some_and(|m| m.iter().any(|c| c.sid == Some(sid)))
     }
 
     /// 连接是否仍在连接表里（被踢后旧任务不得再受理任何帧）
@@ -145,7 +215,7 @@ impl AppState {
         self.conns.get(&uid).map(|m| m.len()).unwrap_or(0)
     }
 
-    pub fn issue_ticket(&self, uid: Uuid, session_version: i64) -> String {
+    pub fn issue_ticket(&self, uid: Uuid, session_version: i64, sid: Option<Uuid>) -> String {
         let mut buf = [0u8; 32];
         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut buf);
         let ticket = hex::encode(buf);
@@ -157,6 +227,7 @@ impl AppState {
             TicketGrant {
                 uid,
                 session_version,
+                sid,
                 issued: Instant::now(),
             },
         );

@@ -31,6 +31,16 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
         .route("/auth/refresh", post(refresh))
         .route("/auth/logout", post(logout))
         .route("/users/me", get(get_me).patch(update_me))
+        .route("/users/me/password", post(crate::sessions::change_password))
+        .route("/users/me/sessions", get(crate::sessions::list_sessions))
+        .route(
+            "/users/me/sessions/revoke-others",
+            post(crate::sessions::revoke_other_sessions),
+        )
+        .route(
+            "/users/me/sessions/{id}",
+            delete(crate::sessions::revoke_session),
+        )
         .route("/users/search", get(search_user))
         .route("/friends", get(list_friends))
         .route("/friends/{user_id}", delete(delete_friend))
@@ -142,8 +152,8 @@ async fn push_presence(st: &SharedState, from: Uuid, to: Uuid) {
         st.send_to_user(to, &p);
     }
 }
-/// IP 滑动窗口限流（注册/登录）：20 次 / 5 分钟
-fn rate_limit(st: &SharedState, key: String) -> AppResult<()> {
+/// IP/UID 滑动窗口限流（注册/登录按 IP、改密按 uid）：20 次 / 5 分钟
+pub(crate) fn rate_limit(st: &SharedState, key: String) -> AppResult<()> {
     const LIMIT: usize = 20;
     const WINDOW_SECS: u64 = 300;
     let mut entry = st.rate.entry(key).or_default();
@@ -164,6 +174,7 @@ fn valid_username(s: &str) -> bool {
 async fn register(
     State(st): State<SharedState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<RegisterReq>,
 ) -> AppResult<Json<AuthResponse>> {
     rate_limit(&st, format!("reg:{}", addr.ip()))?;
@@ -205,7 +216,15 @@ async fn register(
         }
     })?;
 
-    let res = auth::issue_tokens(&mut *tx, &st.cfg, &row, None).await?;
+    // 注册即一条登录会话（一台设备）
+    let sid = auth::create_session(
+        &mut *tx,
+        row.id,
+        &crate::sessions::device_label_of(req.device_label.as_deref()),
+        &crate::sessions::user_agent_of(&headers),
+    )
+    .await?;
+    let res = auth::issue_tokens(&mut *tx, &st.cfg, &row, sid).await?;
     tx.commit().await?;
     Ok(Json(res))
 }
@@ -213,6 +232,7 @@ async fn register(
 async fn login(
     State(st): State<SharedState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<LoginReq>,
 ) -> AppResult<Json<AuthResponse>> {
     rate_limit(&st, format!("login:{}", addr.ip()))?;
@@ -229,13 +249,22 @@ async fn login(
     if row.disabled_at.is_some() {
         return Err(AppError::forbidden("账号已被禁用"));
     }
-    let res = auth::issue_tokens(&mut *tx, &st.cfg, &row, None).await?;
+    // 登录即一条登录会话（一台设备）
+    let sid = auth::create_session(
+        &mut *tx,
+        row.id,
+        &crate::sessions::device_label_of(req.device_label.as_deref()),
+        &crate::sessions::user_agent_of(&headers),
+    )
+    .await?;
+    let res = auth::issue_tokens(&mut *tx, &st.cfg, &row, sid).await?;
     tx.commit().await?;
     Ok(Json(res))
 }
 
 async fn refresh(
     State(st): State<SharedState>,
+    headers: HeaderMap,
     Json(req): Json<RefreshReq>,
 ) -> AppResult<Json<AuthResponse>> {
     let hash = auth::refresh_hash(&req.refresh_token);
@@ -261,21 +290,53 @@ async fn refresh(
         .fetch_one(&mut *tx)
         .await?;
     // 等待用户锁期间可能已被撤销；锁内重检并轮换，失败回滚旧 token。
-    let revoked = sqlx::query(
+    let old_sid = sqlx::query_scalar::<_, Option<Uuid>>(
         "UPDATE refresh_tokens SET revoked_at = now()
-          WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()",
+          WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()
+          RETURNING session_id",
     )
     .bind(&hash)
-    .execute(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
-    if revoked.rows_affected() == 0 {
+    let Some(old_sid) = old_sid else {
         return Err(AppError::unauthorized("invalid refresh token"));
-    }
+    };
     if row.disabled_at.is_some() {
         tx.commit().await?;
         return Err(AppError::forbidden("账号已被禁用"));
     }
-    let res = auth::issue_tokens(&mut *tx, &st.cfg, &row, None).await?;
+    let sid = match old_sid {
+        Some(sid) => {
+            // 沿用同一登录会话；session 已撤销则整次登录作废（顺带烧掉已轮换的旧 token）
+            let alive = sqlx::query_scalar::<_, bool>(
+                "UPDATE sessions SET last_used_at = now()
+                  WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
+                  RETURNING true",
+            )
+            .bind(sid)
+            .bind(row.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if alive.is_none() {
+                tx.commit().await?;
+                return Err(AppError::unauthorized(
+                    "session expired, please login again",
+                ));
+            }
+            sid
+        }
+        // 升级前签发的老 token（session_id 为 NULL）：补建一条 session
+        None => {
+            auth::create_session(
+                &mut *tx,
+                row.id,
+                "旧设备",
+                &crate::sessions::user_agent_of(&headers),
+            )
+            .await?
+        }
+    };
+    let res = auth::issue_tokens(&mut *tx, &st.cfg, &row, sid).await?;
     tx.commit().await?;
     Ok(Json(res))
 }
@@ -286,22 +347,45 @@ async fn logout(
 ) -> AppResult<StatusCode> {
     let hash = auth::refresh_hash(&req.refresh_token);
     let mut tx = st.pool.begin().await?;
-    let uid = sqlx::query_scalar::<_, Uuid>("SELECT user_id FROM refresh_tokens WHERE token_hash = $1")
-        .bind(&hash)
-        .fetch_optional(&mut *tx)
-        .await?;
-    if let Some(uid) = uid {
+    let found = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
+        "SELECT user_id, session_id FROM refresh_tokens WHERE token_hash = $1",
+    )
+    .bind(&hash)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((uid, sid)) = found {
         sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
             .bind(uid)
             .execute(&mut *tx)
             .await?;
-        sqlx::query(
-            "UPDATE refresh_tokens SET revoked_at = now()
-             WHERE token_hash = $1 AND revoked_at IS NULL",
-        )
-        .bind(&hash)
-        .execute(&mut *tx)
-        .await?;
+        match sid {
+            // 登出 = 撤销该 refresh token 所属的整个登录会话（连带其全部 refresh token）
+            Some(sid) => {
+                sqlx::query(
+                    "UPDATE sessions SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL",
+                )
+                .bind(sid)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE refresh_tokens SET revoked_at = now()
+                     WHERE session_id = $1 AND revoked_at IS NULL",
+                )
+                .bind(sid)
+                .execute(&mut *tx)
+                .await?;
+            }
+            // 无 session 的老 token：只撤销自己
+            None => {
+                sqlx::query(
+                    "UPDATE refresh_tokens SET revoked_at = now()
+                     WHERE token_hash = $1 AND revoked_at IS NULL",
+                )
+                .bind(&hash)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
     }
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1661,8 +1745,8 @@ async fn ws_ticket(
     State(st): State<SharedState>,
     headers: HeaderMap,
 ) -> AppResult<Json<TicketRes>> {
-    let user = auth::require_user(&st, &headers).await?;
-    let ticket = st.issue_ticket(user.id, user.session_version as i64);
+    let authn = auth::require_auth(&st, &headers).await?;
+    let ticket = st.issue_ticket(authn.user.id, authn.user.session_version as i64, authn.sid);
     Ok(Json(TicketRes {
         ticket,
         expires_in: 30,
@@ -1738,7 +1822,10 @@ async fn transfer_ownership(
 // ---------- 后台管理（仅 admin，账号级角色，与会话内 owner 无关） ----------
 
 /// 撤销某用户全部有效 refresh token（禁用/改密时用）
-async fn revoke_all_refresh(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, uid: Uuid) -> AppResult<()> {
+async fn revoke_all_refresh(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    uid: Uuid,
+) -> AppResult<()> {
     sqlx::query(
         "UPDATE refresh_tokens SET revoked_at = now()
          WHERE user_id = $1 AND revoked_at IS NULL",
@@ -1746,6 +1833,18 @@ async fn revoke_all_refresh(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, uid:
     .bind(uid)
     .execute(&mut **tx)
     .await?;
+    Ok(())
+}
+
+/// 撤销某用户全部登录会话（禁用/管理员重置密码时与 refresh 一并撤销）
+async fn revoke_all_sessions(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    uid: Uuid,
+) -> AppResult<()> {
+    sqlx::query("UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL")
+        .bind(uid)
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 
@@ -1872,6 +1971,7 @@ async fn admin_disable(
         .await?;
     }
     revoke_all_refresh(&mut tx, target).await?;
+    revoke_all_sessions(&mut tx, target).await?;
     tx.commit().await?;
     if let Some(epoch) = st.kick_user(target, "disabled") {
         ws::publish_offline(&st, target, epoch).await;
@@ -1978,6 +2078,7 @@ async fn admin_reset_password(
         return Err(AppError::not_found("user not found"));
     }
     revoke_all_refresh(&mut tx, target).await?;
+    revoke_all_sessions(&mut tx, target).await?;
     tx.commit().await?;
     if let Some(epoch) = st.kick_user(target, "password_reset") {
         ws::publish_offline(&st, target, epoch).await;
