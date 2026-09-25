@@ -1,0 +1,267 @@
+//! 全局可配项（server_settings）与注册邀请码。
+//! 配置量极小，每次从库读，不做内存缓存；缺省键按代码默认值处理（不预置行）。
+
+use crate::auth;
+use crate::error::{is_unique_violation, AppError, AppResult};
+use crate::state::SharedState;
+use axum::{
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
+    Json,
+};
+use chrono::{DateTime, Duration, Utc};
+use rand_core::{OsRng, RngCore};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// 注册模式：行不存在即 open（保证现有部署/测试行为不变）
+pub const MODE_OPEN: &str = "open";
+pub const MODE_INVITE: &str = "invite";
+pub const MODE_CLOSED: &str = "closed";
+const VALID_MODES: [&str; 3] = [MODE_OPEN, MODE_INVITE, MODE_CLOSED];
+
+/// 邀请码：10 位无混淆字符（去掉 I/O/0/1）
+const CODE_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const CODE_LEN: usize = 10;
+
+#[derive(Debug, Serialize)]
+pub struct ServerSettings {
+    pub registration_mode: String,
+}
+
+impl Default for ServerSettings {
+    fn default() -> Self {
+        Self {
+            registration_mode: MODE_OPEN.into(),
+        }
+    }
+}
+
+/// 一次查出全部行，缺省键用默认值；未知键与非法值忽略（前向兼容）
+pub async fn load(executor: impl sqlx::PgExecutor<'_>) -> AppResult<ServerSettings> {
+    let rows =
+        sqlx::query_as::<_, (String, serde_json::Value)>("SELECT key, value FROM server_settings")
+            .fetch_all(executor)
+            .await?;
+    let mut s = ServerSettings::default();
+    for (k, v) in rows {
+        if k == "registration_mode" {
+            if let Some(m) = v.as_str() {
+                if VALID_MODES.contains(&m) {
+                    s.registration_mode = m.to_string();
+                }
+            }
+        }
+    }
+    Ok(s)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateSettingsReq {
+    /// 部分更新：缺省字段不改
+    pub registration_mode: Option<String>,
+}
+
+/// 按 patch 逐键 UPSERT（记录 updated_by），返回完整设置
+pub async fn update(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    req: &UpdateSettingsReq,
+    updated_by: Uuid,
+) -> AppResult<ServerSettings> {
+    if let Some(m) = &req.registration_mode {
+        if !VALID_MODES.contains(&m.as_str()) {
+            return Err(AppError::bad_request(
+                "registration_mode 必须是 open / invite / closed",
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO server_settings (key, value, updated_by)
+             VALUES ('registration_mode', to_jsonb($1::text), $2)
+             ON CONFLICT (key) DO UPDATE
+                SET value = EXCLUDED.value, updated_at = now(), updated_by = EXCLUDED.updated_by",
+        )
+        .bind(m)
+        .bind(updated_by)
+        .execute(&mut **tx)
+        .await?;
+    }
+    load(&mut **tx).await
+}
+
+/// 邀请码规范化：比较大小写不敏感、去首尾空白（入库统一大写）
+pub fn normalize_code(code: &str) -> String {
+    code.trim().to_ascii_uppercase()
+}
+
+fn gen_invite_code() -> String {
+    let mut buf = [0u8; CODE_LEN];
+    OsRng.fill_bytes(&mut buf);
+    // 256 % 32 = 0，字节直接索引无模偏置
+    buf.iter()
+        .map(|b| CODE_ALPHABET[(*b & 31) as usize] as char)
+        .collect()
+}
+
+/// invite 模式注册：事务内原子消费邀请码，返回 id 供写 users.invite_id；
+/// 0 行（不存在/已撤销/过期/用完）→ 403
+pub async fn consume_invite(executor: impl sqlx::PgExecutor<'_>, code: &str) -> AppResult<Uuid> {
+    sqlx::query_scalar::<_, Uuid>(
+        "UPDATE invites SET uses = uses + 1
+          WHERE code = $1 AND revoked_at IS NULL
+            AND (expires_at IS NULL OR expires_at > now())
+            AND (max_uses IS NULL OR uses < max_uses)
+          RETURNING id",
+    )
+    .bind(code)
+    .fetch_optional(executor)
+    .await?
+    .ok_or_else(|| AppError::forbidden("邀请码无效或已失效"))
+}
+
+// ---------- 路由处理 ----------
+
+#[derive(Debug, Serialize)]
+pub struct ServerInfo {
+    pub registration_mode: String,
+    // 只放可公开字段；后续阶段按需加
+}
+
+/// GET /server-info：公共端点，供登录页决定注册入口形态
+pub async fn server_info(State(st): State<SharedState>) -> AppResult<Json<ServerInfo>> {
+    let s = load(&st.pool).await?;
+    Ok(Json(ServerInfo {
+        registration_mode: s.registration_mode,
+    }))
+}
+
+pub async fn get_settings(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+) -> AppResult<Json<ServerSettings>> {
+    auth::require_admin(&st, &headers).await?;
+    Ok(Json(load(&st.pool).await?))
+}
+
+pub async fn put_settings(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<UpdateSettingsReq>,
+) -> AppResult<Json<ServerSettings>> {
+    let admin = auth::require_admin(&st, &headers).await?;
+    let mut tx = st.pool.begin().await?;
+    let s = update(&mut tx, &req, admin.id).await?;
+    tx.commit().await?;
+    Ok(Json(s))
+}
+
+/// 邀请码列表/详情共用读模型；usable 由库按「未撤销、未过期、未用完」算出
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct InviteView {
+    pub id: Uuid,
+    pub code: String,
+    pub note: String,
+    pub created_by_name: Option<String>,
+    pub max_uses: Option<i32>,
+    pub uses: i32,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub usable: bool,
+}
+
+const INVITE_SELECT: &str = "SELECT i.id, i.code, i.note, u.display_name AS created_by_name,
+            i.max_uses, i.uses, i.expires_at, i.revoked_at, i.created_at,
+            (i.revoked_at IS NULL
+             AND (i.expires_at IS NULL OR i.expires_at > now())
+             AND (i.max_uses IS NULL OR i.uses < i.max_uses)) AS usable
+       FROM invites i LEFT JOIN users u ON u.id = i.created_by";
+
+pub async fn list_invites(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+) -> AppResult<Json<Vec<InviteView>>> {
+    auth::require_admin(&st, &headers).await?;
+    let rows =
+        sqlx::query_as::<_, InviteView>(&format!("{INVITE_SELECT} ORDER BY i.created_at DESC"))
+            .fetch_all(&st.pool)
+            .await?;
+    Ok(Json(rows))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateInviteReq {
+    /// 缺省 / null = 不限次数
+    pub max_uses: Option<i32>,
+    /// 缺省 / null = 永不过期
+    pub expires_in_hours: Option<i64>,
+    #[serde(default)]
+    pub note: String,
+}
+
+pub async fn create_invite(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateInviteReq>,
+) -> AppResult<Json<InviteView>> {
+    let admin = auth::require_admin(&st, &headers).await?;
+    if let Some(n) = req.max_uses {
+        if !(1..=1000).contains(&n) {
+            return Err(AppError::bad_request("max_uses 需在 1-1000 之间"));
+        }
+    }
+    if let Some(h) = req.expires_in_hours {
+        if !(1..=8760).contains(&h) {
+            return Err(AppError::bad_request("expires_in_hours 需在 1-8760 之间"));
+        }
+    }
+    // 字符级截断，避免按字节切在 UTF-8 边界中间
+    let note: String = req.note.trim().chars().take(100).collect();
+    let expires_at = req
+        .expires_in_hours
+        .map(|h| Utc::now() + Duration::hours(h));
+
+    // 码碰撞概率极低，唯一冲突时重试几次即可
+    let mut id = None;
+    for _ in 0..5 {
+        let code = gen_invite_code();
+        match sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO invites (code, note, created_by, max_uses, expires_at)
+             VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        )
+        .bind(&code)
+        .bind(&note)
+        .bind(admin.id)
+        .bind(req.max_uses)
+        .bind(expires_at)
+        .fetch_one(&st.pool)
+        .await
+        {
+            Ok(v) => {
+                id = Some(v);
+                break;
+            }
+            Err(e) if is_unique_violation(&e) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let id = id.ok_or_else(|| AppError::internal("invite code collision"))?;
+    let row = sqlx::query_as::<_, InviteView>(&format!("{INVITE_SELECT} WHERE i.id = $1"))
+        .bind(id)
+        .fetch_one(&st.pool)
+        .await?;
+    Ok(Json(row))
+}
+
+/// 撤销（置 revoked_at，幂等）：已撤销/不存在的 id 同样返回 204
+pub async fn revoke_invite(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> AppResult<StatusCode> {
+    auth::require_admin(&st, &headers).await?;
+    sqlx::query("UPDATE invites SET revoked_at = COALESCE(revoked_at, now()) WHERE id = $1")
+        .bind(id)
+        .execute(&st.pool)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}

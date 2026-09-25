@@ -639,3 +639,23 @@ button.ctx-item:hover { background: var(--bg); }
   max-width: 100%; margin-top: 2px;
 }
 .ok-hint { color: var(--green); font-size: 12px; }
+
+/* ===== V2 P1-2 ===== */
+.auth-note { color: var(--muted); font-size: 13px; }
+.ad-settings { margin-bottom: 14px; }
+.ad-settings h3 { margin: 4px 0 8px; font-size: 14px; }
+.ad-mode { gap: 14px; margin-bottom: 6px; }
+.ad-radio { display: inline-flex; align-items: center; gap: 5px; font-size: 13px; }
+.ad-radio input { margin: 0; flex: none; }
+.ad-saved { color: var(--green); }
+.ad-invite-form { display: flex; gap: 8px; margin-bottom: 10px; }
+.ad-invite-form select { border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; background: var(--panel); color: var(--text); }
+.ad-invites { font-size: 13px; }
+.ad-invite-row {
+  display: grid; grid-template-columns: 1.2fr 1.2fr 0.9fr 1.3fr 0.7fr 0.9fr 1.9fr;
+  gap: 8px; align-items: center; padding: 7px 4px; border-bottom: 1px solid var(--line);
+}
+.ad-invite-row.ad-head { color: var(--muted); font-size: 12px; }
+.inv-code { font-family: ui-monospace, Consolas, monospace; letter-spacing: 1px; }
+.inv-note { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ad-invite-row .ad-actions button { font-size: 12px; padding: 3px 10px; }

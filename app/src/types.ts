@@ -268,3 +268,39 @@ export interface AdminUserView {
   created_at: string;
   online: boolean;
 }
+
+// ---------- V2 P1-2 注册开关 + 邀请码 ----------
+export type RegistrationMode = "open" | "invite" | "closed";
+
+/** GET /server-info（公共，旧服务端无此接口 → 客户端按 open 处理） */
+export interface ServerInfo {
+  registration_mode: RegistrationMode;
+}
+
+/** GET/PUT /admin/settings */
+export interface AdminSettings {
+  registration_mode: RegistrationMode;
+}
+
+export interface InviteView {
+  id: string;
+  code: string;
+  note: string;
+  created_by_name: string | null;
+  /** null = 不限次数 */
+  max_uses: number | null;
+  uses: number;
+  /** null = 永不过期 */
+  expires_at: string | null;
+  revoked_at: string | null;
+  created_at: string;
+  /** 服务端按「未撤销、未过期、未用完」算出 */
+  usable: boolean;
+}
+
+/** POST /admin/invites 请求体：null/缺省 = 不限 */
+export interface CreateInviteReq {
+  max_uses?: number | null;
+  expires_in_hours?: number | null;
+  note?: string;
+}

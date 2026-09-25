@@ -1,5 +1,6 @@
 import type {
   AdminOverview,
+  AdminSettings,
   AdminUserView,
   AttachmentView,
   AuthResponse,
@@ -7,13 +8,16 @@ import type {
   ConversationPref,
   ConversationPrefEntry,
   ConversationView,
+  CreateInviteReq,
   CreatePollReq,
   FriendView,
+  InviteView,
   MessagesPage,
   MessageView,
   PrefUpdate,
   RequestsView,
   SessionView,
+  ServerInfo,
   UserPublic,
 } from "./types";
 
@@ -201,12 +205,13 @@ export function deviceLabel(): string {
 
 // ---------- auth ----------
 export const auth = {
-  register: (username: string, password: string, display_name?: string) =>
+  register: (username: string, password: string, display_name?: string, inviteCode?: string) =>
     post<AuthResponse>("/auth/register", {
       username,
       password,
       display_name,
       device_label: deviceLabel(),
+      invite_code: inviteCode,
     }),
   login: (username: string, password: string) =>
     post<AuthResponse>("/auth/login", { username, password, device_label: deviceLabel() }),
@@ -327,9 +332,32 @@ export const files = {
   },
 };
 
+// ---------- 公共服务器信息 ----------
+/** 登录前探测注册模式。请求失败/404/字段缺失一律视为 open（兼容旧服务端） */
+export async function serverInfo(server?: string): Promise<ServerInfo> {
+  const srv = (server ?? getServer()).trim().replace(/\/+$/, "");
+  try {
+    const res = await fetch(`${srv}/v1/server-info`);
+    if (!res.ok) return { registration_mode: "open" };
+    const j = (await res.json()) as Partial<ServerInfo>;
+    const m = j.registration_mode;
+    return { registration_mode: m === "invite" || m === "closed" ? m : "open" };
+  } catch {
+    return { registration_mode: "open" };
+  }
+}
+
 // ---------- admin ----------
 export const admin = {
   overview: () => get<AdminOverview>("/admin/overview"),
+  settings: () => get<AdminSettings>("/admin/settings"),
+  /** 部分更新：只传要改的字段；返回完整设置 */
+  updateSettings: (patch: Partial<AdminSettings>) =>
+    put<AdminSettings>("/admin/settings", patch),
+  invites: () => get<InviteView[]>("/admin/invites"),
+  createInvite: (body: CreateInviteReq) => post<InviteView>("/admin/invites", body),
+  /** 撤销（幂等 204） */
+  revokeInvite: (id: string) => del<void>(`/admin/invites/${id}`),
   users: (q = "", offset = 0) =>
     get<AdminUserView[]>(
       `/admin/users?offset=${offset}${q ? `&q=${encodeURIComponent(q)}` : ""}`,

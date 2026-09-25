@@ -53,6 +53,9 @@ pub struct RegisterReq {
     /// 设备名（V2 P1-5）：服务端去控制字符并截断 60 字符
     #[serde(default)]
     pub device_label: Option<String>,
+    /// invite 模式必填；open/closed 忽略（带了也不校验、不计数）
+    #[serde(default)]
+    pub invite_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
