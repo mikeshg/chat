@@ -157,6 +157,7 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
   const [copied, setCopied] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const copy = async () => {
+    let ok = true;
     try {
       await navigator.clipboard.writeText(code);
     } catch {
@@ -168,10 +169,13 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
       document.body.appendChild(ta);
       ta.select();
       try {
-        document.execCommand("copy");
-      } catch {}
+        ok = document.execCommand("copy");
+      } catch {
+        ok = false;
+      }
       ta.remove();
     }
+    if (!ok) return;
     setCopied(true);
     clearTimeout(timer.current);
     timer.current = setTimeout(() => setCopied(false), 1500);
