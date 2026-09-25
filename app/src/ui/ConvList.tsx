@@ -178,9 +178,8 @@ export default function ConvList() {
                   {peerOnline && <i className="online-dot" />}
                 </Avatar>
               ) : (
-                <div className="avatar">
-                  {convAvatarText(c)}
-                  {peerOnline && <i className="online-dot" />}
+                <div className={`avatar ${c.kind === "self" ? "self-avatar" : ""}`}>
+                  {c.kind === "self" ? "🗂" : convAvatarText(c)}
                 </div>
               )}
               <div className="conv-mid">

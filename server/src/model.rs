@@ -500,6 +500,39 @@ pub struct VotePollReq {
     pub client_op_id: Option<Uuid>,
 }
 
+// ---------- 转发 / 收藏（V2 P2-4） ----------
+
+/// POST /messages/{id}/forward：把一条消息复制到最多 10 个目标会话（去重后）。
+/// 收藏 = 转发到本人的文件传输助手，客户端用同一端点。
+#[derive(Debug, Deserialize)]
+pub struct ForwardReq {
+    /// 目标会话 id 列表：1..=10（服务端去重；空/超界 400）
+    pub conversation_ids: Vec<Uuid>,
+    /// 必填：发起者幂等键（同 op+同目标重试返回同一条消息，不重复广播）
+    pub client_op_id: Uuid,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ForwardResultItem {
+    pub conversation_id: Uuid,
+    pub ok: bool,
+    /// ok=true：转发者视角的完整消息视图（含 forwarded_from 快照）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<MessageView>,
+    /// ok=false：稳定错误码（forbidden / not_friends / bad_request）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// ok=false：面向用户的中文原因（与 WS 错误帧口径一致）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_text: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ForwardResp {
+    /// 与请求目标顺序一一对应；逐条独立成败（HTTP 恒 200，除非源侧统一被拒）
+    pub results: Vec<ForwardResultItem>,
+}
+
 // 软删除/reaction 的 REST 响应均为发起者视角的完整 MessageView：
 // 与 WS 广播同形，客户端统一按 (id, edit_version) 整视图合并。
 

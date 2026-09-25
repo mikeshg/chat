@@ -10,6 +10,7 @@ import type {
   ConversationView,
   CreateInviteReq,
   CreatePollReq,
+  ForwardResp,
   FriendView,
   InviteView,
   MessagesPage,
@@ -309,6 +310,10 @@ export const msgs = {
   /** 重连批量回刷缓存消息（每批 ≤100 个 id） */
   refresh: (convId: string, ids: string[]) =>
     post<MessagesPage>(`/conversations/${convId}/messages/refresh`, { ids }),
+  /** 转发/收藏（V2 P2-4）：targets ≤10（服务端去重）；client_op_id 幂等——
+   * 结果未确认时只能用原值重试，否则会产生第二条转发消息 */
+  forward: (id: string, conversation_ids: string[], client_op_id: string) =>
+    post<ForwardResp>(`/messages/${id}/forward`, { conversation_ids, client_op_id }),
 };
 
 // ---------- 轻量投票 ----------

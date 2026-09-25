@@ -221,6 +221,30 @@ pub fn broadcast_reaction_update(st: &SharedState, ch: &ReactionChange) {
     }
 }
 
+/// 新消息广播：成员各连一帧 + 被 @ 解归档成员的个人偏好帧。
+/// WS send_message / REST create_poll / REST forward 三处共用
+/// （第 3 阶段离线推送也挂在它上面，所有新消息必须经过这里）。
+pub async fn broadcast_posted(st: &SharedState, conv: Uuid, posted: &domain::Posted) {
+    if posted.inserted {
+        let p = frame(&WsOut::Message {
+            message: posted.message.clone(),
+        });
+        st.send_to_users(&posted.member_ids, &p);
+    }
+    // 新 @本人消息已在事务内解除其归档：偏好帧只发给本人全部连接（其他成员不可见）
+    for target in &posted.unarchived {
+        if let Ok(preference) = domain::pref_of(&st.pool, conv, *target).await {
+            st.send_to_user(
+                *target,
+                &frame(&WsOut::PreferenceUpdated {
+                    conversation_id: conv,
+                    preference,
+                }),
+            );
+        }
+    }
+}
+
 /// mutation 回执：只回发起连接，与 client_msg_id 严格区分。
 fn op_ack(tx: &mpsc::UnboundedSender<ConnMsg>, client_op_id: Option<Uuid>) {
     if let Some(id) = client_op_id {
@@ -379,29 +403,15 @@ async fn send_message(
             reply_to_id,
             // WS 不接受投票负载：kind='poll' 只能经 REST create_poll 产生（防伪造）
             poll: None,
+            // 转发字段仅服务端转发端点可达：WS 发送不能伪造转发来源/克隆附件
+            forwarded_from: None,
+            forward_attachment: None,
         },
     )
     .await
     .map_err(domain::PostError::into_ws)?;
 
-    if posted.inserted {
-        let p = frame(&WsOut::Message {
-            message: posted.message.clone(),
-        });
-        st.send_to_users(&posted.member_ids, &p);
-    }
-    // 新 @本人消息已在事务内解除其归档：偏好帧只发给本人全部连接（其他成员不可见）
-    for target in &posted.unarchived {
-        if let Ok(preference) = domain::pref_of(&st.pool, conv, *target).await {
-            st.send_to_user(
-                *target,
-                &frame(&WsOut::PreferenceUpdated {
-                    conversation_id: conv,
-                    preference,
-                }),
-            );
-        }
-    }
+    broadcast_posted(st, conv, &posted).await;
     // ack 只回发起连接：携带 client_msg_id 完成乐观替换
     let _ = tx.send(ConnMsg::Frame(frame(&WsOut::MessageAck {
         client_msg_id,
@@ -468,6 +478,15 @@ async fn reaction(
 }
 
 async fn typing(st: &SharedState, uid: Uuid, conv: Uuid) -> WsResult {
+    // self 会话不广播 typing（唯一成员即本人；成员循环本就发不出去，这里显式短路）
+    if domain::conv_kind(&st.pool, conv)
+        .await
+        .map_err(|_| ws_err("internal", "db error"))?
+        .as_deref()
+        == Some("self")
+    {
+        return Ok(());
+    }
     domain::membership(&st.pool, conv, uid)
         .await
         .map_err(|_| ws_err("internal", "db error"))?

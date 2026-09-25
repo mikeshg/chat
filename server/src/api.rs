@@ -86,6 +86,7 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
         .route("/conversations/{id}/polls", post(create_poll))
         .route("/messages/{id}/poll/votes", put(vote_poll))
         .route("/messages/{id}/poll/close", post(close_poll))
+        .route("/messages/{id}/forward", post(forward_message))
         .route("/conversations/{id}/members", post(add_members))
         .route("/conversations/{id}/members/me", delete(leave_conversation))
         .route("/conversations/{id}/members/{uid}", delete(kick_member))
@@ -265,6 +266,9 @@ async fn register(
             e.into()
         }
     })?;
+
+    // 文件传输助手：每用户一个 self 会话，与用户同事务创建（失败整体回滚）
+    domain::ensure_self_conversation(&mut *tx, row.id).await?;
 
     // 注册即一条登录会话（一台设备）
     let sid = auth::create_session(
@@ -1381,24 +1385,7 @@ async fn create_poll(
     let posted = domain::create_poll(&st.pool, conv, uid, &req)
         .await
         .map_err(post_err)?;
-    if posted.inserted {
-        let p = serde_json::to_string(&WsOut::Message {
-            message: posted.message.clone(),
-        })
-        .unwrap();
-        st.send_to_users(&posted.member_ids, &p);
-    }
-    // 问题文本里 @到已归档成员时事务内已解档：给本人推送偏好帧（与 ws 发送路径同口径）
-    for target in &posted.unarchived {
-        if let Ok(preference) = domain::pref_of(&st.pool, conv, *target).await {
-            let f = serde_json::to_string(&WsOut::PreferenceUpdated {
-                conversation_id: conv,
-                preference,
-            })
-            .unwrap();
-            st.send_to_user(*target, &f);
-        }
-    }
+    ws::broadcast_posted(&st, conv, &posted).await;
     Ok(Json(posted.message))
 }
 
@@ -1430,6 +1417,68 @@ async fn close_poll(
         .map_err(post_err)?;
     ws::broadcast_message_updated(&st, &ed).await;
     Ok(Json(ed.row.into_view(uid)))
+}
+
+// ---------- 转发 / 收藏（V2 P2-4） ----------
+
+/// POST /messages/{id}/forward：复制一条消息到至多 10 个目标会话。
+/// 收藏 = 客户端把目标填本人的文件传输助手。
+/// 源侧统一拒绝（非成员 403 / 墓碑或投票 400 / 目标列表形状 400）；目标侧逐条
+/// 独立成败：HTTP 恒 200，results 与去重后的请求目标顺序一一对应。
+/// 每条成功目标走与 WS 发送相同的 message 帧广播（含 unarchive 偏好推送）。
+async fn forward_message(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(message_id): Path<Uuid>,
+    Json(req): Json<ForwardReq>,
+) -> AppResult<Json<ForwardResp>> {
+    let uid = uid_of(&headers, &st).await?;
+    // 整个请求按 uid 限流（与注册/登录同一滑动窗口参数）
+    rate_limit(&st, format!("fwd:{uid}"))?;
+    if req.conversation_ids.is_empty() || req.conversation_ids.len() > 10 {
+        return Err(AppError::bad_request(
+            "conversation_ids must be 1-10 targets",
+        ));
+    }
+    // 去重保持首见顺序（results 按此顺序逐条对应）
+    let mut seen = std::collections::HashSet::new();
+    let targets: Vec<Uuid> = req
+        .conversation_ids
+        .iter()
+        .copied()
+        .filter(|c| seen.insert(*c))
+        .collect();
+
+    let results = domain::forward_message(&st.pool, uid, message_id, &targets, req.client_op_id)
+        .await
+        .map_err(post_err)?;
+    let mut items = Vec::with_capacity(results.len());
+    for r in results {
+        match r {
+            domain::Forwarded::Ok { conv, posted } => {
+                ws::broadcast_posted(&st, conv, &posted).await;
+                items.push(ForwardResultItem {
+                    conversation_id: conv,
+                    ok: true,
+                    message: Some(posted.message),
+                    error: None,
+                    message_text: None,
+                });
+            }
+            domain::Forwarded::Fail {
+                conv,
+                code,
+                message,
+            } => items.push(ForwardResultItem {
+                conversation_id: conv,
+                ok: false,
+                message: None,
+                error: Some(code.to_string()),
+                message_text: Some(message.to_string()),
+            }),
+        }
+    }
+    Ok(Json(ForwardResp { results: items }))
 }
 
 async fn add_members(
@@ -1575,8 +1624,15 @@ async fn kick_member(
     }
     // 锁内重检：我仍是群主、目标仍是非群主成员，才能删
     let mut tx = st.pool.begin().await?;
-    if domain::lock_conversation(&mut tx, conv).await?.is_none() {
+    let Some((kind, _, _)) = domain::lock_conversation(&mut tx, conv).await? else {
         return Err(AppError::forbidden("not a member of this conversation"));
+    };
+    // self 会话单人不可变：把成员操作与 dm 一样拒绝，但统一 400（群主身份本是唯一成员，
+    // 不做类型守卫会落到 member not found 的 404）
+    if kind == "self" {
+        return Err(AppError::bad_request(
+            "self conversation has no members to manage",
+        ));
     }
     let me = domain::membership(&mut *tx, conv, uid)
         .await?
@@ -1613,6 +1669,10 @@ async fn rename_conversation(
     if me.role != "owner" {
         return Err(AppError::forbidden("only the owner can rename"));
     }
+    // self 会话 name 恒 NULL（客户端按 kind 显示「文件传输助手」），改名无意义 → 400
+    if domain::conv_kind(&st.pool, conv).await?.as_deref() == Some("self") {
+        return Err(AppError::bad_request("self conversation cannot be renamed"));
+    }
     let name = req.name.trim();
     if name.is_empty() || name.len() > 100 {
         return Err(AppError::bad_request("name must be 1-100 chars"));
@@ -1635,8 +1695,14 @@ async fn dissolve_conversation(
     let uid = uid_of(&headers, &st).await?;
     // 与拉人/退群/踢人共用会话行锁，锁内重检群主身份与解散标记
     let mut tx = st.pool.begin().await?;
-    if domain::lock_conversation(&mut tx, conv).await?.is_none() {
+    let Some((kind, _, _)) = domain::lock_conversation(&mut tx, conv).await? else {
         return Err(AppError::forbidden("not a member of this conversation"));
+    };
+    // self 会话不可解散：唯一成员即 owner，不做类型守卫会把助手连同成员一起删掉
+    if kind == "self" {
+        return Err(AppError::bad_request(
+            "self conversation cannot be dissolved",
+        ));
     }
     let me = domain::membership(&mut *tx, conv, uid)
         .await?
@@ -2211,8 +2277,14 @@ async fn transfer_ownership(
         return Err(AppError::bad_request("already the owner"));
     }
     let mut tx = st.pool.begin().await?;
-    if domain::lock_conversation(&mut tx, conv).await?.is_none() {
+    let Some((kind, _, _)) = domain::lock_conversation(&mut tx, conv).await? else {
         return Err(AppError::forbidden("not a member of this conversation"));
+    };
+    // self 会话归属本人不可转让（唯一成员即 owner）
+    if kind == "self" {
+        return Err(AppError::bad_request(
+            "self conversation cannot be transferred",
+        ));
     }
     let me = domain::membership(&mut *tx, conv, uid)
         .await?
