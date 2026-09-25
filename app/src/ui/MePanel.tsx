@@ -3,6 +3,7 @@ import { auth, getServer } from "../api";
 import { setState, useApp } from "../store";
 import { stopWs } from "../ws";
 import NotifySettings from "./NotifySettings";
+import ThemeSetting from "./ThemeSetting";
 
 export default function MePanel() {
   const s = useApp();
@@ -53,6 +54,7 @@ export default function MePanel() {
       </section>
 
       <NotifySettings />
+      <ThemeSetting />
 
       <section className="card">
         <h3>连接</h3>

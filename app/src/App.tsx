@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { auth, loadSession } from "./api";
+import { readDrafts } from "./drafts";
 import { syncWindowTitle, unreadTitle } from "./notify";
-import { setState, useApp } from "./store";
+import { flushDrafts, setState, useApp } from "./store";
 import { startWs, stopWs } from "./ws";
 import AuthScreen from "./ui/AuthScreen";
 import ChatScreen from "./ui/ChatScreen";
@@ -12,6 +13,7 @@ export default function App() {
 
   useEffect(() => {
     const onLogout = () => {
+      flushDrafts(); // 先把在途草稿落盘（本地存储保留，同账号下次登录恢复）
       stopWs();
       setState({
         me: null,
@@ -26,6 +28,7 @@ export default function App() {
         activeConv: null,
         wsReady: false,
         toasts: [],
+        drafts: {},
       });
     };
     window.addEventListener("chat:logout", onLogout);
@@ -38,7 +41,7 @@ export default function App() {
     (async () => {
       try {
         const me = await auth.me();
-        setState({ me });
+        setState({ me, drafts: readDrafts(localStorage, me.id) });
         void startWs();
       } catch {
         // session 已失效

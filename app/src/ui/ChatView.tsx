@@ -6,6 +6,7 @@ import {
   convTitle,
   getState,
   prependMessages,
+  setDraft,
   setState,
   upsertMessage,
   useApp,
@@ -98,7 +99,11 @@ function downloadAttachment(a: AttachmentView) {
 
 export default function ChatView() {
   const s = useApp();
-  const [text, setText] = useState("");
+  // 输入框初值取当前会话草稿（组件重挂时不再闪空）
+  const [text, setText] = useState(() => {
+    const st = getState();
+    return st.activeConv ? (st.drafts[st.activeConv] ?? "") : "";
+  });
   const [showInfo, setShowInfo] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -107,6 +112,7 @@ export default function ChatView() {
   const fileInput = useRef<HTMLInputElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const draftBeforeEdit = useRef(""); // 编辑态接管 composer 前的草稿
+  const prevConv = useRef<string | null>(null); // 上一次渲染的会话（草稿归属判定）
   const [members, setMembers] = useState<MemberView[]>([]);
   const [ac, setAc] = useState<{ start: number; prefix: string } | null>(null);
   const [showSearch, setShowSearch] = useState(false);
@@ -169,9 +175,15 @@ export default function ChatView() {
     mutation.current = null;
     draftRevision.current++;
     setMutBusy(false);
+    // V2 P1-3：旧会话草稿落库。编辑态中输入框是被编辑内容，真草稿在 draftBeforeEdit
+    if (prevConv.current != null && prevConv.current !== conv?.id) {
+      setDraft(prevConv.current, getState().editingMessage ? draftBeforeEdit.current : text);
+      draftBeforeEdit.current = "";
+    }
+    prevConv.current = conv?.id ?? null;
     // 切换会话时退出回复/编辑态（目标属于旧会话）
     setState({ replyingTo: null, editingMessage: null });
-    setText("");
+    setText(conv ? (getState().drafts[conv.id] ?? "") : "");
   }, [conv?.id]);
 
   // 打开会话 → 拉历史（P1-11：每会话至少一次；实时缓存非空也要拉，按 id 合并不覆盖）
@@ -411,6 +423,7 @@ export default function ChatView() {
       );
       if (atts.length === 0 && t) sendChat(conv.id, t, undefined, rt);
       setText("");
+      setDraft(conv.id, ""); // 发送即清该会话草稿
       setPendingFiles([]);
       setAc(null);
       setState({ replyingTo: null });
@@ -441,7 +454,9 @@ export default function ChatView() {
   const pickAc = (uname: string) => {
     if (!ac) return;
     const caret = taRef.current?.selectionStart ?? text.length;
-    setText(text.slice(0, ac.start) + "@" + uname + " " + text.slice(caret));
+    const next = text.slice(0, ac.start) + "@" + uname + " " + text.slice(caret);
+    setText(next);
+    if (!s.editingMessage) setDraft(conv.id, next);
     setAc(null);
     taRef.current?.focus();
   };
@@ -533,6 +548,8 @@ export default function ChatView() {
 
   const onInput = (v: string) => {
     setText(v);
+    // V2 P1-3：编辑态下输入框是被编辑消息内容，不能当草稿存
+    if (!s.editingMessage) setDraft(conv.id, v);
     // @补全：光标前最近的 @ 前缀（群聊才启用）
     const caret = taRef.current?.selectionStart ?? v.length;
     const mm = /(^|[\s\n])@([A-Za-z0-9_]*)$/.exec(v.slice(0, caret));
