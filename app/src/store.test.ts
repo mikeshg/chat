@@ -82,6 +82,7 @@ function state(patch: Partial<AppState> = {}): AppState {
     reactionPending: {},
     toasts: [],
     drafts: {},
+    avatars: {},
     ...patch,
   };
 }

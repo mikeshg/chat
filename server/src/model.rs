@@ -529,6 +529,8 @@ pub struct AdminUserView {
     pub last_seen_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub online: bool,
+    pub avatar_version: i32,
+    pub has_avatar: bool,
     /// 该用户附件已用存储（按 storage_path 去重）
     pub storage_bytes: i64,
 }

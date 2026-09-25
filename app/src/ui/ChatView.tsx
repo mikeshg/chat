@@ -18,6 +18,7 @@ import GroupInfo from "./GroupInfo";
 import NewPollModal from "./NewPollModal";
 import PollCard from "./PollCard";
 import { imageBubbleSize } from "./mediaFormat";
+import Avatar from "./Avatar";
 
 function fmtSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -653,7 +654,15 @@ export default function ChatView() {
                 className={`msg-row ${mine ? "mine" : ""}`}
                 data-mid={m.id}
               >
-                {!mine && <div className="avatar sm">{m.sender_name[0]?.toUpperCase()}</div>}
+                {!mine && (
+                  <Avatar
+                    userId={m.sender_id}
+                    name={m.sender_name}
+                    avatarVersion={m.sender_avatar_version}
+                    hasAvatar={m.sender_has_avatar}
+                    size="sm"
+                  />
+                )}
                 <div className="msg-body">
                   {!mine && conv.kind === "group" && (
                     <div className="msg-sender">{m.sender_name}</div>

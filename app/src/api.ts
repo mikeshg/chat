@@ -223,6 +223,14 @@ export const auth = {
   },
   me: () => get<UserPublic>("/users/me"),
   updateMe: (display_name: string) => patch<UserPublic>("/users/me", { display_name }),
+  /** 上传已裁好的头像；字段名 file，返回更新后的本人资料 */
+  uploadAvatar: (file: Blob) => {
+    const fd = new FormData();
+    const ext = file.type === "image/png" ? "png" : file.type === "image/webp" ? "webp" : "jpg";
+    fd.append("file", file, `avatar.${ext}`);
+    return call<UserPublic>("/users/me/avatar", { method: "PUT", body: fd });
+  },
+  removeAvatar: () => call<UserPublic>("/users/me/avatar", { method: "DELETE" }),
   /** 自助改密：返回为当前 session 新签发的凭据（其他 session 已被服务端撤销） */
   changePassword: (old_password: string, new_password: string) =>
     post<AuthResponse>("/users/me/password", { old_password, new_password }),

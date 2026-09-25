@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { convs } from "../api";
-import { setState, useApp } from "../store";
+import { absorbAvatarUsers, setState, useApp } from "../store";
 import type { ConversationDetail, ConversationView } from "../types";
+import Avatar from "./Avatar";
 
 export default function GroupInfo({
   conv,
@@ -24,7 +25,13 @@ export default function GroupInfo({
   const reload = async () => {
     const [d, l] = await Promise.all([convs.detail(conv.id), convs.list()]);
     setDetail(d);
-    setState({ conversations: l });
+    setState((cur) => ({
+      conversations: l,
+      avatars: absorbAvatarUsers(cur.avatars, [
+        ...d.members.map((m) => m.user),
+        ...l.map((c) => c.peer),
+      ]),
+    }));
   };
   useEffect(() => {
     reload().catch(console.warn);
@@ -121,10 +128,15 @@ export default function GroupInfo({
             )}
             {detail.members.map((m) => (
               <div className="row" key={m.user.id}>
-                <div className="avatar sm">
-                  {m.user.display_name[0]?.toUpperCase()}
+                <Avatar
+                  userId={m.user.id}
+                  name={m.user.display_name}
+                  avatarVersion={m.user.avatar_version}
+                  hasAvatar={m.user.has_avatar}
+                  size="sm"
+                >
                   {s.online[m.user.id] && <i className="online-dot" />}
-                </div>
+                </Avatar>
                 <div className="grow">
                   {m.user.display_name}
                   {m.role === "owner" && <span className="tag">群主</span>}

@@ -3,6 +3,7 @@ import { auth, friends } from "../api";
 import { setState, useApp } from "../store";
 import type { UserPublic } from "../types";
 import { openConversation } from "../ws";
+import Avatar from "./Avatar";
 
 export default function ContactsPanel() {
   const s = useApp();
@@ -76,7 +77,7 @@ export default function ContactsPanel() {
         </div>
         {results?.map((u) => (
           <div className="row found" key={u.id}>
-            <div className="avatar">{u.display_name[0]?.toUpperCase()}</div>
+            <Avatar userId={u.id} name={u.display_name} avatarVersion={u.avatar_version} hasAvatar={u.has_avatar} />
             <div className="grow">
               <div>{u.display_name}</div>
               <div className="muted">@{u.username}</div>
@@ -110,7 +111,7 @@ export default function ContactsPanel() {
         )}
         {s.requests.incoming.map((r) => (
           <div className="row" key={r.id}>
-            <div className="avatar">{r.user.display_name[0]?.toUpperCase()}</div>
+            <Avatar userId={r.user.id} name={r.user.display_name} avatarVersion={r.user.avatar_version} hasAvatar={r.user.has_avatar} />
             <div className="grow">
               <div>{r.user.display_name}</div>
               <div className="muted">{r.message || "请求加你为好友"}</div>
@@ -126,7 +127,7 @@ export default function ContactsPanel() {
         ))}
         {s.requests.outgoing.map((r) => (
           <div className="row" key={r.id}>
-            <div className="avatar">{r.user.display_name[0]?.toUpperCase()}</div>
+            <Avatar userId={r.user.id} name={r.user.display_name} avatarVersion={r.user.avatar_version} hasAvatar={r.user.has_avatar} />
             <div className="grow">
               <div>{r.user.display_name}</div>
               <div className="muted">等待对方通过</div>
@@ -139,10 +140,9 @@ export default function ContactsPanel() {
         <h3>我的好友（{s.friends.length}）</h3>
         {s.friends.map((f) => (
           <div className="row" key={f.user.id}>
-            <div className="avatar">
-              {f.user.display_name[0]?.toUpperCase()}
+            <Avatar userId={f.user.id} name={f.user.display_name} avatarVersion={f.user.avatar_version} hasAvatar={f.user.has_avatar}>
               {s.online[f.user.id] && <i className="online-dot" />}
-            </div>
+            </Avatar>
             <div className="grow">
               <div>{f.user.display_name}</div>
               <div className="muted">

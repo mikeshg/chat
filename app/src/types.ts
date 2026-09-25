@@ -282,6 +282,8 @@ export interface AdminUserView {
   last_seen_at: string | null;
   created_at: string;
   online: boolean;
+  avatar_version?: number;
+  has_avatar?: boolean;
   /** 该用户附件已用存储（V2 P2-1；旧服务端缺省） */
   storage_bytes?: number;
 }
