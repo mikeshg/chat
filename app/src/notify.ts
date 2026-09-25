@@ -129,6 +129,7 @@ export function unreadTitle(conversations: ConversationView[]): string {
 function kindLabel(kind: string): string {
   if (kind === "image") return "[图片]";
   if (kind === "file") return "[文件]";
+  if (kind === "audio") return "[语音]";
   if (kind === "poll") return "[投票]";
   return "";
 }
@@ -145,7 +146,9 @@ export function notificationBody(
   const excerpt = m.attachment
     ? m.kind === "image"
       ? "[图片]"
-      : `[文件] ${m.attachment.file_name}`
+      : m.kind === "audio" || m.attachment.duration_ms != null
+        ? "[语音]"
+        : `[文件] ${m.attachment.file_name}`
     : kindLabel(m.kind) || m.content.slice(0, 80);
   return `${o.mentioned ? "[有人@我] " : ""}${m.sender_name}: ${excerpt}`;
 }

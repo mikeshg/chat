@@ -175,6 +175,11 @@ describe("notificationBody", () => {
     expect(notificationBody(msg({ kind: "poll" }), { preview: true, mentioned: false })).toBe(
       "Other: [投票]",
     );
+    const voice = msg({
+      kind: "audio",
+      attachment: { id: "a", file_name: "v.webm", mime: "audio/webm", size: 1, duration_ms: 3000 },
+    });
+    expect(notificationBody(voice, { preview: true, mentioned: false })).toBe("Other: [语音]");
   });
 
   it("@我 时正文加 [有人@我] 前缀", () => {

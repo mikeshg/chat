@@ -811,16 +811,19 @@ fn normalize_body(
         }
         return Ok((content.to_string(), "text"));
     };
-    let kind = if attachment.mime.starts_with("image/") {
+    // 有 duration_ms 才是语音；普通音频文件仍走 file，避免把用户上传的歌曲当成语音条。
+    let kind = if attachment.duration_ms.is_some() {
+        "audio"
+    } else if attachment.mime.starts_with("image/") {
         "image"
     } else {
         "file"
     };
     let stored = if content.is_empty() {
-        if kind == "image" {
-            "[图片]".to_string()
-        } else {
-            format!("[文件] {}", attachment.file_name)
+        match kind {
+            "image" => "[图片]".to_string(),
+            "audio" => "[语音]".to_string(),
+            _ => format!("[文件] {}", attachment.file_name),
         }
     } else {
         content.to_string()

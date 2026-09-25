@@ -324,10 +324,15 @@ export const files = {
   /** 附件地址（能力 URL）：dl=true 强制下载，默认 inline 供预览/<img>/<a> */
   url: (id: string, dl = false) =>
     `${getServer()}/v1/files/${id}${dl ? "?dl=1" : ""}`,
-  upload: async (conversationId: string, file: File): Promise<AttachmentView> => {
+  upload: async (
+    conversationId: string,
+    file: File,
+    opts?: { durationMs?: number },
+  ): Promise<AttachmentView> => {
     const fd = new FormData();
     fd.append("conversation_id", conversationId);
     fd.append("file", file, file.name);
+    if (opts?.durationMs != null) fd.append("duration_ms", String(opts.durationMs));
     return call<AttachmentView>("/files", { method: "POST", body: fd });
   },
 };
