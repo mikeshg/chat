@@ -548,18 +548,23 @@ async fn sync(
 }
 
 async fn user_public(st: &SharedState, uid: Uuid) -> Result<UserPublic, (&'static str, String)> {
-    sqlx::query_as::<_, (String, String, String, Option<chrono::DateTime<Utc>>)>(
-        "SELECT username::text, display_name, role, last_seen_at FROM users WHERE id = $1",
+    sqlx::query_as::<_, (String, String, String, Option<chrono::DateTime<Utc>>, i32, bool)>(
+        "SELECT username::text, display_name, role, last_seen_at, avatar_version, avatar_path IS NOT NULL
+           FROM users WHERE id = $1",
     )
     .bind(uid)
     .fetch_one(&st.pool)
     .await
-    .map(|(username, display_name, role, last_seen_at)| UserPublic {
-        id: uid,
-        username,
-        display_name,
-        role,
-        last_seen_at,
-    })
+    .map(
+        |(username, display_name, role, last_seen_at, avatar_version, has_avatar)| UserPublic {
+            id: uid,
+            username,
+            display_name,
+            role,
+            last_seen_at,
+            avatar_version,
+            has_avatar,
+        },
+    )
     .map_err(|_| ws_err("internal", "db error"))
 }

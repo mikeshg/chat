@@ -14,6 +14,10 @@ pub struct UserRow {
     pub session_version: i32,
     pub last_seen_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// 头像存储名（不对外）；NULL = 未设置
+    pub avatar_path: Option<String>,
+    /// 每次更换/移除 +1，客户端据此失效头像缓存
+    pub avatar_version: i32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -23,6 +27,9 @@ pub struct UserPublic {
     pub display_name: String,
     pub role: String,
     pub last_seen_at: Option<DateTime<Utc>>,
+    /// 头像版本（拼进 GET /users/{id}/avatar?v= 做缓存失效）
+    pub avatar_version: i32,
+    pub has_avatar: bool,
 }
 
 impl From<&UserRow> for UserPublic {
@@ -33,6 +40,8 @@ impl From<&UserRow> for UserPublic {
             display_name: u.display_name.clone(),
             role: u.role.clone(),
             last_seen_at: u.last_seen_at,
+            avatar_version: u.avatar_version,
+            has_avatar: u.avatar_path.is_some(),
         }
     }
 }
@@ -135,6 +144,13 @@ pub struct AttachmentView {
     pub file_name: String,
     pub mime: String,
     pub size: i64,
+    /// 图片像素尺寸（上传时解码得到；旧附件/非图片为 None）
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    /// 有缩略图时可用 GET /files/{id}?thumb=1
+    pub has_thumb: bool,
+    /// 语音时长（毫秒）；有值即语音消息
+    pub duration_ms: Option<i32>,
 }
 
 /// 回复引用预览：只展开一层。deleted=true 时 excerpt 为空，仍保留 id/seq 供跳转。
@@ -194,7 +210,7 @@ pub struct MessageView {
     pub sender_username: String,
     pub sender_name: String,
     pub content: String,
-    pub kind: String, // "text" | "image" | "file"
+    pub kind: String, // "text" | "image" | "file" | "audio" | "poll"
     pub attachment: Option<AttachmentView>,
     pub mentions: Vec<Uuid>, // 被 @ 的用户 id（群聊）
     pub reply_to_id: Option<Uuid>,
@@ -208,6 +224,11 @@ pub struct MessageView {
     /// kind='poll' 时的投票卡片数据（个性化字段按观看者计算）；旧客户端忽略，看 content 占位
     pub poll: Option<PollView>,
     pub created_at: DateTime<Utc>,
+    /// 发送者当前头像版本 / 是否有头像（消息行头像用，免得客户端逐人查）
+    pub sender_avatar_version: i32,
+    pub sender_has_avatar: bool,
+    /// 转发消息：原发送者展示名快照
+    pub forwarded_from: Option<String>,
 }
 
 /// 会话偏好（用户维度，仅本人可见、同步本人全部设备）。

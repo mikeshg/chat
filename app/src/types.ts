@@ -5,6 +5,9 @@ export interface UserPublic {
   display_name: string;
   role: "admin" | "user";
   last_seen_at: string | null;
+  /** 头像版本（拼进 /users/{id}/avatar?v=）；旧服务端缺省 */
+  avatar_version?: number;
+  has_avatar?: boolean;
 }
 
 export interface AuthResponse {
@@ -52,6 +55,13 @@ export interface AttachmentView {
   file_name: string;
   mime: string;
   size: number;
+  /** 图片像素尺寸（旧附件/非图片缺省） */
+  width?: number | null;
+  height?: number | null;
+  /** 有缩略图时可用 ?thumb=1 */
+  has_thumb?: boolean;
+  /** 语音时长（毫秒）；有值即语音消息 */
+  duration_ms?: number | null;
 }
 
 /** 回复引用预览（只展开一层）；deleted=true 时 excerpt 为空，id/seq 仍可用于跳转 */
@@ -116,7 +126,7 @@ export interface MessageView {
   sender_username: string;
   sender_name: string;
   content: string;
-  kind: string; // "text" | "image" | "file" | "poll"
+  kind: string; // "text" | "image" | "file" | "audio" | "poll"
   attachment: AttachmentView | null;
   mentions: string[]; // 被 @ 的用户 id（群聊）
   /** 生命周期字段（旧服务端缺省；无版本字段按 0 处理） */
@@ -130,6 +140,11 @@ export interface MessageView {
   /** kind='poll' 时的投票卡片数据（旧服务端缺省）；墓碑消息为 null */
   poll?: PollView | null;
   created_at: string;
+  /** 发送者头像（消息行用）；旧服务端缺省 */
+  sender_avatar_version?: number;
+  sender_has_avatar?: boolean;
+  /** 转发消息：原发送者展示名 */
+  forwarded_from?: string | null;
 }
 
 /** 会话偏好（用户维度；旧服务端无此字段 → 视为全默认） */
@@ -157,7 +172,7 @@ export interface ConversationPrefEntry {
 
 export interface ConversationView {
   id: string;
-  kind: string; // "dm" | "group"
+  kind: string; // "dm" | "group" | "self"（文件传输助手）
   name: string | null;
   owner_id: string | null;
   peer: UserPublic | null;

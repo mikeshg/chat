@@ -5,11 +5,7 @@
 ## 1. 环境
 
 - 系统：Windows 11，优先用 Git Bash；PowerShell 的嵌套引号容易被截断，复杂命令写成脚本文件再执行。
-- worktree 根目录有 `.env.local`（`KEY=VALUE` 格式），里面是**只属于你**的数据库和端口。用法：
-
-  ```bash
-  set -a; . ./.env.local; set +a
-  ```
+- worktree 根目录的 `.env.local` 里是**只属于你**的数据库和端口，这些变量**已经注入你的进程环境**，直接用 `$DATABASE_URL` 等即可。**不要**读取、打印或 source `.env.local`，也不要用 psql 等单独探测数据库（非交互模式会被拒绝并中断你的会话），要确认数据库可用就直接跑 `cargo test`。
 
   - `DATABASE_URL`：cargo 集成测试用（指向 `postgres` 库，测试自动建 `chat_test`）
   - `APP_DATABASE_URL`：手动跑后端用，启动时写成 `DATABASE_URL=$APP_DATABASE_URL`
@@ -20,11 +16,13 @@
 - 跑后端手动验证（Git Bash）：
 
   ```bash
-  set -a; . ./.env.local; set +a
   cd server && DATABASE_URL=$APP_DATABASE_URL BIND=127.0.0.1 cargo run
   ```
 
-  前端：`cd app && npx vite`（`vite.config.ts` 读取 `CHAT_API` / `CHAT_WEB_PORT`）。
+  前端推荐直接用后端托管构建产物：先 `cd app && npm run build`，后端环境里带上 `APP_DIST=$APP_DIST`，同源访问 `http://127.0.0.1:$PORT`。（`npx vite` 也可用，`vite.config.ts` 读取 `CHAT_API` / `CHAT_WEB_PORT`，但在后台会话里常出现端口不通。）
+- **后台起的服务用完必须关掉**（`taskkill //PID <pid> //T //F`），否则残留子进程会让你的会话无法正常结束。
+- 浏览器实测只用**无头 Playwright**：在 `server/target/wt/browser/` 建临时 node 项目 `npm init -y && npm i playwright`（本机已缓存 Chromium，不要下载浏览器）。**禁止**使用 cua-driver、computer-use 或任何操作真实桌面 / 窗口的工具。
+- 全新数据库里**第一个注册的用户自动成为管理员**；测试普通用户权限时先注册一个占位用户。
 - Windows 注意：后端运行时 `chat-server.exe` 被占用，`cargo build/test` 会报 `failed to remove file`。先停后端，或测试时用 `CARGO_TARGET_DIR=target/verify cargo test --tests`。
 
 ## 2. 硬约束（违反任何一条就停下并在交付文档里说明）
@@ -33,7 +31,7 @@
 - 禁止 `cargo clean`、禁止操作 docker / wsl。
 - 只做任务单范围内的事；发现范围外的问题记在交付文档「发现的其他问题」里，不顺手改。
 - 不新增任务单没列出的依赖（npm / cargo 都一样）。
-- 迁移只用任务单分配的编号；不修改已有迁移文件 `0001`–`0009`（及其他任务的迁移）。
+- 迁移只用任务单分配的编号；不修改已有迁移文件（`0001` 起到当前最新，及其他任务的迁移）。新迁移要追加到 `server/tests/migrations.rs` 的迁移列表末尾。
 - 不在 `server/src/config.rs` 的 `Config` 里加字段；可配项放 `server_settings`（第 1 阶段 P1-2 建立）。
 - 临时文件只放 `server/target/wt/` 下（已被忽略），结束时清理你自己建的。
 
@@ -52,8 +50,7 @@
 ## 4. 必须通过的检查（交付前亲自执行）
 
 ```bash
-set -a; . ./.env.local; set +a
-cd server && cargo fmt && cargo test --tests        # 全部通过，不只是你的新测试
+cd server && cargo fmt && cargo test --tests        # 全部通过，不只是你的新测试（基线已 fmt 干净，cargo fmt 只会动你改的代码）
 cd ../app && npx vitest run && npm run build         # build 含 tsc，必须跑
 ```
 

@@ -60,6 +60,10 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
         include_str!("../migrations/0007_message_lifecycle.sql"),
         include_str!("../migrations/0008_conversation_preferences.sql"),
         include_str!("../migrations/0009_polls.sql"),
+        // 新迁移必须追加到这里：夹具之后调用的领域函数读取最新 message_views 列
+        include_str!("../migrations/0010_server_settings_invites.sql"),
+        include_str!("../migrations/0011_sessions.sql"),
+        include_str!("../migrations/0012_v2_media.sql"),
     ] {
         sqlx::raw_sql(script).execute(&pool).await.unwrap();
     }

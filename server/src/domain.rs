@@ -201,6 +201,14 @@ pub struct MsgViewRow {
     pub reactions: sqlx::types::Json<Vec<ReactionAgg>>,
     /// kind='poll' 消息的投票聚合（墓碑已掩去）；into_view 按 viewer 个性化
     pub poll: Option<sqlx::types::Json<PollAgg>>,
+    // V2 0012：附件尺寸/缩略图/语音时长（墓碑为 NULL）、发送者头像、转发来源
+    pub att_width: Option<i32>,
+    pub att_height: Option<i32>,
+    pub att_has_thumb: Option<bool>,
+    pub att_duration_ms: Option<i32>,
+    pub sender_avatar_version: i32,
+    pub sender_has_avatar: bool,
+    pub forwarded_from: Option<String>,
 }
 
 impl MsgViewRow {
@@ -220,6 +228,10 @@ impl MsgViewRow {
                 file_name: self.att_name.unwrap_or_default(),
                 mime: self.att_mime.unwrap_or_default(),
                 size: self.att_size.unwrap_or_default(),
+                width: self.att_width,
+                height: self.att_height,
+                has_thumb: self.att_has_thumb.unwrap_or(false),
+                duration_ms: self.att_duration_ms,
             }),
             mentions: self.mentions.unwrap_or_default(),
             reply_to_id: self.reply_to_id,
@@ -239,6 +251,9 @@ impl MsgViewRow {
                 .collect(),
             poll: self.poll.map(|j| j.0.into_view(viewer)),
             created_at: self.created_at,
+            sender_avatar_version: self.sender_avatar_version,
+            sender_has_avatar: self.sender_has_avatar,
+            forwarded_from: self.forwarded_from,
         }
     }
 }
@@ -733,8 +748,13 @@ async fn load_attachment(
     let Some(att_id) = msg.attachment_id else {
         return Ok(None);
     };
-    let row = sqlx::query_as::<_, (Uuid, String, String, i64, Uuid)>(
-        "SELECT id, file_name, mime, size, conv_id FROM attachments
+    #[allow(clippy::type_complexity)]
+    let row = sqlx::query_as::<
+        _,
+        (Uuid, String, String, i64, Uuid, Option<i32>, Option<i32>, bool, Option<i32>),
+    >(
+        "SELECT id, file_name, mime, size, conv_id, width, height, thumb_path IS NOT NULL, duration_ms
+           FROM attachments
           WHERE id = $1 AND uploader_id = $2
           FOR UPDATE",
     )
@@ -764,6 +784,10 @@ async fn load_attachment(
         file_name: row.1,
         mime: row.2,
         size: row.3,
+        width: row.5,
+        height: row.6,
+        has_thumb: row.7,
+        duration_ms: row.8,
     }))
 }
 

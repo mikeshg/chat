@@ -507,6 +507,8 @@ struct FriendRow {
     role: String,
     last_seen_at: Option<DateTime<Utc>>,
     since: DateTime<Utc>,
+    avatar_version: i32,
+    has_avatar: bool,
 }
 
 async fn list_friends(
@@ -516,7 +518,7 @@ async fn list_friends(
     let uid = uid_of(&headers, &st).await?;
     let rows = sqlx::query_as::<_, FriendRow>(
         "SELECT u.id, u.username::text AS username, u.display_name, u.role, u.last_seen_at,
-                f.created_at AS since
+                f.created_at AS since, u.avatar_version, u.avatar_path IS NOT NULL AS has_avatar
            FROM friendships f
            JOIN users u ON u.id = CASE WHEN f.user_a = $1 THEN f.user_b ELSE f.user_a END
           WHERE f.user_a = $1 OR f.user_b = $1
@@ -534,6 +536,8 @@ async fn list_friends(
                     display_name: r.display_name,
                     role: r.role,
                     last_seen_at: r.last_seen_at,
+                    avatar_version: r.avatar_version,
+                    has_avatar: r.has_avatar,
                 },
                 since: r.since,
             })
@@ -562,6 +566,19 @@ async fn delete_friend(
 }
 
 #[derive(sqlx::FromRow)]
+struct MemberRow {
+    id: Uuid,
+    username: String,
+    display_name: String,
+    urole: String,
+    last_seen_at: Option<DateTime<Utc>>,
+    role: String,
+    joined_at: DateTime<Utc>,
+    avatar_version: i32,
+    has_avatar: bool,
+}
+
+#[derive(sqlx::FromRow)]
 struct ReqRow {
     id: Uuid,
     message: String,
@@ -571,6 +588,8 @@ struct ReqRow {
     cp_display: String,
     cp_role: String,
     cp_last_seen: Option<DateTime<Utc>>,
+    cp_avatar_version: i32,
+    cp_has_avatar: bool,
 }
 
 async fn list_requests(
@@ -581,7 +600,8 @@ async fn list_requests(
     let incoming = sqlx::query_as::<_, ReqRow>(
         "SELECT r.id, r.message, r.created_at,
                 u.id AS cp_id, u.username::text AS cp_username, u.display_name AS cp_display,
-                u.role AS cp_role, u.last_seen_at AS cp_last_seen
+                u.role AS cp_role, u.last_seen_at AS cp_last_seen,
+                u.avatar_version AS cp_avatar_version, u.avatar_path IS NOT NULL AS cp_has_avatar
            FROM friend_requests r JOIN users u ON u.id = r.from_user
           WHERE r.to_user = $1 AND r.status = 'pending'
           ORDER BY r.created_at DESC",
@@ -592,7 +612,8 @@ async fn list_requests(
     let outgoing = sqlx::query_as::<_, ReqRow>(
         "SELECT r.id, r.message, r.created_at,
                 u.id AS cp_id, u.username::text AS cp_username, u.display_name AS cp_display,
-                u.role AS cp_role, u.last_seen_at AS cp_last_seen
+                u.role AS cp_role, u.last_seen_at AS cp_last_seen,
+                u.avatar_version AS cp_avatar_version, u.avatar_path IS NOT NULL AS cp_has_avatar
            FROM friend_requests r JOIN users u ON u.id = r.to_user
           WHERE r.from_user = $1 AND r.status = 'pending'
           ORDER BY r.created_at DESC",
@@ -611,6 +632,8 @@ async fn list_requests(
                     display_name: r.cp_display,
                     role: r.cp_role,
                     last_seen_at: r.cp_last_seen,
+                    avatar_version: r.cp_avatar_version,
+                    has_avatar: r.cp_has_avatar,
                 },
                 message: r.message,
                 direction: dir,
@@ -785,6 +808,8 @@ struct ConvRow {
     peer_display: Option<String>,
     peer_role: Option<String>,
     peer_last_seen: Option<DateTime<Utc>>,
+    peer_avatar_version: Option<i32>,
+    peer_has_avatar: Option<bool>,
     m_id: Option<Uuid>,
     m_seq: Option<i64>,
     m_sender_id: Option<Uuid>,
@@ -805,6 +830,13 @@ struct ConvRow {
     m_deleted_at: Option<DateTime<Utc>>,
     m_reactions: Option<sqlx::types::Json<Vec<domain::ReactionAgg>>>,
     m_poll: Option<sqlx::types::Json<domain::PollAgg>>,
+    m_att_width: Option<i32>,
+    m_att_height: Option<i32>,
+    m_att_has_thumb: Option<bool>,
+    m_att_duration_ms: Option<i32>,
+    m_sender_avatar_version: Option<i32>,
+    m_sender_has_avatar: Option<bool>,
+    m_forwarded_from: Option<String>,
     // 本人偏好（conversation_preferences 左连接，无行则全 NULL/false）
     p_pinned_at: Option<DateTime<Utc>>,
     p_archived_at: Option<DateTime<Utc>>,
@@ -827,6 +859,7 @@ async fn list_conversations(
                 (SELECT count(*) FROM memberships mc WHERE mc.conversation_id = c.id) AS member_count,
                 p.id AS peer_id, p.username::text AS peer_username, p.display_name AS peer_display,
                 p.role AS peer_role, p.last_seen_at AS peer_last_seen,
+                p.avatar_version AS peer_avatar_version, p.has_avatar AS peer_has_avatar,
                 lm.id AS m_id, lm.seq AS m_seq, lm.sender_id AS m_sender_id,
                 lm.sender_username AS m_sender_username, lm.sender_name AS m_sender_name,
                 lm.content AS m_content, lm.kind AS m_kind, lm.created_at AS m_created_at,
@@ -836,6 +869,10 @@ async fn list_conversations(
                 lm.edited_at AS m_edited_at, lm.edit_version AS m_edit_version,
                 lm.deleted_at AS m_deleted_at, lm.reactions AS m_reactions,
                 lm.poll AS m_poll,
+                lm.att_width AS m_att_width, lm.att_height AS m_att_height,
+                lm.att_has_thumb AS m_att_has_thumb, lm.att_duration_ms AS m_att_duration_ms,
+                lm.sender_avatar_version AS m_sender_avatar_version,
+                lm.sender_has_avatar AS m_sender_has_avatar, lm.forwarded_from AS m_forwarded_from,
                 cp.pinned_at AS p_pinned_at, cp.archived_at AS p_archived_at,
                 cp.muted_until AS p_muted_until, cp.mute_forever AS p_mute_forever,
                 cp.updated_at AS p_updated_at
@@ -845,6 +882,7 @@ async fn list_conversations(
                   ON cp.conversation_id = c.id AND cp.user_id = m.user_id
            LEFT JOIN LATERAL (
                SELECT u.id, u.username, u.display_name, u.role,
+                      u.avatar_version, u.avatar_path IS NOT NULL AS has_avatar,
                       -- last_seen_at 属于 presence：删好友后保留的只读 DM 不得继续暴露
                       CASE WHEN EXISTS(SELECT 1 FROM friendships f
                                         WHERE (f.user_a = $1 AND f.user_b = u.id)
@@ -863,7 +901,9 @@ async fn list_conversations(
            LEFT JOIN LATERAL (
                SELECT id, seq, sender_id, sender_username, sender_name, content, kind, created_at,
                       att_id, att_name, att_mime, att_size, mentions,
-                      reply_to_id, reply_to, edited_at, edit_version, deleted_at, reactions, poll
+                      reply_to_id, reply_to, edited_at, edit_version, deleted_at, reactions, poll,
+                      att_width, att_height, att_has_thumb, att_duration_ms,
+                      sender_avatar_version, sender_has_avatar, forwarded_from
                  FROM message_views
                 WHERE conversation_id = c.id
                 ORDER BY seq DESC
@@ -887,6 +927,8 @@ async fn list_conversations(
                 display_name: r.peer_display.unwrap_or_default(),
                 role: r.peer_role.unwrap_or_else(|| "user".into()),
                 last_seen_at: r.peer_last_seen,
+                avatar_version: r.peer_avatar_version.unwrap_or(0),
+                has_avatar: r.peer_has_avatar.unwrap_or(false),
             });
             let last_message = r.m_id.map(|id| MessageView {
                 id,
@@ -902,6 +944,10 @@ async fn list_conversations(
                     file_name: r.m_att_name.clone().unwrap_or_default(),
                     mime: r.m_att_mime.clone().unwrap_or_default(),
                     size: r.m_att_size.unwrap_or_default(),
+                    width: r.m_att_width,
+                    height: r.m_att_height,
+                    has_thumb: r.m_att_has_thumb.unwrap_or(false),
+                    duration_ms: r.m_att_duration_ms,
                 }),
                 mentions: r.m_mentions.clone().unwrap_or_default(),
                 created_at: r.m_created_at.unwrap_or_else(Utc::now),
@@ -924,6 +970,9 @@ async fn list_conversations(
                     })
                     .unwrap_or_default(),
                 poll: r.m_poll.map(|j| j.0.into_view(uid)),
+                sender_avatar_version: r.m_sender_avatar_version.unwrap_or(0),
+                sender_has_avatar: r.m_sender_has_avatar.unwrap_or(false),
+                forwarded_from: r.m_forwarded_from.clone(),
             });
             ConversationView {
                 id: r.id,
@@ -1090,19 +1139,9 @@ async fn conversation_detail(st: &SharedState, conv: Uuid) -> AppResult<Conversa
         .await?
         .ok_or_else(|| AppError::not_found("conversation not found"))?;
 
-    let members = sqlx::query_as::<
-        _,
-        (
-            Uuid,
-            String,
-            String,
-            String,
-            Option<DateTime<Utc>>,
-            String,
-            DateTime<Utc>,
-        ),
-    >(
-        "SELECT u.id, u.username::text, u.display_name, u.role, u.last_seen_at, m.role, m.joined_at
+    let members = sqlx::query_as::<_, MemberRow>(
+        "SELECT u.id, u.username::text AS username, u.display_name, u.role AS urole, u.last_seen_at,
+                m.role, m.joined_at, u.avatar_version, u.avatar_path IS NOT NULL AS has_avatar
            FROM memberships m JOIN users u ON u.id = m.user_id
           WHERE m.conversation_id = $1 ORDER BY m.joined_at",
     )
@@ -1119,19 +1158,19 @@ async fn conversation_detail(st: &SharedState, conv: Uuid) -> AppResult<Conversa
         created_at,
         members: members
             .into_iter()
-            .map(
-                |(id, username, display_name, urole, last_seen_at, role, joined_at)| MemberView {
-                    user: UserPublic {
-                        id,
-                        username,
-                        display_name,
-                        role: urole,
-                        last_seen_at,
-                    },
-                    role,
-                    joined_at,
+            .map(|r| MemberView {
+                user: UserPublic {
+                    id: r.id,
+                    username: r.username,
+                    display_name: r.display_name,
+                    role: r.urole,
+                    last_seen_at: r.last_seen_at,
+                    avatar_version: r.avatar_version,
+                    has_avatar: r.has_avatar,
                 },
-            )
+                role: r.role,
+                joined_at: r.joined_at,
+            })
             .collect(),
     })
 }
@@ -1713,11 +1752,16 @@ async fn upload_file(
     .bind(&stored)
     .execute(&st.pool)
     .await?;
+    // 尺寸/缩略图（P2-1）与语音时长（P2-3）由各自任务在上传时写入
     Ok(Json(AttachmentView {
         id,
         file_name,
         mime,
         size,
+        width: None,
+        height: None,
+        has_thumb: false,
+        duration_ms: None,
     }))
 }
 
