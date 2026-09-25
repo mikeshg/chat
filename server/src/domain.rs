@@ -367,6 +367,38 @@ pub async fn messages_by_ids(
     Ok(rows.into_iter().map(|r| r.into_view(viewer)).collect())
 }
 
+/// 文件传输助手：每人一个 type='self' 单人会话（owner_id=本人、唯一成员 owner）。
+/// 注册事务、迁移回填与调用方兜底共用；uq_self_conversation 部分唯一索引 +
+/// memberships PK 使并发/重复调用幂等。单条 CTE 原子完成。返回会话 id。
+pub async fn ensure_self_conversation(
+    executor: impl PgExecutor<'_>,
+    uid: Uuid,
+) -> Result<Uuid, sqlx::Error> {
+    let conv = sqlx::query_scalar::<_, Uuid>(
+        "WITH ins AS (
+             INSERT INTO conversations (type, owner_id) VALUES ('self', $1)
+             ON CONFLICT (owner_id) WHERE type = 'self' DO NOTHING
+             RETURNING id
+         ),
+         conv AS (
+             SELECT id FROM ins
+             UNION ALL
+             SELECT id FROM conversations WHERE owner_id = $1 AND type = 'self'
+             LIMIT 1
+         ),
+         mem AS (
+             INSERT INTO memberships (conversation_id, user_id, role)
+             SELECT id, $1, 'owner' FROM conv
+             ON CONFLICT DO NOTHING
+         )
+         SELECT id FROM conv",
+    )
+    .bind(uid)
+    .fetch_one(executor)
+    .await?;
+    Ok(conv)
+}
+
 /// 好友成立时确保 DM 会话存在（dm_key 幂等），双方为 member。返回会话 id。
 pub async fn ensure_dm(tx: &mut Transaction<'_, Postgres>, a: Uuid, b: Uuid) -> AppResult<Uuid> {
     let (lo, hi) = canonical_pair(a, b);
@@ -412,6 +444,11 @@ pub struct PostMessage<'a> {
     /// 投票负载：Some 时本条消息为 kind='poll'（仅群聊、无附件）；
     /// 形状已由 validate_poll_draft 整形（question/options 去首尾空白、去重）
     pub poll: Option<PollSpec>,
+    /// 转发来源（仅服务端转发路径）：原发送者展示名快照，写入 messages.forwarded_from
+    pub forwarded_from: Option<&'a str>,
+    /// 转发专用「已校验附件」：源消息上的 attachment id，事务内在目标会话克隆一行。
+    /// 与 attachment_id 互斥——attachment_id 仍要求 uploader=发送者，此路径不可达普通发送。
+    pub forward_attachment: Option<Uuid>,
 }
 
 /// 已整形的投票定义（随消息同事务落库）
@@ -633,7 +670,11 @@ async fn write_message(
         }
     }
 
-    let attachment = load_attachment(tx, msg).await?;
+    let attachment = match msg.forward_attachment {
+        // 转发路径：调用方已校验源消息可读；在目标会话克隆附件行（共享物理文件）
+        Some(src) => clone_attachment(tx, src, msg.conversation_id).await?,
+        None => load_attachment(tx, msg).await?,
+    };
     let (content, kind) = match &msg.poll {
         // 旧客户端 fallback：content 里始终有 '[投票] 问题' 可读文本
         Some(spec) => (format!("[投票] {}", spec.question), "poll"),
@@ -662,8 +703,9 @@ async fn write_message(
 
     let message_id = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO messages
-            (conversation_id, seq, sender_id, content, kind, attachment_id, client_msg_id, reply_to_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            (conversation_id, seq, sender_id, content, kind, attachment_id,
+             client_msg_id, reply_to_id, forwarded_from)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          RETURNING id",
     )
     .bind(msg.conversation_id)
@@ -674,6 +716,7 @@ async fn write_message(
     .bind(attachment.as_ref().map(|a| a.id))
     .bind(client_msg_id)
     .bind(msg.reply_to_id)
+    .bind(msg.forwarded_from)
     .fetch_one(&mut **tx)
     .await?;
 
@@ -788,6 +831,57 @@ async fn load_attachment(
         height: row.6,
         has_thumb: row.7,
         duration_ms: row.8,
+    }))
+}
+
+/// 转发专用附件克隆（write_message 事务内调用）：
+/// - 在目标会话新 INSERT 一行（新 id），本消息的 attachment_id 指向它——每条消息仍
+///   独占一个 attachment 行，「一消息一附件」不变量不破坏；
+/// - storage_path/thumb_path 与源共享物理文件——孤儿清理按「还有谁引用该 path」计数，
+///   源删除不影响目标、最后一个引用删除时文件才被清；
+/// - uploader 保持原上传者（能力 URL 下载不校验归属，只验证行存在）。
+/// 只在转发路径可达：attachment_id 的 uploader=发送者 检查拦掉了一切普通借用。
+async fn clone_attachment(
+    tx: &mut Transaction<'_, Postgres>,
+    src_id: Uuid,
+    conv: Uuid,
+) -> Result<Option<AttachmentView>, WriteError> {
+    let row = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            String,
+            String,
+            i64,
+            Option<i32>,
+            Option<i32>,
+            bool,
+            Option<i32>,
+        ),
+    >(
+        "INSERT INTO attachments
+            (conv_id, uploader_id, file_name, mime, size, storage_path,
+             width, height, thumb_path, duration_ms)
+         SELECT $2, uploader_id, file_name, mime, size, storage_path,
+                width, height, thumb_path, duration_ms
+           FROM attachments WHERE id = $1
+         RETURNING id, file_name, mime, size, width, height,
+                   thumb_path IS NOT NULL, duration_ms",
+    )
+    .bind(src_id)
+    .bind(conv)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| PostError::deny("bad_message", "source attachment gone"))?;
+    Ok(Some(AttachmentView {
+        id: row.0,
+        file_name: row.1,
+        mime: row.2,
+        size: row.3,
+        width: row.4,
+        height: row.5,
+        has_thumb: row.6,
+        duration_ms: row.7,
     }))
 }
 
@@ -1637,6 +1731,8 @@ pub async fn create_poll(
             client_msg_id: req.client_msg_id.as_deref(),
             attachment_id: None,
             reply_to_id: None,
+            forwarded_from: None,
+            forward_attachment: None,
             poll: Some(PollSpec {
                 question,
                 options,
@@ -1849,4 +1945,104 @@ async fn close_in_tx(
             .await?;
     }
     finish_poll_change(tx, m.conversation_id, message_id).await
+}
+
+// ---------- 转发 / 收藏（V2 P2-4） ----------
+
+/// 逐目标结果：成功时携带完整 Posted（广播方按成员个性化 + unarchive 推送），
+/// 失败带稳定错误码与用户可读原因（forbidden / not_friends / bad_request）。
+pub enum Forwarded {
+    Ok {
+        conv: Uuid,
+        posted: Posted,
+    },
+    Fail {
+        conv: Uuid,
+        code: &'static str,
+        message: &'static str,
+    },
+}
+
+/// POST /v1/messages/{id}/forward 的领域实现。
+///
+/// - 源消息：先成员校验（非成员 403），墓碑/投票 400；
+///   forwarded_from = 源发送者展示名快照（改名/删除后标签不变）。
+/// - 目标逐条独立 post_message：单目标成员/好友校验失败只进该条结果，不拖垮其它；
+///   DM 写限制、群成员、self 归 own 校验全部复用 write_message 事务内检查。
+/// - client_msg_id = `fwd:{op}:{目标会话id}`：同 op+同目标重试命中
+///   uq_messages_client_msg 幂等键返回同一条消息，不重复广播。
+/// - 源附件经 forward_attachment 在目标事务内克隆（共享 storage_path，不破坏
+///   一消息一附件不变量，不占 uploader 配额）；附件删除语义见 clone_attachment。
+pub async fn forward_message(
+    pool: &PgPool,
+    uid: Uuid,
+    message_id: Uuid,
+    targets: &[Uuid],
+    op: Uuid,
+) -> Result<Vec<Forwarded>, PostError> {
+    let member = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+             SELECT 1 FROM memberships mb
+             JOIN messages m ON m.conversation_id = mb.conversation_id
+              WHERE mb.user_id = $1 AND m.id = $2)",
+    )
+    .bind(uid)
+    .bind(message_id)
+    .fetch_one(pool)
+    .await
+    .map_err(PostError::Db)?;
+    if !member {
+        return Err(PostError::deny(
+            "forbidden",
+            "not a member of this conversation",
+        ));
+    }
+    let src = sqlx::query_as::<_, MsgViewRow>("SELECT * FROM message_views WHERE id = $1")
+        .bind(message_id)
+        .fetch_one(pool)
+        .await
+        .map_err(PostError::Db)?;
+    if src.deleted_at.is_some() {
+        return Err(PostError::deny("bad_message", "消息已删除"));
+    }
+    if src.kind == "poll" {
+        return Err(PostError::deny("bad_request", "投票不能转发"));
+    }
+
+    let mut results = Vec::with_capacity(targets.len());
+    for conv in targets {
+        // 幂等键含目标 id：同 op 投往不同会话互不撞键；同目标重试收敛同一行
+        let key = format!("fwd:{op}:{conv}");
+        let posted = post_message(
+            pool,
+            PostMessage {
+                conversation_id: *conv,
+                sender_id: uid,
+                // 视图里的 content 已含附件占位文本（'[图片]'/'[文件] x'），
+                // 重发同名附件时 normalize_body 不会重复拼装。
+                content: &src.content,
+                client_msg_id: Some(&key),
+                attachment_id: None,
+                // 转发不保留回复指向（task：strip reply_to）
+                reply_to_id: None,
+                poll: None,
+                forwarded_from: Some(&src.sender_name),
+                forward_attachment: src.att_id,
+            },
+        )
+        .await;
+        results.push(match posted {
+            Ok(posted) => Forwarded::Ok {
+                conv: *conv,
+                posted,
+            },
+            Err(PostError::Deny { code, message }) => Forwarded::Fail {
+                conv: *conv,
+                code,
+                message,
+            },
+            Err(PostError::Db(e)) => return Err(PostError::Db(e)),
+        });
+    }
+    Ok(results)
 }

@@ -319,3 +319,21 @@ export interface CreateInviteReq {
   expires_in_hours?: number | null;
   note?: string;
 }
+
+// ---------- V2 P2-4 转发 / 收藏 ----------
+
+/** POST /messages/{id}/forward 的逐目标结果（与去重后请求目标一一对应） */
+export interface ForwardResultItem {
+  conversation_id: string;
+  ok: boolean;
+  /** ok=true：转发者视角的完整消息视图（forwarded_from 为来源快照） */
+  message?: MessageView;
+  /** ok=false：稳定错误码（forbidden / not_friends / bad_request） */
+  error?: string;
+  /** ok=false：面向用户的中文原因 */
+  message_text?: string;
+}
+
+export interface ForwardResp {
+  results: ForwardResultItem[];
+}

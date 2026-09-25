@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError, convs, files, msgs as msgsApi, session } from "../api";
 import {
+  applyLiveMessage,
   applyRefreshed,
   applyUpdatedMessage,
   convTitle,
   getState,
   prependMessages,
+  pushToast,
   setDraft,
   setState,
   upsertMessage,
@@ -14,6 +16,7 @@ import {
 import type { AttachmentView, MemberView, MessageView, ReplyPreview } from "../types";
 import { sendChat, sendTyping } from "../ws";
 import RichText from "../richText";
+import ForwardModal from "./ForwardModal";
 import GroupInfo from "./GroupInfo";
 import NewPollModal from "./NewPollModal";
 import PollCard from "./PollCard";
@@ -136,6 +139,8 @@ export default function ChatView() {
   // 投票：创建弹窗开关 + 每条消息的操作 busy 态
   const [showPoll, setShowPoll] = useState(false);
   const [pollBusy, setPollBusy] = useState<Record<string, boolean>>({});
+  // V2 P2-4：转发弹窗的源消息（收藏不走弹窗，直接调接口到 self 会话）
+  const [fwdMsg, setFwdMsg] = useState<MessageView | null>(null);
   const gen = session();
   const viewOwner = useRef<object | null>(null);
   const mutation = useRef<object | null>(null);
@@ -245,6 +250,10 @@ export default function ChatView() {
     (m.sender_id === s.me?.id || (conv.kind === "group" && conv.owner_id === s.me?.id));
   const canActMsg = (m: MessageView) =>
     !m.id.startsWith("client:") && !m.deleted_at && !readonly;
+  // V2 P2-4 转发/收藏入口：非乐观消息、非墓碑、非投票。只读会话仍允许（
+  // 成员读得到就能转出去；目标侧权限由服务端逐条判定）
+  const canForwardMsg = (m: MessageView) =>
+    !m.id.startsWith("client:") && !m.deleted_at && m.kind !== "poll";
 
   const onScroll = () => {
     const el = scrollRef.current;
@@ -374,6 +383,30 @@ export default function ChatView() {
       setState((st) => applyUpdatedMessage(st, d));
     } catch (e) {
       setMutErr(e instanceof Error ? e.message : "删除失败");
+    } finally {
+      setMutBusy(false);
+    }
+  };
+
+  /** 收藏（V2 P2-4）= 转发到本人文件传输助手；每次点击是新 op（重发即有意重复收藏）。
+   * 服务端确认后立即并入 self 会话本地缓存；广播帧到达按 id 去重。 */
+  const doFavorite = async (m: MessageView) => {
+    setMsgMenu(null);
+    const self = s.conversations.find((c) => c.kind === "self");
+    if (!self || mutBusy) return;
+    setMutBusy(true);
+    setMutErr(null);
+    try {
+      const resp = await msgsApi.forward(m.id, [self.id], crypto.randomUUID());
+      const r = resp.results[0];
+      if (r?.ok && r.message) {
+        setState((st) => ({ ...st, ...applyLiveMessage(st, r.message!) }));
+        pushToast({ convId: self.id, title: "收藏", text: "已收藏到文件传输助手" });
+      } else {
+        setMutErr(r?.message_text ?? "收藏失败");
+      }
+    } catch (e) {
+      setMutErr(e instanceof Error ? e.message : "收藏失败");
     } finally {
       setMutBusy(false);
     }
@@ -531,9 +564,10 @@ export default function ChatView() {
   };
 
   const onFile = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const fl = e.target.files;
+    // FileList 是活引用：必须先拷贝成数组再清 value，否则长度归 0 永远早退
+    const fl = Array.from(e.target.files ?? []);
     e.target.value = "";
-    if (!fl?.length || readonly) return;
+    if (!fl.length || readonly) return;
     addPending(fl);
   };
 
@@ -559,7 +593,8 @@ export default function ChatView() {
         : null,
     );
     const now = Date.now();
-    if (now - lastTypingSent.current > 2500) {
+    // self 会话不广播 typing（服务端同样短路兜底）
+    if (conv.kind !== "self" && now - lastTypingSent.current > 2500) {
       lastTypingSent.current = now;
       sendTyping(conv.id);
     }
@@ -571,13 +606,15 @@ export default function ChatView() {
         <div>
           <div className="chat-title">{title}</div>
           <div className="chat-status">
-            {conv.kind === "dm"
-              ? peerOnline
-                ? "在线"
-                : conv.peer?.last_seen_at
-                  ? `最后在线 ${new Date(conv.peer.last_seen_at).toLocaleString()}`
-                  : "离线"
-              : `${conv.member_count} 名成员`}
+            {conv.kind === "self"
+              ? "在你的设备间同步消息与文件"
+              : conv.kind === "dm"
+                ? peerOnline
+                  ? "在线"
+                  : conv.peer?.last_seen_at
+                    ? `最后在线 ${new Date(conv.peer.last_seen_at).toLocaleString()}`
+                    : "离线"
+                : `${conv.member_count} 名成员`}
           </div>
         </div>
         <button
@@ -645,9 +682,9 @@ export default function ChatView() {
                     <div className="msg-sender">{m.sender_name}</div>
                   )}
                   <div className="bubble-wrap">
-                    {canActMsg(m) && (
+                    {(canActMsg(m) || canForwardMsg(m)) && (
                       <div className={`msg-actions ${emojiPick === m.id ? "open" : ""}`}>
-                        {emojiPick === m.id ? (
+                        {emojiPick === m.id && canActMsg(m) ? (
                           <>
                             {QUICK_EMOJI.map((e) => (
                               <button
@@ -672,33 +709,55 @@ export default function ChatView() {
                           </>
                         ) : (
                           <>
-                            <button
-                              title="表情"
-                              aria-label="表情"
-                              onClick={() => setEmojiPick(m.id)}
-                            >
-                              😊
-                            </button>
-                            <button title="回复" aria-label="回复" onClick={() => startReply(m)}>
-                              ↩
-                            </button>
-                            {canEditMsg(m) && (
-                              <button
-                                title="编辑"
-                                aria-label="编辑"
-                                onClick={() => startEdit(m)}
-                              >
-                                ✏️
-                              </button>
+                            {canActMsg(m) && (
+                              <>
+                                <button
+                                  title="表情"
+                                  aria-label="表情"
+                                  onClick={() => setEmojiPick(m.id)}
+                                >
+                                  😊
+                                </button>
+                                <button title="回复" aria-label="回复" onClick={() => startReply(m)}>
+                                  ↩
+                                </button>
+                                {canEditMsg(m) && (
+                                  <button
+                                    title="编辑"
+                                    aria-label="编辑"
+                                    onClick={() => startEdit(m)}
+                                  >
+                                    ✏️
+                                  </button>
+                                )}
+                                {canDeleteMsg(m) && (
+                                  <button
+                                    title="删除"
+                                    aria-label="删除"
+                                    onClick={() => void doDelete(m)}
+                                  >
+                                    🗑
+                                  </button>
+                                )}
+                              </>
                             )}
-                            {canDeleteMsg(m) && (
-                              <button
-                                title="删除"
-                                aria-label="删除"
-                                onClick={() => void doDelete(m)}
-                              >
-                                🗑
-                              </button>
+                            {canForwardMsg(m) && (
+                              <>
+                                <button
+                                  title="转发"
+                                  aria-label="转发"
+                                  onClick={() => setFwdMsg(m)}
+                                >
+                                  ➦
+                                </button>
+                                <button
+                                  title="收藏"
+                                  aria-label="收藏"
+                                  onClick={() => void doFavorite(m)}
+                                >
+                                  ⭐
+                                </button>
+                              </>
                             )}
                           </>
                         )}
@@ -714,11 +773,14 @@ export default function ChatView() {
                           m.mentions.includes(s.me?.id ?? "") ? "mentioned" : ""
                         } ${flashId === m.id ? "flash" : ""}`}
                         onContextMenu={(e) => {
-                          if (!canActMsg(m)) return;
+                          if (!canActMsg(m) && !canForwardMsg(m)) return;
                           e.preventDefault();
                           setMsgMenu({ x: e.clientX, y: e.clientY, m });
                         }}
                       >
+                        {m.forwarded_from && (
+                          <div className="fwd-from">转发自 {m.forwarded_from}</div>
+                        )}
                         {m.reply_to_preview && (
                           <button
                             type="button"
@@ -935,6 +997,9 @@ export default function ChatView() {
       {showPoll && conv.kind === "group" && (
         <NewPollModal convId={conv.id} onClose={() => setShowPoll(false)} />
       )}
+      {fwdMsg && (
+        <ForwardModal message={fwdMsg} onClose={() => setFwdMsg(null)} />
+      )}
 
       {/* 附件预览 */}
       {preview && (
@@ -986,39 +1051,59 @@ export default function ChatView() {
           onContextMenu={(e) => e.preventDefault()}
         >
           <div className="ctx-menu" style={{ left: msgMenu.x, top: msgMenu.y }}>
-            <div
-              className="ctx-item"
-              onClick={() => {
-                setEmojiPick(msgMenu.m.id);
-                setMsgMenu(null);
-              }}
-            >
-              表情
-            </div>
-            <div
-              className="ctx-item"
-              onClick={() => {
-                startReply(msgMenu.m);
-                setMsgMenu(null);
-              }}
-            >
-              回复
-            </div>
-            {canEditMsg(msgMenu.m) && (
-              <div
-                className="ctx-item"
-                onClick={() => {
-                  startEdit(msgMenu.m);
-                  setMsgMenu(null);
-                }}
-              >
-                编辑
-              </div>
+            {canActMsg(msgMenu.m) && (
+              <>
+                <div
+                  className="ctx-item"
+                  onClick={() => {
+                    setEmojiPick(msgMenu.m.id);
+                    setMsgMenu(null);
+                  }}
+                >
+                  表情
+                </div>
+                <div
+                  className="ctx-item"
+                  onClick={() => {
+                    startReply(msgMenu.m);
+                    setMsgMenu(null);
+                  }}
+                >
+                  回复
+                </div>
+                {canEditMsg(msgMenu.m) && (
+                  <div
+                    className="ctx-item"
+                    onClick={() => {
+                      startEdit(msgMenu.m);
+                      setMsgMenu(null);
+                    }}
+                  >
+                    编辑
+                  </div>
+                )}
+                {canDeleteMsg(msgMenu.m) && (
+                  <div className="ctx-item" onClick={() => void doDelete(msgMenu.m)}>
+                    删除
+                  </div>
+                )}
+              </>
             )}
-            {canDeleteMsg(msgMenu.m) && (
-              <div className="ctx-item" onClick={() => void doDelete(msgMenu.m)}>
-                删除
-              </div>
+            {canForwardMsg(msgMenu.m) && (
+              <>
+                <div
+                  className="ctx-item"
+                  onClick={() => {
+                    setFwdMsg(msgMenu.m);
+                    setMsgMenu(null);
+                  }}
+                >
+                  转发
+                </div>
+                <div className="ctx-item" onClick={() => void doFavorite(msgMenu.m)}>
+                  收藏
+                </div>
+              </>
             )}
           </div>
         </div>

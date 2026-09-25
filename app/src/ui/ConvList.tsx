@@ -167,8 +167,8 @@ export default function ConvList() {
               onClick={() => openConversation(c.id)}
               onContextMenu={(e) => openMenu(e, c)}
             >
-              <div className="avatar">
-                {convAvatarText(c)}
+              <div className={`avatar ${c.kind === "self" ? "self-avatar" : ""}`}>
+                {c.kind === "self" ? "🗂" : convAvatarText(c)}
                 {peerOnline && <i className="online-dot" />}
               </div>
               <div className="conv-mid">

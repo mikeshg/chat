@@ -64,6 +64,7 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
         include_str!("../migrations/0010_server_settings_invites.sql"),
         include_str!("../migrations/0011_sessions.sql"),
         include_str!("../migrations/0012_v2_media.sql"),
+        include_str!("../migrations/0015_self_conversations.sql"),
     ] {
         sqlx::raw_sql(script).execute(&pool).await.unwrap();
     }
@@ -117,6 +118,116 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
             assert_eq!(deleted.orphan_files, vec!["migration-shared-path"]);
         }
     }
+    pool.close().await;
+    sqlx::query(&format!("DROP DATABASE {name}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+}
+
+/// V2 P2-4：0015 为 0015 之前已存在的用户回填 type='self' 会话与 owner 成员；
+/// 重复执行幂等（uq_self_conversation 部分唯一索引 + memberships PK 兜底）。
+#[tokio::test]
+async fn upgrade_backfills_self_conversations() {
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://chat:chat@localhost:5432/postgres".into());
+    let options = PgConnectOptions::from_str(&database_url).unwrap();
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone())
+        .await
+        .unwrap();
+    let name = format!("chat_migration_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE DATABASE {name}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let pool = PgPoolOptions::new()
+        .max_connections(3)
+        .connect_with(options.database(&name))
+        .await
+        .unwrap();
+    for script in [
+        include_str!("../migrations/0001_init.sql"),
+        include_str!("../migrations/0002_attachments.sql"),
+        include_str!("../migrations/0003_mentions.sql"),
+        include_str!("../migrations/0004_admin.sql"),
+        include_str!("../migrations/0005_sync_invariants.sql"),
+        include_str!("../migrations/0006_session_version.sql"),
+        include_str!("../migrations/0007_message_lifecycle.sql"),
+        include_str!("../migrations/0008_conversation_preferences.sql"),
+        include_str!("../migrations/0009_polls.sql"),
+        include_str!("../migrations/0010_server_settings_invites.sql"),
+        include_str!("../migrations/0011_sessions.sql"),
+        include_str!("../migrations/0012_v2_media.sql"),
+    ] {
+        sqlx::raw_sql(script).execute(&pool).await.unwrap();
+    }
+
+    // 旧 schema 上的两个既有用户
+    let u1 = Uuid::new_v4();
+    let u2 = Uuid::new_v4();
+    for (u, name) in [(u1, "old_user_a"), (u2, "old_user_b")] {
+        sqlx::query(
+            "INSERT INTO users (id,username,display_name,password_hash) VALUES ($1,$2,$3,'unused')",
+        )
+        .bind(u)
+        .bind(name)
+        .bind(name)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // 0015 跑两遍：回填必须幂等（不重复建会话、不重复建成员）
+    for _ in 0..2 {
+        sqlx::raw_sql(include_str!("../migrations/0015_self_conversations.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let total =
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM conversations WHERE type = 'self'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(total, 2, "每个用户恰一个 self 会话");
+
+    for u in [u1, u2] {
+        let (name_null, owners): (bool, i64) = sqlx::query_as(
+            "SELECT c.name IS NULL,
+                    (SELECT count(*) FROM memberships mb
+                      WHERE mb.conversation_id = c.id AND mb.user_id = $1 AND mb.role = 'owner')
+               FROM conversations c
+              WHERE c.type = 'self' AND c.owner_id = $1",
+        )
+        .bind(u)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(name_null, "self 会话 name 必须为 NULL");
+        assert_eq!(owners, 1, "self 会话恰一个 owner 成员");
+    }
+
+    // 注册/兜底共用的领域函数在已迁移库上同样幂等
+    let again = domain::ensure_self_conversation(&pool, u1).await.unwrap();
+    let total = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM conversations WHERE type = 'self' AND owner_id = $1",
+    )
+    .bind(u1)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(total, 1);
+    let member_count =
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM memberships WHERE conversation_id = $1")
+            .bind(again)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(member_count, 1);
+
     pool.close().await;
     sqlx::query(&format!("DROP DATABASE {name}"))
         .execute(&admin)

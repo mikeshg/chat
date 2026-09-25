@@ -93,6 +93,8 @@ export function useApp(): AppState {
 
 export function convTitle(c: ConversationView, meId?: string): string {
   if (c.kind === "group") return c.name ?? `群聊(${c.member_count})`;
+  // V2 P2-4：self 会话 name 恒 NULL、peer 恒空，标题固定
+  if (c.kind === "self") return "文件传输助手";
   return c.peer?.display_name ?? c.name ?? "会话";
 }
 

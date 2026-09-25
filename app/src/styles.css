@@ -659,3 +659,32 @@ button.ctx-item:hover { background: var(--bg); }
 .inv-code { font-family: ui-monospace, Consolas, monospace; letter-spacing: 1px; }
 .inv-note { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ad-invite-row .ad-actions button { font-size: 12px; padding: 3px 10px; }
+
+/* ===== V2 P2-4 文件传输助手 + 转发/收藏 ===== */
+/* self 会话专用图标：与首字母方块同尺寸，换底色区分 */
+.avatar.self-avatar { background: var(--warn-bg); color: var(--warn-fg); font-size: 20px; }
+.fwd-avatar { font-size: 16px; }
+
+/* 气泡顶部转发来源小字 */
+.fwd-from { font-size: 11px; color: var(--muted); margin-bottom: 3px; }
+
+/* 转发弹窗 */
+.fwd-modal { width: 360px; }
+.fwd-list {
+  max-height: 320px; overflow-y: auto; margin: 8px 0;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.fwd-item {
+  display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+  border-radius: 6px; cursor: pointer; font-size: 14px;
+}
+.fwd-item:hover { background: var(--hover); }
+.fwd-item.on { background: var(--selected); }
+.fwd-item.dim { opacity: 0.45; }
+.fwd-item input { margin: 0; flex: none; }
+.fwd-item .avatar { width: 30px; height: 30px; font-size: 14px; }
+.fwd-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fwd-count { text-align: right; margin-bottom: 4px; }
+.fwd-result { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+.fwd-ok { color: var(--green); font-size: 14px; }
+.fwd-fail { color: var(--danger); font-size: 13px; }
