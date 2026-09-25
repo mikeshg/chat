@@ -1029,13 +1029,23 @@ async fn token_issuance_waits_for_user_authorization() {
         let u = register(&base, &format!("iu_{}", uniq())).await;
         let uid = uuid::Uuid::parse_str(&u.id).unwrap();
         let mut reset = st.pool.begin().await.unwrap();
-        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *reset).await.unwrap();
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *reset)
+            .await
+            .unwrap();
         sqlx::query("SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE")
-            .bind(uid).execute(&mut *reset).await.unwrap();
+            .bind(uid)
+            .execute(&mut *reset)
+            .await
+            .unwrap();
         let request = if refresh {
-            http().post(format!("{base}/v1/auth/refresh")).json(&json!({"refresh_token":u.refresh}))
+            http()
+                .post(format!("{base}/v1/auth/refresh"))
+                .json(&json!({"refresh_token":u.refresh}))
         } else {
-            http().post(format!("{base}/v1/auth/login")).json(&json!({"username":u.username,"password":"secret123"}))
+            http()
+                .post(format!("{base}/v1/auth/login"))
+                .json(&json!({"username":u.username,"password":"secret123"}))
         };
         let task = tokio::spawn(async move { request.send().await.unwrap() });
         wait_for_blocker(&st.pool, pid, &task).await;
@@ -1044,10 +1054,20 @@ async fn token_issuance_waits_for_user_authorization() {
             .bind(uid).bind(chat_server::auth::hash_password("new-password").unwrap())
             .execute(&mut *reset).await.unwrap();
         sqlx::query("UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1")
-            .bind(uid).execute(&mut *reset).await.unwrap();
+            .bind(uid)
+            .execute(&mut *reset)
+            .await
+            .unwrap();
         reset.commit().await.unwrap();
-        let r = tokio::time::timeout(std::time::Duration::from_secs(5), task).await.unwrap().unwrap();
-        assert_eq!(r.status(), 401, "stale login/refresh authorization must not mint tokens");
+        let r = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            401,
+            "stale login/refresh authorization must not mint tokens"
+        );
     }
 }
 
@@ -1057,18 +1077,43 @@ async fn registration_is_not_visible_before_token_issuance_commits() {
     let admin = register(&base, &format!("rga_{}", uniq())).await;
     let name = format!("rgu_{}", uniq());
     let mut barrier = st.pool.begin().await.unwrap();
-    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *barrier).await.unwrap();
-    sqlx::query("LOCK TABLE refresh_tokens IN SHARE MODE").execute(&mut *barrier).await.unwrap();
-    let request = http().post(format!("{base}/v1/auth/register"))
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *barrier)
+        .await
+        .unwrap();
+    sqlx::query("LOCK TABLE refresh_tokens IN SHARE MODE")
+        .execute(&mut *barrier)
+        .await
+        .unwrap();
+    let request = http()
+        .post(format!("{base}/v1/auth/register"))
         .json(&json!({"username":name,"password":"secret123"}));
     let task = tokio::spawn(async move { request.send().await.unwrap() });
     wait_for_blocker(&st.pool, pid, &task).await;
     assert!(!task.is_finished());
-    let visible: Value = http().get(format!("{base}/v1/admin/users?q={name}"))
-        .header("authorization", authz(&admin.access)).send().await.unwrap().json().await.unwrap();
-    assert_eq!(visible, json!([]), "an admin must not reset/disable a half-issued registration");
+    let visible: Value = http()
+        .get(format!("{base}/v1/admin/users?q={name}"))
+        .header("authorization", authz(&admin.access))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        visible,
+        json!([]),
+        "an admin must not reset/disable a half-issued registration"
+    );
     barrier.commit().await.unwrap();
-    assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(5), task).await.unwrap().unwrap().status(), 200);
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .status(),
+        200
+    );
 }
 
 #[tokio::test]
@@ -1079,22 +1124,52 @@ async fn reset_and_disable_revoke_tokens_atomically() {
         let u = register(&base, &format!("atu_{}", uniq())).await;
         let uid = uuid::Uuid::parse_str(&u.id).unwrap();
         let mut barrier = st.pool.begin().await.unwrap();
-        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *barrier).await.unwrap();
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *barrier)
+            .await
+            .unwrap();
         sqlx::query("SELECT id FROM refresh_tokens WHERE user_id = $1 FOR UPDATE")
-            .bind(uid).execute(&mut *barrier).await.unwrap();
-        let request = http().post(format!("{base}/v1/admin/users/{}/{operation}", u.id))
-            .header("authorization", authz(&admin.access)).json(&json!({"password":"new-password"}));
+            .bind(uid)
+            .execute(&mut *barrier)
+            .await
+            .unwrap();
+        let request = http()
+            .post(format!("{base}/v1/admin/users/{}/{operation}", u.id))
+            .header("authorization", authz(&admin.access))
+            .json(&json!({"password":"new-password"}));
         let task = tokio::spawn(async move { request.send().await.unwrap() });
         wait_for_blocker(&st.pool, pid, &task).await;
-        assert!(!task.is_finished(), "revocation must wait for the token barrier");
-        let during = http().get(format!("{base}/v1/users/me"))
-            .header("authorization", authz(&u.access)).send().await.unwrap();
+        assert!(
+            !task.is_finished(),
+            "revocation must wait for the token barrier"
+        );
+        let during = http()
+            .get(format!("{base}/v1/users/me"))
+            .header("authorization", authz(&u.access))
+            .send()
+            .await
+            .unwrap();
         // Neither new credentials nor disabled/version state may commit before token revocation.
-        assert_eq!(during.status(), 200, "partially committed session revocation");
+        assert_eq!(
+            during.status(),
+            200,
+            "partially committed session revocation"
+        );
         barrier.commit().await.unwrap();
-        assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(5), task).await.unwrap().unwrap().status(), 204);
-        let r = http().post(format!("{base}/v1/auth/refresh"))
-            .json(&json!({"refresh_token":u.refresh})).send().await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .status(),
+            204
+        );
+        let r = http()
+            .post(format!("{base}/v1/auth/refresh"))
+            .json(&json!({"refresh_token":u.refresh}))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(r.status(), 401);
     }
 }
@@ -1215,13 +1290,18 @@ where
                 Some(Ok(WsMsg::Close(_))) | None => break,
                 Some(Ok(WsMsg::Text(text))) => {
                     let f: Value = serde_json::from_str(&text).unwrap();
-                    assert_eq!(f["type"], "force_logout", "revoked connection accepted application frames");
+                    assert_eq!(
+                        f["type"], "force_logout",
+                        "revoked connection accepted application frames"
+                    );
                 }
                 Some(Err(e)) => panic!("expected a clean server close: {e}"),
                 _ => {}
             }
         }
-    }).await.expect("revoked connection was not closed");
+    })
+    .await
+    .expect("revoked connection was not closed");
 }
 
 #[tokio::test]
@@ -1236,32 +1316,52 @@ async fn ws_reset_between_upgrade_and_registration_closes_without_presence() {
     let resume = release.clone();
     let session_state = st.clone();
     // Pause only the test's upgrade continuation; production needs no timing/debug hooks.
-    let router = axum::Router::new().route("/", axum::routing::get(
-        move |upgrade: axum::extract::WebSocketUpgrade| {
+    let router = axum::Router::new().route(
+        "/",
+        axum::routing::get(move |upgrade: axum::extract::WebSocketUpgrade| {
             let resume = resume.clone();
             let state = session_state.clone();
             async move {
                 upgrade.on_upgrade(move |socket| async move {
                     resume.notified().await;
-                    chat_server::ws::handle_session(socket, state, chat_server::auth::AccessGrant {
-                        uid, session_version: version,
-                    }).await;
+                    chat_server::ws::handle_session(
+                        socket,
+                        state,
+                        chat_server::auth::AccessGrant {
+                            uid,
+                            session_version: version,
+                            sid: None,
+                        },
+                    )
+                    .await;
                 })
             }
-        },
-    ));
+        }),
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
-    let (mut delayed, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/")).await.unwrap();
-    let reset = http().post(format!("{base}/v1/admin/users/{}/password", u.id))
-        .header("authorization", authz(&admin.access)).json(&json!({"password":"new-password"}))
-        .send().await.unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let (mut delayed, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+        .await
+        .unwrap();
+    let reset = http()
+        .post(format!("{base}/v1/admin/users/{}/password", u.id))
+        .header("authorization", authz(&admin.access))
+        .json(&json!({"password":"new-password"}))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(reset.status(), 204);
     assert_eq!(st.conn_count(uid), 0);
     release.notify_one();
     closed_without_application_frames(&mut delayed).await;
-    assert_eq!(st.conn_count(uid), 0, "late revoked registration leaked presence");
+    assert_eq!(
+        st.conn_count(uid),
+        0,
+        "late revoked registration leaked presence"
+    );
     assert!(!st.is_online(uid));
     server.abort();
 }
@@ -1274,28 +1374,58 @@ async fn ws_rechecks_session_version_before_frames_and_preserves_other_connectio
     befriend(&base, &u, &peer).await;
     let uid = uuid::Uuid::parse_str(&u.id).unwrap();
     let conv = mk_group(&base, &u, &[peer.id.clone()]).await;
-    let (mut old, _) = tokio_tungstenite::connect_async(ws_url(&base, &u).await).await.unwrap();
+    let (mut old, _) = tokio_tungstenite::connect_async(ws_url(&base, &u).await)
+        .await
+        .unwrap();
     next_of(&mut old, "presence_init").await;
     // Model the committed version change before the in-memory kick is delivered.
     sqlx::query("UPDATE users SET session_version = session_version + 1 WHERE id = $1")
-        .bind(uid).execute(&st.pool).await.unwrap();
-    let r = http().post(format!("{base}/v1/auth/login"))
-        .json(&json!({"username":u.username,"password":"secret123"})).send().await.unwrap();
+        .bind(uid)
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    let r = http()
+        .post(format!("{base}/v1/auth/login"))
+        .json(&json!({"username":u.username,"password":"secret123"}))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 200);
     let tokens: Value = r.json().await.unwrap();
-    let fresh = TestUser { id:u.id, username:u.username, access:tokens["access_token"].as_str().unwrap().into(),
-        refresh:tokens["refresh_token"].as_str().unwrap().into() };
-    let (mut current, _) = tokio_tungstenite::connect_async(ws_url(&base, &fresh).await).await.unwrap();
+    let fresh = TestUser {
+        id: u.id,
+        username: u.username,
+        access: tokens["access_token"].as_str().unwrap().into(),
+        refresh: tokens["refresh_token"].as_str().unwrap().into(),
+    };
+    let (mut current, _) = tokio_tungstenite::connect_async(ws_url(&base, &fresh).await)
+        .await
+        .unwrap();
     next_of(&mut current, "presence_init").await;
     assert_eq!(st.conn_count(uid), 2);
-    old.send(WsMsg::Text(json!({"type":"sync","conversation_id":conv,"last_seq":0}).to_string().into()))
-        .await.unwrap();
+    old.send(WsMsg::Text(
+        json!({"type":"sync","conversation_id":conv,"last_seq":0})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
     closed_without_application_frames(&mut old).await;
     // Fence the remaining connection and check that stale cleanup did not remove its epoch/bucket.
-    current.send(WsMsg::Text(json!({"type":"sync","conversation_id":conv,"last_seq":0}).to_string().into()))
-        .await.unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(3), next_of(&mut current, "sync_messages"))
-        .await.unwrap();
+    current
+        .send(WsMsg::Text(
+            json!({"type":"sync","conversation_id":conv,"last_seq":0})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        next_of(&mut current, "sync_messages"),
+    )
+    .await
+    .unwrap();
     assert_eq!(st.conn_count(uid), 1);
     assert!(st.is_online(uid));
 }
@@ -1333,7 +1463,10 @@ async fn owner_transfer_leave_race() {
             .send(),
     );
     let transfer = r1.unwrap().status().as_u16();
-    assert!(matches!(transfer, 204 | 403), "unexpected transfer status: {transfer}");
+    assert!(
+        matches!(transfer, 204 | 403),
+        "unexpected transfer status: {transfer}"
+    );
     assert_eq!(r2.unwrap().status(), 204);
 
     // 终态不变量（不依赖竞态赢家）：恰好一个群主、群主属于剩余成员、a 已离群
@@ -1393,7 +1526,10 @@ async fn dissolve_invite_race() {
     );
     assert_eq!(r1.unwrap().status(), 204);
     let invite = r2.unwrap().status().as_u16();
-    assert!(matches!(invite, 204 | 400 | 403), "unexpected invite status: {invite}");
+    assert!(
+        matches!(invite, 204 | 400 | 403),
+        "unexpected invite status: {invite}"
+    );
 
     // 终态：会话已解散，且没有任何成员残留（含刚被拉进来的 c）
     let pool = PgPoolOptions::new().connect(&test_db_url()).await.unwrap();
@@ -1468,7 +1604,10 @@ async fn admin_role_safety() {
             .send(),
     );
     let codes = [r1.unwrap().status().as_u16(), r2.unwrap().status().as_u16()];
-    assert!(codes.iter().all(|s| matches!(s, 204 | 400 | 403)), "unexpected demotion status: {codes:?}");
+    assert!(
+        codes.iter().all(|s| matches!(s, 204 | 400 | 403)),
+        "unexpected demotion status: {codes:?}"
+    );
     assert!(
         codes.iter().filter(|s| **s == 204).count() == 1,
         "double demote both succeeded: {codes:?}"
@@ -2726,7 +2865,10 @@ async fn prefs_crud_and_order() {
         .await
         .unwrap();
     assert_eq!(r1["pinned_at"].is_string(), true);
-    assert_eq!(r2["pinned_at"], r1["pinned_at"], "repeated pin preserves ordering");
+    assert_eq!(
+        r2["pinned_at"], r1["pinned_at"],
+        "repeated pin preserves ordering"
+    );
     assert_eq!(r2["archived_at"], r1["archived_at"]);
 
     // 空 PUT：200，不改任何字段
@@ -2767,20 +2909,33 @@ async fn preferences_advance_after_waited_conversation_lock() {
     let uid = uuid::Uuid::parse_str(&b.id).unwrap();
     for mention in [false, true] {
         let initial: Value = put_pref(&base, &b, &conv, json!({"pinned":true,"archived":true}))
-            .await.json().await.unwrap();
-        let (mut sa, _) = tokio_tungstenite::connect_async(ws_url(&base, &a).await).await.unwrap();
+            .await
+            .json()
+            .await
+            .unwrap();
+        let (mut sa, _) = tokio_tungstenite::connect_async(ws_url(&base, &a).await)
+            .await
+            .unwrap();
         next_of(&mut sa, "presence_init").await;
         let mut barrier = st.pool.begin().await.unwrap();
-        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *barrier).await.unwrap();
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *barrier)
+            .await
+            .unwrap();
         sqlx::query("SELECT id FROM conversations WHERE id = $1 FOR UPDATE")
-            .bind(cid).execute(&mut *barrier).await.unwrap();
+            .bind(cid)
+            .execute(&mut *barrier)
+            .await
+            .unwrap();
         let task = if mention {
             let conv = conv.clone();
             let text = format!("@{} check this", b.username);
             tokio::spawn(async move { ws_send(&mut sa, &conv, json!({"content":text})).await })
         } else {
-            let request = http().put(format!("{base}/v1/conversations/{conv}/preferences"))
-                .header("authorization", authz(&b.access)).json(&json!({"pinned":true,"archived":false}));
+            let request = http()
+                .put(format!("{base}/v1/conversations/{conv}/preferences"))
+                .header("authorization", authz(&b.access))
+                .json(&json!({"pinned":true,"archived":false}));
             tokio::spawn(async move {
                 let r = request.send().await.unwrap();
                 assert_eq!(r.status(), 200);
@@ -2792,12 +2947,24 @@ async fn preferences_advance_after_waited_conversation_lock() {
         let previous: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
             "UPDATE conversation_preferences SET updated_at = clock_timestamp()
              WHERE conversation_id = $1 AND user_id = $2 RETURNING updated_at",
-        ).bind(cid).bind(uid).fetch_one(&mut *barrier).await.unwrap();
+        )
+        .bind(cid)
+        .bind(uid)
+        .fetch_one(&mut *barrier)
+        .await
+        .unwrap();
         barrier.commit().await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), task).await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
         let current = pref_of(&conv_list(&base, &b).await, &conv);
-        let updated = chrono::DateTime::parse_from_rfc3339(current["updated_at"].as_str().unwrap()).unwrap();
-        assert!(updated > previous, "a waited write must advance freshness, mention={mention}");
+        let updated =
+            chrono::DateTime::parse_from_rfc3339(current["updated_at"].as_str().unwrap()).unwrap();
+        assert!(
+            updated > previous,
+            "a waited write must advance freshness, mention={mention}"
+        );
         assert!(current["archived_at"].is_null());
         assert_eq!(current["pinned_at"], initial["pinned_at"]);
     }
@@ -3210,7 +3377,14 @@ async fn boundary_char_counts() {
     .await;
     assert_eq!(r.status(), 200);
     let m: Value = r.json().await.unwrap();
-    assert_eq!(m["poll"]["options"][0]["label"].as_str().unwrap().chars().count(), 100);
+    assert_eq!(
+        m["poll"]["options"][0]["label"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count(),
+        100
+    );
     let r = post_poll(
         &base,
         &a,
@@ -3641,8 +3815,12 @@ async fn poll_creation_replay_is_private_over_rest_and_ws() {
     let b = register(&base, &format!("prb_{}", uniq())).await;
     befriend(&base, &a, &b).await;
     let conv = mk_group(&base, &a, &[b.id.clone()]).await;
-    let (mut sa, _) = tokio_tungstenite::connect_async(ws_url(&base, &a).await).await.unwrap();
-    let (mut sb, _) = tokio_tungstenite::connect_async(ws_url(&base, &b).await).await.unwrap();
+    let (mut sa, _) = tokio_tungstenite::connect_async(ws_url(&base, &a).await)
+        .await
+        .unwrap();
+    let (mut sb, _) = tokio_tungstenite::connect_async(ws_url(&base, &b).await)
+        .await
+        .unwrap();
     next_of(&mut sa, "presence_init").await;
     next_of(&mut sb, "presence_init").await;
     let body = json!({"question":"private choices","options":["x","y"],
@@ -3655,12 +3833,22 @@ async fn poll_creation_replay_is_private_over_rest_and_ws() {
     assert_eq!(next_of(&mut sa, "message").await["message"]["id"], mid);
     assert_eq!(next_of(&mut sb, "message").await["message"]["id"], mid);
     for (user, choice) in [(&a, &ids[0]), (&b, &ids[1])] {
-        assert_eq!(vote(&base, user, mid, &[choice.clone()]).await.status(), 200);
+        assert_eq!(
+            vote(&base, user, mid, &[choice.clone()]).await.status(),
+            200
+        );
         next_of(&mut sa, "message_updated").await;
         next_of(&mut sb, "message_updated").await;
     }
-    let r = http().put(format!("{base}/v1/messages/{mid}/reactions/{}", urlencoded("\u{1f44d}")))
-        .header("authorization", authz(&a.access)).send().await.unwrap();
+    let r = http()
+        .put(format!(
+            "{base}/v1/messages/{mid}/reactions/{}",
+            urlencoded("\u{1f44d}")
+        ))
+        .header("authorization", authz(&a.access))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 200);
     let a_view = next_of(&mut sa, "reaction_update").await["message"].clone();
     let b_view = next_of(&mut sb, "reaction_update").await["message"].clone();
@@ -3671,7 +3859,12 @@ async fn poll_creation_replay_is_private_over_rest_and_ws() {
 
     for websocket in [false, true] {
         let replay = if websocket {
-            ws_send(&mut sa, &conv, json!({"client_msg_id":"private-replay","content":"retry"})).await
+            ws_send(
+                &mut sa,
+                &conv,
+                json!({"client_msg_id":"private-replay","content":"retry"}),
+            )
+            .await
         } else {
             let r = post_poll(&base, &a, &conv, body.clone()).await;
             assert_eq!(r.status(), 200);
@@ -3681,18 +3874,30 @@ async fn poll_creation_replay_is_private_over_rest_and_ws() {
         assert_eq!(replay["seq"], original["seq"]);
         assert_eq!(replay, a_view);
         // Sync is a queue fence: any replay broadcast would precede this response.
-        sb.send(WsMsg::Text(json!({"type":"sync","conversation_id":conv,"last_seq":0}).to_string().into()))
-            .await.unwrap();
+        sb.send(WsMsg::Text(
+            json!({"type":"sync","conversation_id":conv,"last_seq":0})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
         let sync = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
                 if let WsMsg::Text(t) = sb.next().await.unwrap().unwrap() {
                     let f: Value = serde_json::from_str(&t).unwrap();
-                    assert_ne!(f["type"], "message", "replay must not broadcast a creation view");
+                    assert_ne!(
+                        f["type"], "message",
+                        "replay must not broadcast a creation view"
+                    );
                     assert_ne!(f["type"], "preference_updated", "replay must not re-notify");
-                    if f["type"] == "sync_messages" { break f; }
+                    if f["type"] == "sync_messages" {
+                        break f;
+                    }
                 }
             }
-        }).await.expect("sync fence timed out");
+        })
+        .await
+        .expect("sync fence timed out");
         assert_eq!(sync["messages"], json!([b_view]));
         for option in sync["messages"][0]["poll"]["options"].as_array().unwrap() {
             assert_eq!(option["voters"], json!([]));
@@ -3758,4 +3963,509 @@ async fn poll_concurrent_votes() {
         .unwrap();
     assert_eq!(pm["poll"]["version"].as_i64().unwrap(), 3); // 2 + 1 次真实变更
     assert_eq!(opt_by_label(pm, "z")["count"].as_i64().unwrap(), 1);
+}
+
+// ===== V2 P1-5：自助改密码 + 登录设备管理 =====
+
+/// 带 device_label 的登录（同一账号多次登录 = 多台设备/多个 session）
+async fn login_device(base: &str, username: &str, password: &str, device_label: &str) -> TestUser {
+    let r: Value = http()
+        .post(format!("{base}/v1/auth/login"))
+        .json(&json!({"username": username, "password": password, "device_label": device_label}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        r["access_token"].as_str().is_some(),
+        "login failed for {username}"
+    );
+    TestUser {
+        id: r["user"]["id"].as_str().unwrap().into(),
+        username: username.into(),
+        access: r["access_token"].as_str().unwrap().into(),
+        refresh: r["refresh_token"].as_str().unwrap().into(),
+    }
+}
+
+async fn sessions_of(base: &str, access: &str) -> Vec<Value> {
+    http()
+        .get(format!("{base}/v1/users/me/sessions"))
+        .header("authorization", authz(access))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+async fn rest_status(base: &str, method: &str, path: &str, access: &str) -> u16 {
+    let c = http();
+    let req = match method {
+        "GET" => c.get(format!("{base}/v1{path}")),
+        "POST" => c.post(format!("{base}/v1{path}")),
+        "DELETE" => c.delete(format!("{base}/v1{path}")),
+        _ => unreachable!(),
+    };
+    req.header("authorization", authz(access))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+async fn login_status(base: &str, username: &str, password: &str) -> u16 {
+    http()
+        .post(format!("{base}/v1/auth/login"))
+        .json(&json!({"username": username, "password": password}))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// 读帧直到见到 want；中途收到 force_logout 直接判失败（未被踢的连接不该收到踢人帧）
+async fn next_of_no_kick<S>(s: &mut S, want: &str) -> Value
+where
+    S: StreamExt<Item = Result<WsMsg, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    for _ in 0..10 {
+        if let WsMsg::Text(t) = s.next().await.unwrap().unwrap() {
+            let v: Value = serde_json::from_str(&t).unwrap();
+            assert_ne!(v["type"], "force_logout", "unexpected force_logout: {v}");
+            if v["type"] == want {
+                return v;
+            }
+        }
+    }
+    panic!("did not receive frame type={want}");
+}
+
+/// 设备列表能看到多次登录，current 只标发起请求的 session，online 反映 WS 连接
+#[tokio::test]
+async fn sessions_list_marks_current_and_online() {
+    let base = spawn().await;
+    let u = register(&base, &format!("sa_{}", uniq())).await;
+    let dev_a = login_device(&base, &u.username, "secret123", "设备甲").await;
+    let _dev_b = login_device(&base, &u.username, "secret123", "设备乙").await;
+
+    // 注册 + 两次登录 = 3 个 session
+    let list = sessions_of(&base, &dev_a.access).await;
+    assert_eq!(list.len(), 3);
+    let a = list.iter().find(|s| s["device_label"] == "设备甲").unwrap();
+    let b = list.iter().find(|s| s["device_label"] == "设备乙").unwrap();
+    assert_eq!(a["current"], true);
+    assert_eq!(b["current"], false);
+    assert_eq!(a["online"], false);
+    assert_eq!(b["online"], false);
+    assert!(list.iter().all(|s| s["user_agent"].is_string()));
+
+    // A 建立 WS 后仅 A 的 session 在线
+    let (mut wa, _) = tokio_tungstenite::connect_async(ws_url(&base, &dev_a).await)
+        .await
+        .unwrap();
+    next_of(&mut wa, "presence_init").await;
+    let list = sessions_of(&base, &dev_a.access).await;
+    let a = list.iter().find(|s| s["device_label"] == "设备甲").unwrap();
+    let b = list.iter().find(|s| s["device_label"] == "设备乙").unwrap();
+    assert_eq!(a["online"], true);
+    assert_eq!(b["online"], false);
+}
+
+/// refresh 轮换沿用同一 session，且推进 last_used_at
+#[tokio::test]
+async fn refresh_rotates_token_within_same_session() {
+    let base = spawn().await;
+    let u = register(&base, &format!("sb_{}", uniq())).await;
+    let dev = login_device(&base, &u.username, "secret123", "本机").await;
+    let before = sessions_of(&base, &dev.access).await;
+    let s0 = before.iter().find(|s| s["device_label"] == "本机").unwrap();
+    let sid = s0["id"].as_str().unwrap().to_string();
+    let used0 = s0["last_used_at"].as_str().unwrap().to_string();
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let r = http()
+        .post(format!("{base}/v1/auth/refresh"))
+        .json(&json!({"refresh_token": dev.refresh}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let res: Value = r.json().await.unwrap();
+    let new_access = res["access_token"].as_str().unwrap();
+
+    let after = sessions_of(&base, new_access).await;
+    let s1 = after
+        .iter()
+        .find(|s| s["id"] == sid)
+        .expect("session id changed");
+    assert!(
+        s1["last_used_at"].as_str().unwrap() > used0.as_str(),
+        "last_used_at 应前进"
+    );
+    // refresh 不产生新 session
+    assert_eq!(after.len(), before.len());
+}
+
+/// A 移出设备 B：B 的 WS 收 force_logout(session_revoked) 并被关闭、凭据全失效；
+/// A 的连接不受影响；U 仍在线 → 好友收不到离线广播
+#[tokio::test]
+async fn revoke_session_kicks_only_that_device() {
+    let base = spawn().await;
+    let u = register(&base, &format!("sc_{}", uniq())).await;
+    let f = register(&base, &format!("sf_{}", uniq())).await;
+    befriend(&base, &u, &f).await;
+    let conv = dm_conv(&base, &u).await;
+    let dev_a = login_device(&base, &u.username, "secret123", "A").await;
+    let dev_b = login_device(&base, &u.username, "secret123", "B").await;
+
+    let (mut wa, _) = tokio_tungstenite::connect_async(ws_url(&base, &dev_a).await)
+        .await
+        .unwrap();
+    let (mut wb, _) = tokio_tungstenite::connect_async(ws_url(&base, &dev_b).await)
+        .await
+        .unwrap();
+    let (mut wf, _) = tokio_tungstenite::connect_async(ws_url(&base, &f).await)
+        .await
+        .unwrap();
+    next_of(&mut wa, "presence_init").await;
+    next_of(&mut wb, "presence_init").await;
+    next_of(&mut wf, "presence_init").await;
+
+    // A 移出 B 的 session
+    let list = sessions_of(&base, &dev_a.access).await;
+    let b_sid = list.iter().find(|s| s["device_label"] == "B").unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        rest_status(
+            &base,
+            "DELETE",
+            &format!("/users/me/sessions/{b_sid}"),
+            &dev_a.access
+        )
+        .await,
+        204
+    );
+
+    // B：先收 force_logout(session_revoked)，随后服务端关闭 socket
+    let kicked = next_of(&mut wb, "force_logout").await;
+    assert_eq!(kicked["reason"], "session_revoked");
+    closed_without_application_frames(&mut wb).await;
+
+    // B 的 access / refresh 全部失效
+    assert_eq!(
+        rest_status(&base, "GET", "/users/me", &dev_b.access).await,
+        401
+    );
+    let r = http()
+        .post(format!("{base}/v1/auth/refresh"))
+        .json(&json!({"refresh_token": dev_b.refresh}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+
+    // A 的连接仍可受理帧，且全程没收到 force_logout
+    wa.send(WsMsg::Text(
+        json!({"type":"sync","conversation_id":conv,"last_seq":0})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    next_of_no_kick(&mut wa, "sync_messages").await;
+
+    // U 仍有 A 在线 → F（好友观察者）不得收到 U 的离线广播
+    let stray = tokio::time::timeout(std::time::Duration::from_millis(800), wf.next()).await;
+    if let Ok(Some(Ok(WsMsg::Text(t)))) = stray {
+        let v: Value = serde_json::from_str(&t).unwrap();
+        assert!(
+            !(v["type"] == "presence" && v["user_id"] == u.id && v["online"] == false),
+            "仍在在线的用户不该被广播离线: {v}"
+        );
+    }
+}
+
+/// 撤销当前 session → 400；撤销他人/不存在的 session → 404；重复撤销幂等 204
+#[tokio::test]
+async fn revoke_session_guards_and_idempotent() {
+    let base = spawn().await;
+    let u = register(&base, &format!("sd_{}", uniq())).await;
+    let other = register(&base, &format!("se_{}", uniq())).await;
+    let dev_a = login_device(&base, &u.username, "secret123", "A").await;
+    let _dev_b = login_device(&base, &u.username, "secret123", "B").await;
+
+    let list = sessions_of(&base, &dev_a.access).await;
+    let cur = list.iter().find(|s| s["current"] == true).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b_sid = list.iter().find(|s| s["device_label"] == "B").unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 当前设备 → 400
+    assert_eq!(
+        rest_status(
+            &base,
+            "DELETE",
+            &format!("/users/me/sessions/{cur}"),
+            &dev_a.access
+        )
+        .await,
+        400
+    );
+    // 别人的 session → 404；不存在的 id → 404
+    let other_sid = sessions_of(&base, &other.access).await[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        rest_status(
+            &base,
+            "DELETE",
+            &format!("/users/me/sessions/{other_sid}"),
+            &dev_a.access
+        )
+        .await,
+        404
+    );
+    assert_eq!(
+        rest_status(
+            &base,
+            "DELETE",
+            &format!("/users/me/sessions/{}", uuid::Uuid::new_v4()),
+            &dev_a.access
+        )
+        .await,
+        404
+    );
+    // 正常撤销 → 204；再撤一次仍 204（幂等）
+    assert_eq!(
+        rest_status(
+            &base,
+            "DELETE",
+            &format!("/users/me/sessions/{b_sid}"),
+            &dev_a.access
+        )
+        .await,
+        204
+    );
+    assert_eq!(
+        rest_status(
+            &base,
+            "DELETE",
+            &format!("/users/me/sessions/{b_sid}"),
+            &dev_a.access
+        )
+        .await,
+        204
+    );
+}
+
+/// 自助改密：旧密码错 403；成功后签发新凭据、当前 session 不变；
+/// 其他 session 的 token/refresh/WS 全失效；新密码可登录旧密码不能
+#[tokio::test]
+async fn change_password_kicks_other_sessions() {
+    let base = spawn().await;
+    let u = register(&base, &format!("sg_{}", uniq())).await;
+    let dev_a = login_device(&base, &u.username, "secret123", "A").await;
+    let dev_b = login_device(&base, &u.username, "secret123", "B").await;
+    let (mut wb, _) = tokio_tungstenite::connect_async(ws_url(&base, &dev_b).await)
+        .await
+        .unwrap();
+    next_of(&mut wb, "presence_init").await;
+    let c = http();
+    let sid_before = sessions_of(&base, &dev_a.access)
+        .await
+        .iter()
+        .find(|s| s["current"] == true)
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 旧密码错误 → 403（不能是 401，否则客户端会走刷新流程）
+    let r = c
+        .post(format!("{base}/v1/users/me/password"))
+        .header("authorization", authz(&dev_a.access))
+        .json(&json!({"old_password":"nope-nope","new_password":"newpass456"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    // 新密码长度不合规 → 400（与注册一致 6-72）
+    let r = c
+        .post(format!("{base}/v1/users/me/password"))
+        .header("authorization", authz(&dev_a.access))
+        .json(&json!({"old_password":"secret123","new_password":"x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+
+    // 成功 → 返回为当前 session 新签发的凭据
+    let r = c
+        .post(format!("{base}/v1/users/me/password"))
+        .header("authorization", authz(&dev_a.access))
+        .json(&json!({"old_password":"secret123","new_password":"newpass456"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let res: Value = r.json().await.unwrap();
+    let new_access = res["access_token"].as_str().unwrap().to_string();
+    let new_refresh = res["refresh_token"].as_str().unwrap().to_string();
+
+    // 新凭据可用；session 列表只剩当前一条且 id 不变
+    assert_eq!(
+        rest_status(&base, "GET", "/users/me", &new_access).await,
+        200
+    );
+    let list = sessions_of(&base, &new_access).await;
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["id"].as_str().unwrap(), sid_before);
+    assert_eq!(list[0]["current"], true);
+
+    // A 的旧 access → 401（session_version 已 +1）；B 的 access/refresh → 401
+    assert_eq!(
+        rest_status(&base, "GET", "/users/me", &dev_a.access).await,
+        401
+    );
+    assert_eq!(
+        rest_status(&base, "GET", "/users/me", &dev_b.access).await,
+        401
+    );
+    let r = c
+        .post(format!("{base}/v1/auth/refresh"))
+        .json(&json!({"refresh_token": dev_b.refresh}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    // 同一 session 的新 refresh 仍有效（改密不撤销本设备的登录）
+    let r = c
+        .post(format!("{base}/v1/auth/refresh"))
+        .json(&json!({"refresh_token": new_refresh}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    // B 的 WS：force_logout(password_changed) → 服务端关闭
+    let kicked = next_of(&mut wb, "force_logout").await;
+    assert_eq!(kicked["reason"], "password_changed");
+    closed_without_application_frames(&mut wb).await;
+
+    // 新密码可登录，旧密码不能
+    assert_eq!(login_status(&base, &u.username, "secret123").await, 401);
+    assert_eq!(login_status(&base, &u.username, "newpass456").await, 200);
+}
+
+/// 一键退出其他所有设备：只剩当前 session
+#[tokio::test]
+async fn revoke_other_sessions_keeps_current() {
+    let base = spawn().await;
+    let u = register(&base, &format!("sh_{}", uniq())).await;
+    let dev_a = login_device(&base, &u.username, "secret123", "A").await;
+    let dev_b = login_device(&base, &u.username, "secret123", "B").await;
+    let dev_c = login_device(&base, &u.username, "secret123", "C").await;
+
+    assert_eq!(
+        rest_status(
+            &base,
+            "POST",
+            "/users/me/sessions/revoke-others",
+            &dev_a.access
+        )
+        .await,
+        204
+    );
+    let list = sessions_of(&base, &dev_a.access).await;
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["device_label"], "A");
+    assert_eq!(list[0]["current"], true);
+
+    // 其他设备的凭据全部失效
+    assert_eq!(
+        rest_status(&base, "GET", "/users/me", &dev_b.access).await,
+        401
+    );
+    assert_eq!(
+        rest_status(&base, "GET", "/users/me", &dev_c.access).await,
+        401
+    );
+    let r = http()
+        .post(format!("{base}/v1/auth/refresh"))
+        .json(&json!({"refresh_token": dev_b.refresh}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    // 幂等：再调一次仍 204
+    assert_eq!(
+        rest_status(
+            &base,
+            "POST",
+            "/users/me/sessions/revoke-others",
+            &dev_a.access
+        )
+        .await,
+        204
+    );
+}
+
+/// 老 access token（无 sid claim）仍可通过 require_user：session_version 对就行
+#[tokio::test]
+async fn legacy_access_token_without_sid_still_accepted() {
+    let base = spawn().await;
+    let u = register(&base, &format!("si_{}", uniq())).await;
+    let uid = uuid::Uuid::parse_str(&u.id).unwrap();
+    // 模拟升级前签发的 token：session_version=0、不带 sid
+    let (at, _) = chat_server::auth::mint_access(uid, 0, None, "test-secret").unwrap();
+    assert_eq!(rest_status(&base, "GET", "/users/me", &at).await, 200);
+    assert_eq!(rest_status(&base, "GET", "/ws/ticket", &at).await, 200);
+}
+
+/// 登出撤销所属 session：设备列表里消失、该设备的 access/refresh 全失效
+#[tokio::test]
+async fn logout_revokes_whole_session() {
+    let base = spawn().await;
+    let u = register(&base, &format!("sj_{}", uniq())).await;
+    let dev_a = login_device(&base, &u.username, "secret123", "A").await;
+    let dev_b = login_device(&base, &u.username, "secret123", "B").await;
+
+    let r = http()
+        .post(format!("{base}/v1/auth/logout"))
+        .json(&json!({"refresh_token": dev_a.refresh}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+
+    // B 视角：A 的 session 从列表消失（剩注册时的 session + B）
+    let list = sessions_of(&base, &dev_b.access).await;
+    assert_eq!(list.len(), 2);
+    assert!(list.iter().all(|s| s["device_label"] != "A"));
+
+    // A 的凭据随 session 一起失效
+    assert_eq!(
+        rest_status(&base, "GET", "/users/me", &dev_a.access).await,
+        401
+    );
+    let r = http()
+        .post(format!("{base}/v1/auth/refresh"))
+        .json(&json!({"refresh_token": dev_a.refresh}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
 }

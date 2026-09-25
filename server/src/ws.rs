@@ -28,12 +28,17 @@ pub async fn ws_handler(
     if grant.issued.elapsed() > Duration::from_secs(30) {
         return Err(crate::error::AppError::unauthorized("ticket expired"));
     }
-    // ticket 签发后被禁用/改密的缝隙：升级前再确认一次（禁用与凭据版本都要仍有效）
+    // ticket 签发后被禁用/改密/移出设备的缝隙：升级前再确认一次（禁用、凭据版本、登录会话都要仍有效）
     let ok = sqlx::query_scalar::<_, bool>(
-        "SELECT disabled_at IS NULL AND session_version = $2 FROM users WHERE id = $1",
+        "SELECT disabled_at IS NULL AND session_version = $2
+            AND ($3::uuid IS NULL OR EXISTS(
+                 SELECT 1 FROM sessions s
+                  WHERE s.id = $3 AND s.user_id = users.id AND s.revoked_at IS NULL))
+           FROM users WHERE id = $1",
     )
     .bind(grant.uid)
     .bind(grant.session_version)
+    .bind(grant.sid)
     .fetch_one(&st.pool)
     .await
     .unwrap_or(false);
@@ -45,6 +50,7 @@ pub async fn ws_handler(
     let access = crate::auth::AccessGrant {
         uid: grant.uid,
         session_version: grant.session_version,
+        sid: grant.sid,
     };
     Ok(ws.on_upgrade(move |socket| handle_session(socket, st, access)))
 }
@@ -54,15 +60,19 @@ fn frame(out: &WsOut) -> String {
 }
 
 /// Process an upgraded socket using the grant validated at the HTTP boundary.
-pub async fn handle_session(mut socket: WebSocket, st: SharedState, grant: crate::auth::AccessGrant) {
+pub async fn handle_session(
+    mut socket: WebSocket,
+    st: SharedState,
+    grant: crate::auth::AccessGrant,
+) {
     let uid = grant.uid;
     let conn_id = Uuid::new_v4();
     let (tx, mut rx) = mpsc::unbounded_channel::<ConnMsg>();
 
-    let online_epoch = st.register_conn(uid, conn_id, tx.clone());
+    let online_epoch = st.register_conn(uid, conn_id, tx.clone(), grant.sid);
 
     let watchers = st.watchers(uid).await.unwrap_or_default();
-    if !connection_valid(&st, uid, conn_id, grant.session_version).await {
+    if !connection_valid(&st, uid, conn_id, grant.session_version, grant.sid).await {
         st.unregister_conn(uid, conn_id);
         let _ = socket.send(Message::Close(None)).await;
         return;
@@ -115,7 +125,7 @@ pub async fn handle_session(mut socket: WebSocket, st: SharedState, grant: crate
             incoming = stream.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        if !on_text(&st, uid, conn_id, grant.session_version, &tx, &text).await {
+                        if !on_text(&st, uid, conn_id, grant.session_version, grant.sid, &tx, &text).await {
                             let _ = sink.send(Message::Close(None)).await;
                             break;
                         }
@@ -218,12 +228,24 @@ fn op_ack(tx: &mpsc::UnboundedSender<ConnMsg>, client_op_id: Option<Uuid>) {
     }
 }
 
-async fn connection_valid(st: &SharedState, uid: Uuid, conn_id: Uuid, session_version: i64) -> bool {
+/// 每帧复核：账号未禁用、凭据版本未变、所属登录会话未撤销（老连接无 sid 不查 session）
+async fn connection_valid(
+    st: &SharedState,
+    uid: Uuid,
+    conn_id: Uuid,
+    session_version: i64,
+    sid: Option<Uuid>,
+) -> bool {
     let valid = sqlx::query_scalar::<_, bool>(
-        "SELECT disabled_at IS NULL AND session_version = $2 FROM users WHERE id = $1",
+        "SELECT disabled_at IS NULL AND session_version = $2
+            AND ($3::uuid IS NULL OR EXISTS(
+                 SELECT 1 FROM sessions s
+                  WHERE s.id = $3 AND s.user_id = users.id AND s.revoked_at IS NULL))
+           FROM users WHERE id = $1",
     )
     .bind(uid)
     .bind(session_version)
+    .bind(sid)
     .fetch_one(&st.pool)
     .await
     .unwrap_or(false);
@@ -235,10 +257,11 @@ async fn on_text(
     uid: Uuid,
     conn_id: Uuid,
     session_version: i64,
+    sid: Option<Uuid>,
     tx: &mpsc::UnboundedSender<ConnMsg>,
     text: &str,
 ) -> bool {
-    if !connection_valid(st, uid, conn_id, session_version).await {
+    if !connection_valid(st, uid, conn_id, session_version, sid).await {
         return false;
     }
     let parsed: Result<WsIn, _> = serde_json::from_str(text);

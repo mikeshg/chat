@@ -50,12 +50,36 @@ pub struct RegisterReq {
     pub username: String,
     pub display_name: Option<String>,
     pub password: String,
+    /// 设备名（V2 P1-5）：服务端去控制字符并截断 60 字符
+    #[serde(default)]
+    pub device_label: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct LoginReq {
     pub username: String,
     pub password: String,
+    #[serde(default)]
+    pub device_label: Option<String>,
+}
+
+/// POST /users/me/password：旧密码错误返回 403（401 会触发客户端刷新 token 流程）
+#[derive(Debug, Deserialize)]
+pub struct ChangePasswordReq {
+    pub old_password: String,
+    pub new_password: String,
+}
+
+/// GET /users/me/sessions 的单条：current 按请求 token 的 sid 判定，online = 有在线 WS 连接
+#[derive(Debug, Serialize)]
+pub struct SessionView {
+    pub id: Uuid,
+    pub device_label: String,
+    pub user_agent: String,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: DateTime<Utc>,
+    pub current: bool,
+    pub online: bool,
 }
 
 #[derive(Debug, Deserialize)]

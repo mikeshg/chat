@@ -566,7 +566,15 @@ async fn write_message(
         .await?
         {
             // 幂等命中：归档解除在首个事务已生效，不再重复推送
-            return Ok(load_posted(tx, msg.conversation_id, msg.sender_id, id, false, Vec::new()).await?);
+            return Ok(load_posted(
+                tx,
+                msg.conversation_id,
+                msg.sender_id,
+                id,
+                false,
+                Vec::new(),
+            )
+            .await?);
         }
     }
 

@@ -13,6 +13,7 @@ import type {
   MessageView,
   PrefUpdate,
   RequestsView,
+  SessionView,
   UserPublic,
 } from "./types";
 
@@ -165,12 +166,50 @@ const put = <T>(p: string, body?: unknown) =>
     body: body === undefined ? undefined : JSON.stringify(body),
   });
 
+// ---------- 设备名（V2 P1-5） ----------
+// 登录/注册带给服务端的 device_label：Tauri 壳固定文案，Web 端按 UA 拼「浏览器 · 系统」。
+function osOfUa(ua: string): string {
+  if (/Windows NT/i.test(ua)) return "Windows";
+  if (/Android/i.test(ua)) return "Android";
+  if (/iPhone|iPad|iPod/i.test(ua)) return "iOS";
+  if (/Mac OS X/i.test(ua)) return "macOS";
+  if (/Linux/i.test(ua)) return "Linux";
+  return "未知系统";
+}
+function browserOfUa(ua: string): string {
+  // Edge/Opera 的 UA 也含 Chrome/，必须先判
+  if (/Edg(e|A|iOS)?\//i.test(ua)) return "Edge";
+  if (/OPR\/|Opera/i.test(ua)) return "Opera";
+  if (/Firefox\//i.test(ua)) return "Firefox";
+  if (/Chrome\//i.test(ua)) return "Chrome";
+  if (/Safari\//i.test(ua)) return "Safari";
+  return "浏览器";
+}
+/** 纯函数：按 UA 生成 Web 端设备名（便于测试） */
+export function browserDeviceLabel(ua: string): string {
+  return `${browserOfUa(ua)} · ${osOfUa(ua)}`;
+}
+/** 当前设备的 device_label：Tauri Android → Chat Android；Tauri 桌面 → Chat 桌面端 (OS)；其余按 UA */
+export function deviceLabel(): string {
+  const w = globalThis as { __TAURI_INTERNALS__?: unknown; __TAURI__?: unknown; navigator?: { userAgent?: string } };
+  const ua = w.navigator?.userAgent ?? "";
+  if (w.__TAURI_INTERNALS__ || w.__TAURI__) {
+    return /Android/i.test(ua) ? "Chat Android" : `Chat 桌面端 (${osOfUa(ua)})`;
+  }
+  return browserDeviceLabel(ua);
+}
+
 // ---------- auth ----------
 export const auth = {
   register: (username: string, password: string, display_name?: string) =>
-    post<AuthResponse>("/auth/register", { username, password, display_name }),
+    post<AuthResponse>("/auth/register", {
+      username,
+      password,
+      display_name,
+      device_label: deviceLabel(),
+    }),
   login: (username: string, password: string) =>
-    post<AuthResponse>("/auth/login", { username, password }),
+    post<AuthResponse>("/auth/login", { username, password, device_label: deviceLabel() }),
   logout: () => {
     const rt = localStorage.getItem(LS_REFRESH);
     if (rt) post("/auth/logout", { refresh_token: rt }).catch(() => {});
@@ -178,6 +217,15 @@ export const auth = {
   },
   me: () => get<UserPublic>("/users/me"),
   updateMe: (display_name: string) => patch<UserPublic>("/users/me", { display_name }),
+  /** 自助改密：返回为当前 session 新签发的凭据（其他 session 已被服务端撤销） */
+  changePassword: (old_password: string, new_password: string) =>
+    post<AuthResponse>("/users/me/password", { old_password, new_password }),
+  /** 登录设备列表 */
+  sessions: () => get<SessionView[]>("/users/me/sessions"),
+  /** 移出一台设备（不能是当前会话） */
+  revokeSession: (id: string) => del<void>(`/users/me/sessions/${id}`),
+  /** 退出其他所有设备 */
+  revokeOtherSessions: () => post<void>("/users/me/sessions/revoke-others"),
   searchUser: async (q: string) => {
     const r = await get<unknown>(`/users/search?q=${encodeURIComponent(q)}`);
     // 兼容旧服务端返回单对象的形态

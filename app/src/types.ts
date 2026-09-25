@@ -14,6 +14,20 @@ export interface AuthResponse {
   user: UserPublic;
 }
 
+/** GET /users/me/sessions 的单条登录会话（V2 P1-5）：一次登录 = 一台设备 */
+export interface SessionView {
+  id: string;
+  device_label: string;
+  user_agent: string;
+  created_at: string;
+  /** 最近一次 refresh 换发时间 */
+  last_used_at: string;
+  /** 是否当前请求的 access token 所属会话 */
+  current: boolean;
+  /** 该会话是否有在线 WS 连接 */
+  online: boolean;
+}
+
 export interface FriendRequestView {
   id: string;
   user: UserPublic;
