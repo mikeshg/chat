@@ -66,6 +66,7 @@ function conv(patch: Partial<ConversationView> = {}): ConversationView {
 function state(patch: Partial<AppState> = {}): AppState {
   return {
     me,
+    drafts: {},
     conversations: [conv()],
     messages: {},
     hasMore: {},
