@@ -7,6 +7,7 @@ import {
   session,
   wsBase,
 } from "./api";
+import { notifyIncoming } from "./notify";
 import {
   applyLiveMessage,
   applyPrefUpdate,
@@ -376,14 +377,30 @@ function dispatch(f: WsOut) {
   }
 }
 
+/** 窗口在前台（可见且有焦点）：只有这时「打开着的会话」才算正在看 */
+function inForeground(): boolean {
+  return typeof document === "undefined" || (!document.hidden && document.hasFocus());
+}
+
+// 回到前台：补报当前打开会话的已读（后台期间不自动已读，未读数与标题才准确）
+function readActiveOnReturn() {
+  const s = getState();
+  if (s.activeConv && s.tab === "chats" && inForeground()) openConversation(s.activeConv);
+}
+if (typeof window !== "undefined") {
+  window.addEventListener("focus", readActiveOnReturn);
+  document.addEventListener("visibilitychange", readActiveOnReturn);
+}
+
 function onMessage(m: MessageView) {
   const known = getState().conversations.some((c) => c.id === m.conversation_id);
   const s = getState();
-  const isActive = s.activeConv === m.conversation_id && s.tab === "chats";
+  const fg = inForeground();
+  const isActive = s.activeConv === m.conversation_id && s.tab === "chats" && fg;
   const mine = m.sender_id === s.me?.id;
-  setState((cur) => applyLiveMessage(cur, m));
+  setState((cur) => applyLiveMessage(cur, m, fg));
   if (!known) void refreshCatalogs().catch((e) => console.warn("refresh failed", e));
-  // 当前打开的会话收到别人消息 → 上报已读
+  // 当前打开且在前台的会话收到别人消息 → 上报已读
   if (isActive && !mine) sendRead(m.conversation_id, m.seq);
   // 最小应用内提示：静音会话被抑制（@我 除外）；点击打开会话
   const cur = getState();
@@ -403,6 +420,8 @@ function onMessage(m: MessageView) {
       text: `${tag}${m.sender_name}: ${excerpt}`,
     });
   }
+  // P1-1 系统通知：窗口不在前台时弹出（与 toast 共用 !existed 去重；开关/权限/静音在内部判定）
+  if (!existed) void notifyIncoming(cur, m, openConversation);
 }
 
 async function refreshByWhat(what: string) {

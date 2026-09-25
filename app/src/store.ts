@@ -259,12 +259,15 @@ export function mergeConversationLists(
   return sortConversations(merged);
 }
 
-/** 实时消息。同一 id 再投递一次不重复加未读。 */
-export function applyLiveMessage(s: AppState, m: MessageView): Partial<AppState> {
+/**
+ * 实时消息。同一 id 再投递一次不重复加未读。
+ * foreground=false（窗口在后台）时打开着的会话也照常计未读，回到前台再补报已读。
+ */
+export function applyLiveMessage(s: AppState, m: MessageView, foreground = true): Partial<AppState> {
   const list = s.messages[m.conversation_id] ?? [];
   const exists = list.some((x) => x.id === m.id) || s.conversations.some((c) => c.last_message?.id === m.id);
   const refreshed = applyRefreshed(s, m.conversation_id, [m]);
-  const isActive = s.activeConv === m.conversation_id && s.tab === "chats";
+  const isActive = s.activeConv === m.conversation_id && s.tab === "chats" && foreground;
   const mine = m.sender_id === s.me?.id;
   const { [m.conversation_id]: _typing, ...typing } = s.typing;
   return {

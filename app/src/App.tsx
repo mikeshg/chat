@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { auth, loadSession } from "./api";
+import { syncWindowTitle, unreadTitle } from "./notify";
 import { setState, useApp } from "./store";
 import { startWs, stopWs } from "./ws";
 import AuthScreen from "./ui/AuthScreen";
@@ -46,6 +47,11 @@ export default function App() {
       }
     })();
   }, [booting]);
+
+  // P1-1 标题未读数："(N) Chat"；登出后 conversations 清空 → 恢复 "Chat"
+  useEffect(() => {
+    syncWindowTitle(unreadTitle(s.conversations));
+  }, [s.conversations]);
 
   if (booting) return <div className="boot">加载中…</div>;
   if (!s.me) return <AuthScreen />;
