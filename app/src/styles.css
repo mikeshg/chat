@@ -249,7 +249,7 @@ button.ctx-item:hover { background: var(--bg); }
   margin-bottom: 14px; border: 1px solid var(--line);
 }
 .card h3 { margin: 0 0 10px; font-size: 14px; }
-.card input { flex: 1; }
+.card input:not([type="checkbox"]):not([type="radio"]) { flex: 1; }
 .found { background: var(--bg); padding: 8px; border-radius: 6px; }
 .tag {
   background: var(--warn-bg); color: var(--warn-fg); font-size: 10px;
