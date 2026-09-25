@@ -14,6 +14,7 @@ pub enum AppError {
     Forbidden(String),
     NotFound(String),
     Conflict(String),
+    PayloadTooLarge(String),
     Internal(String),
 }
 
@@ -33,6 +34,9 @@ impl AppError {
     pub fn conflict(m: impl Into<String>) -> Self {
         Self::Conflict(m.into())
     }
+    pub fn payload_too_large(m: impl Into<String>) -> Self {
+        Self::PayloadTooLarge(m.into())
+    }
     pub fn internal(m: impl std::fmt::Display) -> Self {
         Self::Internal(m.to_string())
     }
@@ -46,6 +50,7 @@ impl IntoResponse for AppError {
             Self::Forbidden(m) => (StatusCode::FORBIDDEN, m),
             Self::NotFound(m) => (StatusCode::NOT_FOUND, m),
             Self::Conflict(m) => (StatusCode::CONFLICT, m),
+            Self::PayloadTooLarge(m) => (StatusCode::PAYLOAD_TOO_LARGE, m),
             Self::Internal(m) => {
                 tracing::error!(error = %m, "internal error");
                 (

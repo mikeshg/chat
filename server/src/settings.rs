@@ -24,15 +24,21 @@ const VALID_MODES: [&str; 3] = [MODE_OPEN, MODE_INVITE, MODE_CLOSED];
 const CODE_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const CODE_LEN: usize = 10;
 
+/// 每用户附件存储上限（MB）的合法区间；0 = 不限
+pub const QUOTA_MAX_MB: i64 = 1_048_576;
+
 #[derive(Debug, Serialize)]
 pub struct ServerSettings {
     pub registration_mode: String,
+    /// 每用户附件总量上限（MB）；0 = 不限
+    pub storage_quota_mb: i64,
 }
 
 impl Default for ServerSettings {
     fn default() -> Self {
         Self {
             registration_mode: MODE_OPEN.into(),
+            storage_quota_mb: 0,
         }
     }
 }
@@ -51,6 +57,12 @@ pub async fn load(executor: impl sqlx::PgExecutor<'_>) -> AppResult<ServerSettin
                     s.registration_mode = m.to_string();
                 }
             }
+        } else if k == "storage_quota_mb" {
+            if let Some(q) = v.as_i64() {
+                if (0..=QUOTA_MAX_MB).contains(&q) {
+                    s.storage_quota_mb = q;
+                }
+            }
         }
     }
     Ok(s)
@@ -60,6 +72,8 @@ pub async fn load(executor: impl sqlx::PgExecutor<'_>) -> AppResult<ServerSettin
 pub struct UpdateSettingsReq {
     /// 部分更新：缺省字段不改
     pub registration_mode: Option<String>,
+    /// 每用户附件存储上限（MB，0 = 不限）；带值时必须为合法整数
+    pub storage_quota_mb: Option<serde_json::Value>,
 }
 
 /// 按 patch 逐键 UPSERT（记录 updated_by），返回完整设置
@@ -81,6 +95,22 @@ pub async fn update(
                 SET value = EXCLUDED.value, updated_at = now(), updated_by = EXCLUDED.updated_by",
         )
         .bind(m)
+        .bind(updated_by)
+        .execute(&mut **tx)
+        .await?;
+    }
+    if let Some(v) = &req.storage_quota_mb {
+        let q = v
+            .as_i64()
+            .filter(|q| (0..=QUOTA_MAX_MB).contains(q))
+            .ok_or_else(|| AppError::bad_request("storage_quota_mb 必须是 0-1048576 的整数"))?;
+        sqlx::query(
+            "INSERT INTO server_settings (key, value, updated_by)
+             VALUES ('storage_quota_mb', to_jsonb($1::bigint), $2)
+             ON CONFLICT (key) DO UPDATE
+                SET value = EXCLUDED.value, updated_at = now(), updated_by = EXCLUDED.updated_by",
+        )
+        .bind(q)
         .bind(updated_by)
         .execute(&mut **tx)
         .await?;
