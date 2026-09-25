@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { admin } from "../api";
 import { useApp } from "../store";
 import type { AdminOverview, AdminUserView } from "../types";
+import AdminSettings from "./AdminSettings";
 
 const PAGE = 50;
 
@@ -77,6 +78,8 @@ export default function AdminPanel() {
           {stat("附件", `${ov.attachment_count}（${fmtBytes(ov.attachment_bytes)}）`)}
         </div>
       )}
+
+      <AdminSettings />
 
       <div className="card">
         <div className="ad-toolbar">

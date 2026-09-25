@@ -50,6 +50,9 @@ pub struct RegisterReq {
     pub username: String,
     pub display_name: Option<String>,
     pub password: String,
+    /// invite 模式必填；open/closed 忽略（带了也不校验、不计数）
+    #[serde(default)]
+    pub invite_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -2,6 +2,7 @@ use crate::auth;
 use crate::domain;
 use crate::error::{is_unique_violation, AppError, AppResult};
 use crate::model::*;
+use crate::settings;
 use crate::state::SharedState;
 use crate::ws;
 use axum::{
@@ -77,8 +78,18 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
         .route("/files/{id}", get(download_file))
         .route("/ws/ticket", get(ws_ticket))
         .route("/ws", get(ws::ws_handler))
+        .route("/server-info", get(settings::server_info))
         // ---------- 后台管理（admin only） ----------
         .route("/admin/overview", get(admin_overview))
+        .route(
+            "/admin/settings",
+            get(settings::get_settings).put(settings::put_settings),
+        )
+        .route(
+            "/admin/invites",
+            get(settings::list_invites).post(settings::create_invite),
+        )
+        .route("/admin/invites/{id}", delete(settings::revoke_invite))
         .route("/admin/users", get(admin_users))
         .route("/admin/users/{id}/disable", post(admin_disable))
         .route("/admin/users/{id}/enable", post(admin_enable))
@@ -186,15 +197,43 @@ async fn register(
 
     let hash = auth::hash_password(&req.password)?;
     let mut tx = st.pool.begin().await?;
+
+    // 注册闸门：判断与插入在同一事务内（不留竞态窗口）。
+    // 空库放行（首个用户仍是管理员引导路径）；非空库按 registration_mode 校验。
+    let mut invite_id = None;
+    if sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users)")
+        .fetch_one(&mut *tx)
+        .await?
+    {
+        match settings::load(&mut *tx).await?.registration_mode.as_str() {
+            settings::MODE_CLOSED => {
+                return Err(AppError::forbidden("管理员已关闭注册"));
+            }
+            settings::MODE_INVITE => {
+                let code = req
+                    .invite_code
+                    .as_deref()
+                    .map(settings::normalize_code)
+                    .filter(|c| !c.is_empty())
+                    .ok_or_else(|| AppError::forbidden("邀请码无效或已失效"))?;
+                invite_id = Some(settings::consume_invite(&mut *tx, &code).await?);
+            }
+            // open（含未知值兜底）：忽略 invite_code，不校验不计数
+            _ => {}
+        }
+    }
+
     let row = sqlx::query_as::<_, UserRow>(
-        "INSERT INTO users (username, display_name, password_hash, role)
+        "INSERT INTO users (username, display_name, password_hash, role, invite_id)
          SELECT $1, $2, $3,
-                CASE WHEN NOT EXISTS(SELECT 1 FROM users) THEN 'admin' ELSE 'user' END
+                CASE WHEN NOT EXISTS(SELECT 1 FROM users) THEN 'admin' ELSE 'user' END,
+                $4
          RETURNING *",
     )
     .bind(username)
     .bind(&display_name)
     .bind(&hash)
+    .bind(invite_id)
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| {

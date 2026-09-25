@@ -5,6 +5,7 @@ pub mod db;
 pub mod domain;
 pub mod error;
 pub mod model;
+pub mod settings;
 pub mod state;
 pub mod ws;
 
