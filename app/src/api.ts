@@ -4,10 +4,14 @@ import type {
   AttachmentView,
   AuthResponse,
   ConversationDetail,
+  ConversationPref,
+  ConversationPrefEntry,
   ConversationView,
+  CreatePollReq,
   FriendView,
   MessagesPage,
   MessageView,
+  PrefUpdate,
   RequestsView,
   UserPublic,
 } from "./types";
@@ -23,7 +27,11 @@ export function getServer(): string {
   return (localStorage.getItem(LS_SERVER) ?? "").replace(/\/+$/, "");
 }
 export function setServer(url: string) {
-  localStorage.setItem(LS_SERVER, url.trim().replace(/\/+$/, ""));
+  const next = url.trim().replace(/\/+$/, "");
+  if (next !== getServer()) {
+    localStorage.setItem(LS_SERVER, next);
+    sessionGen++; // 服务器切换：旧服务器的异步结果一律作废
+  }
 }
 export function wsBase(): string {
   const s = getServer() || location.origin;
@@ -31,10 +39,17 @@ export function wsBase(): string {
 }
 
 // ---------- 会话凭据 ----------
+// 会话代次：登录/登出/换服务器都会 +1；异步回调先比对代次再落地，防旧账号结果污染新账号
+let sessionGen = 0;
+export function session(): number {
+  return sessionGen;
+}
+
 export function saveSession(r: AuthResponse) {
   localStorage.setItem(LS_ACCESS, r.access_token);
   localStorage.setItem(LS_REFRESH, r.refresh_token);
   localStorage.setItem(LS_USER, JSON.stringify(r.user));
+  sessionGen++; // 新登录 = 新会话
 }
 export function loadSession(): { user: UserPublic } | null {
   const u = localStorage.getItem(LS_USER);
@@ -49,6 +64,7 @@ export function clearSession() {
   localStorage.removeItem(LS_ACCESS);
   localStorage.removeItem(LS_REFRESH);
   localStorage.removeItem(LS_USER);
+  sessionGen++; // 登出 = 旧会话作废
 }
 
 export class ApiError extends Error {
@@ -59,51 +75,74 @@ export class ApiError extends Error {
   }
 }
 
-let refreshing: Promise<boolean> | null = null;
+let refreshing: { gen: number; promise: Promise<boolean> } | null = null;
 
-async function tryRefresh(): Promise<boolean> {
+function requireSession(gen: number) {
+  if (gen !== session()) throw new ApiError(0, "session changed");
+}
+
+async function tryRefresh(gen: number, srv: string): Promise<boolean> {
+  requireSession(gen);
+  if (refreshing?.gen === gen) return refreshing.promise;
   const rt = localStorage.getItem(LS_REFRESH);
   if (!rt) return false;
-  refreshing ??= (async () => {
+  const owner = { gen, promise: Promise.resolve(false) };
+  refreshing = owner;
+  owner.promise = (async () => {
     try {
-      const res = await fetch(`${getServer()}/v1/auth/refresh`, {
+      const res = await fetch(`${srv}/v1/auth/refresh`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ refresh_token: rt }),
       });
       if (!res.ok) return false;
       const r: AuthResponse = await res.json();
-      saveSession(r);
+      // 期间发生了登录/登出/换服务器：不能把旧凭据写回新会话
+      if (gen !== session() || localStorage.getItem(LS_REFRESH) !== rt || getServer() !== srv) return false;
+      localStorage.setItem(LS_ACCESS, r.access_token);
+      localStorage.setItem(LS_REFRESH, r.refresh_token);
+      localStorage.setItem(LS_USER, JSON.stringify(r.user));
       return true;
     } catch {
       return false;
     } finally {
-      setTimeout(() => (refreshing = null), 0);
+      setTimeout(() => { if (refreshing === owner) refreshing = null; }, 0);
     }
   })();
-  return refreshing;
+  return owner.promise;
 }
 
-async function raw(path: string, init?: RequestInit): Promise<Response> {
+async function raw(srv: string, path: string, init?: RequestInit): Promise<Response> {
   const headers: Record<string, string> = {
     ...(init?.headers as Record<string, string>),
   };
   const at = localStorage.getItem(LS_ACCESS);
   if (at) headers["authorization"] = `Bearer ${at}`;
-  if (init?.body) headers["Content-Type"] = "application/json";
-  return fetch(`${getServer()}/v1${path}`, { ...init, headers });
+  if (typeof init?.body === "string") headers["Content-Type"] = "application/json";
+  return fetch(`${srv}/v1${path}`, { ...init, headers });
 }
 
-async function call<T>(path: string, init?: RequestInit, retried = false): Promise<T> {
-  const res = await raw(path, init);
-  if (res.status === 401 && !retried) {
-    if (await tryRefresh()) return call<T>(path, init, true);
-    clearSession();
-    window.dispatchEvent(new Event("chat:logout"));
-    throw new ApiError(401, "unauthorized");
+async function call<T>(path: string, init?: RequestInit): Promise<T> {
+  const gen = session();
+  const srv = getServer();
+  let res = await raw(srv, path, init);
+  requireSession(gen);
+  if (res.status === 401) {
+    const refreshed = await tryRefresh(gen, srv);
+    requireSession(gen);
+    if (refreshed) {
+      res = await raw(srv, path, init);
+      requireSession(gen);
+    }
+    if (!refreshed || res.status === 401) {
+      clearSession();
+      window.dispatchEvent(new Event("chat:logout"));
+      throw new ApiError(401, "unauthorized");
+    }
   }
   if (res.status === 204) return undefined as T;
   const text = await res.text();
+  requireSession(gen);
   if (!res.ok) {
     let msg = text;
     try {
@@ -120,6 +159,11 @@ const get = <T>(p: string) => call<T>(p);
 const del = <T>(p: string) => call<T>(p, { method: "DELETE" });
 const patch = <T>(p: string, body: unknown) =>
   call<T>(p, { method: "PATCH", body: JSON.stringify(body) });
+const put = <T>(p: string, body?: unknown) =>
+  call<T>(p, {
+    method: "PUT",
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
 
 // ---------- auth ----------
 export const auth = {
@@ -158,8 +202,8 @@ export const convs = {
   detail: (id: string) => get<ConversationDetail>(`/conversations/${id}`),
   messages: (id: string, opts?: { before_seq?: number; after_seq?: number; limit?: number }) => {
     const p = new URLSearchParams();
-    if (opts?.before_seq) p.set("before_seq", String(opts.before_seq));
-    if (opts?.after_seq) p.set("after_seq", String(opts.after_seq));
+    if (opts?.before_seq != null) p.set("before_seq", String(opts.before_seq));
+    if (opts?.after_seq != null) p.set("after_seq", String(opts.after_seq));
     p.set("limit", String(opts?.limit ?? 50));
     return get<MessagesPage>(`/conversations/${id}/messages?${p}`);
   },
@@ -175,7 +219,51 @@ export const convs = {
   dissolve: (id: string) => del<void>(`/conversations/${id}`),
   transfer: (id: string, uid: string) =>
     post(`/conversations/${id}/transfer`, { user_id: uid }),
+  /** 全量偏好（列表已带 preference，一般无需单独拉） */
+  preferences: () => get<ConversationPrefEntry[]>("/conversations/preferences"),
+  /** 更新本人偏好：只传要改的字段；返回最新偏好（幂等覆写） */
+  setPref: (id: string, body: PrefUpdate) =>
+    put<ConversationPref>(`/conversations/${id}/preferences`, body),
   ticket: () => get<{ ticket: string; expires_in: number }>("/ws/ticket"),
+};
+
+// ---------- 消息生命周期 ----------
+// mutation 全部服务端确认后更新（不乐观回滚）；client_op_id 为 UUID 幂等键，
+// 操作结果未知时只能用原 id 重试。reaction/删除响应带 edit_version 供版本合并。
+export const msgs = {
+  edit: (id: string, content: string, expected_version: number, client_op_id?: string) =>
+    patch<MessageView>(`/messages/${id}`, { content, expected_version, client_op_id }),
+  remove: (id: string, client_op_id?: string) =>
+    del<MessageView>(
+      `/messages/${id}${client_op_id ? `?client_op_id=${client_op_id}` : ""}`,
+    ),
+  react: (id: string, emoji: string, add: boolean, client_op_id?: string) => {
+    const q = client_op_id ? `?client_op_id=${client_op_id}` : "";
+    const p = `/messages/${id}/reactions/${encodeURIComponent(emoji)}${q}`;
+    return add ? put<MessageView>(p) : del<MessageView>(p);
+  },
+  /** 重连批量回刷缓存消息（每批 ≤100 个 id） */
+  refresh: (convId: string, ids: string[]) =>
+    post<MessagesPage>(`/conversations/${convId}/messages/refresh`, { ids }),
+};
+
+// ---------- 轻量投票 ----------
+// mutation 走 REST（服务端确认后更新）；同步靠既有 message / message_updated 广播帧。
+export const polls = {
+  /** 创建投票（仅群聊）；client_msg_id 为发送幂等键（重试收敛同一消息） */
+  create: (convId: string, body: CreatePollReq) =>
+    post<MessageView>(`/conversations/${convId}/polls`, body),
+  /** 替换本人选择集合；空数组 = 撤票。返回本人视角完整 MessageView */
+  vote: (msgId: string, optionIds: string[], client_op_id?: string) =>
+    put<MessageView>(`/messages/${msgId}/poll/votes`, {
+      option_ids: optionIds,
+      client_op_id,
+    }),
+  /** 关闭投票（创建者或群主；幂等） */
+  close: (msgId: string, client_op_id?: string) =>
+    post<MessageView>(
+      `/messages/${msgId}/poll/close${client_op_id ? `?client_op_id=${client_op_id}` : ""}`,
+    ),
 };
 
 // ---------- files ----------
@@ -187,22 +275,7 @@ export const files = {
     const fd = new FormData();
     fd.append("conversation_id", conversationId);
     fd.append("file", file, file.name);
-    const at = localStorage.getItem(LS_ACCESS);
-    const res = await fetch(`${getServer()}/v1/files`, {
-      method: "POST",
-      headers: at ? { authorization: `Bearer ${at}` } : {},
-      body: fd,
-    });
-    if (res.status === 401 && (await tryRefresh())) return files.upload(conversationId, file);
-    if (!res.ok) {
-      const text = await res.text();
-      let msg = text;
-      try {
-        msg = JSON.parse(text).error ?? text;
-      } catch {}
-      throw new ApiError(res.status, msg);
-    }
-    return res.json() as Promise<AttachmentView>;
+    return call<AttachmentView>("/files", { method: "POST", body: fd });
   },
 };
 

@@ -128,6 +128,45 @@ input:focus, textarea:focus { border-color: var(--green); }
   background: var(--danger); color: #fff; font-size: 10px;
   border-radius: 8px; padding: 1px 6px; min-width: 16px; text-align: center;
 }
+/* 静音会话未读数仍照常更新，仅弱化为灰底（@我 标记不受影响） */
+.unread.muted { background: var(--muted); }
+
+/* ---------- 会话偏好（置顶/静音/归档） ---------- */
+.conv-tabs { display: flex; gap: 4px; padding: 6px 10px; border-bottom: 1px solid var(--line); }
+.conv-tabs button {
+  flex: 1; border: none; background: transparent; padding: 5px 0;
+  border-radius: 5px; color: var(--muted); font-size: 12px;
+}
+.conv-tabs button.on { background: var(--bg); color: var(--text); font-weight: 600; }
+.conv-flag { margin-right: 3px; font-size: 11px; }
+.conv-menu-btn {
+  display: none; position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+  width: 26px; font-size: 14px; border: none; background: transparent;
+}
+.conv-item { position: relative; }
+.conv-item:hover .conv-menu-btn,
+.conv-menu-btn:focus-visible { display: block; }
+.ctx-item { display: block; width: 100%; }
+button.ctx-item { border: none; background: transparent; text-align: left; }
+button.ctx-item:hover { background: var(--bg); }
+.ctx-err { color: var(--danger); font-size: 12px; padding: 6px 14px; }
+
+/* ---------- 应用内新消息提示（点击打开会话） ---------- */
+.toasts {
+  position: fixed; top: 14px; right: 14px; z-index: 300;
+  display: flex; flex-direction: column; gap: 8px; max-width: 300px;
+}
+.toast {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.14); padding: 9px 12px;
+  text-align: left; cursor: pointer;
+}
+.toast b { font-size: 13px; }
+.toast span {
+  color: var(--muted); font-size: 12px; max-width: 270px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 
 /* ---------- 聊天窗 ---------- */
 .chat-view { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
@@ -352,3 +391,112 @@ input:focus, textarea:focus { border-color: var(--green); }
 .ad-actions .danger { color: var(--danger, #d33); border-color: var(--danger, #d33); }
 .ad-empty { text-align: center; padding: 20px; }
 .ad-pager { display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 10px; }
+
+/* ---------- 消息生命周期 ---------- */
+.bubble-wrap { position: relative; display: inline-block; max-width: 100%; }
+.msg-actions {
+  position: absolute; top: -15px; right: 6px; z-index: 20;
+  display: none; align-items: center; gap: 1px; padding: 2px;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 6px; box-shadow: 0 2px 8px rgba(0,0,0,0.10);
+}
+.msg-row.mine .msg-actions { right: auto; left: 6px; }
+.msg-row:hover .msg-actions,
+.msg-actions:focus-within,
+.msg-actions.open { display: flex; }
+.msg-actions button {
+  border: none; background: transparent; cursor: pointer;
+  font-size: 13px; padding: 4px 7px; border-radius: 4px; line-height: 1.2;
+}
+.msg-actions button:hover { background: var(--bg); }
+.msg-actions button:disabled { opacity: 0.5; cursor: default; }
+.rx-pick { font-size: 15px; }
+
+/* 软删除墓碑 */
+.bubble.deleted {
+  color: var(--muted); font-style: italic;
+  background: var(--bg); border: 1px dashed var(--line);
+  box-shadow: none;
+}
+.edited-mark { color: var(--muted); font-size: 11px; margin-left: 6px; }
+
+/* 回复引用块（气泡内顶部，点击跳转原消息） */
+.reply-quote {
+  display: block; width: 100%; text-align: left; cursor: pointer;
+  border: none; border-left: 3px solid var(--accent, var(--green));
+  background: rgba(0,0,0,0.05); border-radius: 4px;
+  padding: 4px 8px; margin-bottom: 5px; font-size: 12px;
+}
+.msg-row.mine .reply-quote { background: rgba(255,255,255,0.18); }
+.rq-name { display: block; font-weight: 600; font-size: 11px; color: var(--muted); }
+.rq-text {
+  display: block; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 340px;
+}
+.msg-row.mine .rq-name, .msg-row.mine .rq-text { color: inherit; opacity: 0.75; }
+
+/* reaction 聚合条 */
+.reactions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.msg-row.mine .reactions { justify-content: flex-end; }
+.rx-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  border: 1px solid var(--line); background: var(--panel);
+  border-radius: 12px; padding: 2px 8px; font-size: 12px; cursor: pointer;
+}
+.rx-chip:hover { background: var(--bg); }
+.rx-chip.me { border-color: var(--accent, var(--green)); background: #e8f5ec; }
+.rx-chip:disabled { opacity: 0.55; cursor: default; }
+.rx-count { color: var(--muted); font-size: 11px; }
+.rx-chip.me .rx-count { color: inherit; }
+
+/* composer 回复/编辑横幅与 mutation 错误 */
+.composer-banner {
+  display: flex; align-items: center; gap: 8px;
+  border-left: 3px solid var(--accent, var(--green));
+  background: var(--bg); border-radius: 4px; padding: 6px 10px; font-size: 12px;
+}
+.composer-banner.editing { border-left-color: #d9a441; }
+.cb-label { font-weight: 600; white-space: nowrap; }
+.cb-text {
+  color: var(--muted); flex: 1;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mut-err { color: var(--danger); font-size: 12px; }
+
+/* ---------- 投票卡片 ---------- */
+.poll-card { min-width: 220px; max-width: 320px; }
+.poll-q { font-weight: 600; line-height: 1.4; word-break: break-word; }
+.poll-ic { margin-right: 4px; }
+.poll-meta { color: var(--muted); font-size: 11px; margin: 2px 0 8px; }
+.poll-opt {
+  position: relative; display: flex; align-items: center; gap: 6px;
+  width: 100%; text-align: left; border: 1px solid var(--line);
+  border-radius: 6px; padding: 7px 10px; margin-top: 6px;
+  background: var(--panel); overflow: hidden; font-size: 13px;
+}
+.poll-opt:hover:not(:disabled) { border-color: var(--green); }
+.poll-opt:disabled { cursor: default; opacity: 0.8; }
+.poll-opt.mine { border-color: var(--green); }
+.poll-fill {
+  position: absolute; inset: 0 auto 0 0; background: #e8f5ec;
+  pointer-events: none;
+}
+.poll-label { position: relative; flex: 1; word-break: break-word; }
+.poll-count { position: relative; color: var(--muted); font-size: 11px; white-space: nowrap; }
+.poll-foot {
+  display: flex; align-items: center; gap: 10px; margin-top: 8px;
+  color: var(--muted); font-size: 11px;
+}
+.poll-act {
+  border: none; background: none; padding: 0; color: #576b95;
+  font-size: 12px; cursor: pointer;
+}
+.poll-act:hover { background: none; text-decoration: underline; }
+.poll-act:disabled { opacity: 0.5; }
+.poll-opts-edit { max-height: 260px; overflow-y: auto; }
+.poll-opt-row input { flex: 1; }
+.poll-add {
+  border: 1px dashed var(--line); background: none; width: 100%;
+  color: var(--muted); padding: 7px; margin-top: 4px;
+}
+.poll-add:hover { color: var(--text); border-color: var(--green); }

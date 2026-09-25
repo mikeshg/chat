@@ -5,10 +5,10 @@ use crate::model::*;
 use crate::state::SharedState;
 use crate::ws;
 use axum::{
-    extract::{ConnectInfo, Multipart, Path, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
@@ -18,7 +18,13 @@ use std::net::SocketAddr;
 use std::time::Instant;
 use uuid::Uuid;
 
-pub fn router() -> Router<SharedState> {
+/// multipart 边界/表单字段/文件头的额外余量；文件本体仍由流式检查卡 upload_max_bytes
+const UPLOAD_BODY_MARGIN: usize = 1024 * 1024;
+
+/// 账号管理操作（角色/禁用）的事务级顾问锁：串行化，防止并发降权越过末位保护
+const ADMIN_LOCK_KEY: i64 = 0x63_68_61_74_61_64_6D_69; // "chatadmi"
+
+pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
     Router::new()
         .route("/auth/register", post(register))
         .route("/auth/login", post(login))
@@ -32,6 +38,7 @@ pub fn router() -> Router<SharedState> {
         .route("/friends/requests/{id}/accept", post(accept_request))
         .route("/friends/requests/{id}/decline", post(decline_request))
         .route("/conversations", get(list_conversations))
+        .route("/conversations/preferences", get(list_preferences))
         .route("/conversations/group", post(create_group))
         .route(
             "/conversations/{id}",
@@ -41,11 +48,32 @@ pub fn router() -> Router<SharedState> {
         )
         .route("/conversations/{id}/messages", get(list_messages))
         .route("/conversations/{id}/messages/search", get(search_messages))
+        .route(
+            "/conversations/{id}/messages/refresh",
+            post(refresh_messages),
+        )
+        .route("/conversations/{id}/preferences", put(put_preferences))
+        .route(
+            "/messages/{id}",
+            axum::routing::patch(edit_message).delete(delete_message),
+        )
+        .route(
+            "/messages/{id}/reactions/{emoji}",
+            put(reaction_add).delete(reaction_remove),
+        )
+        .route("/conversations/{id}/polls", post(create_poll))
+        .route("/messages/{id}/poll/votes", put(vote_poll))
+        .route("/messages/{id}/poll/close", post(close_poll))
         .route("/conversations/{id}/members", post(add_members))
         .route("/conversations/{id}/members/me", delete(leave_conversation))
         .route("/conversations/{id}/members/{uid}", delete(kick_member))
         .route("/conversations/{id}/transfer", post(transfer_ownership))
-        .route("/files", post(upload_file))
+        .route(
+            "/files",
+            post(upload_file).layer(DefaultBodyLimit::max(
+                cfg.upload_max_bytes + UPLOAD_BODY_MARGIN,
+            )),
+        )
         .route("/files/{id}", get(download_file))
         .route("/ws/ticket", get(ws_ticket))
         .route("/ws", get(ws::ws_handler))
@@ -67,6 +95,34 @@ fn notify(st: &SharedState, uids: &[Uuid], what: &'static str) {
     st.send_to_users(uids, &payload);
 }
 
+/// 消息 mutation 的领域拒绝 → HTTP 状态（WS 侧走 PostError::into_ws 错误帧）。
+fn post_err(e: domain::PostError) -> AppError {
+    match e {
+        domain::PostError::Deny { code, message } => match code {
+            "forbidden" | "not_friends" => AppError::forbidden(message),
+            "not_found" => AppError::not_found(message),
+            "conflict" => AppError::conflict(message),
+            _ => AppError::bad_request(message),
+        },
+        domain::PostError::Db(e) => e.into(),
+    }
+}
+
+/// 软删除后异步清理已无引用的附件物理文件（失败只记日志：行已删，下载已失效）。
+pub fn spawn_file_cleanup(st: &SharedState, paths: Vec<String>) {
+    if paths.is_empty() {
+        return;
+    }
+    let files_dir = st.cfg.files_dir.clone();
+    tokio::spawn(async move {
+        for p in paths {
+            let fp = stored_file_path(&files_dir, &p);
+            if let Err(e) = tokio::fs::remove_file(&fp).await {
+                tracing::warn!(path = %fp.display(), error = %e, "orphan attachment cleanup failed");
+            }
+        }
+    });
+}
 
 /// 关系建立后补发 presence：to 立刻看到 from 的真实在线状态
 async fn push_presence(st: &SharedState, from: Uuid, to: Uuid) {
@@ -129,6 +185,7 @@ async fn register(
         .to_string();
 
     let hash = auth::hash_password(&req.password)?;
+    let mut tx = st.pool.begin().await?;
     let row = sqlx::query_as::<_, UserRow>(
         "INSERT INTO users (username, display_name, password_hash, role)
          SELECT $1, $2, $3,
@@ -138,7 +195,7 @@ async fn register(
     .bind(username)
     .bind(&display_name)
     .bind(&hash)
-    .fetch_one(&st.pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
         if is_unique_violation(&e) {
@@ -148,8 +205,8 @@ async fn register(
         }
     })?;
 
-    let user = UserPublic::from(&row);
-    let res = auth::issue_tokens(&st.pool, &st.cfg, &user, None).await?;
+    let res = auth::issue_tokens(&mut *tx, &st.cfg, &row, None).await?;
+    tx.commit().await?;
     Ok(Json(res))
 }
 
@@ -159,9 +216,10 @@ async fn login(
     Json(req): Json<LoginReq>,
 ) -> AppResult<Json<AuthResponse>> {
     rate_limit(&st, format!("login:{}", addr.ip()))?;
-    let row = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE username = $1")
+    let mut tx = st.pool.begin().await?;
+    let row = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE username = $1 FOR UPDATE")
         .bind(req.username.trim())
-        .fetch_optional(&st.pool)
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::unauthorized("invalid credentials"))?;
 
@@ -171,10 +229,9 @@ async fn login(
     if row.disabled_at.is_some() {
         return Err(AppError::forbidden("账号已被禁用"));
     }
-    let user = UserPublic::from(&row);
-    Ok(Json(
-        auth::issue_tokens(&st.pool, &st.cfg, &user, None).await?,
-    ))
+    let res = auth::issue_tokens(&mut *tx, &st.cfg, &row, None).await?;
+    tx.commit().await?;
+    Ok(Json(res))
 }
 
 async fn refresh(
@@ -182,47 +239,71 @@ async fn refresh(
     Json(req): Json<RefreshReq>,
 ) -> AppResult<Json<AuthResponse>> {
     let hash = auth::refresh_hash(&req.refresh_token);
-    let tok = sqlx::query_as::<_, (Uuid, Uuid, DateTime<Utc>, Option<DateTime<Utc>>)>(
-        "SELECT id, user_id, expires_at, revoked_at FROM refresh_tokens WHERE token_hash = $1",
+    let mut tx = st.pool.begin().await?;
+    // 先定位用户，再按 user → refresh 顺序加锁，与改密/禁用串行化。
+    let user_id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT user_id FROM refresh_tokens
+          WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()",
     )
     .bind(&hash)
-    .fetch_optional(&st.pool)
-    .await?
-    .ok_or_else(|| AppError::unauthorized("invalid refresh token"))?;
+    .fetch_optional(&mut *tx)
+    .await?;
 
-    let (tok_id, user_id, expires_at, revoked_at) = tok;
-    if revoked_at.is_some() || expires_at < Utc::now() {
-        return Err(AppError::unauthorized("refresh token expired"));
-    }
-    sqlx::query("UPDATE refresh_tokens SET revoked_at = now() WHERE id = $1")
-        .bind(tok_id)
-        .execute(&st.pool)
-        .await?;
+    let Some(user_id) = user_id else {
+        // 统一 401：不区分「从未签发」与「已撤销/过期」，避免令牌状态探测。
+        // 失败路径不再向 pool 借第二个连接（本函数只持有这一个事务连接），
+        // 并发非法 refresh 不会把连接池拖死。
+        return Err(AppError::unauthorized("invalid refresh token"));
+    };
 
-    let row = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE id = $1")
+    let row = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE id = $1 FOR UPDATE")
         .bind(user_id)
-        .fetch_one(&st.pool)
+        .fetch_one(&mut *tx)
         .await?;
+    // 等待用户锁期间可能已被撤销；锁内重检并轮换，失败回滚旧 token。
+    let revoked = sqlx::query(
+        "UPDATE refresh_tokens SET revoked_at = now()
+          WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()",
+    )
+    .bind(&hash)
+    .execute(&mut *tx)
+    .await?;
+    if revoked.rows_affected() == 0 {
+        return Err(AppError::unauthorized("invalid refresh token"));
+    }
     if row.disabled_at.is_some() {
+        tx.commit().await?;
         return Err(AppError::forbidden("账号已被禁用"));
     }
-    let user = UserPublic::from(&row);
-    Ok(Json(
-        auth::issue_tokens(&st.pool, &st.cfg, &user, None).await?,
-    ))
+    let res = auth::issue_tokens(&mut *tx, &st.cfg, &row, None).await?;
+    tx.commit().await?;
+    Ok(Json(res))
 }
 
 async fn logout(
     State(st): State<SharedState>,
     Json(req): Json<LogoutReq>,
 ) -> AppResult<StatusCode> {
-    sqlx::query(
-        "UPDATE refresh_tokens SET revoked_at = now()
-         WHERE token_hash = $1 AND revoked_at IS NULL",
-    )
-    .bind(auth::refresh_hash(&req.refresh_token))
-    .execute(&st.pool)
-    .await?;
+    let hash = auth::refresh_hash(&req.refresh_token);
+    let mut tx = st.pool.begin().await?;
+    let uid = sqlx::query_scalar::<_, Uuid>("SELECT user_id FROM refresh_tokens WHERE token_hash = $1")
+        .bind(&hash)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if let Some(uid) = uid {
+        sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+            .bind(uid)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE refresh_tokens SET revoked_at = now()
+             WHERE token_hash = $1 AND revoked_at IS NULL",
+        )
+        .bind(&hash)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -273,7 +354,7 @@ async fn search_user(
     if needle.is_empty() {
         return Ok(Json(vec![]));
     }
-        let esc = needle
+    let esc = needle
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_");
@@ -429,10 +510,10 @@ async fn create_request(
     let to = sqlx::query_as::<_, UserRow>(
         "SELECT * FROM users WHERE username = $1 AND disabled_at IS NULL",
     )
-        .bind(req.username.trim())
-        .fetch_optional(&st.pool)
-        .await?
-        .ok_or_else(|| AppError::not_found("user not found"))?;
+    .bind(req.username.trim())
+    .fetch_optional(&st.pool)
+    .await?
+    .ok_or_else(|| AppError::not_found("user not found"))?;
 
     if to.id == uid {
         return Err(AppError::bad_request("cannot add yourself"));
@@ -455,14 +536,28 @@ async fn create_request(
         return Ok(Json(json!({ "status": "accepted" })));
     }
 
-    let msg = req.message.trim();
+    // 同方向已被拒绝过 → 不再接受重复申请（除非对方重新发起，由上面的 reverse 分支接住）
+    let declined = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM friend_requests
+         WHERE from_user = $1 AND to_user = $2 AND status = 'declined')",
+    )
+    .bind(uid)
+    .bind(to.id)
+    .fetch_one(&st.pool)
+    .await?;
+    if declined {
+        return Err(AppError::conflict("对方已拒绝过你的好友申请"));
+    }
+
+    // 字符级截断：按字节切中文会落在 UTF-8 边界中间直接 panic
+    let msg: String = req.message.trim().chars().take(200).collect();
     let id = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO friend_requests (from_user, to_user, message)
          VALUES ($1, $2, $3) RETURNING id",
     )
     .bind(uid)
     .bind(to.id)
-    .bind(if msg.len() > 200 { &msg[..200] } else { msg })
+    .bind(&msg)
     .fetch_one(&st.pool)
     .await
     .map_err(|e| {
@@ -535,17 +630,17 @@ async fn decline_request(
     Path(req_id): Path<Uuid>,
 ) -> AppResult<StatusCode> {
     let uid = uid_of(&headers, &st).await?;
-    let res = sqlx::query(
+    let from_user = sqlx::query_scalar::<_, Uuid>(
         "UPDATE friend_requests SET status = 'declined', resolved_at = now()
-         WHERE id = $1 AND to_user = $2 AND status = 'pending'",
+         WHERE id = $1 AND to_user = $2 AND status = 'pending'
+         RETURNING from_user",
     )
     .bind(req_id)
     .bind(uid)
-    .execute(&st.pool)
-    .await?;
-    if res.rows_affected() == 0 {
-        return Err(AppError::not_found("request not found or resolved"));
-    }
+    .fetch_optional(&st.pool)
+    .await?
+    .ok_or_else(|| AppError::not_found("request not found or resolved"))?;
+    notify(&st, &[uid, from_user], "requests");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -575,6 +670,24 @@ struct ConvRow {
     m_content: Option<String>,
     m_kind: Option<String>,
     m_created_at: Option<DateTime<Utc>>,
+    m_att_id: Option<Uuid>,
+    m_att_name: Option<String>,
+    m_att_mime: Option<String>,
+    m_att_size: Option<i64>,
+    m_mentions: Option<Vec<Uuid>>,
+    m_reply_to_id: Option<Uuid>,
+    m_reply_to: Option<sqlx::types::Json<ReplyPreview>>,
+    m_edited_at: Option<DateTime<Utc>>,
+    m_edit_version: Option<i32>,
+    m_deleted_at: Option<DateTime<Utc>>,
+    m_reactions: Option<sqlx::types::Json<Vec<domain::ReactionAgg>>>,
+    m_poll: Option<sqlx::types::Json<domain::PollAgg>>,
+    // 本人偏好（conversation_preferences 左连接，无行则全 NULL/false）
+    p_pinned_at: Option<DateTime<Utc>>,
+    p_archived_at: Option<DateTime<Utc>>,
+    p_muted_until: Option<DateTime<Utc>>,
+    p_mute_forever: Option<bool>,
+    p_updated_at: Option<DateTime<Utc>>,
 }
 
 async fn list_conversations(
@@ -592,23 +705,51 @@ async fn list_conversations(
                 p.id AS peer_id, p.username::text AS peer_username, p.display_name AS peer_display,
                 p.role AS peer_role, p.last_seen_at AS peer_last_seen,
                 lm.id AS m_id, lm.seq AS m_seq, lm.sender_id AS m_sender_id,
-                su.username::text AS m_sender_username, su.display_name AS m_sender_name,
-                lm.content AS m_content, lm.kind AS m_kind, lm.created_at AS m_created_at
+                lm.sender_username AS m_sender_username, lm.sender_name AS m_sender_name,
+                lm.content AS m_content, lm.kind AS m_kind, lm.created_at AS m_created_at,
+                lm.att_id AS m_att_id, lm.att_name AS m_att_name, lm.att_mime AS m_att_mime,
+                lm.att_size AS m_att_size, lm.mentions AS m_mentions,
+                lm.reply_to_id AS m_reply_to_id, lm.reply_to AS m_reply_to,
+                lm.edited_at AS m_edited_at, lm.edit_version AS m_edit_version,
+                lm.deleted_at AS m_deleted_at, lm.reactions AS m_reactions,
+                lm.poll AS m_poll,
+                cp.pinned_at AS p_pinned_at, cp.archived_at AS p_archived_at,
+                cp.muted_until AS p_muted_until, cp.mute_forever AS p_mute_forever,
+                cp.updated_at AS p_updated_at
            FROM memberships m
            JOIN conversations c ON c.id = m.conversation_id
+           LEFT JOIN conversation_preferences cp
+                  ON cp.conversation_id = c.id AND cp.user_id = m.user_id
            LEFT JOIN LATERAL (
-               SELECT u.id, u.username, u.display_name, u.role, u.last_seen_at
+               SELECT u.id, u.username, u.display_name, u.role,
+                      -- last_seen_at 属于 presence：删好友后保留的只读 DM 不得继续暴露
+                      CASE WHEN EXISTS(SELECT 1 FROM friendships f
+                                        WHERE (f.user_a = $1 AND f.user_b = u.id)
+                                           OR (f.user_b = $1 AND f.user_a = u.id))
+                            OR EXISTS(SELECT 1 FROM memberships mx1
+                                       JOIN memberships mx2
+                                         ON mx1.conversation_id = mx2.conversation_id
+                                       JOIN conversations cx
+                                         ON cx.id = mx1.conversation_id AND cx.type = 'group'
+                                       WHERE mx1.user_id = $1 AND mx2.user_id = u.id)
+                           THEN u.last_seen_at END AS last_seen_at
                  FROM memberships mm JOIN users u ON u.id = mm.user_id
                 WHERE mm.conversation_id = c.id AND mm.user_id <> $1
                 LIMIT 1
            ) p ON c.type = 'dm'
            LEFT JOIN LATERAL (
-               SELECT id, seq, sender_id, content, kind, created_at FROM messages
-                WHERE conversation_id = c.id ORDER BY seq DESC LIMIT 1
+               SELECT id, seq, sender_id, sender_username, sender_name, content, kind, created_at,
+                      att_id, att_name, att_mime, att_size, mentions,
+                      reply_to_id, reply_to, edited_at, edit_version, deleted_at, reactions, poll
+                 FROM message_views
+                WHERE conversation_id = c.id
+                ORDER BY seq DESC
+                LIMIT 1
            ) lm ON true
-           LEFT JOIN users su ON su.id = lm.sender_id
           WHERE m.user_id = $1
-          ORDER BY COALESCE(lm.created_at, c.created_at) DESC",
+          -- 置顶块在前按 pinned_at DESC，块内与未置顶均按原活动时间 DESC、id 兜底
+          ORDER BY (cp.pinned_at IS NOT NULL) DESC, cp.pinned_at DESC,
+                   COALESCE(lm.created_at, c.created_at) DESC, c.id",
     )
     .bind(uid)
     .fetch_all(&st.pool)
@@ -633,9 +774,33 @@ async fn list_conversations(
                 sender_name: r.m_sender_name.unwrap_or_default(),
                 content: r.m_content.unwrap_or_default(),
                 kind: r.m_kind.unwrap_or_else(|| "text".into()),
-                attachment: None,
-                mentions: Vec::new(),
+                attachment: r.m_att_id.map(|att_id| AttachmentView {
+                    id: att_id,
+                    file_name: r.m_att_name.clone().unwrap_or_default(),
+                    mime: r.m_att_mime.clone().unwrap_or_default(),
+                    size: r.m_att_size.unwrap_or_default(),
+                }),
+                mentions: r.m_mentions.clone().unwrap_or_default(),
                 created_at: r.m_created_at.unwrap_or_else(Utc::now),
+                reply_to_id: r.m_reply_to_id,
+                reply_to_preview: r.m_reply_to.clone().map(|j| j.0),
+                edited_at: r.m_edited_at,
+                edit_version: r.m_edit_version.unwrap_or(0),
+                deleted_at: r.m_deleted_at,
+                reactions: r
+                    .m_reactions
+                    .as_ref()
+                    .map(|j| {
+                        j.0.iter()
+                            .map(|a| ReactionView {
+                                emoji: a.emoji.clone(),
+                                count: a.users.len() as i64,
+                                reacted_by_me: a.users.contains(&uid),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                poll: r.m_poll.map(|j| j.0.into_view(uid)),
             });
             ConversationView {
                 id: r.id,
@@ -648,11 +813,84 @@ async fn list_conversations(
                 unread_count: r.unread_count,
                 has_mention: r.has_mention,
                 last_message,
+                preference: ConversationPref {
+                    pinned_at: r.p_pinned_at,
+                    archived_at: r.p_archived_at,
+                    muted_until: r.p_muted_until,
+                    mute_forever: r.p_mute_forever.unwrap_or(false),
+                    updated_at: r.p_updated_at,
+                },
                 created_at: r.created_at,
             }
         })
         .collect();
     Ok(Json(out))
+}
+
+// ---------- 会话偏好（仅本人可见、同步本人全部设备） ----------
+
+/// 全量偏好列表：仅供需要时单独拉取；会话列表本身已带 preference 字段，无需 N+1。
+async fn list_preferences(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+) -> AppResult<Json<Vec<PrefEntry>>> {
+    let uid = uid_of(&headers, &st).await?;
+    let rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+            bool,
+            DateTime<Utc>,
+        ),
+    >(
+        "SELECT conversation_id, pinned_at, archived_at, muted_until, mute_forever, updated_at
+           FROM conversation_preferences WHERE user_id = $1",
+    )
+    .bind(uid)
+    .fetch_all(&st.pool)
+    .await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(
+                |(cid, pinned_at, archived_at, muted_until, mute_forever, t)| PrefEntry {
+                    conversation_id: cid,
+                    preference: ConversationPref {
+                        pinned_at,
+                        archived_at,
+                        muted_until,
+                        mute_forever,
+                        updated_at: Some(t),
+                    },
+                },
+            )
+            .collect(),
+    ))
+}
+
+/// 更新本人偏好：缺省字段不改；mute 形状/时间在领域层校验；解散/非成员 403。
+/// client_op_id 仅作契约参数（状态覆写天然幂等，无需持久化 op_id）。
+/// 成功后给本人全部连接发 preference_updated（含发起连接，幂等收敛）。
+async fn put_preferences(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(conv): Path<Uuid>,
+    Query(_q): Query<ClientOpQuery>,
+    Json(req): Json<PrefUpdateReq>,
+) -> AppResult<Json<ConversationPref>> {
+    let uid = uid_of(&headers, &st).await?;
+    let pref = domain::set_preferences(&st.pool, conv, uid, &req)
+        .await
+        .map_err(post_err)?;
+    let frame = serde_json::to_string(&WsOut::PreferenceUpdated {
+        conversation_id: conv,
+        preference: pref.clone(),
+    })
+    .unwrap();
+    st.send_to_user(uid, &frame);
+    Ok(Json(pref))
 }
 
 async fn create_group(
@@ -670,17 +908,7 @@ async fn create_group(
     if ids.is_empty() {
         return Err(AppError::bad_request("invite at least one friend"));
     }
-    let friend_count = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM friendships
-         WHERE (user_a = $1 AND user_b = ANY($2)) OR (user_b = $1 AND user_a = ANY($2))",
-    )
-    .bind(uid)
-    .bind(&ids)
-    .fetch_one(&st.pool)
-    .await?;
-    if friend_count != ids.len() as i64 {
-        return Err(AppError::forbidden("can only invite your friends"));
-    }
+    domain::ensure_friends(&st.pool, uid, &ids).await?;
 
     let name = req
         .name
@@ -769,18 +997,16 @@ async fn conversation_detail(st: &SharedState, conv: Uuid) -> AppResult<Conversa
         members: members
             .into_iter()
             .map(
-                |(id, username, display_name, urole, last_seen_at, role, joined_at)| {
-                    MemberView {
-                        user: UserPublic {
-                            id,
-                            username,
-                            display_name,
-                            role: urole,
-                            last_seen_at,
-                        },
-                        role,
-                        joined_at,
-                    }
+                |(id, username, display_name, urole, last_seen_at, role, joined_at)| MemberView {
+                    user: UserPublic {
+                        id,
+                        username,
+                        display_name,
+                        role: urole,
+                        last_seen_at,
+                    },
+                    role,
+                    joined_at,
                 },
             )
             .collect(),
@@ -814,56 +1040,12 @@ async fn list_messages(
     require_member(&st, conv, uid).await?;
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
 
-    let messages: Vec<MessageView> = if let Some(after) = q.after_seq {
-        sqlx::query_as::<_, domain::MsgViewRow>(
-            &format!(
-                "SELECT {} {} WHERE m.conversation_id = $1 AND m.seq > $2
-                   ORDER BY m.seq ASC LIMIT $3",
-                domain::MsgViewRow::SELECT,
-                domain::MsgViewRow::JOIN
-            ),
-        )
-        .bind(conv)
-        .bind(after)
-        .bind(limit)
-        .fetch_all(&st.pool)
-        .await?
-        .into_iter()
-        .map(domain::MsgViewRow::into_view)
-        .collect()
+    let messages = if let Some(after) = q.after_seq {
+        domain::messages_after(&st.pool, conv, uid, after, limit).await?
+    } else if let Some(before) = q.before_seq {
+        domain::messages_before(&st.pool, conv, uid, before, limit).await?
     } else {
-        let mut rows = if let Some(before) = q.before_seq {
-            sqlx::query_as::<_, domain::MsgViewRow>(
-                &format!(
-                    "SELECT {} {} WHERE m.conversation_id = $1 AND m.seq < $2
-                       ORDER BY m.seq DESC LIMIT $3",
-                    domain::MsgViewRow::SELECT,
-                    domain::MsgViewRow::JOIN
-                ),
-            )
-            .bind(conv)
-            .bind(before)
-            .bind(limit)
-            .fetch_all(&st.pool)
-            .await?
-        } else {
-            sqlx::query_as::<_, domain::MsgViewRow>(
-                &format!(
-                    "SELECT {} {} WHERE m.conversation_id = $1
-                       ORDER BY m.seq DESC LIMIT $2",
-                    domain::MsgViewRow::SELECT,
-                    domain::MsgViewRow::JOIN
-                ),
-            )
-            .bind(conv)
-            .bind(limit)
-            .fetch_all(&st.pool)
-            .await?
-        };
-        rows.reverse();
-        rows.into_iter()
-            .map(domain::MsgViewRow::into_view)
-            .collect()
+        domain::messages_latest(&st.pool, conv, uid, limit).await?
     };
 
     let has_more = if q.after_seq.is_some() {
@@ -873,7 +1055,6 @@ async fn list_messages(
     };
     Ok(Json(MessagesPage { messages, has_more }))
 }
-
 
 #[derive(Deserialize)]
 struct MsgSearchQuery {
@@ -895,25 +1076,173 @@ async fn search_messages(
         return Ok(Json(vec![]));
     }
     let limit = q.limit.unwrap_or(50).clamp(1, 100);
-    let esc = needle
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_");
-    let rows = sqlx::query_as::<_, domain::MsgViewRow>(&format!(
-        "SELECT {} {} WHERE m.conversation_id = $1
-           AND m.content ILIKE '%' || $2 || '%' ESCAPE '\\'
-         ORDER BY m.seq DESC LIMIT $3",
-        domain::MsgViewRow::SELECT,
-        domain::MsgViewRow::JOIN
-    ))
-    .bind(conv)
-    .bind(esc)
-    .bind(limit)
-    .fetch_all(&st.pool)
-    .await?;
     Ok(Json(
-        rows.into_iter().map(domain::MsgViewRow::into_view).collect(),
+        domain::search_messages(&st.pool, conv, uid, needle, limit).await?,
     ))
+}
+
+// ---------- 消息生命周期 REST ----------
+
+/// 重连批量刷新：按 id 回读最新状态（正文/墓碑/编辑/reaction/回复预览）。
+/// 未授权会话直接 403，客户端据此丢弃本地缓存。每批上限 100。
+async fn refresh_messages(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(conv): Path<Uuid>,
+    Json(req): Json<RefreshMessagesReq>,
+) -> AppResult<Json<MessagesPage>> {
+    let uid = uid_of(&headers, &st).await?;
+    if req.ids.len() > 100 {
+        return Err(AppError::bad_request("too many ids (max 100)"));
+    }
+    require_member(&st, conv, uid).await?;
+    let messages = domain::messages_by_ids(&st.pool, conv, uid, &req.ids).await?;
+    Ok(Json(MessagesPage {
+        messages,
+        has_more: false,
+    }))
+}
+
+/// 编辑消息：仅发送者、文本、15 分钟窗口、expected_version 乐观并发。
+/// 成功后按成员个性化广播 message_updated；REST 返回发起者视角视图。
+async fn edit_message(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(message_id): Path<Uuid>,
+    Json(req): Json<EditMessageReq>,
+) -> AppResult<Json<MessageView>> {
+    let uid = uid_of(&headers, &st).await?;
+    let ed = domain::edit_message(
+        &st.pool,
+        message_id,
+        uid,
+        &req.content,
+        req.expected_version,
+        req.client_op_id,
+    )
+    .await
+    .map_err(post_err)?;
+    ws::broadcast_message_updated(&st, &ed).await;
+    Ok(Json(ed.row.into_view(uid)))
+}
+
+/// 软删除：本人/群主权限在领域层锁内判定；重复删除幂等。
+/// client_op_id 仅作幂等契约参数（删除本身已状态幂等）。
+/// 返回发起者视角的完整墓碑视图（与 message_deleted 广播同形），发起端立即合并。
+async fn delete_message(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(message_id): Path<Uuid>,
+    Query(_q): Query<ClientOpQuery>,
+) -> AppResult<Json<MessageView>> {
+    let uid = uid_of(&headers, &st).await?;
+    let d = domain::delete_message(&st.pool, message_id, uid)
+        .await
+        .map_err(post_err)?;
+    ws::broadcast_message_deleted(&st, &d);
+    spawn_file_cleanup(&st, d.orphan_files);
+    Ok(Json(d.row.into_view(uid)))
+}
+
+async fn reaction_write(
+    st: &SharedState,
+    headers: &HeaderMap,
+    message_id: Uuid,
+    emoji: &str,
+    add: bool,
+) -> AppResult<Json<MessageView>> {
+    let uid = uid_of(headers, st).await?;
+    let ch = domain::set_reaction(&st.pool, message_id, uid, emoji, add)
+        .await
+        .map_err(post_err)?;
+    ws::broadcast_reaction_update(st, &ch);
+    // REST 响应为发起者视角的完整视图（客户端按 id+version 整视图合并）
+    Ok(Json(ch.row.into_view(uid)))
+}
+
+async fn reaction_add(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path((message_id, emoji)): Path<(Uuid, String)>,
+    Query(_q): Query<ClientOpQuery>,
+) -> AppResult<Json<MessageView>> {
+    reaction_write(&st, &headers, message_id, &emoji, true).await
+}
+
+async fn reaction_remove(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path((message_id, emoji)): Path<(Uuid, String)>,
+    Query(_q): Query<ClientOpQuery>,
+) -> AppResult<Json<MessageView>> {
+    reaction_write(&st, &headers, message_id, &emoji, false).await
+}
+
+// ---------- 轻量投票 REST ----------
+// 投票 mutation 只走 REST；同步复用现有 WS 广播（创建→message 帧，
+// 投票/关闭→message_updated 完整个性化视图），不新增 WS mutation/事件类型。
+
+/// 创建投票（仅群聊成员）：复用 post_message 单事务（seq + client_msg_id 幂等），
+/// 成功即按普通消息广播 message 帧（视图已含 poll 卡片数据），响应为发起者视角视图。
+async fn create_poll(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(conv): Path<Uuid>,
+    Json(req): Json<CreatePollReq>,
+) -> AppResult<Json<MessageView>> {
+    let uid = uid_of(&headers, &st).await?;
+    let posted = domain::create_poll(&st.pool, conv, uid, &req)
+        .await
+        .map_err(post_err)?;
+    if posted.inserted {
+        let p = serde_json::to_string(&WsOut::Message {
+            message: posted.message.clone(),
+        })
+        .unwrap();
+        st.send_to_users(&posted.member_ids, &p);
+    }
+    // 问题文本里 @到已归档成员时事务内已解档：给本人推送偏好帧（与 ws 发送路径同口径）
+    for target in &posted.unarchived {
+        if let Ok(preference) = domain::pref_of(&st.pool, conv, *target).await {
+            let f = serde_json::to_string(&WsOut::PreferenceUpdated {
+                conversation_id: conv,
+                preference,
+            })
+            .unwrap();
+            st.send_to_user(*target, &f);
+        }
+    }
+    Ok(Json(posted.message))
+}
+
+/// 投票：PUT 替换本人选择集合（空数组撤票）；广播 message_updated 逐成员个性化视图。
+async fn vote_poll(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(message_id): Path<Uuid>,
+    Json(req): Json<VotePollReq>,
+) -> AppResult<Json<MessageView>> {
+    let uid = uid_of(&headers, &st).await?;
+    let ed = domain::vote_poll(&st.pool, message_id, uid, &req.option_ids)
+        .await
+        .map_err(post_err)?;
+    ws::broadcast_message_updated(&st, &ed).await;
+    Ok(Json(ed.row.into_view(uid)))
+}
+
+/// 关闭投票：创建者或群主；重复关票幂等。client_op_id 仅作契约参数。
+async fn close_poll(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(message_id): Path<Uuid>,
+    Query(_q): Query<ClientOpQuery>,
+) -> AppResult<Json<MessageView>> {
+    let uid = uid_of(&headers, &st).await?;
+    let ed = domain::close_poll(&st.pool, message_id, uid)
+        .await
+        .map_err(post_err)?;
+    ws::broadcast_message_updated(&st, &ed).await;
+    Ok(Json(ed.row.into_view(uid)))
 }
 
 async fn add_members(
@@ -923,12 +1252,6 @@ async fn add_members(
     Json(req): Json<AddMembersReq>,
 ) -> AppResult<StatusCode> {
     let uid = uid_of(&headers, &st).await?;
-    require_member(&st, conv, uid).await?;
-    if domain::conv_kind(&st.pool, conv).await?.as_deref() != Some("group") {
-        return Err(AppError::bad_request(
-            "only group conversations accept members",
-        ));
-    }
     let ids: Vec<Uuid> = {
         let mut v: Vec<Uuid> = req.user_ids.into_iter().filter(|i| *i != uid).collect();
         v.sort();
@@ -938,26 +1261,36 @@ async fn add_members(
     if ids.is_empty() {
         return Err(AppError::bad_request("no users to add"));
     }
-    let friend_count = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM friendships
-         WHERE (user_a = $1 AND user_b = ANY($2)) OR (user_b = $1 AND user_a = ANY($2))",
-    )
-    .bind(uid)
-    .bind(&ids)
-    .fetch_one(&st.pool)
-    .await?;
-    if friend_count != ids.len() as i64 {
-        return Err(AppError::forbidden("can only invite your friends"));
+    domain::ensure_friends(&st.pool, uid, &ids).await?;
+
+    // 与解散/退群/踢人共用会话行锁：锁内重检类型、解散标记与我的成员身份，
+    // 防止「邀请」恰好落在解散与成员清空之间把人插回已解散会话。
+    let mut tx = st.pool.begin().await?;
+    let Some((kind, _, dissolved)) = domain::lock_conversation(&mut tx, conv).await? else {
+        return Err(AppError::forbidden("not a member of this conversation"));
+    };
+    if kind != "group" {
+        return Err(AppError::bad_request(
+            "only group conversations accept members",
+        ));
     }
+    if dissolved {
+        return Err(AppError::bad_request("group already dissolved"));
+    }
+    domain::membership(&mut *tx, conv, uid)
+        .await?
+        .ok_or_else(|| AppError::forbidden("not a member of this conversation"))?;
     sqlx::query(
         "INSERT INTO memberships (conversation_id, user_id, role)
          SELECT $1, unnest($2::uuid[]), 'member' ON CONFLICT DO NOTHING",
     )
     .bind(conv)
     .bind(&ids)
-    .execute(&st.pool)
+    .execute(&mut *tx)
     .await?;
-    let all = domain::member_ids(&st.pool, conv).await?;
+    let all = domain::member_ids(&mut *tx, conv).await?;
+    tx.commit().await?;
+
     notify(&st, &all, "conversations");
     // 新成员与既有成员互推在线状态
     for nid in &ids {
@@ -977,54 +1310,65 @@ async fn leave_conversation(
     Path(conv): Path<Uuid>,
 ) -> AppResult<StatusCode> {
     let uid = uid_of(&headers, &st).await?;
-    let info = require_member(&st, conv, uid).await?;
-    if domain::conv_kind(&st.pool, conv).await?.as_deref() != Some("group") {
+
+    // 全程在会话行锁内做检查与改写：转让/退群/踢人/解散互斥，杜绝零群主。
+    let mut tx = st.pool.begin().await?;
+    let Some((kind, _, _)) = domain::lock_conversation(&mut tx, conv).await? else {
+        return Err(AppError::forbidden("not a member of this conversation"));
+    };
+    if kind != "group" {
         return Err(AppError::bad_request("cannot leave a direct conversation"));
     }
-    let others = domain::member_ids(&st.pool, conv)
+    let me = domain::membership(&mut *tx, conv, uid)
         .await?
-        .into_iter()
-        .filter(|u| *u != uid)
-        .collect::<Vec<_>>();
+        .ok_or_else(|| AppError::forbidden("not a member of this conversation"))?;
+    let others = sqlx::query_scalar::<_, Uuid>(
+        "SELECT user_id FROM memberships
+         WHERE conversation_id = $1 AND user_id <> $2
+         ORDER BY joined_at",
+    )
+    .bind(conv)
+    .bind(uid)
+    .fetch_all(&mut *tx)
+    .await?;
 
-    let mut tx = st.pool.begin().await?;
-    if info.role == "owner" {
+    if me.role == "owner" {
         if others.is_empty() {
             sqlx::query("DELETE FROM conversations WHERE id = $1")
                 .bind(conv)
                 .execute(&mut *tx)
                 .await?;
         } else {
-            // 转让给最早加入的成员
+            // 转让给最早加入的成员；锁内执行，rows_affected 异常即整体回滚
             let new_owner = sqlx::query_scalar::<_, Uuid>(
                 "UPDATE memberships SET role = 'owner'
-                 WHERE conversation_id = $1 AND user_id = (
-                     SELECT user_id FROM memberships
-                     WHERE conversation_id = $1 AND user_id <> $2
-                     ORDER BY joined_at LIMIT 1)
+                 WHERE conversation_id = $1 AND user_id = $2
                  RETURNING user_id",
             )
             .bind(conv)
-            .bind(uid)
-            .fetch_one(&mut *tx)
-            .await?;
+            .bind(others[0])
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::internal("ownership transfer failed"))?;
             sqlx::query("UPDATE conversations SET owner_id = $2 WHERE id = $1")
                 .bind(conv)
                 .bind(new_owner)
                 .execute(&mut *tx)
                 .await?;
+        }
+    }
+    if me.role == "owner" && others.is_empty() {
+        // 最后一人退出：会话已连同成员一起删除
+    } else {
+        let res =
             sqlx::query("DELETE FROM memberships WHERE conversation_id = $1 AND user_id = $2")
                 .bind(conv)
                 .bind(uid)
                 .execute(&mut *tx)
                 .await?;
+        if res.rows_affected() != 1 {
+            return Err(AppError::internal("leave failed"));
         }
-    } else {
-        sqlx::query("DELETE FROM memberships WHERE conversation_id = $1 AND user_id = $2")
-            .bind(conv)
-            .bind(uid)
-            .execute(&mut *tx)
-            .await?;
     }
     tx.commit().await?;
 
@@ -1042,7 +1386,14 @@ async fn kick_member(
     if uid == target {
         return Err(AppError::bad_request("use leave endpoint for yourself"));
     }
-    let me = require_member(&st, conv, uid).await?;
+    // 锁内重检：我仍是群主、目标仍是非群主成员，才能删
+    let mut tx = st.pool.begin().await?;
+    if domain::lock_conversation(&mut tx, conv).await?.is_none() {
+        return Err(AppError::forbidden("not a member of this conversation"));
+    }
+    let me = domain::membership(&mut *tx, conv, uid)
+        .await?
+        .ok_or_else(|| AppError::forbidden("not a member of this conversation"))?;
     if me.role != "owner" {
         return Err(AppError::forbidden("only the owner can remove members"));
     }
@@ -1051,12 +1402,14 @@ async fn kick_member(
     )
     .bind(conv)
     .bind(target)
-    .execute(&st.pool)
+    .execute(&mut *tx)
     .await?;
     if res.rows_affected() == 0 {
         return Err(AppError::not_found("member not found"));
     }
-    let rest = domain::member_ids(&st.pool, conv).await?;
+    let rest = domain::member_ids(&mut *tx, conv).await?;
+    tx.commit().await?;
+
     notify(&st, &rest, "conversations");
     notify(&st, &[target], "conversations");
     Ok(StatusCode::NO_CONTENT)
@@ -1093,21 +1446,52 @@ async fn dissolve_conversation(
     Path(conv): Path<Uuid>,
 ) -> AppResult<StatusCode> {
     let uid = uid_of(&headers, &st).await?;
-    let me = require_member(&st, conv, uid).await?;
+    // 与拉人/退群/踢人共用会话行锁，锁内重检群主身份与解散标记
+    let mut tx = st.pool.begin().await?;
+    if domain::lock_conversation(&mut tx, conv).await?.is_none() {
+        return Err(AppError::forbidden("not a member of this conversation"));
+    }
+    let me = domain::membership(&mut *tx, conv, uid)
+        .await?
+        .ok_or_else(|| AppError::forbidden("not a member of this conversation"))?;
     if me.role != "owner" {
         return Err(AppError::forbidden("only the owner can dissolve"));
     }
-    let members = domain::member_ids(&st.pool, conv).await?;
-    sqlx::query("DELETE FROM conversations WHERE id = $1")
+    // 解散保留消息：标记解散、移出全部成员。最后一人退群仍删除会话。
+    let res = sqlx::query(
+        "UPDATE conversations SET dissolved_at = now() WHERE id = $1 AND dissolved_at IS NULL",
+    )
+    .bind(conv)
+    .execute(&mut *tx)
+    .await?;
+    if res.rows_affected() == 0 {
+        return Err(AppError::conflict("group already dissolved"));
+    }
+    let members =
+        sqlx::query_scalar::<_, Uuid>("SELECT user_id FROM memberships WHERE conversation_id = $1")
+            .bind(conv)
+            .fetch_all(&mut *tx)
+            .await?;
+    sqlx::query("DELETE FROM memberships WHERE conversation_id = $1")
         .bind(conv)
-        .execute(&st.pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     notify(&st, &members, "conversations");
     Ok(StatusCode::NO_CONTENT)
 }
 
-
 // ---------- 文件上传/下载 ----------
+
+/// 新附件只存 uuid 文件名；历史行可能是带目录的相对路径或绝对路径。
+fn stored_file_path(files_dir: &str, stored: &str) -> std::path::PathBuf {
+    let path = std::path::Path::new(stored);
+    if path.is_absolute() || path.components().count() > 1 {
+        path.to_path_buf()
+    } else {
+        std::path::Path::new(files_dir).join(path)
+    }
+}
 
 fn pct_encode(s: &str) -> String {
     s.bytes()
@@ -1132,6 +1516,7 @@ async fn upload_file(
     let mut mime = "application/octet-stream".to_string();
     let mut buf: Vec<u8> = Vec::new();
     let mut got_file = false;
+    let mut too_large = false;
 
     while let Some(mut field) = mp
         .next_field()
@@ -1162,14 +1547,21 @@ async fn upload_file(
                     .await
                     .map_err(|e| AppError::bad_request(format!("read error: {e}")))?
                 {
+                    if too_large {
+                        continue; // 排空剩余 body，保证 400 响应能送达
+                    }
                     buf.extend_from_slice(&chunk);
                     if buf.len() > st.cfg.upload_max_bytes {
-                        return Err(AppError::bad_request("file too large"));
+                        too_large = true;
+                        buf.clear();
                     }
                 }
             }
             _ => {}
         }
+    }
+    if too_large {
+        return Err(AppError::bad_request("file too large"));
     }
     let conv = conv.ok_or_else(|| AppError::bad_request("missing conversation_id"))?;
     if !got_file || buf.is_empty() {
@@ -1178,7 +1570,9 @@ async fn upload_file(
     require_member(&st, conv, uid).await?;
 
     let id = Uuid::new_v4();
-    let path = format!("{}/{}", st.cfg.files_dir, id);
+    // 只存文件名。FILES_DIR 换位置时仍能拼回来；旧的绝对路径在下载时照旧使用。
+    let stored = id.to_string();
+    let path = stored_file_path(&st.cfg.files_dir, &stored);
     tokio::fs::write(&path, &buf)
         .await
         .map_err(|e| AppError::internal(format!("store file: {e}")))?;
@@ -1193,7 +1587,7 @@ async fn upload_file(
     .bind(&file_name)
     .bind(&mime)
     .bind(size)
-    .bind(&path)
+    .bind(&stored)
     .execute(&st.pool)
     .await?;
     Ok(Json(AttachmentView {
@@ -1210,29 +1604,52 @@ struct FileQuery {
     dl: Option<u8>,
 }
 
+/// 允许 inline 预览的 MIME 白名单：仅渲染型媒体。SVG 可携带脚本，必须排除；
+/// text/html、xhtml、xml 等一律走 attachment，避免在聊天 origin 上同源执行。
+fn inline_safe(mime: &str) -> bool {
+    let m = mime
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    (m.starts_with("image/") && !m.contains("svg"))
+        || m.starts_with("audio/")
+        || m.starts_with("video/")
+        || m == "application/pdf"
+}
+
 async fn download_file(
     State(st): State<SharedState>,
     Path(id): Path<Uuid>,
     Query(q): Query<FileQuery>,
 ) -> AppResult<impl IntoResponse> {
-    let (file_name, mime, path) = sqlx::query_as::<_, (String, String, String)>(
+    let (file_name, mime, stored) = sqlx::query_as::<_, (String, String, String)>(
         "SELECT file_name, mime, storage_path FROM attachments WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(&st.pool)
     .await?
     .ok_or_else(|| AppError::not_found("file not found"))?;
-    let data = tokio::fs::read(&path)
+    let data = tokio::fs::read(stored_file_path(&st.cfg.files_dir, &stored))
         .await
         .map_err(|_| AppError::not_found("file not found"))?;
-    // dl=1 → attachment 触发浏览器/客户端下载；默认 inline 供预览
-    let mode = if q.dl == Some(1) { "attachment" } else { "inline" };
+    // dl=1 → attachment 触发下载；inline 只留给安全媒体白名单（防 Stored XSS）
+    let mode = if q.dl != Some(1) && inline_safe(&mime) {
+        "inline"
+    } else {
+        "attachment"
+    };
     let dispo = format!("{}; filename*=UTF-8''{}", mode, pct_encode(&file_name));
     Ok((
         [
             (header::CONTENT_TYPE, mime),
             (header::CONTENT_DISPOSITION, dispo),
-            (header::CACHE_CONTROL, "private, max-age=31536000, immutable".into()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            (
+                header::CACHE_CONTROL,
+                "private, max-age=31536000, immutable".into(),
+            ),
         ],
         data,
     ))
@@ -1244,8 +1661,8 @@ async fn ws_ticket(
     State(st): State<SharedState>,
     headers: HeaderMap,
 ) -> AppResult<Json<TicketRes>> {
-    let uid = uid_of(&headers, &st).await?;
-    let ticket = st.issue_ticket(uid);
+    let user = auth::require_user(&st, &headers).await?;
+    let ticket = st.issue_ticket(user.id, user.session_version as i64);
     Ok(Json(TicketRes {
         ticket,
         expires_in: 30,
@@ -1256,7 +1673,7 @@ struct TransferReq {
     user_id: Uuid,
 }
 
-/// 群主转让：仅群主；目标必须是普通成员
+/// 群主转让：仅群主；目标必须是普通成员。全程持会话行锁，两步角色变更必须各自命中。
 async fn transfer_ownership(
     State(st): State<SharedState>,
     headers: HeaderMap,
@@ -1267,38 +1684,53 @@ async fn transfer_ownership(
     if uid == req.user_id {
         return Err(AppError::bad_request("already the owner"));
     }
-    let me = require_member(&st, conv, uid).await?;
+    let mut tx = st.pool.begin().await?;
+    if domain::lock_conversation(&mut tx, conv).await?.is_none() {
+        return Err(AppError::forbidden("not a member of this conversation"));
+    }
+    let me = domain::membership(&mut *tx, conv, uid)
+        .await?
+        .ok_or_else(|| AppError::forbidden("not a member of this conversation"))?;
     if me.role != "owner" {
         return Err(AppError::forbidden("only the owner can transfer ownership"));
     }
-    let target = require_member(&st, conv, req.user_id).await?;
+    let target = domain::membership(&mut *tx, conv, req.user_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("member not found"))?;
     if target.role == "owner" {
         return Err(AppError::bad_request("target is already the owner"));
     }
 
-    let mut tx = st.pool.begin().await?;
-    sqlx::query(
-        "UPDATE memberships SET role = 'member' WHERE conversation_id = $1 AND user_id = $2",
+    let res = sqlx::query(
+        "UPDATE memberships SET role = 'member'
+         WHERE conversation_id = $1 AND user_id = $2 AND role = 'owner'",
     )
     .bind(conv)
     .bind(uid)
     .execute(&mut *tx)
     .await?;
-    sqlx::query(
-        "UPDATE memberships SET role = 'owner' WHERE conversation_id = $1 AND user_id = $2",
+    if res.rows_affected() != 1 {
+        return Err(AppError::internal("ownership transfer failed"));
+    }
+    let res = sqlx::query(
+        "UPDATE memberships SET role = 'owner'
+         WHERE conversation_id = $1 AND user_id = $2 AND role = 'member'",
     )
     .bind(conv)
     .bind(req.user_id)
     .execute(&mut *tx)
     .await?;
+    if res.rows_affected() != 1 {
+        return Err(AppError::internal("ownership transfer failed"));
+    }
     sqlx::query("UPDATE conversations SET owner_id = $2 WHERE id = $1")
         .bind(conv)
         .bind(req.user_id)
         .execute(&mut *tx)
         .await?;
+    let members = domain::member_ids(&mut *tx, conv).await?;
     tx.commit().await?;
 
-    let members = domain::member_ids(&st.pool, conv).await?;
     notify(&st, &members, "conversations");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1306,13 +1738,13 @@ async fn transfer_ownership(
 // ---------- 后台管理（仅 admin，账号级角色，与会话内 owner 无关） ----------
 
 /// 撤销某用户全部有效 refresh token（禁用/改密时用）
-async fn revoke_all_refresh(st: &SharedState, uid: Uuid) -> AppResult<()> {
+async fn revoke_all_refresh(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, uid: Uuid) -> AppResult<()> {
     sqlx::query(
         "UPDATE refresh_tokens SET revoked_at = now()
          WHERE user_id = $1 AND revoked_at IS NULL",
     )
     .bind(uid)
-    .execute(&st.pool)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }
@@ -1337,20 +1769,15 @@ async fn admin_overview(
     )
     .fetch_one(&st.pool)
     .await?;
-    let message_count =
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM messages")
-            .fetch_one(&st.pool)
-            .await?;
+    let message_count = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM messages")
+        .fetch_one(&st.pool)
+        .await?;
     let (attachment_count, attachment_bytes) = sqlx::query_as::<_, (i64, i64)>(
         "SELECT count(*), COALESCE(sum(size), 0)::bigint FROM attachments",
     )
     .fetch_one(&st.pool)
     .await?;
-    let online_users = st
-        .conns
-        .iter()
-        .filter(|e| !e.value().is_empty())
-        .count() as i64;
+    let online_users = st.conns.iter().filter(|e| !e.value().is_empty()).count() as i64;
     let online_conns = st.conns.iter().map(|e| e.value().len() as i64).sum();
     Ok(Json(AdminOverview {
         user_count,
@@ -1391,13 +1818,11 @@ async fn admin_users(
         .fetch_all(&st.pool)
         .await?
     } else {
-        sqlx::query_as::<_, UserRow>(
-            "SELECT * FROM users ORDER BY created_at LIMIT $1 OFFSET $2",
-        )
-        .bind(ADMIN_PAGE)
-        .bind(q.offset.max(0))
-        .fetch_all(&st.pool)
-        .await?
+        sqlx::query_as::<_, UserRow>("SELECT * FROM users ORDER BY created_at LIMIT $1 OFFSET $2")
+            .bind(ADMIN_PAGE)
+            .bind(q.offset.max(0))
+            .fetch_all(&st.pool)
+            .await?
     };
     Ok(Json(
         rows.iter()
@@ -1415,27 +1840,42 @@ async fn admin_users(
     ))
 }
 
-/// 禁用：置标记 → 撤销 refresh token → 踢下线（force_logout 帧 + 断连）
+/// 禁用：顾问锁 + 行锁串行化 → 置标记并 bump 凭据版本 → 撤 refresh → 踢下线（帧 + 主动断连）
 async fn admin_disable(
     State(st): State<SharedState>,
     headers: HeaderMap,
     Path(target): Path<Uuid>,
 ) -> AppResult<StatusCode> {
     auth::require_admin(&st, &headers).await?;
-    let role = sqlx::query_scalar::<_, String>("SELECT role FROM users WHERE id = $1")
-        .bind(target)
-        .fetch_optional(&st.pool)
-        .await?
-        .ok_or_else(|| AppError::not_found("user not found"))?;
+    let mut tx = st.pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(ADMIN_LOCK_KEY)
+        .execute(&mut *tx)
+        .await?;
+    let (role, already) = sqlx::query_as::<_, (String, bool)>(
+        "SELECT role, disabled_at IS NOT NULL FROM users WHERE id = $1 FOR UPDATE",
+    )
+    .bind(target)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::not_found("user not found"))?;
     if role == "admin" {
         return Err(AppError::bad_request("管理员账号不可禁用"));
     }
-    sqlx::query("UPDATE users SET disabled_at = now() WHERE id = $1")
+    if !already {
+        sqlx::query(
+            "UPDATE users SET disabled_at = now(), session_version = session_version + 1
+             WHERE id = $1",
+        )
         .bind(target)
-        .execute(&st.pool)
+        .execute(&mut *tx)
         .await?;
-    revoke_all_refresh(&st, target).await?;
-    st.kick_user(target, "disabled");
+    }
+    revoke_all_refresh(&mut tx, target).await?;
+    tx.commit().await?;
+    if let Some(epoch) = st.kick_user(target, "disabled") {
+        ws::publish_offline(&st, target, epoch).await;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1445,14 +1885,25 @@ async fn admin_enable(
     Path(target): Path<Uuid>,
 ) -> AppResult<StatusCode> {
     auth::require_admin(&st, &headers).await?;
-    sqlx::query("UPDATE users SET disabled_at = NULL WHERE id = $1")
-        .bind(target)
-        .execute(&st.pool)
+    // 与 disable/set_role 共用顾问锁：disabled 变更串行化，恢复管理员可用性的时点可预期
+    let mut tx = st.pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(ADMIN_LOCK_KEY)
+        .execute(&mut *tx)
         .await?;
+    let res = sqlx::query("UPDATE users SET disabled_at = NULL WHERE id = $1")
+        .bind(target)
+        .execute(&mut *tx)
+        .await?;
+    if res.rows_affected() == 0 {
+        return Err(AppError::not_found("user not found"));
+    }
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// 任命/撤销管理员。末位保护：最后一个管理员不可被撤销。
+/// 任命/撤销管理员。顾问锁串行化并发降权；末位保护按「可用（未禁用）管理员」计数；
+/// 被禁用的账号不能被任命为管理员。
 async fn admin_set_role(
     State(st): State<SharedState>,
     headers: HeaderMap,
@@ -1463,29 +1914,46 @@ async fn admin_set_role(
     if req.role != "admin" && req.role != "user" {
         return Err(AppError::bad_request("role must be admin or user"));
     }
-    let cur = sqlx::query_scalar::<_, String>("SELECT role FROM users WHERE id = $1")
+    let mut tx = st.pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(ADMIN_LOCK_KEY)
+        .execute(&mut *tx)
+        .await?;
+    let (cur, disabled) = sqlx::query_as::<_, (String, bool)>(
+        "SELECT role, disabled_at IS NOT NULL FROM users WHERE id = $1 FOR UPDATE",
+    )
+    .bind(target)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::not_found("user not found"))?;
+    if req.role == "admin" {
+        if disabled {
+            return Err(AppError::bad_request("禁用账号不能设为管理员"));
+        }
+    } else if cur == "admin" {
+        // 撤管理员：要求目标之外仍存在至少一名可用管理员，防止并发双降权把系统锁死
+        let usable = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM users
+              WHERE role = 'admin' AND disabled_at IS NULL AND id <> $1",
+        )
         .bind(target)
-        .fetch_optional(&st.pool)
-        .await?
-        .ok_or_else(|| AppError::not_found("user not found"))?;
-    if req.role == "user" && cur == "admin" {
-        let admins =
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users WHERE role = 'admin'")
-                .fetch_one(&st.pool)
-                .await?;
-        if admins <= 1 {
-            return Err(AppError::bad_request("至少保留一名管理员"));
+        .fetch_one(&mut *tx)
+        .await?;
+        if usable == 0 {
+            return Err(AppError::bad_request("至少保留一名可用管理员"));
         }
     }
     sqlx::query("UPDATE users SET role = $2 WHERE id = $1")
         .bind(target)
         .bind(&req.role)
-        .execute(&st.pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// 重置他人密码：改哈希 → 撤 refresh → 踢下线强制重登
+/// 重置他人密码：改哈希 + bump 凭据版本（旧 access token/WS ticket 即失效）
+/// → 撤 refresh → 踢下线强制重登
 async fn admin_reset_password(
     State(st): State<SharedState>,
     headers: HeaderMap,
@@ -1496,20 +1964,23 @@ async fn admin_reset_password(
     if !(6..=72).contains(&req.password.len()) {
         return Err(AppError::bad_request("password must be 6-72 chars"));
     }
-    let exists = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)")
-        .bind(target)
-        .fetch_one(&st.pool)
-        .await?;
-    if !exists {
+    let hash = auth::hash_password(&req.password)?;
+    let mut tx = st.pool.begin().await?;
+    let res = sqlx::query(
+        "UPDATE users SET password_hash = $2, session_version = session_version + 1
+         WHERE id = $1",
+    )
+    .bind(target)
+    .bind(&hash)
+    .execute(&mut *tx)
+    .await?;
+    if res.rows_affected() == 0 {
         return Err(AppError::not_found("user not found"));
     }
-    let hash = auth::hash_password(&req.password)?;
-    sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
-        .bind(target)
-        .bind(&hash)
-        .execute(&st.pool)
-        .await?;
-    revoke_all_refresh(&st, target).await?;
-    st.kick_user(target, "password_reset");
+    revoke_all_refresh(&mut tx, target).await?;
+    tx.commit().await?;
+    if let Some(epoch) = st.kick_user(target, "password_reset") {
+        ws::publish_offline(&st, target, epoch).await;
+    }
     Ok(StatusCode::NO_CONTENT)
 }

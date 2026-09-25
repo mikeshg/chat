@@ -4,6 +4,7 @@
 //   node scripts/e2e.mjs phase2     # phase2: 重启后持久化验证（读 .e2e-state.json）
 // 环境: BASE_URL=http://localhost:8080
 import { readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -65,6 +66,7 @@ const mk = (n) => ({ username: `e2e${rid}${n}`, password: 'pass123456' });
 
 async function phase1() {
   const [A, B, C] = [mk('a'), mk('b'), mk('c')];
+  const attachments = [];
   console.log(`users: ${A.username} ${B.username} ${C.username}`);
 
   // --- 注册/登录/资料 ---
@@ -269,6 +271,14 @@ async function phase1() {
     wsa.send({ type: 'send_message', conversation_id: A.dmId, client_msg_id: 'f2', content: '', attachment_id: f2.json.id });
     const im = await wsa.waitType('message', (x) => x.message.attachment?.id === f2.json.id);
     ok('image kind derived from mime', im.message.kind === 'image' && im.message.content === '[图片]', JSON.stringify(im.message.kind));
+    for (const [message, bytes] of [[fm.message, Buffer.from('hello file')], [im.message, png]]) {
+      attachments.push({
+        message_id: message.id,
+        attachment_id: message.attachment.id,
+        size: bytes.length,
+        sha256: createHash('sha256').update(bytes).digest('hex'),
+      });
+    }
     // B 复用 A 的附件 → 拒
     wsb2.send({ type: 'send_message', conversation_id: B.dmId, client_msg_id: 'f3', content: '', attachment_id: f1.json.id });
     try {
@@ -337,19 +347,23 @@ async function phase1() {
     ok('disabled user cannot login', dl.status === 403);
     const en = await api(at, 'POST', `/admin/users/${B.user.id}/enable`);
     ok('enable user', en.status === 204);
-    const em = await api(B.access_token, 'GET', '/users/me');
-    ok('enabled user restored', em.status === 200);
+    // 禁用时 session_version 已 +1：旧 token 永久失效，启用后须重新登录
+    const stale = await api(B.access_token, 'GET', '/users/me');
+    ok('old token stays revoked after enable', stale.status === 401);
+    const relog = await api(null, 'POST', '/auth/login', { username: B.username, password: B.password });
+    ok('enabled user can re-login', relog.status === 200);
     wsb3.close();
   } else {
     console.log('  (skip admin-flow asserts: set E2E_ADMIN_USER/E2E_ADMIN_PASS to enable)');
   }
 
-  writeFileSync(STATE, JSON.stringify({ A, B, C, dmId: A.dmId }, null, 2));
+  writeFileSync(STATE, JSON.stringify({ base: BASE, A, B, C, dmId: A.dmId, attachments }, null, 2));
   console.log(`state saved -> ${STATE}`);
 }
 
 async function phase2() {
   const s = JSON.parse(readFileSync(STATE, 'utf8'));
+  if (s.base !== BASE) throw new Error('phase2 must use the same deployment as phase1');
   const login = await api(null, 'POST', '/auth/login', { username: s.A.username, password: s.A.password });
   ok('alice still exists after restart', login.status === 200);
   const t = login.json.access_token;
@@ -359,7 +373,17 @@ async function phase2() {
     ok('message history persisted', contents.includes('hi bob') && contents.includes('off2'), JSON.stringify(contents));
     const convs = await api(t, 'GET', '/conversations');
     const dm = convs.json.find((c) => c.id === s.dmId);
-    ok('conversation metadata persisted', dm && dm.last_seq === 3, `last_seq=${dm?.last_seq}`);
+    // phase1 共 5 条 DM：hi bob(1) off1(2) off2(3) 文件(4) 图片(5) —— HEAD 旧断言 3 早于附件消息加入，属过时断言
+    ok('conversation metadata persisted', dm && dm.last_seq === 5, `last_seq=${dm?.last_seq}`);
+    ok('attachment baseline recorded', s.attachments.length === 2);
+    for (const attachment of s.attachments) {
+      const message = msgs.json.messages.find((m) => m.id === attachment.message_id);
+      ok('attachment metadata persisted', message?.attachment?.id === attachment.attachment_id);
+      const download = await fetch(`${BASE}/files/${attachment.attachment_id}`);
+      const bytes = Buffer.from(await download.arrayBuffer());
+      ok('attachment bytes persisted', download.status === 200 && bytes.length === attachment.size &&
+        createHash('sha256').update(bytes).digest('hex') === attachment.sha256);
+    }
   }
   const lb = await api(null, 'POST', '/auth/login', { username: s.B.username, password: s.B.password });
   const fr = await api(lb.json.access_token, 'GET', '/friends');

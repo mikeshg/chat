@@ -10,6 +10,8 @@ pub struct UserRow {
     pub password_hash: String,
     pub role: String, // "admin" | "user"（账号级，与会话内 memberships.role 无关）
     pub disabled_at: Option<DateTime<Utc>>,
+    /// 凭据版本：禁用/重置密码时 +1，旧 access token 与 WS ticket 随之失效
+    pub session_version: i32,
     pub last_seen_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
@@ -108,6 +110,54 @@ pub struct AttachmentView {
     pub size: i64,
 }
 
+/// 回复引用预览：只展开一层。deleted=true 时 excerpt 为空，仍保留 id/seq 供跳转。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplyPreview {
+    pub message_id: Uuid,
+    pub seq: i64,
+    pub sender_name: String,
+    pub excerpt: String,
+    pub kind: String,
+    pub deleted: bool,
+}
+
+/// 单个 emoji 的聚合视图；reacted_by_me 按观看者个性化，广播时逐成员计算。
+#[derive(Debug, Clone, Serialize)]
+pub struct ReactionView {
+    pub emoji: String,
+    pub count: i64,
+    pub reacted_by_me: bool,
+}
+
+/// 投票选项读模型。voters 仅非匿名投票输出（匿名恒为空数组，不落客户端）。
+#[derive(Debug, Clone, Serialize)]
+pub struct PollOptionView {
+    pub id: Uuid,
+    pub index: i32,
+    pub label: String,
+    pub count: i64,
+    pub voters: Vec<Uuid>,
+}
+
+/// 投票卡片读模型：挂在 kind='poll' 的消息上，墓碑消息掩去。
+/// my_option_ids / voters 由读模型按观看者逐人计算（§8.4）。
+#[derive(Debug, Clone, Serialize)]
+pub struct PollView {
+    pub question: String,
+    pub allow_multiple: bool,
+    pub anonymous: bool,
+    pub closed_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<DateTime<Utc>>,
+    /// 服务端按数据库 now() 计算的到期态（客户端时钟不可信）
+    pub expired: bool,
+    /// 投票级单调版本；真实变更与 messages.edit_version 同步 +1
+    pub version: i64,
+    pub total_voters: i64,
+    pub options: Vec<PollOptionView>,
+    /// 当前观看者已投的选项 id（匿名投票也返回本人选择）
+    pub my_option_ids: Vec<Uuid>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageView {
     pub id: Uuid,
@@ -120,7 +170,29 @@ pub struct MessageView {
     pub kind: String, // "text" | "image" | "file"
     pub attachment: Option<AttachmentView>,
     pub mentions: Vec<Uuid>, // 被 @ 的用户 id（群聊）
+    pub reply_to_id: Option<Uuid>,
+    pub reply_to_preview: Option<ReplyPreview>,
+    pub edited_at: Option<DateTime<Utc>>,
+    /// 消息级单调变更版本：编辑/软删除/reaction 实际变更均 +1
+    pub edit_version: i32,
+    /// 软删除时间；墓碑消息的正文/附件/提及已被读模型掩去
+    pub deleted_at: Option<DateTime<Utc>>,
+    pub reactions: Vec<ReactionView>,
+    /// kind='poll' 时的投票卡片数据（个性化字段按观看者计算）；旧客户端忽略，看 content 占位
+    pub poll: Option<PollView>,
     pub created_at: DateTime<Utc>,
+}
+
+/// 会话偏好（用户维度，仅本人可见、同步本人全部设备）。
+/// 无偏好行时全默认；updated_at 为 NULL 表示从未写入。
+#[derive(Debug, Clone, Default, Serialize, sqlx::FromRow)]
+pub struct ConversationPref {
+    pub pinned_at: Option<DateTime<Utc>>,
+    pub archived_at: Option<DateTime<Utc>>,
+    /// 定时静音截止；NULL 只表示无定时静音（永久静音看 mute_forever）
+    pub muted_until: Option<DateTime<Utc>>,
+    pub mute_forever: bool,
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -135,7 +207,32 @@ pub struct ConversationView {
     pub unread_count: i64,
     pub has_mention: bool, // 有未读的 @我 消息
     pub last_message: Option<MessageView>,
+    /// 本人对该会话的偏好（置顶/静音/归档）；旧客户端可忽略
+    pub preference: ConversationPref,
     pub created_at: DateTime<Utc>,
+}
+
+/// GET /conversations/preferences 的条目：{conversation_id, preference}
+/// 与 WS preference_updated 帧同构（嵌套而非扁平），便于前端同一合并路径处理。
+#[derive(Debug, Serialize)]
+pub struct PrefEntry {
+    pub conversation_id: Uuid,
+    pub preference: ConversationPref,
+}
+
+/// PUT /conversations/{id}/preferences：只更新显式字段，缺省字段保持不变；
+/// JSON null 与缺省等价（null 不作为 forever）。
+#[derive(Debug, Deserialize)]
+pub struct PrefUpdateReq {
+    pub pinned: Option<bool>,
+    pub archived: Option<bool>,
+    pub mute: Option<PrefMuteReq>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PrefMuteReq {
+    pub mode: String, // "none" | "until" | "forever"
+    pub until: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -193,6 +290,30 @@ pub enum WsIn {
         kind: Option<String>,
         #[serde(default)]
         attachment_id: Option<Uuid>,
+        /// 回复目标：必须是同会话消息
+        #[serde(default)]
+        reply_to_id: Option<Uuid>,
+    },
+    EditMessage {
+        message_id: Uuid,
+        content: String,
+        /// 乐观并发控制：必须等于当前 edit_version，否则冲突
+        expected_version: i32,
+        client_op_id: Option<Uuid>,
+    },
+    DeleteMessage {
+        message_id: Uuid,
+        client_op_id: Option<Uuid>,
+    },
+    ReactionUpsert {
+        message_id: Uuid,
+        emoji: String,
+        client_op_id: Option<Uuid>,
+    },
+    ReactionRemove {
+        message_id: Uuid,
+        emoji: String,
+        client_op_id: Option<Uuid>,
     },
     Typing {
         conversation_id: Uuid,
@@ -236,6 +357,37 @@ pub enum WsOut {
     SyncMessages {
         conversation_id: Uuid,
         messages: Vec<MessageView>,
+        /// 还有更多 seq > 本页末尾 的消息待拉取（超过单页上限时逐页续拉）
+        has_more: bool,
+    },
+    /// 编辑成功广播；reactions 已按接收者个性化，需逐成员单独成帧
+    MessageUpdated {
+        conversation_id: Uuid,
+        message: MessageView,
+        edit_version: i32,
+    },
+    /// 软删除广播：携带完整墓碑视图（id/seq 保留，正文/附件/reaction 已被读模型掩去），
+    /// 与 message_updated/reaction_update 一样整视图按 (id, edit_version) 合并——
+    /// 部分字段帧会因全局版本互相吞掉更新（反序交付丢正文）。
+    MessageDeleted {
+        conversation_id: Uuid,
+        message: MessageView,
+        edit_version: i32,
+    },
+    /// reaction 聚合变更：携带完整消息视图（reactions 按接收者个性化，逐成员成帧）
+    ReactionUpdate {
+        conversation_id: Uuid,
+        message: MessageView,
+        edit_version: i32,
+    },
+    /// 非发送类 mutation 的最小回执：与 client_msg_id 严格区分，只回发起连接
+    OpAck {
+        client_op_id: Uuid,
+    },
+    /// 会话偏好变更：只发给当前 uid 的全部连接（偏好仅本人可见，不广播给其他成员）
+    PreferenceUpdated {
+        conversation_id: Uuid,
+        preference: ConversationPref,
     },
     Invalidate {
         what: &'static str, // "friends" | "conversations" | "requests"
@@ -243,8 +395,65 @@ pub enum WsOut {
     Error {
         code: &'static str,
         message: String,
+        client_msg_id: Option<String>,
+        /// 非发送类 mutation 的回执关联；与 client_msg_id 不混用
+        client_op_id: Option<Uuid>,
     },
 }
+
+// ---------- 消息生命周期 REST ----------
+
+#[derive(Debug, Deserialize)]
+pub struct EditMessageReq {
+    pub content: String,
+    /// 必填：等于当前 edit_version 才允许写入，冲突返回 409
+    pub expected_version: i32,
+    pub client_op_id: Option<Uuid>,
+}
+
+/// DELETE /messages/{id} 与 reactions 端点的可选幂等键（query 参数携带；非 UUID 自动 400）
+#[derive(Debug, Deserialize)]
+pub struct ClientOpQuery {
+    pub client_op_id: Option<Uuid>,
+}
+
+/// 重连后批量刷新本地缓存消息：按 id 回读正文/墓碑/reaction/回复预览（每批 ≤100）
+#[derive(Debug, Deserialize)]
+pub struct RefreshMessagesReq {
+    pub ids: Vec<Uuid>,
+}
+
+// ---------- 轻量投票 REST ----------
+// 投票 mutation 只走 REST（WS 不新增 mutation 帧）；同步复用现有广播：
+// 创建 → message 帧，投票/关闭 → message_updated（完整个性化 MessageView）。
+
+/// POST /conversations/{id}/polls：创建投票（仅群聊）。
+/// 复用发消息事务的 seq 与 client_msg_id 幂等键；kind='poll'，content='[投票] question'。
+#[derive(Debug, Deserialize)]
+pub struct CreatePollReq {
+    pub question: String,
+    pub options: Vec<String>,
+    #[serde(default)]
+    pub allow_multiple: bool,
+    #[serde(default)]
+    pub anonymous: bool,
+    pub expires_at: Option<DateTime<Utc>>,
+    /// 与 send_message 同一幂等键空间（重试/重复提交收敛到同一条消息）
+    pub client_msg_id: Option<String>,
+    /// 契约参数（不持久化；创建幂等由 client_msg_id 承担）
+    pub client_op_id: Option<Uuid>,
+}
+
+/// PUT /messages/{id}/poll/votes：替换本人选择集合（空数组 = 撤票）。
+#[derive(Debug, Deserialize)]
+pub struct VotePollReq {
+    pub option_ids: Vec<Uuid>,
+    /// 契约参数（投票本身是状态替换幂等，无需持久化 op_id）
+    pub client_op_id: Option<Uuid>,
+}
+
+// 软删除/reaction 的 REST 响应均为发起者视角的完整 MessageView：
+// 与 WS 广播同形，客户端统一按 (id, edit_version) 整视图合并。
 
 // ---------- 后台管理（仅 admin） ----------
 

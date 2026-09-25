@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
 import type {
+  ConversationPref,
   ConversationView,
   FriendView,
   MessageView,
@@ -7,12 +8,23 @@ import type {
   UserPublic,
 } from "./types";
 
+/** 应用内新消息提示（最小通知出口；点击打开会话） */
+export interface Toast {
+  id: string;
+  convId: string;
+  title: string;
+  text: string;
+  ts: number;
+}
+
 export interface AppState {
   me: UserPublic | null;
   conversations: ConversationView[];
   /** conv_id -> 按 seq 升序的消息（含乐观未确认消息，pending 用 client: 前缀 id） */
   messages: Record<string, MessageView[]>;
   hasMore: Record<string, boolean>;
+  /** conv_id -> 初始历史页是否已加载（P1-11：实时缓存非空也不能跳过历史拉取） */
+  historyLoaded: Record<string, boolean>;
   activeConv: string | null;
   online: Record<string, boolean>;
   /** conv_id -> { user, ts } 正在输入 */
@@ -21,6 +33,14 @@ export interface AppState {
   requests: RequestsView;
   wsReady: boolean;
   tab: "chats" | "contacts" | "me" | "admin";
+  /** composer 引用卡片：正在回复的目标消息（null=普通发送） */
+  replyingTo: MessageView | null;
+  /** composer 编辑态：正在编辑的消息（expected_version 取其当前 edit_version） */
+  editingMessage: MessageView | null;
+  /** `${messageId}:${emoji}` -> 提交中（reaction 按钮 busy 态） */
+  reactionPending: Record<string, boolean>;
+  /** 应用内通知栈（新消息提示，自动过期） */
+  toasts: Toast[];
 }
 
 let state: AppState = {
@@ -28,6 +48,7 @@ let state: AppState = {
   conversations: [],
   messages: {},
   hasMore: {},
+  historyLoaded: {},
   activeConv: null,
   online: {},
   typing: {},
@@ -35,6 +56,10 @@ let state: AppState = {
   requests: { incoming: [], outgoing: [] },
   wsReady: false,
   tab: "chats",
+  replyingTo: null,
+  editingMessage: null,
+  reactionPending: {},
+  toasts: [],
 };
 
 const listeners = new Set<() => void>();
@@ -72,12 +97,51 @@ export function convAvatarText(c: ConversationView): string {
   return (t[0] ?? "?").toUpperCase();
 }
 
-/** 消息按 seq 插入（乐观消息 client:xxx 排最后），去重 */
+/**
+ * 消息按 seq 插入（乐观消息 client:xxx 排最后），去重。
+ * 统一 id+version 合并规则：incoming.edit_version（缺省按 0）低于缓存版本时丢弃，
+ * 保证迟到的旧生命周期事件不覆盖较新的编辑/删除/reaction 状态。
+ */
+function selectMessage(local: MessageView, incoming: MessageView): MessageView {
+  const delta = (incoming.edit_version ?? 0) - (local.edit_version ?? 0);
+  if (delta < 0) return local;
+  if (delta > 0) return incoming;
+  return {
+    ...local,
+    reply_to_preview: local.deleted_at || local.reply_to_preview?.deleted
+      ? local.reply_to_preview
+      : incoming.reply_to_preview ?? local.reply_to_preview,
+    ...(local.poll && incoming.poll?.expired ? { poll: { ...local.poll, expired: true } } : {}),
+  };
+}
+
+export function replyPreview(m: MessageView) {
+  return {
+    message_id: m.id,
+    seq: m.seq,
+    sender_name: m.sender_name,
+    excerpt: m.deleted_at ? "" : m.attachment
+      ? m.kind === "image" ? "[图片]" : `[文件] ${m.attachment.file_name}`
+      : Array.from(m.content).slice(0, 120).join(""),
+    kind: m.kind,
+    deleted: !!m.deleted_at,
+  };
+}
+
+function selectLast(local: MessageView | null, incoming: MessageView | null): MessageView | null {
+  if (!local) return incoming;
+  if (!incoming) return local;
+  if (local.id === incoming.id) return selectMessage(local, incoming);
+  return incoming.seq > local.seq ? incoming : local;
+}
+
 export function upsertMessage(list: MessageView[], m: MessageView): MessageView[] {
   const idx = list.findIndex((x) => x.id === m.id);
   if (idx >= 0) {
+    const selected = selectMessage(list[idx], m);
+    if (selected === list[idx]) return list;
     const next = [...list];
-    next[idx] = m;
+    next[idx] = selected;
     return next;
   }
   const next = [...list, m];
@@ -90,17 +154,240 @@ export function prependMessages(list: MessageView[], older: MessageView[]): Mess
   return [...older.filter((m) => !seen.has(m.id)), ...list];
 }
 
+// ---------- 会话偏好 ----------
+
+export function isPinned(c: ConversationView): boolean {
+  return !!c.preference?.pinned_at;
+}
+
+export function isArchived(c: ConversationView): boolean {
+  return !!c.preference?.archived_at;
+}
+
+/** 静音是否生效：永久静音或未过期的定时静音（过期时间按本地时钟判断） */
+export function isMuted(c: ConversationView): boolean {
+  const p = c.preference;
+  if (!p) return false;
+  if (p.mute_forever) return true;
+  return !!p.muted_until && Date.parse(p.muted_until) > Date.now();
+}
+
+function selectPreference(
+  local: ConversationView["preference"],
+  incoming: ConversationView["preference"],
+): ConversationView["preference"] {
+  if (!local?.updated_at) return incoming ?? local;
+  if (!incoming?.updated_at) return local;
+  return Date.parse(incoming.updated_at) < Date.parse(local.updated_at) ? local : incoming;
+}
+
+/** 偏好变更合并入口（preference_updated 帧 / PUT 响应共用）：更新字段并重排列表 */
+export function applyPrefUpdate(
+  s: AppState,
+  conversationId: string,
+  preference: ConversationPref,
+): Partial<AppState> {
+  if (!s.conversations.some((c) => c.id === conversationId)) return {};
+  return {
+    conversations: sortConversations(
+      s.conversations.map((c) =>
+        c.id === conversationId ? { ...c, preference: selectPreference(c.preference, preference) } : c,
+      ),
+    ),
+  };
+}
+
+/**
+ * 新消息是否触发应用内提示：非本人所发、非当前打开的会话；
+ * 静音会话抑制提示，但 @本人 可突破静音（§8.3）。
+ */
+export function shouldNotify(s: AppState, m: MessageView): boolean {
+  if (s.me == null || m.sender_id === s.me.id) return false;
+  if (s.activeConv === m.conversation_id && s.tab === "chats") return false;
+  const conv = s.conversations.find((c) => c.id === m.conversation_id);
+  if (conv && isMuted(conv) && !m.mentions.includes(s.me.id)) return false;
+  return true;
+}
+
+export function pushToast(t: Omit<Toast, "id" | "ts">) {
+  const id = crypto.randomUUID();
+  setState((s) => ({
+    toasts: [...s.toasts.slice(-3), { ...t, id, ts: Date.now() }],
+  }));
+  setTimeout(() => dismissToast(id), 5000);
+}
+
+export function dismissToast(id: string) {
+  setState((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }));
+}
+
+/** 置顶优先：置顶块内按 pinned_at DESC，其余按原活动时间 DESC，id 兜底保序 */
+export function sortConversations(list: ConversationView[]): ConversationView[] {
+  const act = (c: ConversationView) => c.last_message?.created_at ?? c.created_at;
+  return [...list].sort((a, b) => {
+    const ap = a.preference?.pinned_at ?? null;
+    const bp = b.preference?.pinned_at ?? null;
+    if (ap == null && bp != null) return 1;
+    if (ap != null && bp == null) return -1;
+    if (ap != null && bp != null && ap !== bp) return bp.localeCompare(ap);
+    return act(b).localeCompare(act(a)) || a.id.localeCompare(b.id);
+  });
+}
+
+/** 目录刷新和实时消息可能交错。本地 seq 更新的预览留下来，远端没有的会话以远端为准（退群会消失）。 */
+export function mergeConversationLists(
+  local: ConversationView[],
+  remote: ConversationView[],
+): ConversationView[] {
+  const localById = new Map(local.map((c) => [c.id, c]));
+  const merged = remote.map((rc) => {
+    const lc = localById.get(rc.id);
+    if (!lc) return rc;
+    rc = { ...rc, preference: selectPreference(lc.preference, rc.preference) };
+    if (!lc.last_message) return rc;
+    if (lc.last_message.seq > (rc.last_message?.seq ?? 0)) {
+      return {
+        ...rc,
+        last_message: lc.last_message,
+        last_seq: Math.max(lc.last_seq, rc.last_seq),
+        unread_count: lc.unread_count,
+        has_mention: lc.has_mention || rc.has_mention,
+      };
+    }
+    return { ...rc, last_message: selectLast(lc.last_message, rc.last_message) };
+  });
+  return sortConversations(merged);
+}
+
+/** 实时消息。同一 id 再投递一次不重复加未读。 */
+export function applyLiveMessage(s: AppState, m: MessageView): Partial<AppState> {
+  const list = s.messages[m.conversation_id] ?? [];
+  const exists = list.some((x) => x.id === m.id) || s.conversations.some((c) => c.last_message?.id === m.id);
+  const refreshed = applyRefreshed(s, m.conversation_id, [m]);
+  const isActive = s.activeConv === m.conversation_id && s.tab === "chats";
+  const mine = m.sender_id === s.me?.id;
+  const { [m.conversation_id]: _typing, ...typing } = s.typing;
+  return {
+    ...refreshed,
+    conversations: sortConversations(
+      (refreshed.conversations ?? s.conversations).map((c) =>
+        c.id === m.conversation_id
+          ? {
+              ...c,
+              last_message: selectLast(c.last_message, refreshed.messages?.[m.conversation_id].find((x) => x.id === m.id) ?? m),
+              last_seq: Math.max(c.last_seq, m.seq),
+              unread_count: exists || mine || isActive ? c.unread_count : c.unread_count + 1,
+              has_mention:
+                c.has_mention ||
+                (!exists && !mine && !isActive && s.me != null && m.mentions.includes(s.me.id)),
+            }
+          : c,
+      ),
+    ),
+    typing,
+  };
+}
+
+/** 断线补齐。未读以目录刷新为准，这里只补线程和更新的预览。 */
+export function applySyncMessages(
+  s: AppState,
+  conversationId: string,
+  incoming: MessageView[],
+): Partial<AppState> {
+  if (incoming.length === 0) return {};
+  const refreshed = applyRefreshed(s, conversationId, incoming);
+  const { [conversationId]: _typing, ...typing } = s.typing;
+  return {
+    ...refreshed,
+    typing,
+    conversations: sortConversations(
+      (refreshed.conversations ?? s.conversations).map((c) => {
+        if (c.id !== conversationId) return c;
+        let last = c.last_message;
+        let lastSeq = c.last_seq;
+        for (const m of refreshed.messages?.[conversationId] ?? incoming) {
+          if (m.id.startsWith("client:")) continue;
+          last = selectLast(last, m);
+          if (m.seq > lastSeq) lastSeq = m.seq;
+        }
+        return { ...c, last_message: last, last_seq: lastSeq };
+      }),
+    ),
+  };
+}
+
+export function dropOptimistic(s: AppState, convId: string, clientMsgId: string): Partial<AppState> {
+  const id = `client:${clientMsgId}`;
+  return {
+    messages: {
+      ...s.messages,
+      [convId]: (s.messages[convId] ?? []).filter((m) => m.id !== id),
+    },
+  };
+}
+
+/** 生命周期广播（编辑/删除/reaction）唯一合并入口：服务端所有 mutation 帧
+ * 均携带完整 MessageView（reactions 已按本接收者个性化），按 id+edit_version
+ * 整视图合并——版本更高的视图天然包含低版本的全部变更，迟到的旧帧直接丢弃，
+ * 不存在部分字段帧互相吞更新的问题。会话卡片上的 last_message 同步换新版。 */
+export function applyUpdatedMessage(s: AppState, m: MessageView): Partial<AppState> {
+  return applyRefreshed(s, m.conversation_id, [m]);
+}
+
+/** 重连批量刷新：回包按同一 id+version 规则合并；last_message 引用同 id 时换新 */
+export function applyRefreshed(
+  s: AppState,
+  convId: string,
+  incoming: MessageView[],
+): Partial<AppState> {
+  if (incoming.length === 0) return {};
+  const cached = s.messages[convId] ?? [];
+  const byId = new Map(cached.map((m) => [m.id, m]));
+  const merge = (m: MessageView) => {
+    const old = byId.get(m.id);
+    byId.set(m.id, old ? selectMessage(old, m) : m);
+  };
+  for (const c of s.conversations) {
+    if (c.id === convId && c.last_message) merge(c.last_message);
+  }
+  incoming.filter((m) => m.conversation_id === convId).forEach(merge);
+  const withReply = (m: MessageView): MessageView => {
+    const source = m.reply_to_id && byId.get(m.reply_to_id);
+    return source && !m.deleted_at && !(m.reply_to_preview?.deleted && !source.deleted_at)
+      ? { ...m, reply_to_preview: replyPreview(source) }
+      : m;
+  };
+  const ids = new Set([...cached.map((m) => m.id), ...incoming.filter((m) => m.conversation_id === convId).map((m) => m.id)]);
+  const list = [...ids].map((id) => withReply(byId.get(id)!)).sort((a, b) => a.seq - b.seq);
+  return {
+    messages: { ...s.messages, [convId]: list },
+    conversations: s.conversations.map((c) => c.id === convId && c.last_message
+      ? { ...c, last_message: withReply(byId.get(c.last_message.id)!) }
+      : c),
+    replyingTo: s.replyingTo?.conversation_id === convId
+      ? withReply(byId.get(s.replyingTo.id) ?? s.replyingTo)
+      : s.replyingTo,
+  };
+}
+
+/** 会话不再可访问（refresh 403/404）：丢弃本地消息缓存与滚动状态 */
+export function dropConversationCache(s: AppState, convId: string): Partial<AppState> {
+  const messages = { ...s.messages };
+  delete messages[convId];
+  const hasMore = { ...s.hasMore };
+  delete hasMore[convId];
+  const historyLoaded = { ...s.historyLoaded };
+  delete historyLoaded[convId];
+  const typing = { ...s.typing };
+  delete typing[convId];
+  return { messages, hasMore, historyLoaded, typing };
+}
+
 /** ack 到达：用服务端消息替换乐观副本（message 回显可能先于 ack，需按 id 去重） */
 export function resolveAck(
   list: MessageView[],
   clientMsgId: string | null,
   real: MessageView,
 ): MessageView[] {
-  const mapped = clientMsgId
-    ? list.map((m) => (m.id === `client:${clientMsgId}` ? real : m))
-    : list;
-  const seen = new Set<string>();
-  return mapped
-    .filter((m) => !seen.has(m.id) && (seen.add(m.id), true))
-    .sort((a, b) => a.seq - b.seq);
+  return upsertMessage(list.filter((m) => m.id !== `client:${clientMsgId}`), real);
 }

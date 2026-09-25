@@ -20,7 +20,7 @@ use tracing_subscriber::EnvFilter;
 /// 构建完整路由（API + 可选静态托管）。测试复用。
 pub fn build_router(state: SharedState, cfg: &Config) -> Router {
     let mut app = Router::new()
-        .nest("/v1", api::router())
+        .nest("/v1", api::router(cfg))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);

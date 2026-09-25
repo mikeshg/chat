@@ -40,6 +40,60 @@ export interface AttachmentView {
   size: number;
 }
 
+/** 回复引用预览（只展开一层）；deleted=true 时 excerpt 为空，id/seq 仍可用于跳转 */
+export interface ReplyPreview {
+  message_id: string;
+  seq: number;
+  sender_name: string;
+  excerpt: string;
+  kind: string;
+  deleted: boolean;
+}
+
+/** 单 emoji 聚合；reacted_by_me 是服务端按当前用户个性化输出的 */
+export interface ReactionView {
+  emoji: string;
+  count: number;
+  reacted_by_me: boolean;
+}
+
+/** 投票选项视图；voters 仅非匿名投票返回（匿名恒为空数组） */
+export interface PollOptionView {
+  id: string;
+  index: number;
+  label: string;
+  count: number;
+  voters: string[];
+}
+
+/** 投票卡片视图（kind='poll' 消息携带；个性化字段已按本人计算） */
+export interface PollView {
+  question: string;
+  allow_multiple: boolean;
+  anonymous: boolean;
+  closed_at: string | null;
+  expires_at: string | null;
+  /** 服务端按库时间计算的到期态 */
+  expired: boolean;
+  /** 投票级单调版本；与消息 edit_version 同步递增 */
+  version: number;
+  total_voters: number;
+  options: PollOptionView[];
+  /** 本人已投选项 id（匿名投票也返回） */
+  my_option_ids: string[];
+}
+
+/** POST /conversations/{id}/polls 请求体 */
+export interface CreatePollReq {
+  question: string;
+  options: string[];
+  allow_multiple: boolean;
+  anonymous: boolean;
+  expires_at?: string | null;
+  /** 与 send_message 同一幂等键空间 */
+  client_msg_id?: string;
+}
+
 export interface MessageView {
   id: string;
   conversation_id: string;
@@ -48,10 +102,43 @@ export interface MessageView {
   sender_username: string;
   sender_name: string;
   content: string;
-  kind: string; // "text" | "image" | "file"
+  kind: string; // "text" | "image" | "file" | "poll"
   attachment: AttachmentView | null;
   mentions: string[]; // 被 @ 的用户 id（群聊）
+  /** 生命周期字段（旧服务端缺省；无版本字段按 0 处理） */
+  reply_to_id?: string | null;
+  reply_to_preview?: ReplyPreview | null;
+  edited_at?: string | null;
+  /** 消息级单调变更版本：编辑/软删除/reaction 实际变更均 +1 */
+  edit_version?: number;
+  deleted_at?: string | null;
+  reactions?: ReactionView[];
+  /** kind='poll' 时的投票卡片数据（旧服务端缺省）；墓碑消息为 null */
+  poll?: PollView | null;
   created_at: string;
+}
+
+/** 会话偏好（用户维度；旧服务端无此字段 → 视为全默认） */
+export interface ConversationPref {
+  pinned_at: string | null;
+  archived_at: string | null;
+  /** 定时静音截止（RFC3339）；null 只表示无定时静音 */
+  muted_until: string | null;
+  mute_forever: boolean;
+  updated_at: string | null;
+}
+
+/** PUT /conversations/{id}/preferences 请求体：缺省字段不改（null 与缺省等价） */
+export interface PrefUpdate {
+  pinned?: boolean;
+  archived?: boolean;
+  mute?: { mode: "none" | "until" | "forever"; until?: string };
+}
+
+/** GET /conversations/preferences 条目：与 preference_updated 帧同构 */
+export interface ConversationPrefEntry {
+  conversation_id: string;
+  preference: ConversationPref;
 }
 
 export interface ConversationView {
@@ -65,6 +152,8 @@ export interface ConversationView {
   unread_count: number;
   has_mention: boolean; // 有未读的 @我
   last_message: MessageView | null;
+  /** 本人偏好（置顶/静音/归档）；旧服务端缺省 */
+  preference?: ConversationPref | null;
   created_at: string;
 }
 
@@ -96,10 +185,50 @@ export type WsOut =
   | { type: "presence"; user_id: string; online: boolean; last_seen_at: string | null }
   | { type: "presence_init"; online: string[] }
   | { type: "read_sync"; conversation_id: string; seq: number }
-  | { type: "sync_messages"; conversation_id: string; messages: MessageView[] }
+  | {
+      type: "sync_messages";
+      conversation_id: string;
+      messages: MessageView[];
+      /** 服务端分页：true 表示缺口未完，需要按新水位继续 sync（旧服务端无此字段→视为 false） */
+      has_more?: boolean;
+    }
+  | {
+      type: "message_updated";
+      conversation_id: string;
+      message: MessageView;
+      edit_version: number;
+    }
+  | {
+      /** 软删除广播：完整墓碑视图（正文/附件/reaction 已掩蔽，id/seq 保留） */
+      type: "message_deleted";
+      conversation_id: string;
+      message: MessageView;
+      edit_version: number;
+    }
+  | {
+      /** reaction 变更广播：完整视图，reactions 已按本接收者个性化 */
+      type: "reaction_update";
+      conversation_id: string;
+      message: MessageView;
+      edit_version: number;
+    }
+  | { type: "op_ack"; client_op_id: string }
+  | {
+      /** 会话偏好变更：服务端只发给本人全部连接 */
+      type: "preference_updated";
+      conversation_id: string;
+      preference: ConversationPref;
+    }
   | { type: "invalidate"; what: string }
   | { type: "force_logout"; reason: string }
-  | { type: "error"; code: string; message: string };
+  | {
+      type: "error";
+      code: string;
+      message: string;
+      client_msg_id?: string | null;
+      /** 非发送类 mutation 的回执关联；与 client_msg_id 不混用 */
+      client_op_id?: string | null;
+    };
 
 // ---------- 后台管理 ----------
 export interface AdminOverview {

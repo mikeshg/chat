@@ -1,7 +1,7 @@
-use crate::domain;
+use crate::domain::{self, ReactionChange};
 use crate::error::AppResult;
-use crate::model::{AttachmentView, UserPublic, WsIn, WsOut, WsTicketQuery};
-use crate::state::SharedState;
+use crate::model::{UserPublic, WsIn, WsOut, WsTicketQuery};
+use crate::state::{ConnMsg, SharedState};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -20,49 +20,62 @@ pub async fn ws_handler(
     Query(q): Query<WsTicketQuery>,
     ws: WebSocketUpgrade,
 ) -> AppResult<Response> {
-    let (uid, issued) = st
+    let grant = st
         .tickets
         .remove(&q.ticket)
         .map(|(_, v)| v)
         .ok_or_else(|| crate::error::AppError::unauthorized("invalid ticket"))?;
-    if issued.elapsed() > Duration::from_secs(30) {
+    if grant.issued.elapsed() > Duration::from_secs(30) {
         return Err(crate::error::AppError::unauthorized("ticket expired"));
     }
-    // ticket 签发后被禁用的缝隙：升级前再确认一次
-    let disabled = sqlx::query_scalar::<_, bool>(
-        "SELECT disabled_at IS NOT NULL FROM users WHERE id = $1",
+    // ticket 签发后被禁用/改密的缝隙：升级前再确认一次（禁用与凭据版本都要仍有效）
+    let ok = sqlx::query_scalar::<_, bool>(
+        "SELECT disabled_at IS NULL AND session_version = $2 FROM users WHERE id = $1",
     )
-    .bind(uid)
+    .bind(grant.uid)
+    .bind(grant.session_version)
     .fetch_one(&st.pool)
     .await
-    .unwrap_or(true);
-    if disabled {
-        return Err(crate::error::AppError::forbidden("账号已被禁用"));
+    .unwrap_or(false);
+    if !ok {
+        return Err(crate::error::AppError::unauthorized(
+            "session expired, please login again",
+        ));
     }
-    Ok(ws.on_upgrade(move |socket| handle(socket, st, uid)))
+    let access = crate::auth::AccessGrant {
+        uid: grant.uid,
+        session_version: grant.session_version,
+    };
+    Ok(ws.on_upgrade(move |socket| handle_session(socket, st, access)))
 }
 
 fn frame(out: &WsOut) -> String {
     serde_json::to_string(out).unwrap()
 }
 
-async fn handle(socket: WebSocket, st: SharedState, uid: Uuid) {
+/// Process an upgraded socket using the grant validated at the HTTP boundary.
+pub async fn handle_session(mut socket: WebSocket, st: SharedState, grant: crate::auth::AccessGrant) {
+    let uid = grant.uid;
     let conn_id = Uuid::new_v4();
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<ConnMsg>();
 
-    let first_conn = {
-        st.conns.entry(uid).or_default().insert(conn_id, tx.clone());
-        st.conn_count(uid) == 1
-    };
+    let online_epoch = st.register_conn(uid, conn_id, tx.clone());
 
     let watchers = st.watchers(uid).await.unwrap_or_default();
-    if first_conn {
-        let p = frame(&WsOut::Presence {
-            user_id: uid,
-            online: true,
-            last_seen_at: None,
-        });
-        st.send_to_users(&watchers, &p);
+    if !connection_valid(&st, uid, conn_id, grant.session_version).await {
+        st.unregister_conn(uid, conn_id);
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    }
+    if let Some(epoch) = online_epoch {
+        if st.epoch_is(uid, epoch) && st.is_online(uid) {
+            let p = frame(&WsOut::Presence {
+                user_id: uid,
+                online: true,
+                last_seen_at: None,
+            });
+            st.send_to_users(&watchers, &p);
+        }
     }
     // 告知本连接：我的观察者中谁在线
     let online: Vec<Uuid> = watchers
@@ -70,7 +83,7 @@ async fn handle(socket: WebSocket, st: SharedState, uid: Uuid) {
         .copied()
         .filter(|w| st.is_online(*w))
         .collect();
-    let _ = tx.send(frame(&WsOut::PresenceInit { online }));
+    let _ = tx.send(ConnMsg::Frame(frame(&WsOut::PresenceInit { online })));
 
     let (mut sink, mut stream) = socket.split();
     let mut ping = tokio::time::interval(Duration::from_secs(30));
@@ -80,10 +93,16 @@ async fn handle(socket: WebSocket, st: SharedState, uid: Uuid) {
         tokio::select! {
             out = rx.recv() => {
                 match out {
-                    Some(payload) => {
+                    Some(ConnMsg::Frame(payload)) => {
                         if sink.send(Message::Text(payload.into())).await.is_err() {
                             break;
                         }
+                    }
+                    // 被踢下线：先把 force_logout 帧送到客户端，再主动关闭 socket
+                    Some(ConnMsg::Shutdown(payload)) => {
+                        let _ = sink.send(Message::Text(payload.into())).await;
+                        let _ = sink.send(Message::Close(None)).await;
+                        break;
                     }
                     None => break,
                 }
@@ -96,7 +115,10 @@ async fn handle(socket: WebSocket, st: SharedState, uid: Uuid) {
             incoming = stream.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        on_text(&st, uid, &tx, &text).await;
+                        if !on_text(&st, uid, conn_id, grant.session_version, &tx, &text).await {
+                            let _ = sink.send(Message::Close(None)).await;
+                            break;
+                        }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Err(_)) => break,
@@ -106,215 +128,331 @@ async fn handle(socket: WebSocket, st: SharedState, uid: Uuid) {
         }
     }
 
-    // 清理连接；最后一个断开 → 落 last_seen + 广播离线
-    let last = {
-        if let Some(m) = st.conns.get(&uid) {
-            m.remove(&conn_id);
-        }
-        let empty = st.conn_count(uid) == 0;
-        if empty {
-            st.conns.remove(&uid);
-        }
-        empty
-    };
-    if last {
-        let now = Utc::now();
-        let _ = sqlx::query("UPDATE users SET last_seen_at = now() WHERE id = $1")
-            .bind(uid)
-            .execute(&st.pool)
-            .await;
-        let p = frame(&WsOut::Presence {
-            user_id: uid,
-            online: false,
-            last_seen_at: Some(now),
-        });
-        // 用最新关系快照广播下线（连接期间好友/群成员可能已变化）
-        let watchers_now = st.watchers(uid).await.unwrap_or_default();
-        st.send_to_users(&watchers_now, &p);
+    if let Some(epoch) = st.unregister_conn(uid, conn_id) {
+        publish_offline(&st, uid, epoch).await;
     }
 }
 
-async fn on_text(st: &SharedState, uid: Uuid, tx: &mpsc::UnboundedSender<String>, text: &str) {
+/// 最后一个连接断开或被踢下线后广播离线。epoch 已经变了就放弃，避免盖住刚连上的设备。
+pub async fn publish_offline(st: &SharedState, uid: Uuid, epoch: u64) {
+    if !st.epoch_is(uid, epoch) || st.is_online(uid) {
+        return;
+    }
+    let now = Utc::now();
+    let _ = sqlx::query("UPDATE users SET last_seen_at = now() WHERE id = $1")
+        .bind(uid)
+        .execute(&st.pool)
+        .await;
+    if !st.epoch_is(uid, epoch) || st.is_online(uid) {
+        return;
+    }
+    let watchers = st.watchers(uid).await.unwrap_or_default();
+    if !st.epoch_is(uid, epoch) || st.is_online(uid) {
+        return;
+    }
+    let p = frame(&WsOut::Presence {
+        user_id: uid,
+        online: false,
+        last_seen_at: Some(now),
+    });
+    st.send_to_users(&watchers, &p);
+}
+
+fn ws_err(code: &'static str, message: impl Into<String>) -> (&'static str, String) {
+    (code, message.into())
+}
+
+// ---------- 生命周期广播（api.rs REST 路径复用） ----------
+
+/// 编辑广播：reactions 含 reacted_by_me，必须逐成员分别序列化。
+pub async fn broadcast_message_updated(st: &SharedState, ed: &domain::Edited) {
+    for m in &ed.member_ids {
+        let view = ed.row.clone().into_view(*m);
+        st.send_to_user(
+            *m,
+            &frame(&WsOut::MessageUpdated {
+                conversation_id: ed.conversation_id,
+                message: view,
+                edit_version: ed.edit_version,
+            }),
+        );
+    }
+}
+
+/// 软删除广播：完整墓碑视图逐成员成帧（删除后 reactions 已清空，各成员等价，
+/// 但统一走 into_view 保持协议形状一致）。
+pub fn broadcast_message_deleted(st: &SharedState, d: &domain::Deleted) {
+    for m in &d.member_ids {
+        let view = d.row.clone().into_view(*m);
+        st.send_to_user(
+            *m,
+            &frame(&WsOut::MessageDeleted {
+                conversation_id: d.conversation_id,
+                edit_version: view.edit_version,
+                message: view,
+            }),
+        );
+    }
+}
+
+/// reaction 变更广播：完整视图逐成员成帧（reactions.reacted_by_me 按接收者计算）。
+/// 携带整视图是关键——部分字段帧的全局版本会吞掉反序到达的完整编辑。
+pub fn broadcast_reaction_update(st: &SharedState, ch: &ReactionChange) {
+    for m in &ch.member_ids {
+        let view = ch.row.clone().into_view(*m);
+        st.send_to_user(
+            *m,
+            &frame(&WsOut::ReactionUpdate {
+                conversation_id: ch.conversation_id,
+                edit_version: view.edit_version,
+                message: view,
+            }),
+        );
+    }
+}
+
+/// mutation 回执：只回发起连接，与 client_msg_id 严格区分。
+fn op_ack(tx: &mpsc::UnboundedSender<ConnMsg>, client_op_id: Option<Uuid>) {
+    if let Some(id) = client_op_id {
+        let _ = tx.send(ConnMsg::Frame(frame(&WsOut::OpAck { client_op_id: id })));
+    }
+}
+
+async fn connection_valid(st: &SharedState, uid: Uuid, conn_id: Uuid, session_version: i64) -> bool {
+    let valid = sqlx::query_scalar::<_, bool>(
+        "SELECT disabled_at IS NULL AND session_version = $2 FROM users WHERE id = $1",
+    )
+    .bind(uid)
+    .bind(session_version)
+    .fetch_one(&st.pool)
+    .await
+    .unwrap_or(false);
+    valid && st.conn_alive(uid, conn_id)
+}
+
+async fn on_text(
+    st: &SharedState,
+    uid: Uuid,
+    conn_id: Uuid,
+    session_version: i64,
+    tx: &mpsc::UnboundedSender<ConnMsg>,
+    text: &str,
+) -> bool {
+    if !connection_valid(st, uid, conn_id, session_version).await {
+        return false;
+    }
     let parsed: Result<WsIn, _> = serde_json::from_str(text);
-    let res = match parsed {
+    let (res, client_msg_id, client_op_id) = match parsed {
         Ok(WsIn::SendMessage {
             conversation_id,
             client_msg_id,
             content,
-            kind,
             attachment_id,
+            reply_to_id,
+            ..
         }) => {
-            send_message(
+            let res = send_message(
                 st,
                 uid,
                 tx,
                 conversation_id,
-                client_msg_id,
+                client_msg_id.clone(),
                 &content,
-                kind,
                 attachment_id,
+                reply_to_id,
             )
-            .await
+            .await;
+            (res, client_msg_id, None)
         }
-        Ok(WsIn::Typing { conversation_id }) => typing(st, uid, conversation_id).await,
+        Ok(WsIn::EditMessage {
+            message_id,
+            content,
+            expected_version,
+            client_op_id,
+        }) => {
+            let res = edit_message(
+                st,
+                uid,
+                tx,
+                message_id,
+                &content,
+                expected_version,
+                client_op_id.clone(),
+            )
+            .await;
+            (res, None, client_op_id)
+        }
+        Ok(WsIn::DeleteMessage {
+            message_id,
+            client_op_id,
+        }) => {
+            let res = delete_message(st, uid, tx, message_id, client_op_id.clone()).await;
+            (res, None, client_op_id)
+        }
+        Ok(WsIn::ReactionUpsert {
+            message_id,
+            emoji,
+            client_op_id,
+        }) => {
+            let res = reaction(st, uid, tx, message_id, &emoji, true, client_op_id.clone()).await;
+            (res, None, client_op_id)
+        }
+        Ok(WsIn::ReactionRemove {
+            message_id,
+            emoji,
+            client_op_id,
+        }) => {
+            let res = reaction(st, uid, tx, message_id, &emoji, false, client_op_id.clone()).await;
+            (res, None, client_op_id)
+        }
+        Ok(WsIn::Typing { conversation_id }) => {
+            (typing(st, uid, conversation_id).await, None, None)
+        }
         Ok(WsIn::Read {
             conversation_id,
             seq,
-        }) => mark_read(st, uid, conversation_id, seq).await,
+        }) => (mark_read(st, uid, conversation_id, seq).await, None, None),
         Ok(WsIn::Sync {
             conversation_id,
             last_seq,
-        }) => sync(st, uid, tx, conversation_id, last_seq).await,
-        Err(_) => Err(("bad_frame", "unrecognized frame")),
+        }) => (
+            sync(st, uid, tx, conversation_id, last_seq).await,
+            None,
+            None,
+        ),
+        Err(_) => (Err(ws_err("bad_frame", "unrecognized frame")), None, None),
     };
     if let Err((code, message)) = res {
-        let _ = tx.send(frame(&WsOut::Error {
+        let _ = tx.send(ConnMsg::Frame(frame(&WsOut::Error {
             code,
-            message: message.to_string(),
-        }));
+            message,
+            client_msg_id,
+            client_op_id,
+        })));
     }
+    true
 }
 
-type WsResult = Result<(), (&'static str, &'static str)>;
+type WsResult = Result<(), (&'static str, String)>;
 
 async fn send_message(
     st: &SharedState,
     uid: Uuid,
-    tx: &mpsc::UnboundedSender<String>,
+    tx: &mpsc::UnboundedSender<ConnMsg>,
     conv: Uuid,
     client_msg_id: Option<String>,
     content: &str,
-    _kind: Option<String>,
     attachment_id: Option<Uuid>,
+    reply_to_id: Option<Uuid>,
 ) -> WsResult {
-    let content = content.trim();
-    if content.chars().count() > 4000 {
-        return Err(("bad_message", "message too long (max 4000 chars)"));
-    }
-    // 附件归属校验：必须是本人上传、绑定到本会话、且未被其他消息使用
-    let attachment = if let Some(att_id) = attachment_id {
-        let row = sqlx::query_as::<_, (Uuid, String, String, i64, Uuid)>(
-            "SELECT id, file_name, mime, size, conv_id FROM attachments
-             WHERE id = $1 AND uploader_id = $2",
-        )
-        .bind(att_id)
-        .bind(uid)
-        .fetch_optional(&st.pool)
-        .await
-        .map_err(|_| ("internal", "db error"))?
-        .ok_or(("not_found", "attachment not found"))?;
-        if row.4 != conv {
-            return Err(("bad_attachment", "attachment belongs to another conversation"));
-        }
-        let used = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM messages WHERE attachment_id = $1)",
-        )
-        .bind(att_id)
-        .fetch_one(&st.pool)
-        .await
-        .map_err(|_| ("internal", "db error"))?;
-        if used {
-            return Err(("bad_attachment", "attachment already sent"));
-        }
-        Some(AttachmentView {
-            id: row.0,
-            file_name: row.1,
-            mime: row.2,
-            size: row.3,
-        })
-    } else {
-        None
-    };
-    if attachment.is_none() && content.is_empty() {
-        return Err(("bad_message", "message must be 1-4000 chars"));
-    }
-    let kind: &str = match &attachment {
-        Some(a) if a.mime.starts_with("image/") => "image",
-        Some(_) => "file",
-        None => "text",
-    };
-    let content: String = if content.is_empty() {
-        match kind {
-            "image" => "[图片]".into(),
-            _ => format!("[文件] {}", attachment.as_ref().unwrap().file_name),
-        }
-    } else {
-        content.to_string()
-    };
-    domain::membership(&st.pool, conv, uid)
-        .await
-        .map_err(|_| ("internal", "db error"))?
-        .ok_or(("forbidden", "not a member of this conversation"))?;
+    let posted = domain::post_message(
+        &st.pool,
+        domain::PostMessage {
+            conversation_id: conv,
+            sender_id: uid,
+            content,
+            client_msg_id: client_msg_id.as_deref(),
+            attachment_id,
+            reply_to_id,
+            // WS 不接受投票负载：kind='poll' 只能经 REST create_poll 产生（防伪造）
+            poll: None,
+        },
+    )
+    .await
+    .map_err(domain::PostError::into_ws)?;
 
-    let ctype = domain::conv_kind(&st.pool, conv)
-        .await
-        .map_err(|_| ("internal", "db error"))?
-        .unwrap_or_default();
-
-    // DM：好友关系解除后只读
-    if ctype == "dm" {
-        let others = domain::member_ids(&st.pool, conv)
-            .await
-            .map_err(|_| ("internal", "db error"))?;
-        if let Some(peer) = others.iter().copied().find(|u| *u != uid) {
-            let still = domain::is_friend(&st.pool, uid, peer)
-                .await
-                .map_err(|_| ("internal", "db error"))?;
-            if !still {
-                return Err(("not_friends", "好友关系已解除，会话只读"));
-            }
+    if posted.inserted {
+        let p = frame(&WsOut::Message {
+            message: posted.message.clone(),
+        });
+        st.send_to_users(&posted.member_ids, &p);
+    }
+    // 新 @本人消息已在事务内解除其归档：偏好帧只发给本人全部连接（其他成员不可见）
+    for target in &posted.unarchived {
+        if let Ok(preference) = domain::pref_of(&st.pool, conv, *target).await {
+            st.send_to_user(
+                *target,
+                &frame(&WsOut::PreferenceUpdated {
+                    conversation_id: conv,
+                    preference,
+                }),
+            );
         }
     }
-
-    // @提及：仅群聊解析，匹配成员用户名，去重且不含发送者
-    let mentions: Vec<Uuid> = if ctype == "group" {
-        let members = sqlx::query_as::<_, (Uuid, String)>(
-            "SELECT m.user_id, u.username::text FROM memberships m
-             JOIN users u ON u.id = m.user_id WHERE m.conversation_id = $1",
-        )
-        .bind(conv)
-        .fetch_all(&st.pool)
-        .await
-        .map_err(|_| ("internal", "db error"))?;
-        parse_mentions(&content, &members, uid)
-    } else {
-        Vec::new()
-    };
-
-    let mut db_tx = st
-        .pool
-        .begin()
-        .await
-        .map_err(|_| ("internal", "db error"))?;
-    let msg = domain::append_message(&mut db_tx, conv, uid, &content, kind, attachment, &mentions)
-        .await
-        .map_err(|_| ("internal", "db error"))?;
-    db_tx.commit().await.map_err(|_| ("internal", "db error"))?;
-
-    let members = domain::member_ids(&st.pool, conv)
-        .await
-        .map_err(|_| ("internal", "db error"))?;
-    let p = frame(&WsOut::Message {
-        message: msg.clone(),
-    });
-    st.send_to_users(&members, &p);
     // ack 只回发起连接：携带 client_msg_id 完成乐观替换
-    let _ = tx.send(frame(&WsOut::MessageAck {
+    let _ = tx.send(ConnMsg::Frame(frame(&WsOut::MessageAck {
         client_msg_id,
-        message: msg,
-    }));
+        message: posted.message,
+    })));
+    Ok(())
+}
+
+async fn edit_message(
+    st: &SharedState,
+    uid: Uuid,
+    tx: &mpsc::UnboundedSender<ConnMsg>,
+    message_id: Uuid,
+    content: &str,
+    expected_version: i32,
+    client_op_id: Option<Uuid>,
+) -> WsResult {
+    let ed = domain::edit_message(
+        &st.pool,
+        message_id,
+        uid,
+        content,
+        expected_version,
+        client_op_id,
+    )
+    .await
+    .map_err(domain::PostError::into_ws)?;
+    broadcast_message_updated(st, &ed).await;
+    op_ack(tx, client_op_id);
+    Ok(())
+}
+
+async fn delete_message(
+    st: &SharedState,
+    uid: Uuid,
+    tx: &mpsc::UnboundedSender<ConnMsg>,
+    message_id: Uuid,
+    client_op_id: Option<Uuid>,
+) -> WsResult {
+    let d = domain::delete_message(&st.pool, message_id, uid)
+        .await
+        .map_err(domain::PostError::into_ws)?;
+    broadcast_message_deleted(st, &d);
+    op_ack(tx, client_op_id);
+    crate::api::spawn_file_cleanup(st, d.orphan_files);
+    Ok(())
+}
+
+async fn reaction(
+    st: &SharedState,
+    uid: Uuid,
+    tx: &mpsc::UnboundedSender<ConnMsg>,
+    message_id: Uuid,
+    emoji: &str,
+    add: bool,
+    client_op_id: Option<Uuid>,
+) -> WsResult {
+    let ch = domain::set_reaction(&st.pool, message_id, uid, emoji, add)
+        .await
+        .map_err(domain::PostError::into_ws)?;
+    broadcast_reaction_update(st, &ch);
+    op_ack(tx, client_op_id);
     Ok(())
 }
 
 async fn typing(st: &SharedState, uid: Uuid, conv: Uuid) -> WsResult {
     domain::membership(&st.pool, conv, uid)
         .await
-        .map_err(|_| ("internal", "db error"))?
-        .ok_or(("forbidden", "not a member"))?;
+        .map_err(|_| ws_err("internal", "db error"))?
+        .ok_or_else(|| ws_err("forbidden", "not a member"))?;
     let user = user_public(st, uid).await?;
     let members = domain::member_ids(&st.pool, conv)
         .await
-        .map_err(|_| ("internal", "db error"))?;
+        .map_err(|_| ws_err("internal", "db error"))?;
     let p = frame(&WsOut::Typing {
         conversation_id: conv,
         user,
@@ -328,90 +466,65 @@ async fn typing(st: &SharedState, uid: Uuid, conv: Uuid) -> WsResult {
 async fn mark_read(st: &SharedState, uid: Uuid, conv: Uuid, seq: i64) -> WsResult {
     domain::membership(&st.pool, conv, uid)
         .await
-        .map_err(|_| ("internal", "db error"))?
-        .ok_or(("forbidden", "not a member"))?;
-    sqlx::query(
+        .map_err(|_| ws_err("internal", "db error"))?
+        .ok_or_else(|| ws_err("forbidden", "not a member"))?;
+    // 只推进不回退；回显实际生效的 seq（可能因 last_seq 上限被收敛），无变化则不广播
+    let applied = sqlx::query_scalar::<_, i64>(
         "UPDATE memberships SET last_read_seq = LEAST($3, (SELECT last_seq FROM conversations WHERE id = $1))
-         WHERE conversation_id = $1 AND user_id = $2 AND last_read_seq < $3",
+         WHERE conversation_id = $1 AND user_id = $2 AND last_read_seq < $3
+         RETURNING last_read_seq",
     )
     .bind(conv)
     .bind(uid)
     .bind(seq)
-    .execute(&st.pool)
+    .fetch_optional(&st.pool)
     .await
-    .map_err(|_| ("internal", "db error"))?;
-    // 同步到我的其他设备（清除未读角标）
-    st.send_to_user(
-        uid,
-        &frame(&WsOut::ReadSync {
-            conversation_id: conv,
-            seq,
-        }),
-    );
+    .map_err(|_| ws_err("internal", "db error"))?;
+    if let Some(applied) = applied {
+        // 同步到我的其他设备（清除未读角标）
+        st.send_to_user(
+            uid,
+            &frame(&WsOut::ReadSync {
+                conversation_id: conv,
+                seq: applied,
+            }),
+        );
+    }
     Ok(())
 }
+
+/// sync 单页上限；缺口更大时 has_more=true，客户端按新水位续拉
+const SYNC_PAGE: i64 = 500;
 
 async fn sync(
     st: &SharedState,
     uid: Uuid,
-    tx: &mpsc::UnboundedSender<String>,
+    tx: &mpsc::UnboundedSender<ConnMsg>,
     conv: Uuid,
     last_seq: i64,
 ) -> WsResult {
     domain::membership(&st.pool, conv, uid)
         .await
-        .map_err(|_| ("internal", "db error"))?
-        .ok_or(("forbidden", "not a member"))?;
-    let rows = sqlx::query_as::<_, domain::MsgViewRow>(&format!(
-        "SELECT {} {} WHERE m.conversation_id = $1 AND m.seq > $2
-          ORDER BY m.seq ASC LIMIT 500",
-        domain::MsgViewRow::SELECT,
-        domain::MsgViewRow::JOIN
-    ))
-    .bind(conv)
-    .bind(last_seq)
-    .fetch_all(&st.pool)
-    .await
-    .map_err(|_| ("internal", "db error"))?;
-    let _ = tx.send(frame(&WsOut::SyncMessages {
+        .map_err(|_| ws_err("internal", "db error"))?
+        .ok_or_else(|| ws_err("forbidden", "not a member"))?;
+    // 多取一条探测是否还有后续页
+    let mut messages = domain::messages_after(&st.pool, conv, uid, last_seq, SYNC_PAGE + 1)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = ?e, "sync failed");
+            ws_err("internal", "db error")
+        })?;
+    let has_more = messages.len() as i64 > SYNC_PAGE;
+    messages.truncate(SYNC_PAGE as usize);
+    let _ = tx.send(ConnMsg::Frame(frame(&WsOut::SyncMessages {
         conversation_id: conv,
-        messages: rows.into_iter().map(|r| r.into_view()).collect(),
-    }));
+        messages,
+        has_more,
+    })));
     Ok(())
 }
 
-/// 从消息内容提取 @username，匹配群成员（去重、不含发送者）
-fn parse_mentions(content: &str, members: &[(Uuid, String)], sender: Uuid) -> Vec<Uuid> {
-    let mut out = Vec::new();
-    let b = content.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'@' {
-            let start = i + 1;
-            let mut end = start;
-            while end < b.len() && (b[end].is_ascii_alphanumeric() || b[end] == b'_') {
-                end += 1;
-            }
-            if end > start {
-                let name = &content[start..end];
-                if let Some((uid, _)) = members.iter().find(|(_, u)| u == name) {
-                    if *uid != sender && !out.contains(uid) {
-                        out.push(*uid);
-                    }
-                }
-            }
-            i = end.max(i + 1);
-        } else {
-            i += 1;
-        }
-    }
-    out
-}
-
-async fn user_public(
-    st: &SharedState,
-    uid: Uuid,
-) -> Result<UserPublic, (&'static str, &'static str)> {
+async fn user_public(st: &SharedState, uid: Uuid) -> Result<UserPublic, (&'static str, String)> {
     sqlx::query_as::<_, (String, String, String, Option<chrono::DateTime<Utc>>)>(
         "SELECT username::text, display_name, role, last_seen_at FROM users WHERE id = $1",
     )
@@ -425,5 +538,5 @@ async fn user_public(
         role,
         last_seen_at,
     })
-    .map_err(|_| ("internal", "db error"))
+    .map_err(|_| ws_err("internal", "db error"))
 }

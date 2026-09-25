@@ -16,12 +16,15 @@ export default function App() {
         me: null,
         conversations: [],
         messages: {},
+        hasMore: {},
+        historyLoaded: {},
         friends: [],
         requests: { incoming: [], outgoing: [] },
         online: {},
         typing: {},
         activeConv: null,
         wsReady: false,
+        toasts: [],
       });
     };
     window.addEventListener("chat:logout", onLogout);

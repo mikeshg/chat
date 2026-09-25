@@ -2,6 +2,7 @@ import { useState } from "react";
 import { auth, friends } from "../api";
 import { setState, useApp } from "../store";
 import type { UserPublic } from "../types";
+import { openConversation } from "../ws";
 
 export default function ContactsPanel() {
   const s = useApp();
@@ -47,7 +48,9 @@ export default function ContactsPanel() {
 
   const openDm = (u: UserPublic) => {
     const c = s.conversations.find((c) => c.kind === "dm" && c.peer?.id === u.id);
-    setState({ tab: "chats", activeConv: c?.id ?? null });
+    // 走统一入口：已读上报 + 归档会话打开即解除归档（§8.3）
+    if (c) openConversation(c.id);
+    else setState({ tab: "chats", activeConv: null });
   };
 
   const removeFriend = async (u: UserPublic) => {

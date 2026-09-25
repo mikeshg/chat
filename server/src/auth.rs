@@ -12,7 +12,6 @@ use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, 
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
 use uuid::Uuid;
 
 pub const ACCESS_TTL_SECS: i64 = 15 * 60;
@@ -23,6 +22,16 @@ struct Claims {
     sub: String,
     iat: usize,
     exp: usize,
+    /// 签发时的 users.session_version；禁用/改密 bump 后旧 token 失效。
+    /// default 兼容升级前签发的旧 token（等同 session_version=0）。
+    #[serde(default)]
+    sv: i64,
+}
+
+/// 校验通过的 access token 承载的身份
+pub struct AccessGrant {
+    pub uid: Uuid,
+    pub session_version: i64,
 }
 
 pub fn hash_password(pw: &str) -> AppResult<String> {
@@ -40,12 +49,13 @@ pub fn verify_password(hash: &str, pw: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn mint_access(user_id: Uuid, secret: &str) -> AppResult<(String, i64)> {
+pub fn mint_access(user_id: Uuid, session_version: i64, secret: &str) -> AppResult<(String, i64)> {
     let now = Utc::now().timestamp();
     let claims = Claims {
         sub: user_id.to_string(),
         iat: now as usize,
         exp: (now + ACCESS_TTL_SECS) as usize,
+        sv: session_version,
     };
     let token = encode(
         &Header::new(Algorithm::HS256),
@@ -56,14 +66,19 @@ pub fn mint_access(user_id: Uuid, secret: &str) -> AppResult<(String, i64)> {
     Ok((token, ACCESS_TTL_SECS))
 }
 
-pub fn verify_access(token: &str, secret: &str) -> AppResult<Uuid> {
+pub fn verify_access(token: &str, secret: &str) -> AppResult<AccessGrant> {
     let data = decode::<Claims>(
         token,
         &DecodingKey::from_secret(secret.as_bytes()),
         &Validation::new(Algorithm::HS256),
     )
     .map_err(|_| AppError::unauthorized("invalid or expired access token"))?;
-    Uuid::parse_str(&data.claims.sub).map_err(|_| AppError::unauthorized("bad token subject"))
+    let uid = Uuid::parse_str(&data.claims.sub)
+        .map_err(|_| AppError::unauthorized("bad token subject"))?;
+    Ok(AccessGrant {
+        uid,
+        session_version: data.claims.sv,
+    })
 }
 
 /// 生成不透明刷新令牌：(给客户端的原始值, 落库的 sha256 hex)
@@ -79,8 +94,8 @@ pub fn refresh_hash(raw: &str) -> String {
     hex::encode(Sha256::digest(raw.as_bytes()))
 }
 
-/// 从 Authorization: Bearer 头解析当前用户 id
-pub fn bearer_uid(headers: &HeaderMap, cfg: &Config) -> AppResult<Uuid> {
+/// 从 Authorization: Bearer 头解析当前用户身份（uid + 会话版本）
+pub fn bearer_grant(headers: &HeaderMap, cfg: &Config) -> AppResult<AccessGrant> {
     let value = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -91,16 +106,21 @@ pub fn bearer_uid(headers: &HeaderMap, cfg: &Config) -> AppResult<Uuid> {
     verify_access(token, &cfg.jwt_secret)
 }
 
-/// 解析 token 并取出用户行；账号被禁用立即拒绝（禁用即时生效）
+/// 解析 token 并取出用户行；账号被禁用或会话版本落后（改密/禁用后签发的旧 token）立即拒绝
 pub async fn require_user(st: &SharedState, headers: &HeaderMap) -> AppResult<UserRow> {
-    let uid = bearer_uid(headers, &st.cfg)?;
+    let grant = bearer_grant(headers, &st.cfg)?;
     let user = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE id = $1")
-        .bind(uid)
+        .bind(grant.uid)
         .fetch_optional(&st.pool)
         .await?
         .ok_or_else(|| AppError::unauthorized("user not found"))?;
     if user.disabled_at.is_some() {
         return Err(AppError::forbidden("账号已被禁用"));
+    }
+    if user.session_version as i64 != grant.session_version {
+        return Err(AppError::unauthorized(
+            "session expired, please login again",
+        ));
     }
     Ok(user)
 }
@@ -114,14 +134,15 @@ pub async fn require_admin(st: &SharedState, headers: &HeaderMap) -> AppResult<U
     Ok(user)
 }
 
-/// 签发 access + refresh 令牌并落库
+/// 签发 access + refresh 令牌并落库（access 绑定当前 session_version）。
+/// 调用方须在同一事务内持有该用户行锁（或新插入行），从鉴权直到签发提交。
 pub async fn issue_tokens(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     cfg: &Config,
-    user: &UserPublic,
+    user: &UserRow,
     device_label: Option<&str>,
 ) -> AppResult<AuthResponse> {
-    let (access, expires_in) = mint_access(user.id, &cfg.jwt_secret)?;
+    let (access, expires_in) = mint_access(user.id, user.session_version as i64, &cfg.jwt_secret)?;
     let (raw, hash) = mint_refresh();
     sqlx::query(
         "INSERT INTO refresh_tokens (user_id, token_hash, device_label, expires_at)
@@ -131,12 +152,12 @@ pub async fn issue_tokens(
     .bind(hash)
     .bind(device_label)
     .bind(Utc::now() + Duration::days(REFRESH_TTL_DAYS))
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(AuthResponse {
         access_token: access,
         refresh_token: raw,
         access_expires_in: expires_in,
-        user: user.clone(),
+        user: UserPublic::from(user),
     })
 }

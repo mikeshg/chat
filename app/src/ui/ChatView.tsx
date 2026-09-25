@@ -1,9 +1,20 @@
 import { useEffect, useRef, useState } from "react";
-import { convs, files } from "../api";
-import { convTitle, getState, prependMessages, setState, useApp } from "../store";
-import type { AttachmentView, MemberView, MessageView } from "../types";
+import { ApiError, convs, files, msgs as msgsApi, session } from "../api";
+import {
+  applyRefreshed,
+  applyUpdatedMessage,
+  convTitle,
+  getState,
+  prependMessages,
+  setState,
+  upsertMessage,
+  useApp,
+} from "../store";
+import type { AttachmentView, MemberView, MessageView, ReplyPreview } from "../types";
 import { sendChat, sendTyping } from "../ws";
 import GroupInfo from "./GroupInfo";
+import NewPollModal from "./NewPollModal";
+import PollCard from "./PollCard";
 
 function fmtSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -40,6 +51,53 @@ function isTextLike(a: AttachmentView): boolean {
   );
 }
 
+/** 正在拉取初始历史页的会话（避免 StrictMode 双挂载/快速切换重复请求） */
+const historyInflight = new Set<string>();
+
+type EditSubmission = { id: string; content: string; expectedVersion: number; clientOpId: string };
+export function prepareEditSubmission(previous: EditSubmission | null, id: string, text: string, expectedVersion: number): EditSubmission {
+  const content = text.trim();
+  if (!content || Array.from(content).length > 4000) throw new Error("消息需 1–4000 字");
+  if (previous?.id === id && previous.content === content) return previous;
+  return { id, content, expectedVersion, clientOpId: crypto.randomUUID() };
+}
+
+/** 编辑结果归属：仅当组件 owner、编辑代次、目标消息、会话与账号代次全部未变时才收尾编辑态 */
+export function ownsEditResult(
+  submitted: { token: object | null; rev: number; messageId: string; convId: string; gen: number },
+  live: { owner: object | null; rev: number; editingId: string | null; activeConv: string | null; gen: number },
+): boolean {
+  return (
+    submitted.token != null &&
+    submitted.token === live.owner &&
+    submitted.rev === live.rev &&
+    live.editingId === submitted.messageId &&
+    submitted.gen === live.gen &&
+    live.activeConv === submitted.convId
+  );
+}
+
+/** 服务端明确拒绝的编辑结果：下一次提交必须是新 op；其余错误按“结果未确认”保留原 clientOpId 供幂等重试 */
+export function editRejected(e: unknown): boolean {
+  return e instanceof ApiError && [400, 403, 404, 409, 422].includes(e.status);
+}
+
+/** 快捷 emoji 表态集合 */
+const QUICK_EMOJI = ["👍", "❤️", "😂", "😮", "😢", "🙏", "🎉", "🔥"];
+
+/** 回复预览里非文本 kind 的占位摘要 */
+function kindLabel(kind: string): string {
+  if (kind === "image") return "[图片]";
+  if (kind === "file") return "[文件]";
+  if (kind === "poll") return "[投票]";
+  return "";
+}
+
+/** 编辑窗口 15 分钟（客户端只用于隐藏入口，服务端按库时间强制判定） */
+function withinEditWindow(m: MessageView): boolean {
+  return Date.now() - new Date(m.created_at).getTime() < 15 * 60 * 1000;
+}
+
 /** 触发客户端下载（借助 Content-Disposition: attachment） */
 function downloadAttachment(a: AttachmentView) {
   const el = document.createElement("a");
@@ -60,6 +118,7 @@ export default function ChatView() {
   const lastTypingSent = useRef(0);
   const fileInput = useRef<HTMLInputElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const draftBeforeEdit = useRef(""); // 编辑态接管 composer 前的草稿
   const [members, setMembers] = useState<MemberView[]>([]);
   const [ac, setAc] = useState<{ start: number; prefix: string } | null>(null);
   const [showSearch, setShowSearch] = useState(false);
@@ -75,42 +134,81 @@ export default function ChatView() {
   } | null>(null);
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
   const [sending, setSending] = useState(false);
+  // 生命周期：emoji 选择器展开的消息 id、消息右键菜单、mutation 错误/忙碌
+  const [emojiPick, setEmojiPick] = useState<string | null>(null);
+  const [msgMenu, setMsgMenu] = useState<{ x: number; y: number; m: MessageView } | null>(null);
+  const [mutErr, setMutErr] = useState<string | null>(null);
+  const [mutBusy, setMutBusy] = useState(false);
+  // 投票：创建弹窗开关 + 每条消息的操作 busy 态
+  const [showPoll, setShowPoll] = useState(false);
+  const [pollBusy, setPollBusy] = useState<Record<string, boolean>>({});
+  const gen = session();
+  const viewOwner = useRef<object | null>(null);
+  const mutation = useRef<object | null>(null);
+  const editSubmission = useRef<EditSubmission | null>(null);
+  const draftRevision = useRef(0);
+  const uploadOwner = useRef<object | null>(null);
+  const moreOwner = useRef<object | null>(null);
+  const searchRequest = useRef(0);
+  const previewRequest = useRef(0);
+  const jumpRequest = useRef(0);
+  const jumpTimers = useRef<ReturnType<typeof setTimeout>[]>([]);
 
   const conv = s.conversations.find((c) => c.id === s.activeConv) ?? null;
   const msgs = conv ? (s.messages[conv.id] ?? []) : [];
   const hasMore = conv ? (s.hasMore[conv.id] ?? false) : false;
+  const current = (token: object | null) => token != null && token === viewOwner.current && gen === session() && getState().activeConv === conv?.id;
 
   // 群聊拉成员列表（@补全用）
   useEffect(() => {
+    const token = {};
+    viewOwner.current = token;
+    setMembers([]);
     if (conv?.kind === "group") {
       convs
         .detail(conv.id)
-        .then((d) => setMembers(d.members))
-        .catch(() => setMembers([]));
-    } else {
-      setMembers([]);
+        .then((d) => { if (current(token)) setMembers(d.members); })
+        .catch(() => { if (current(token)) setMembers([]); });
     }
     setAc(null);
     setShowSearch(false);
     setSearchRes(null);
     setFlashId(null);
+    setEmojiPick(null);
+    setMsgMenu(null);
+    setMutErr(null);
+    // 切换会话：在途 mutation 回调失权（owner token 已换），忙碌态与编辑代次一并复位
+    mutation.current = null;
+    draftRevision.current++;
+    setMutBusy(false);
+    // 切换会话时退出回复/编辑态（目标属于旧会话）
+    setState({ replyingTo: null, editingMessage: null });
+    setText("");
   }, [conv?.id]);
 
-  // 打开会话 → 拉历史（本地为空时）
+  // 打开会话 → 拉历史（P1-11：每会话至少一次；实时缓存非空也要拉，按 id 合并不覆盖）
   useEffect(() => {
     if (!conv) return;
-    if ((getState().messages[conv.id] ?? []).length === 0) {
-      convs
-        .messages(conv.id, { limit: 50 })
-        .then((p) =>
-          setState((st) => ({
-            messages: { ...st.messages, [conv.id]: p.messages },
-            hasMore: { ...st.hasMore, [conv.id]: p.has_more },
-          })),
-        )
-        .catch(console.warn);
-    }
     setShowInfo(false);
+    if (getState().historyLoaded[conv.id] || historyInflight.has(conv.id)) return;
+    historyInflight.add(conv.id);
+    convs
+      .messages(conv.id, { limit: 50 })
+      .then((p) =>
+        setState((st) => {
+          const merged = p.messages.reduce(
+            (l, m) => upsertMessage(l, m),
+            st.messages[conv.id] ?? [],
+          );
+          return {
+            messages: { ...st.messages, [conv.id]: merged },
+            hasMore: { ...st.hasMore, [conv.id]: (merged[0]?.seq ?? 1) > 1 },
+            historyLoaded: { ...st.historyLoaded, [conv.id]: true },
+          };
+        }),
+      )
+      .catch(console.warn)
+      .finally(() => historyInflight.delete(conv.id));
   }, [conv?.id]);
 
   // 新消息滚到底（若本来就在底部）
@@ -133,6 +231,20 @@ export default function ChatView() {
   const typing = s.typing[conv.id];
   const typingFresh = typing && Date.now() - typing.ts < 5000;
   const readonly = conv.kind === "dm" && conv.peer && !s.friends.some((f) => f.user.id === conv.peer!.id);
+
+  // 生命周期入口可见性（服务端在锁内二次校验；这里只做 UI 层收敛）
+  const canEditMsg = (m: MessageView) =>
+    !m.id.startsWith("client:") &&
+    !m.deleted_at &&
+    m.sender_id === s.me?.id &&
+    m.kind === "text" &&
+    withinEditWindow(m);
+  const canDeleteMsg = (m: MessageView) =>
+    !m.id.startsWith("client:") &&
+    !m.deleted_at &&
+    (m.sender_id === s.me?.id || (conv.kind === "group" && conv.owner_id === s.me?.id));
+  const canActMsg = (m: MessageView) =>
+    !m.id.startsWith("client:") && !m.deleted_at && !readonly;
 
   const onScroll = () => {
     const el = scrollRef.current;
@@ -163,9 +275,141 @@ export default function ChatView() {
     }
   };
 
+  // ---------- 生命周期动作 ----------
+
+  const startReply = (m: MessageView) => {
+    setState({ replyingTo: m, editingMessage: null });
+    setMutErr(null);
+    taRef.current?.focus();
+  };
+
+  const startEdit = (m: MessageView) => {
+    draftRevision.current++; // 新编辑态：在途的旧编辑回调一律作废
+    draftBeforeEdit.current = text; // 暂存草稿，取消/保存后还原
+    setState({ editingMessage: m, replyingTo: null });
+    setText(m.content);
+    setMutErr(null);
+    taRef.current?.focus();
+  };
+
+  const cancelEdit = () => {
+    draftRevision.current++;
+    setState({ editingMessage: null });
+    setText(draftBeforeEdit.current);
+    draftBeforeEdit.current = "";
+    setMutErr(null);
+  };
+
+  /** 编辑提交：REST + expected_version；结果未确认的重试复用同一 client_op_id 幂等回放，
+   * 409 说明期间被别人（另一设备）改过。回调先判归属：取消/改编辑另一条/换会话或账号后不碰编辑态与草稿。 */
+  const submitEdit = async () => {
+    const em = s.editingMessage;
+    const t = text.trim();
+    const token = viewOwner.current;
+    const rev = draftRevision.current;
+    if (!em || !t || mutBusy || mutation.current != null || !current(token)) return;
+    let payload: EditSubmission;
+    try {
+      payload = prepareEditSubmission(editSubmission.current, em.id, t, em.edit_version ?? 0);
+    } catch (e) {
+      setMutErr(e instanceof Error ? e.message : "编辑失败");
+      return;
+    }
+    editSubmission.current = payload;
+    mutation.current = token;
+    setMutBusy(true);
+    setMutErr(null);
+    const mine = () =>
+      ownsEditResult(
+        { token, rev, messageId: em.id, convId: conv.id, gen },
+        {
+          owner: viewOwner.current,
+          rev: draftRevision.current,
+          editingId: getState().editingMessage?.id ?? null,
+          activeConv: getState().activeConv,
+          gen: session(),
+        },
+      );
+    try {
+      const updated = await msgsApi.edit(
+        payload.id,
+        payload.content,
+        payload.expectedVersion,
+        payload.clientOpId,
+      );
+      if (!current(token)) return;
+      // 服务端确认（含幂等回放视图）按版本合并进列表；
+      // 只有用户仍停留在本次编辑态时才退出编辑并还原草稿
+      const own = mine();
+      setState((st) => ({
+        messages: {
+          ...st.messages,
+          [conv.id]: upsertMessage(st.messages[conv.id] ?? [], updated),
+        },
+        ...(own ? { editingMessage: null } : {}),
+      }));
+      if (own) {
+        editSubmission.current = null;
+        setText(draftBeforeEdit.current);
+        draftBeforeEdit.current = "";
+      }
+    } catch (e) {
+      if (!mine()) return;
+      if (editRejected(e)) editSubmission.current = null;
+      setMutErr(e instanceof Error ? e.message : "编辑失败");
+    } finally {
+      if (mutation.current === token) mutation.current = null;
+      if (current(token)) setMutBusy(false);
+    }
+  };
+
+  const doDelete = async (m: MessageView) => {
+    setMsgMenu(null);
+    if (mutBusy) return;
+    if (!window.confirm("删除这条消息？所有人将看到“消息已删除”")) return;
+    setMutBusy(true);
+    setMutErr(null);
+    try {
+      const d = await msgsApi.remove(m.id, crypto.randomUUID());
+      setState((st) => applyUpdatedMessage(st, d));
+    } catch (e) {
+      setMutErr(e instanceof Error ? e.message : "删除失败");
+    } finally {
+      setMutBusy(false);
+    }
+  };
+
+  /** reaction 切换：已表态→取消，未表态→添加；服务端确认后更新 */
+  const toggleReaction = async (m: MessageView, emoji: string) => {
+    const key = `${m.id}:${emoji}`;
+    if (s.reactionPending[key]) return;
+    setState((st) => ({
+      reactionPending: { ...st.reactionPending, [key]: true },
+    }));
+    setMutErr(null);
+    try {
+      const mine = (m.reactions ?? []).some((r) => r.emoji === emoji && r.reacted_by_me);
+      const res = await msgsApi.react(m.id, emoji, !mine, crypto.randomUUID());
+      setState((st) => applyUpdatedMessage(st, res));
+    } catch (e) {
+      setMutErr(e instanceof Error ? e.message : "表情操作失败");
+    } finally {
+      setState((st) => {
+        const next = { ...st.reactionPending };
+        delete next[key];
+        return { reactionPending: next };
+      });
+    }
+  };
+
   const send = async () => {
     const t = text.trim();
-    if ((!t && pendingFiles.length === 0) || readonly || sending) return;
+    if (readonly || sending || mutBusy) return;
+    if (s.editingMessage) {
+      await submitEdit();
+      return;
+    }
+    if (!t && pendingFiles.length === 0) return;
     setSending(true);
     try {
       // 先上传待发附件，文字随最后一个附件消息一起发
@@ -173,13 +417,15 @@ export default function ChatView() {
       for (const f of pendingFiles) {
         atts.push(await files.upload(conv.id, f));
       }
+      const rt = s.replyingTo ?? undefined;
       atts.forEach((att, i) =>
-        sendChat(conv.id, i === atts.length - 1 ? t : "", att),
+        sendChat(conv.id, i === atts.length - 1 ? t : "", att, i === atts.length - 1 ? rt : undefined),
       );
-      if (atts.length === 0 && t) sendChat(conv.id, t);
+      if (atts.length === 0 && t) sendChat(conv.id, t, undefined, rt);
       setText("");
       setPendingFiles([]);
       setAc(null);
+      setState({ replyingTo: null });
       stickBottom.current = true;
     } catch (err) {
       alert(err instanceof Error ? err.message : "发送失败");
@@ -224,20 +470,27 @@ export default function ChatView() {
       .catch(() => setSearchRes([]));
   };
 
-  // 跳到搜索结果：目标消息不在本地时拉取以其为中心的窗口
-  const jump = async (m: MessageView) => {
+  // 跳到消息：目标不在本地时拉取以其为中心的窗口（回复预览/搜索结果共用）
+  const jumpToRef = async (id: string, seq: number) => {
     setShowSearch(false);
-    setFlashId(m.id);
-    if (!(getState().messages[conv.id] ?? []).some((x) => x.id === m.id)) {
+    setFlashId(id);
+    if (!(getState().messages[conv.id] ?? []).some((x) => x.id === id)) {
       try {
         const p = await convs.messages(conv.id, {
-          after_seq: Math.max(0, m.seq - 25),
+          after_seq: Math.max(0, seq - 25),
           limit: 50,
         });
-        setState((st) => ({
-          messages: { ...st.messages, [conv.id]: p.messages },
-          hasMore: { ...st.hasMore, [conv.id]: (p.messages[0]?.seq ?? 1) > 1 },
-        }));
+        // P1-11：按 id/seq 合并进现有窗口，不能整体替换（会丢弃实时/乐观消息）
+        setState((st) => {
+          const merged = p.messages.reduce(
+            (l, x) => upsertMessage(l, x),
+            st.messages[conv.id] ?? [],
+          );
+          return {
+            messages: { ...st.messages, [conv.id]: merged },
+            hasMore: { ...st.hasMore, [conv.id]: (merged[0]?.seq ?? 1) > 1 },
+          };
+        });
       } catch (e) {
         console.warn(e);
       }
@@ -245,11 +498,16 @@ export default function ChatView() {
     stickBottom.current = false;
     setTimeout(() => {
       scrollRef.current
-        ?.querySelector(`[data-mid="${m.id}"]`)
+        ?.querySelector(`[data-mid="${id}"]`)
         ?.scrollIntoView({ block: "center" });
     }, 60);
     setTimeout(() => setFlashId(null), 2600);
   };
+
+  const jump = (m: MessageView) => jumpToRef(m.id, m.seq);
+
+  /** 回复预览点击 → 定位原消息（删除的墓碑仍可定位） */
+  const jumpPreview = (p: ReplyPreview) => jumpToRef(p.message_id, p.seq);
 
   const openPreview = (att: AttachmentView) => {
     setPreview(att);
@@ -264,6 +522,8 @@ export default function ChatView() {
 
   const onAttMenu = (e: React.MouseEvent, att: AttachmentView) => {
     e.preventDefault();
+    e.stopPropagation(); // 附件菜单优先，不再冒泡到消息菜单
+    setMsgMenu(null);
     setCtxMenu({ x: e.clientX, y: e.clientY, att });
   };
 
@@ -379,34 +639,151 @@ export default function ChatView() {
                   {!mine && conv.kind === "group" && (
                     <div className="msg-sender">{m.sender_name}</div>
                   )}
-                  <div
-                    className={`bubble ${pending ? "pending" : ""} ${
-                      m.mentions.includes(s.me?.id ?? "") ? "mentioned" : ""
-                    } ${flashId === m.id ? "flash" : ""}`}
-                  >
-                    {m.attachment && m.kind === "image" && (
-                      <img
-                        className="msg-img"
-                        src={files.url(m.attachment.id)}
-                        alt={m.attachment.file_name}
-                        onClick={() => openPreview(m.attachment!)}
-                        onContextMenu={(e) => onAttMenu(e, m.attachment!)}
-                      />
-                    )}
-                    {m.attachment && m.kind === "file" && (
-                      <div
-                        className="msg-file"
-                        onClick={() => openPreview(m.attachment!)}
-                        onContextMenu={(e) => onAttMenu(e, m.attachment!)}
-                      >
-                        <span className="file-ic">📄</span>
-                        <span className="file-meta">
-                          <b>{m.attachment.file_name}</b>
-                          <i>{fmtSize(m.attachment.size)}</i>
-                        </span>
+                  <div className="bubble-wrap">
+                    {canActMsg(m) && (
+                      <div className={`msg-actions ${emojiPick === m.id ? "open" : ""}`}>
+                        {emojiPick === m.id ? (
+                          <>
+                            {QUICK_EMOJI.map((e) => (
+                              <button
+                                key={e}
+                                className="rx-pick"
+                                disabled={!!s.reactionPending[`${m.id}:${e}`]}
+                                onClick={() => {
+                                  setEmojiPick(null);
+                                  void toggleReaction(m, e);
+                                }}
+                              >
+                                {e}
+                              </button>
+                            ))}
+                            <button
+                              className="rx-pick"
+                              title="收起"
+                              onClick={() => setEmojiPick(null)}
+                            >
+                              ✕
+                            </button>
+                          </>
+                        ) : (
+                          <>
+                            <button
+                              title="表情"
+                              aria-label="表情"
+                              onClick={() => setEmojiPick(m.id)}
+                            >
+                              😊
+                            </button>
+                            <button title="回复" aria-label="回复" onClick={() => startReply(m)}>
+                              ↩
+                            </button>
+                            {canEditMsg(m) && (
+                              <button
+                                title="编辑"
+                                aria-label="编辑"
+                                onClick={() => startEdit(m)}
+                              >
+                                ✏️
+                              </button>
+                            )}
+                            {canDeleteMsg(m) && (
+                              <button
+                                title="删除"
+                                aria-label="删除"
+                                onClick={() => void doDelete(m)}
+                              >
+                                🗑
+                              </button>
+                            )}
+                          </>
+                        )}
                       </div>
                     )}
-                    {showText(m) && renderContent(m.content)}
+                    {m.deleted_at ? (
+                      <div className={`bubble deleted ${flashId === m.id ? "flash" : ""}`}>
+                        消息已删除
+                      </div>
+                    ) : (
+                      <div
+                        className={`bubble ${pending ? "pending" : ""} ${
+                          m.mentions.includes(s.me?.id ?? "") ? "mentioned" : ""
+                        } ${flashId === m.id ? "flash" : ""}`}
+                        onContextMenu={(e) => {
+                          if (!canActMsg(m)) return;
+                          e.preventDefault();
+                          setMsgMenu({ x: e.clientX, y: e.clientY, m });
+                        }}
+                      >
+                        {m.reply_to_preview && (
+                          <button
+                            type="button"
+                            className="reply-quote"
+                            onClick={() => jumpPreview(m.reply_to_preview!)}
+                          >
+                            <span className="rq-name">{m.reply_to_preview.sender_name}</span>
+                            <span className="rq-text">
+                              {m.reply_to_preview.deleted
+                                ? "原消息已删除"
+                                : m.reply_to_preview.excerpt ||
+                                  kindLabel(m.reply_to_preview.kind)}
+                            </span>
+                          </button>
+                        )}
+                        {m.attachment && m.kind === "image" && (
+                          <img
+                            className="msg-img"
+                            src={files.url(m.attachment.id)}
+                            alt={m.attachment.file_name}
+                            onClick={() => openPreview(m.attachment!)}
+                            onContextMenu={(e) => onAttMenu(e, m.attachment!)}
+                          />
+                        )}
+                        {m.attachment && m.kind === "file" && (
+                          <div
+                            className="msg-file"
+                            onClick={() => openPreview(m.attachment!)}
+                            onContextMenu={(e) => onAttMenu(e, m.attachment!)}
+                          >
+                            <span className="file-ic">📄</span>
+                            <span className="file-meta">
+                              <b>{m.attachment.file_name}</b>
+                              <i>{fmtSize(m.attachment.size)}</i>
+                            </span>
+                          </div>
+                        )}
+                        {m.kind === "poll" && m.poll ? (
+                          <PollCard
+                            m={m}
+                            conv={conv}
+                            members={members}
+                            busy={!!pollBusy[m.id]}
+                            setBusy={(v) =>
+                              setPollBusy((b) => ({ ...b, [m.id]: v }))
+                            }
+                            onErr={setMutErr}
+                          />
+                        ) : (
+                          showText(m) && renderContent(m.content)
+                        )}
+                        {m.edited_at && <span className="edited-mark">（已编辑）</span>}
+                      </div>
+                    )}
+                    {(m.reactions?.length ?? 0) > 0 && (
+                      <div className="reactions">
+                        {m.reactions!.map((r) => (
+                          <button
+                            key={r.emoji}
+                            className={`rx-chip ${r.reacted_by_me ? "me" : ""}`}
+                            disabled={!!s.reactionPending[`${m.id}:${r.emoji}`]}
+                            title={r.reacted_by_me ? "取消表态" : "表态"}
+                            onClick={() => void toggleReaction(m, r.emoji)}
+                          >
+                            {r.emoji}
+                            <span className="rx-count">{r.count}</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>
@@ -422,6 +799,41 @@ export default function ChatView() {
         ) : (
           <>
             <input ref={fileInput} type="file" hidden multiple onChange={onFile} />
+            {s.replyingTo && (
+              <div className="composer-banner">
+                <span className="cb-label">回复 {s.replyingTo.sender_name}</span>
+                <span className="cb-text">
+                  {s.replyingTo.deleted_at
+                    ? "原消息已删除"
+                    : s.replyingTo.attachment
+                      ? kindLabel(s.replyingTo.kind)
+                      : s.replyingTo.content.slice(0, 60)}
+                </span>
+                <button
+                  className="icon-btn"
+                  title="取消回复"
+                  aria-label="取消回复"
+                  onClick={() => setState({ replyingTo: null })}
+                >
+                  ✕
+                </button>
+              </div>
+            )}
+            {s.editingMessage && (
+              <div className="composer-banner editing">
+                <span className="cb-label">正在编辑消息</span>
+                <span className="cb-text">{s.editingMessage.content.slice(0, 60)}</span>
+                <button
+                  className="icon-btn"
+                  title="取消编辑"
+                  aria-label="取消编辑"
+                  onClick={cancelEdit}
+                >
+                  ✕
+                </button>
+              </div>
+            )}
+            {mutErr && <div className="mut-err">{mutErr}</div>}
             {acList.length > 0 && (
               <div className="ac-list">
                 {acList.map((x) => (
@@ -465,6 +877,16 @@ export default function ChatView() {
               >
                 📎
               </button>
+              {conv.kind === "group" && (
+                <button
+                  className="icon-btn"
+                  title="发起投票"
+                  aria-label="发起投票"
+                  onClick={() => setShowPoll(true)}
+                >
+                  🗳
+                </button>
+              )}
               <textarea
                 ref={taRef}
                 value={text}
@@ -480,16 +902,23 @@ export default function ChatView() {
                       send();
                     }
                   }
-                  if (e.key === "Escape") setAc(null);
+                  if (e.key === "Escape") {
+                    if (ac) setAc(null);
+                    else if (emojiPick) setEmojiPick(null);
+                    else if (s.editingMessage) cancelEdit();
+                    else if (s.replyingTo) setState({ replyingTo: null });
+                  }
                 }}
                 rows={3}
               />
               <button
                 className="primary send-btn"
                 onClick={send}
-                disabled={sending || (!text.trim() && pendingFiles.length === 0)}
+                disabled={
+                  sending || mutBusy || (!text.trim() && pendingFiles.length === 0)
+                }
               >
-                {sending ? "发送中…" : "发送"}
+                {s.editingMessage ? (mutBusy ? "保存中…" : "保存") : sending ? "发送中…" : "发送"}
               </button>
             </div>
           </>
@@ -497,6 +926,9 @@ export default function ChatView() {
       </footer>
       {showInfo && conv.kind === "group" && (
         <GroupInfo conv={conv} onClose={() => setShowInfo(false)} />
+      )}
+      {showPoll && conv.kind === "group" && (
+        <NewPollModal convId={conv.id} onClose={() => setShowPoll(false)} />
       )}
 
       {/* 附件预览 */}
@@ -537,6 +969,52 @@ export default function ChatView() {
                   <div className="pv-unsupported">暂不支持预览此格式，请下载后查看</div>
                 )}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* 消息右键菜单（生命周期操作；可用性与 hover 操作条一致） */}
+      {msgMenu && (
+        <div
+          className="ctx-mask"
+          onClick={() => setMsgMenu(null)}
+          onContextMenu={(e) => e.preventDefault()}
+        >
+          <div className="ctx-menu" style={{ left: msgMenu.x, top: msgMenu.y }}>
+            <div
+              className="ctx-item"
+              onClick={() => {
+                setEmojiPick(msgMenu.m.id);
+                setMsgMenu(null);
+              }}
+            >
+              表情
+            </div>
+            <div
+              className="ctx-item"
+              onClick={() => {
+                startReply(msgMenu.m);
+                setMsgMenu(null);
+              }}
+            >
+              回复
+            </div>
+            {canEditMsg(msgMenu.m) && (
+              <div
+                className="ctx-item"
+                onClick={() => {
+                  startEdit(msgMenu.m);
+                  setMsgMenu(null);
+                }}
+              >
+                编辑
+              </div>
+            )}
+            {canDeleteMsg(msgMenu.m) && (
+              <div className="ctx-item" onClick={() => void doDelete(msgMenu.m)}>
+                删除
+              </div>
+            )}
           </div>
         </div>
       )}

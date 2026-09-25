@@ -1,6 +1,6 @@
 import { useEffect } from "react";
-import { convs, friends } from "../api";
-import { setState, useApp } from "../store";
+import { dismissToast, setState, useApp } from "../store";
+import { openConversation, refreshCatalogs } from "../ws";
 import ConvList from "./ConvList";
 import ChatView from "./ChatView";
 import ContactsPanel from "./ContactsPanel";
@@ -11,18 +11,7 @@ export default function ChatScreen() {
   const s = useApp();
 
   useEffect(() => {
-    (async () => {
-      try {
-        const [c, f, r] = await Promise.all([
-          convs.list(),
-          friends.list(),
-          friends.requests(),
-        ]);
-        setState({ conversations: c, friends: f, requests: r });
-      } catch (e) {
-        console.warn("initial load failed", e);
-      }
-    })();
+    void refreshCatalogs().catch((e) => console.warn("initial load failed", e));
   }, []);
 
   const pendingCount = s.requests.incoming.length;
@@ -80,6 +69,23 @@ export default function ChatScreen() {
       {s.tab === "contacts" && <ContactsPanel />}
       {s.tab === "me" && <MePanel />}
       {s.tab === "admin" && s.me?.role === "admin" && <AdminPanel />}
+
+      {/* 最小应用内提示：新消息 toast，点击打开会话；静音会话已被抑制（@我除外） */}
+      <div className="toasts" aria-live="polite">
+        {s.toasts.map((t) => (
+          <button
+            key={t.id}
+            className="toast"
+            onClick={() => {
+              dismissToast(t.id);
+              openConversation(t.convId);
+            }}
+          >
+            <b>{t.title}</b>
+            <span>{t.text}</span>
+          </button>
+        ))}
+      </div>
     </div>
   );
 }
