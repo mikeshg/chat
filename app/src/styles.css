@@ -500,3 +500,46 @@ button.ctx-item:hover { background: var(--bg); }
   color: var(--muted); padding: 7px; margin-top: 4px;
 }
 .poll-add:hover { color: var(--text); border-color: var(--green); }
+
+/* ===== V2 P1-4 ===== */
+/* 富文本消息：链接 / 行内代码 / 代码块 */
+/* mine 行内容右对齐（气泡内文本仍左排）；行内块容器撑满 msg-body 时保持贴右 */
+.msg-row.mine .msg-body { text-align: right; }
+/* 气泡宽度不得越过 bubble-wrap（长代码行会让 shrink-to-fit 取内容宽度而溢出） */
+.bubble { max-width: 100%; text-align: left; }
+
+.rt-link { color: var(--link, #576b95); overflow-wrap: anywhere; }
+.msg-row.mine .rt-link { color: var(--link, #2b5f8e); }
+
+.rt-code {
+  font-family: ui-monospace, Consolas, monospace; font-size: 0.92em;
+  background: var(--code-bg, rgba(0,0,0,0.06)); color: var(--code-fg, inherit);
+  border-radius: 4px; padding: 1px 5px;
+}
+.msg-row.mine .rt-code { background: var(--code-bg, rgba(0,0,0,0.12)); }
+
+.rt-block {
+  margin: 6px 0; border-radius: 6px; overflow: hidden; max-width: 100%;
+  background: var(--code-bg, rgba(0,0,0,0.06)); color: var(--code-fg, inherit);
+}
+.rt-block:first-child { margin-top: 0; }
+.rt-block:last-child { margin-bottom: 0; }
+.msg-row.mine .rt-block { background: var(--code-bg, rgba(0,0,0,0.12)); }
+.rt-block-head {
+  display: flex; align-items: center; justify-content: flex-end;
+  gap: 8px; padding: 3px 6px 0; min-height: 22px;
+}
+.rt-lang {
+  color: var(--muted); font-size: 11px;
+  font-family: ui-monospace, Consolas, monospace;
+}
+.rt-copy {
+  border: none; background: transparent; padding: 1px 6px;
+  font-size: 11px; color: var(--link, #576b95); cursor: pointer; border-radius: 4px;
+}
+.rt-copy:hover { background: rgba(0,0,0,0.08); }
+.rt-block pre {
+  margin: 0; padding: 4px 10px 8px; overflow-x: auto;
+  font: 12px/1.5 ui-monospace, Consolas, monospace;
+  white-space: pre; text-align: left;
+}

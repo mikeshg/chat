@@ -12,6 +12,7 @@ import {
 } from "../store";
 import type { AttachmentView, MemberView, MessageView, ReplyPreview } from "../types";
 import { sendChat, sendTyping } from "../ws";
+import RichText from "../richText";
 import GroupInfo from "./GroupInfo";
 import NewPollModal from "./NewPollModal";
 import PollCard from "./PollCard";
@@ -26,19 +27,6 @@ function fmtSize(n: number): string {
 function showText(m: MessageView): boolean {
   if (!m.attachment) return true;
   return m.content !== "[图片]" && m.content !== `[文件] ${m.attachment.file_name}`;
-}
-
-/** @username 片段高亮渲染 */
-function renderContent(text: string) {
-  return text.split(/(@[A-Za-z0-9_]+)/g).map((p, i) =>
-    p.startsWith("@") ? (
-      <span key={i} className="mt">
-        {p}
-      </span>
-    ) : (
-      p
-    ),
-  );
 }
 
 /** 可按文本预览的附件（mime 或扩展名判断） */
@@ -763,7 +751,7 @@ export default function ChatView() {
                             onErr={setMutErr}
                           />
                         ) : (
-                          showText(m) && renderContent(m.content)
+                          showText(m) && <RichText text={m.content} />
                         )}
                         {m.edited_at && <span className="edited-mark">（已编辑）</span>}
                       </div>
