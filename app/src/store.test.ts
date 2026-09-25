@@ -385,3 +385,15 @@ describe("投票消息：message_updated 整视图版本合并", () => {
     expect(s.messages[CONV][0].poll).toBeNull();
   });
 });
+
+describe("V2 P1-1 后台时打开着的会话照常计未读", () => {
+  const unread = (s: Partial<AppState>) => s.conversations?.find((c) => c.id === CONV)?.unread_count;
+  it("前台：打开着的会话不计未读", () => {
+    const s = state({ activeConv: CONV, me: { id: "me" } as AppState["me"] });
+    expect(unread(applyLiveMessage(s, msg({ seq: 2 })))).toBe(0);
+  });
+  it("后台：打开着的会话计未读，标题与通知才准确", () => {
+    const s = state({ activeConv: CONV, me: { id: "me" } as AppState["me"] });
+    expect(unread(applyLiveMessage(s, msg({ seq: 2 }), false))).toBe(1);
+  });
+});

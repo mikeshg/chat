@@ -2,6 +2,7 @@ import { useState } from "react";
 import { auth, getServer } from "../api";
 import { setState, useApp } from "../store";
 import { stopWs } from "../ws";
+import NotifySettings from "./NotifySettings";
 
 export default function MePanel() {
   const s = useApp();
@@ -50,6 +51,8 @@ export default function MePanel() {
         </div>
         {hint && <div className="muted">{hint}</div>}
       </section>
+
+      <NotifySettings />
 
       <section className="card">
         <h3>连接</h3>

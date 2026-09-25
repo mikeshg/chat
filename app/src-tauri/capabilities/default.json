@@ -3,5 +3,10 @@
   "identifier": "default",
   "description": "default window permissions",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "notification:default",
+    "core:window:allow-set-title",
+    "core:window:allow-request-user-attention"
+  ]
 }
