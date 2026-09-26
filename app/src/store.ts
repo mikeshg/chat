@@ -46,6 +46,8 @@ export interface AppState {
   drafts: Record<string, string>;
   /** user_id -> 已知最新头像版本。只增不减；404 回落时把 has 记为 false。 */
   avatars: Record<string, AvatarInfo>;
+  /** 全局搜索跳转目标（V2 P3-1）：打开会话后由 ChatView 消费并清空 */
+  pendingJump: { convId: string; messageId: string; seq: number } | null;
 }
 
 /** 头像缓存条目：版本较大的那组才有效。 */
@@ -73,6 +75,7 @@ let state: AppState = {
   toasts: [],
   drafts: {},
   avatars: {},
+  pendingJump: null,
 };
 
 const listeners = new Set<() => void>();

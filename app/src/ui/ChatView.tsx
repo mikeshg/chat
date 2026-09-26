@@ -17,6 +17,7 @@ import type { AttachmentView, MemberView, MessageView, ReplyPreview } from "../t
 import { sendChat, sendTyping } from "../ws";
 import RichText from "../richText";
 import AudioBubble from "./AudioBubble";
+import ConvMedia from "./ConvMedia";
 import ForwardModal from "./ForwardModal";
 import GroupInfo from "./GroupInfo";
 import NewPollModal from "./NewPollModal";
@@ -241,6 +242,15 @@ export default function ChatView() {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [msgs.length, conv?.id]);
+
+  // V2 P3-1：消费全局搜索跳转 —— 会话打开后定位并闪烁目标消息，随后清空
+  useEffect(() => {
+    const pj = s.pendingJump;
+    if (!pj || !conv || pj.convId !== conv.id) return;
+    setState({ pendingJump: null });
+    void jumpToRef(pj.messageId, pj.seq);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [s.pendingJump, conv?.id]);
 
   if (!conv) {
     return (
@@ -649,11 +659,14 @@ export default function ChatView() {
         >
           🔍
         </button>
-        {conv.kind === "group" && (
-          <button className="icon-btn" title="群信息" onClick={() => setShowInfo(!showInfo)}>
-            ⋯
-          </button>
-        )}
+        {/* V2 P3-1：群=群信息（含文件与图片页签）；私聊/文件传输助手=文件与图片入口 */}
+        <button
+          className="icon-btn"
+          title={conv.kind === "group" ? "群信息" : "文件与图片"}
+          onClick={() => setShowInfo(!showInfo)}
+        >
+          ⋯
+        </button>
       </header>
 
       {showSearch && (
@@ -1033,7 +1046,22 @@ export default function ChatView() {
         )}
       </footer>
       {showInfo && conv.kind === "group" && (
-        <GroupInfo conv={conv} onClose={() => setShowInfo(false)} />
+        <GroupInfo
+          conv={conv}
+          onClose={() => setShowInfo(false)}
+          onPreview={openPreview}
+        />
+      )}
+      {showInfo && conv.kind !== "group" && (
+        <aside className="group-info">
+          <div className="gi-head">
+            <h3>{conv.kind === "self" ? "文件传输助手" : "文件与图片"}</h3>
+            <button className="icon-btn" onClick={() => setShowInfo(false)}>
+              ✕
+            </button>
+          </div>
+          <ConvMedia conv={conv} onPreview={openPreview} />
+        </aside>
       )}
       {showPoll && conv.kind === "group" && (
         <NewPollModal convId={conv.id} onClose={() => setShowPoll(false)} />

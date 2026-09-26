@@ -30,6 +30,7 @@ export default function App() {
         toasts: [],
         drafts: {},
         avatars: {},
+        pendingJump: null,
       });
     };
     window.addEventListener("chat:logout", onLogout);

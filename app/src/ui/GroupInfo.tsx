@@ -1,18 +1,23 @@
 import { useEffect, useState } from "react";
 import { convs } from "../api";
 import { absorbAvatarUsers, setState, useApp } from "../store";
-import type { ConversationDetail, ConversationView } from "../types";
+import type { AttachmentView, ConversationDetail, ConversationView } from "../types";
 import Avatar from "./Avatar";
+import ConvMedia from "./ConvMedia";
 
 export default function GroupInfo({
   conv,
   onClose,
+  onPreview,
 }: {
   conv: ConversationView;
   onClose: () => void;
+  /** V2 P3-1：文件与图片页签里点缩略图 → 外层预览弹窗 */
+  onPreview?: (att: AttachmentView) => void;
 }) {
   const s = useApp();
   const [detail, setDetail] = useState<ConversationDetail | null>(null);
+  const [tab, setTab] = useState<"info" | "media">("info");
   const [renaming, setRenaming] = useState(false);
   const [newName, setNewName] = useState("");
   const [adding, setAdding] = useState(false);
@@ -56,7 +61,27 @@ export default function GroupInfo({
           ✕
         </button>
       </div>
-      {detail && (
+      {/* V2 P3-1：群信息页签 —— 详情 / 文件与图片 */}
+      <div className="gi-tabs" role="tablist">
+        <button
+          role="tab"
+          aria-selected={tab === "info"}
+          className={`gs-chip ${tab === "info" ? "on" : ""}`}
+          onClick={() => setTab("info")}
+        >
+          详情
+        </button>
+        <button
+          role="tab"
+          aria-selected={tab === "media"}
+          className={`gs-chip ${tab === "media" ? "on" : ""}`}
+          onClick={() => setTab("media")}
+        >
+          文件与图片
+        </button>
+      </div>
+      {tab === "media" && <ConvMedia conv={conv} onPreview={onPreview} />}
+      {tab === "info" && detail && (
         <>
           <div className="gi-name">
             {renaming ? (

@@ -65,6 +65,7 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
         include_str!("../migrations/0011_sessions.sql"),
         include_str!("../migrations/0012_v2_media.sql"),
         include_str!("../migrations/0015_self_conversations.sql"),
+        include_str!("../migrations/0016_search_trgm.sql"),
     ] {
         sqlx::raw_sql(script).execute(&pool).await.unwrap();
     }
@@ -227,6 +228,105 @@ async fn upgrade_backfills_self_conversations() {
             .await
             .unwrap();
     assert_eq!(member_count, 1);
+
+    pool.close().await;
+    sqlx::query(&format!("DROP DATABASE {name}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+}
+
+/// V2 P3-1：0016 在已有数据上创建 pg_trgm 扩展与 messages.content 部分 GIN 索引。
+#[tokio::test]
+async fn upgrade_creates_search_trgm_index() {
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://chat:chat@localhost:5432/postgres".into());
+    let options = PgConnectOptions::from_str(&database_url).unwrap();
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone())
+        .await
+        .unwrap();
+    let name = format!("chat_migration_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE DATABASE {name}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let pool = PgPoolOptions::new()
+        .max_connections(3)
+        .connect_with(options.database(&name))
+        .await
+        .unwrap();
+    for script in [
+        include_str!("../migrations/0001_init.sql"),
+        include_str!("../migrations/0002_attachments.sql"),
+        include_str!("../migrations/0003_mentions.sql"),
+        include_str!("../migrations/0004_admin.sql"),
+        include_str!("../migrations/0005_sync_invariants.sql"),
+        include_str!("../migrations/0006_session_version.sql"),
+        include_str!("../migrations/0007_message_lifecycle.sql"),
+        include_str!("../migrations/0008_conversation_preferences.sql"),
+        include_str!("../migrations/0009_polls.sql"),
+        include_str!("../migrations/0010_server_settings_invites.sql"),
+        include_str!("../migrations/0011_sessions.sql"),
+        include_str!("../migrations/0012_v2_media.sql"),
+        include_str!("../migrations/0015_self_conversations.sql"),
+    ] {
+        sqlx::raw_sql(script).execute(&pool).await.unwrap();
+    }
+
+    // 0016 之前已存在的数据：一条活消息 + 一条墓碑（content 已被占位文本覆写）
+    let u = Uuid::new_v4();
+    let conv = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id,username,display_name,password_hash) VALUES ($1,'trgm_user','Trgm','unused')")
+        .bind(u).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO conversations (id,type,name,owner_id) VALUES ($1,'group','Trgm',$2)")
+        .bind(conv)
+        .bind(u)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO memberships (conversation_id,user_id,role) VALUES ($1,$2,'owner')")
+        .bind(conv)
+        .bind(u)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO messages (conversation_id,seq,sender_id,content) VALUES ($1,1,$2,'live keyword')")
+        .bind(conv).bind(u).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO messages (conversation_id,seq,sender_id,content,deleted_at) VALUES ($1,2,$2,'消息已删除',now())")
+        .bind(conv).bind(u).execute(&pool).await.unwrap();
+
+    sqlx::raw_sql(include_str!("../migrations/0016_search_trgm.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let ext = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(ext, "pg_trgm extension must exist");
+    let idx = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM pg_indexes
+          WHERE tablename = 'messages' AND indexname = 'idx_messages_content_trgm')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(idx, "trgm index must exist on existing data");
+
+    // 部分索引只覆盖未删除行：活消息可命中，墓碑行被 deleted_at 条件排除
+    let hits = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM messages
+          WHERE deleted_at IS NULL AND content ILIKE '%keyword%' ESCAPE '\\'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(hits, 1);
 
     pool.close().await;
     sqlx::query(&format!("DROP DATABASE {name}"))
