@@ -53,6 +53,10 @@ pub struct AppState {
     pub ws_idle_timeout_ms: AtomicU64,
     /// V2 P3-3：WS ping 周期（毫秒），默认 30s；与超时一起调小做心跳测试
     pub ws_ping_interval_ms: AtomicU64,
+    /// V2 P4-1：维护模式。为 true 时除正在执行的恢复请求外所有 /v1 请求 503（含 WS 升级）。
+    pub maintenance: AtomicBool,
+    /// V2 P4-1：备份/恢复互斥锁（同一时间只允许一个备份生成或一次恢复进行）。
+    pub backup_busy: AtomicBool,
 }
 
 impl AppState {
@@ -67,6 +71,8 @@ impl AppState {
             push_last: DashMap::new(),
             ws_idle_timeout_ms: AtomicU64::new(75_000),
             ws_ping_interval_ms: AtomicU64::new(30_000),
+            maintenance: AtomicBool::new(false),
+            backup_busy: AtomicBool::new(false),
         })
     }
 

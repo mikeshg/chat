@@ -4,6 +4,7 @@ import { useApp } from "../store";
 import type { AdminOverview, AdminUserView } from "../types";
 import AdminSettings from "./AdminSettings";
 import Avatar from "./Avatar";
+import BackupPanel from "./BackupPanel";
 
 const PAGE = 50;
 
@@ -81,6 +82,7 @@ export default function AdminPanel() {
       )}
 
       <AdminSettings />
+      <BackupPanel />
 
       <div className="card">
         <div className="ad-toolbar">

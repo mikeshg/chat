@@ -391,3 +391,34 @@ export interface ForwardResultItem {
 export interface ForwardResp {
   results: ForwardResultItem[];
 }
+
+// ---------- V2 P4-1 备份/恢复 ----------
+
+/** GET /admin/backups 单条成品备份 */
+export interface BackupItem {
+  name: string;
+  size: number;
+  created_at: string;
+}
+
+export interface BackupList {
+  /** 有备份或恢复在进行中 */
+  in_progress: boolean;
+  items: BackupItem[];
+}
+
+/** POST /admin/backups → 202 */
+export interface BackupCreated {
+  name: string;
+}
+
+/** POST /admin/backups/{name}/download-ticket → {url} */
+export interface BackupTicket {
+  url: string;
+}
+
+/** POST /admin/restore → {tables, files} */
+export interface RestoreResult {
+  tables: string[];
+  files: number;
+}
