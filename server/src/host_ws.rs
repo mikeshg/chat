@@ -185,7 +185,7 @@ async fn fail_running(st: &SharedState, host_id: Uuid) {
           WHERE finished_at IS NULL
             AND status IN ('running', 'awaiting_approval')
             AND agent_id IN (SELECT id FROM agents WHERE host_id = $1)
-         RETURNING id, agent_id, conversation_id, trigger_message_id, status, error,
+         RETURNING id, agent_id, conversation_id, trigger_message_id, schedule_id, status, error,
                    created_at, started_at, finished_at",
     )
     .bind(host_id)

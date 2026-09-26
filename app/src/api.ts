@@ -11,7 +11,10 @@ import type {
   BackupList,
   BackupTicket,
   CreateAgentReq,
+  CreateScheduleReq,
   PatchAgentReq,
+  PatchScheduleReq,
+  ScheduleView,
   InvocationView,
   RestoreResult,
   ConversationDetail,
@@ -356,6 +359,13 @@ export const agents = {
     post<void>(`/conversations/${convId}/agent-context/reset`),
   /** 取消排队中 / 运行中 / 等待审批的调用。409 = 已经结束 */
   cancel: (id: string) => post<InvocationView>(`/agent-invocations/${id}/cancel`),
+  /** A17：这个 Agent 的定时任务 */
+  schedules: (agentId: string) => get<ScheduleView[]>(`/agents/${agentId}/schedules`),
+  createSchedule: (agentId: string, body: CreateScheduleReq) =>
+    post<ScheduleView>(`/agents/${agentId}/schedules`, body),
+  patchSchedule: (id: string, body: PatchScheduleReq) =>
+    patch<ScheduleView>(`/agent-schedules/${id}`, body),
+  deleteSchedule: (id: string) => del<void>(`/agent-schedules/${id}`),
 };
 
 // ---------- 消息生命周期 ----------

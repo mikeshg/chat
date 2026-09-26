@@ -4,6 +4,7 @@ import { cropAvatarFile } from "../avatar";
 import type { AgentView, ReportedOptions } from "../types";
 import { shapeAgentPatch } from "./agentForm";
 import AgentAvatar from "./AgentAvatar";
+import AgentSchedules from "./AgentSchedules";
 import { OUTPUT_MODE_OPTIONS, QUEUE_TIMEOUT_OPTIONS } from "./AgentSettings";
 
 function errText(e: unknown): string {
@@ -337,6 +338,7 @@ export default function AgentEditor({
           删除 Agent
         </button>
       )}
+      <AgentSchedules agentId={agent.id} conversationId={agent.conversation_id} />
     </section>
   );
 }

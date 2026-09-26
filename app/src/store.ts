@@ -563,7 +563,11 @@ export function applyInvocations(
 ): Partial<AppState> {
   if (incoming.length === 0) return {};
   const invocations = { ...s.invocations };
+  let touched = false;
   for (const inv of incoming) {
+    // 定时调用没有触发消息，状态不挂在某一条消息下面（回复本身会出现在会话里）
+    if (!inv.trigger_message_id) continue;
+    touched = true;
     const cur = { ...(invocations[inv.conversation_id] ?? {}) };
     const prev = cur[inv.trigger_message_id] ?? [];
     const idx = prev.findIndex((x) => x.id === inv.id);
@@ -571,7 +575,7 @@ export function applyInvocations(
       idx >= 0 ? prev.map((x, i) => (i === idx ? inv : x)) : [...prev, inv];
     invocations[inv.conversation_id] = cur;
   }
-  return { invocations };
+  return touched ? { invocations } : {};
 }
 
 /** 调用状态标签，按 status 查表。failed 的原因另走 invocationErrorText。

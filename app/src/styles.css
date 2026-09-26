@@ -976,3 +976,35 @@ button.agent-host-name:hover { background: transparent; color: var(--link); }
 .ac-item.ac-agent .ac-mark { flex: 0 0 auto; }
 .ac-item .ac-online { margin-left: auto; color: var(--green); font-size: 12px; }
 .ac-item .ac-offline { margin-left: auto; color: var(--muted); font-size: 12px; }
+
+/* ===== Agent A17 ===== */
+.agent-schedules {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+.sched-list { display: flex; flex-direction: column; }
+.sched-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line);
+}
+.sched-main { flex: 1 1 160px; min-width: 0; }
+.sched-name { font-weight: 600; }
+.sched-meta { color: var(--muted); font-size: 12px; }
+.sched-enable {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.sched-form { display: flex; flex-direction: column; gap: 8px; }
+.sched-days { display: flex; flex-wrap: wrap; gap: 8px 12px; font-size: 13px; }
+.sched-days label { display: flex; align-items: center; gap: 4px; }

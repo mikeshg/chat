@@ -231,6 +231,49 @@ export interface AgentUserSettings {
   queue_timeout_secs: number;
 }
 
+/** 定时任务时间表，与服务端 spec 同形 */
+export interface ScheduleSpec {
+  type: "once" | "daily" | "weekly" | "interval";
+  at?: string;
+  time?: string;
+  days?: number[];
+  minutes?: number;
+}
+
+export interface ScheduleView {
+  id: string;
+  agent_id: string;
+  owner_id: string;
+  name: string;
+  prompt: string;
+  target_conversation_id: string;
+  spec: ScheduleSpec;
+  timezone: string;
+  enabled: boolean;
+  next_run_at: string | null;
+  last_run_at: string | null;
+  created_by: string;
+  created_at: string;
+  disabled_reason?: string | null;
+}
+
+export interface CreateScheduleReq {
+  name: string;
+  prompt: string;
+  target_conversation_id?: string;
+  spec: ScheduleSpec;
+  timezone: string;
+}
+
+export interface PatchScheduleReq {
+  name?: string;
+  prompt?: string;
+  target_conversation_id?: string;
+  spec?: ScheduleSpec;
+  timezone?: string;
+  enabled?: boolean;
+}
+
 /** PATCH /agents/{id}：缺省字段不改；覆盖项 null = 清除、回到个人默认 */
 export interface PatchAgentReq {
   output_mode?: AgentOutputMode | null;
@@ -258,8 +301,10 @@ export interface InvocationView {
   id: string;
   agent_id: string;
   conversation_id: string;
-  /** 触发这条调用的主人消息 id */
-  trigger_message_id: string;
+  /** 触发这条调用的主人消息 id。定时调用没有触发消息，为 null */
+  trigger_message_id: string | null;
+  /** 定时调用的来源；普通消息触发时缺省 */
+  schedule_id?: string | null;
   status: string;
   error: string | null;
   created_at: string;

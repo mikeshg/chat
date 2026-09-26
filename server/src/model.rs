@@ -643,7 +643,11 @@ pub struct InvocationView {
     pub id: Uuid,
     pub agent_id: Uuid,
     pub conversation_id: Uuid,
-    pub trigger_message_id: Uuid,
+    /// 主人发消息触发时有值。定时调用没有触发消息，为 null。
+    pub trigger_message_id: Option<Uuid>,
+    /// 定时调用的来源。普通消息触发时不出现在 JSON 里。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule_id: Option<Uuid>,
     pub status: String,
     pub error: Option<String>,
     pub created_at: DateTime<Utc>,
