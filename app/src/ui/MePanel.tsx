@@ -3,6 +3,7 @@ import { auth, getServer } from "../api";
 import { setState, useApp } from "../store";
 import { stopWs } from "../ws";
 import AgentsPanel from "./AgentsPanel";
+import AutostartSetting from "./AutostartSetting";
 import NotifySettings from "./NotifySettings";
 import PushSettings from "./PushSettings";
 import ThemeSetting from "./ThemeSetting";
@@ -67,6 +68,8 @@ export default function MePanel() {
           <span className="muted">›</span>
         </div>
       </section>
+
+      <AutostartSetting />
 
       <NotifySettings />
       <PushSettings />

@@ -952,3 +952,23 @@ button.icon-btn.chat-head-btn.topic-btn:disabled { opacity: 0.5; }
 /* ===== Agent A04 ===== */
 .inv-status { display: flex; align-items: center; gap: 8px; }
 .inv-cancel { font-size: 12px; padding: 1px 8px; line-height: 18px; }
+
+/* ===== Agent A09 ===== */
+.agent-panel { max-width: calc(100vw - 24px); }
+.agent-host-group { display: flex; flex-direction: column; gap: 2px; }
+.agent-host-head {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px;
+  padding: 8px 2px 6px; border-bottom: 1px solid var(--line);
+}
+.agent-host-group .online-dot {
+  position: static; border: none; width: 8px; height: 8px; flex-shrink: 0;
+}
+button.agent-host-name {
+  border: none; background: transparent; padding: 0;
+  font-size: 14px; font-weight: 600; max-width: 100%; text-align: left;
+}
+button.agent-host-name:hover { background: transparent; color: var(--link); }
+.agent-host-meta { color: var(--muted); font-size: 12px; }
+.agent-host-edit { display: flex; flex-wrap: wrap; gap: 6px; flex: 1 1 180px; min-width: 0; }
+.agent-host-edit input { flex: 1 1 120px; min-width: 0; }
+.agent-host-empty { padding: 4px 2px 8px; }

@@ -438,7 +438,7 @@ function dispatch(f: WsOut) {
       break;
     case "agent_host_status":
       // Agent A01：宿主上下线 → 宿主列表与 agent 会话的在线点同步翻转
-      setState((cur) => applyHostStatus(cur, f.host_id, f.online));
+      setState((cur) => applyHostStatus(cur, f.host_id, f.online, f.label));
       break;
     case "agent_invocation":
       setState((cur) => applyInvocations(cur, [f.invocation]));

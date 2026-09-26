@@ -485,6 +485,20 @@ describe("Agent A01：宿主状态与调用记录", () => {
     expect(s.conversations[0].agent?.host_online).toBe(false);
   });
 
+  it("applyHostStatus：带 label 时改名，不带 label 的上下线帧保留原名", () => {
+    let s = state({
+      agentHosts: [
+        { id: "h1", label: "pc", platform: "windows", online: true, last_seen_at: "t" },
+      ],
+    });
+    s = { ...s, ...applyHostStatus(s, "h1", false, "家里") };
+    expect(s.agentHosts[0].label).toBe("家里");
+    expect(s.agentHosts[0].online).toBe(false);
+    s = { ...s, ...applyHostStatus(s, "h1", true) };
+    expect(s.agentHosts[0].label).toBe("家里");
+    expect(s.agentHosts[0].online).toBe(true);
+  });
+
   it("applyInvocations：按 trigger_message_id 归档，后到的状态覆盖先到的", () => {
     const running = {
       id: "i1",

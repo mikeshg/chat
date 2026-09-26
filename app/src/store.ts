@@ -537,14 +537,17 @@ export function dropConversationCache(s: AppState, convId: string): Partial<AppS
 
 // ---------- Agent A01：宿主在线态 / 调用记录 ----------
 
-/** agent_host_status 帧：更新宿主列表与所有挂在该宿主上的 agent 会话在线点 */
+/** agent_host_status 帧：更新在线态；带 label 时同时改名（上下线帧不带 label，保留原名） */
 export function applyHostStatus(
   s: AppState,
   hostId: string,
   online: boolean,
+  label?: string,
 ): Partial<AppState> {
   return {
-    agentHosts: s.agentHosts.map((h) => (h.id === hostId ? { ...h, online } : h)),
+    agentHosts: s.agentHosts.map((h) =>
+      h.id === hostId ? { ...h, online, ...(label ? { label } : {}) } : h,
+    ),
     conversations: s.conversations.map((c) =>
       c.agent?.host_id === hostId && c.agent.host_online !== online
         ? { ...c, agent: { ...c.agent, host_online: online } }

@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 import { agents, ApiError, convs } from "../api";
 import { setState, useApp } from "../store";
-import type { AgentView } from "../types";
+import type { AgentHostView, AgentView } from "../types";
 import { openConversation } from "../ws";
+import { groupAgentsByHost, hostDisplayName } from "./agentHosts";
 import AgentAvatar from "./AgentAvatar";
 import AgentEditor from "./AgentEditor";
 import AgentSettings from "./AgentSettings";
@@ -21,8 +22,13 @@ export default function AgentsPanel({ onClose }: { onClose: () => void }) {
   const [busy, setBusy] = useState(false);
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingHostId, setEditingHostId] = useState<string | null>(null);
+  const [hostDraft, setHostDraft] = useState("");
+  const [hostErr, setHostErr] = useState("");
+  const [hostBusy, setHostBusy] = useState(false);
 
-  const hosts = s.agentHosts; // online 由 agent_host_status 帧实时更新
+  const hosts = s.agentHosts; // online / label 由 agent_host_status 帧实时更新
+  const groups = groupAgentsByHost(hosts, list);
 
   useEffect(() => {
     let alive = true;
@@ -62,6 +68,34 @@ export default function AgentsPanel({ onClose }: { onClose: () => void }) {
     return h ? (h.label || "宿主") + (h.platform ? ` (${h.platform})` : "") : "未知宿主";
   };
   const hostOnline = (id: string) => hosts.find((x) => x.id === id)?.online ?? false;
+
+  const saveHost = async (id: string) => {
+    if (hostBusy) return;
+    const label = hostDraft.trim();
+    if (!label || [...label].length > 60) {
+      setHostErr("名称需要 1–60 个字符");
+      return;
+    }
+    setHostBusy(true);
+    setHostErr("");
+    try {
+      const updated = await agents.patchHost(id, label);
+      setState((cur) => ({
+        agentHosts: cur.agentHosts.map((h) => (h.id === updated.id ? updated : h)),
+      }));
+      setEditingHostId(null);
+    } catch (e) {
+      setHostErr(
+        e instanceof ApiError && e.message === "bad_label"
+          ? "名称需要 1–60 个字符"
+          : e instanceof Error
+            ? e.message
+            : "改名失败",
+      );
+    } finally {
+      setHostBusy(false);
+    }
+  };
 
   const openAgentConv = async (a: AgentView) => {
     // 专属会话可能还没进本地列表（刚创建、invalidate 未刷新）：先刷目录再跳
@@ -125,52 +159,70 @@ export default function AgentsPanel({ onClose }: { onClose: () => void }) {
         </div>
 
         <section>
-          <h4 className="agent-sec">我的宿主（这台电脑/其他电脑上的桌面端）</h4>
-          {hosts.length === 0 && (
+          <h4 className="agent-sec">我的 Agent</h4>
+          {groups.length === 0 && (
             <div className="muted">
               {loaded ? "还没有宿主。在桌面端登录后，这台电脑会自动成为宿主。" : "加载中…"}
             </div>
           )}
-          {hosts.map((h) => (
-            <div key={h.id} className="row agent-item">
-              <i className={`online-dot ${h.online ? "" : "off"}`} />
-              <span className="grow">
-                {h.label || "宿主"}
-                {h.platform ? <span className="muted"> · {h.platform}</span> : null}
-              </span>
-              <span className="muted">{h.online ? "在线" : "离线"}</span>
-            </div>
-          ))}
-        </section>
-
-        <section>
-          <h4 className="agent-sec">我的 Agent</h4>
-          {list.length === 0 && (
-            <div className="muted">{loaded ? "还没有 Agent。" : "加载中…"}</div>
-          )}
-          {list.map((a) => (
+          {groups.map((g) => (
             <div
-              key={a.id}
-              className="row agent-item clickable"
-              onClick={() => void openAgentConv(a)}
-              title="进入专属会话"
+              key={g.host?.id ?? "unknown-host"}
+              className="agent-host-group"
+              role="group"
+              aria-label={g.host ? hostDisplayName(g.host) : "未知宿主"}
             >
-              <AgentAvatar agentId={a.id} name={a.name} version={a.avatar_version} size="sm" />
-              <span className="grow">
-                <b>{a.name}</b>
-                <span className="muted"> · {hostLabel(a.host_id)}</span>
-              </span>
-              <i className={`online-dot ${hostOnline(a.host_id) ? "" : "off"}`} />
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setShowForm(false);
-                  setEditingId(a.id);
-                }}
-              >
-                编辑
-              </button>
+              {g.host ? (
+                <HostTitle
+                  host={g.host}
+                  editing={editingHostId === g.host.id}
+                  draft={hostDraft}
+                  busy={hostBusy}
+                  err={editingHostId === g.host.id ? hostErr : ""}
+                  onDraft={setHostDraft}
+                  onEdit={() => {
+                    setEditingHostId(g.host!.id);
+                    setHostDraft(g.host!.label);
+                    setHostErr("");
+                  }}
+                  onCancel={() => {
+                    setEditingHostId(null);
+                    setHostErr("");
+                  }}
+                  onSave={() => void saveHost(g.host!.id)}
+                />
+              ) : (
+                <div className="agent-host-head">
+                  <span className="agent-host-meta">未知宿主</span>
+                </div>
+              )}
+              {g.agents.length === 0 && (
+                <div className="muted agent-host-empty">这个宿主上还没有 Agent</div>
+              )}
+              {g.agents.map((a) => (
+                <div
+                  key={a.id}
+                  className="row agent-item clickable"
+                  onClick={() => void openAgentConv(a)}
+                  title="进入专属会话"
+                >
+                  <AgentAvatar agentId={a.id} name={a.name} version={a.avatar_version} size="sm" />
+                  <span className="grow">
+                    <b>{a.name}</b>
+                  </span>
+                  <i className={`online-dot ${hostOnline(a.host_id) ? "" : "off"}`} />
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setShowForm(false);
+                      setEditingId(a.id);
+                    }}
+                  >
+                    编辑
+                  </button>
+                </div>
+              ))}
             </div>
           ))}
           {editingId && list.some((a) => a.id === editingId) && (
@@ -249,5 +301,72 @@ export default function AgentsPanel({ onClose }: { onClose: () => void }) {
         )}
       </div>
     </div>
+  );
+}
+
+function fmtSeen(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleString();
+}
+
+function HostTitle({
+  host,
+  editing,
+  draft,
+  busy,
+  err,
+  onDraft,
+  onEdit,
+  onCancel,
+  onSave,
+}: {
+  host: AgentHostView;
+  editing: boolean;
+  draft: string;
+  busy: boolean;
+  err: string;
+  onDraft: (v: string) => void;
+  onEdit: () => void;
+  onCancel: () => void;
+  onSave: () => void;
+}) {
+  return (
+    <>
+      <div className="agent-host-head">
+        <i className={`online-dot ${host.online ? "" : "off"}`} />
+        {editing ? (
+          <form
+            className="agent-host-edit"
+            onSubmit={(e) => {
+              e.preventDefault();
+              onSave();
+            }}
+          >
+            <input
+              aria-label="宿主名称"
+              value={draft}
+              maxLength={60}
+              autoFocus
+              onChange={(e) => onDraft(e.target.value)}
+            />
+            <button type="submit" className="primary" disabled={busy}>
+              {busy ? "保存中…" : "保存"}
+            </button>
+            <button type="button" onClick={onCancel} disabled={busy}>
+              取消
+            </button>
+          </form>
+        ) : (
+          <button type="button" className="agent-host-name" title="点击改名" onClick={onEdit}>
+            {hostDisplayName(host)}
+          </button>
+        )}
+        {host.platform ? <span className="agent-host-meta">{host.platform}</span> : null}
+        <span className="agent-host-meta">{host.online ? "在线" : "离线"}</span>
+        <span className="agent-host-meta">最后在线 {fmtSeen(host.last_seen_at)}</span>
+      </div>
+      {err && <div className="auth-err">{err}</div>}
+    </>
   );
 }

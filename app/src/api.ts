@@ -324,6 +324,9 @@ export const convs = {
 export const agents = {
   /** 本人的宿主列表（含实时 online） */
   hosts: () => get<AgentHostView[]>("/agent-hosts"),
+  /** 改宿主名称（去首尾空白，1–60 字）。别人的宿主 404，空或超长 400 bad_label */
+  patchHost: (id: string, label: string) =>
+    patch<AgentHostView>(`/agent-hosts/${id}`, { label }),
   /** 本人的 Agent 列表 */
   list: () => get<AgentView[]>("/agents"),
   /** 创建 Agent（同时建专属会话）；400 bad_name / 409 name_taken / 404 宿主非本人 */

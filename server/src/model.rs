@@ -503,10 +503,13 @@ pub enum WsOut {
         /// 非发送类 mutation 的回执关联；与 client_msg_id 不混用
         client_op_id: Option<Uuid>,
     },
-    /// Agent A01：宿主上/下线，只发给宿主主人的普通连接
+    /// Agent A01：宿主上/下线，只发给宿主主人的普通连接。
+    /// A09：改名时带 label；上下线省略该字段（旧客户端忽略未知字段）。
     AgentHostStatus {
         host_id: Uuid,
         online: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
     },
     /// Agent A01：调用状态推进，发给调用会话成员（A01 里即主人）的普通连接
     AgentInvocation {

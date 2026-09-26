@@ -389,10 +389,11 @@ export type WsOut =
   | { type: "invalidate"; what: string }
   | { type: "pins_updated"; conversation_id: string }
   | {
-      /** Agent A01：本人宿主上/下线（只发主人普通连接） */
+      /** Agent A01：本人宿主上/下线（只发主人普通连接）。A09 改名时带 label */
       type: "agent_host_status";
       host_id: string;
       online: boolean;
+      label?: string;
     }
   | {
       /** Agent A01：调用状态变化（发给会话成员的普通连接） */

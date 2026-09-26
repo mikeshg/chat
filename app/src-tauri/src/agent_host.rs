@@ -75,8 +75,20 @@ fn install_id(app: &AppHandle) -> Result<Uuid, String> {
     Ok(id)
 }
 
+/// 首次登记用的名称：机器名，拿不到用「桌面端」。与服务端 60 字上限对齐。
+fn default_host_label() -> String {
+    let name = std::env::var("COMPUTERNAME")
+        .ok()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "桌面端".into());
+    name.chars().take(60).collect()
+}
+
 /// 登录后由前端调用：启动（或重启）本机宿主。
-/// `label` 由前端给（机器名拿不到时传「桌面端」类文案）。
+/// `label` 为空时用机器名（拿不到用「桌面端」）。
+/// 服务端只在第一次登记写入名称，之后以服务器为准，重连不再覆盖。
 #[tauri::command]
 pub async fn agent_host_start(
     app: AppHandle,
@@ -89,6 +101,12 @@ pub async fn agent_host_start(
     if let Some(old) = old {
         old.shutdown().await;
     }
+    let given = label.trim();
+    let label = if given.is_empty() {
+        default_host_label()
+    } else {
+        given.chars().take(60).collect()
+    };
     let cfg = agent_host::HostConfig {
         server_url,
         install_id: install_id(&app)?,
@@ -104,11 +122,15 @@ pub async fn agent_host_start(
     Ok(())
 }
 
+/// 取出正在跑的宿主。托盘退出用它，避免把锁留过 await。
+pub(crate) fn take_handle(this: &AgentHostState) -> Option<agent_host::HostHandle> {
+    this.handle.lock().unwrap().take()
+}
+
 /// 退出登录时由前端调用：停宿主（关 WS、杀在跑的 Agent 进程、不再重连）。
 #[tauri::command]
 pub async fn agent_host_stop(state: State<'_, AgentHostState>) -> Result<(), String> {
-    let h = state.handle.lock().unwrap().take();
-    if let Some(h) = h {
+    if let Some(h) = take_handle(&state) {
         h.shutdown().await;
     }
     Ok(())
