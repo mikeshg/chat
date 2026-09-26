@@ -13,7 +13,7 @@ impl Config {
     pub fn from_env() -> Self {
         Self {
             database_url: std::env::var("DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://chat:chat@localhost:5432/chat".into()),
+                .unwrap_or_else(|_| "postgres://chat:chat@localhost:15432/chat".into()),
             jwt_secret: std::env::var("JWT_SECRET")
                 .unwrap_or_else(|_| "dev-secret-change-me".into()),
             bind: std::env::var("BIND").unwrap_or_else(|_| "0.0.0.0".into()),

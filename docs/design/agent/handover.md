@@ -12,7 +12,7 @@
 
 ## 2. 还没做的
 
-1. **A10**（用户在 Mac 上做）：Tauri 打包目标加 macOS / Linux，Mac 上编包、登录后成为宿主并跑通一次调用；README 补打包说明。
+1. **A10**：macOS 已由用户在 Mac 上编包并确认可用（`pnpm tauri build --bundles app`，README 已写；DMG 那步在外接盘上失败，不影响 `.app`）。Linux 包还没在 Linux 上编过。
 
 阶段验收（验收库全量检查、Windows 桌面实机、Claude Code 与 Codex 真 agent 冒烟）已完成，记录在 [acceptance.md](acceptance.md)，验收中修掉的三个问题也在里面。
 

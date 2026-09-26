@@ -46,7 +46,7 @@ docker compose up -d          # WSL/任意有 Docker 的环境
 ## 开发
 
 ```bash
-# 数据库
+# 数据库（主机端口 15432）
 docker compose up db -d
 # 后端（:8080）
 cd server && cargo run
@@ -81,6 +81,15 @@ node gen-icon.cjs                              # 已生成，可跳过
 ./node_modules/.bin/tauri android init         # 首次生成 Android 工程
 ./node_modules/.bin/tauri android build --apk  # 需 Android SDK + NDK + rust android targets
 ```
+
+macOS 要在 Mac 上编（仓库根目录先 `pnpm install`，另需 Rust 和 Xcode 命令行工具）：
+
+```bash
+cd app
+pnpm tauri build --bundles app   # → src-tauri/target/release/bundle/macos/Chat.app
+```
+
+把 `Chat.app` 拖进「应用程序」即可。加上 `dmg`（`--bundles app,dmg`）会多打一个 DMG，但这一步要用 AppleScript 控制 Finder，失败时 `Chat.app` 已经生成，直接拖即可。
 
 Tauri 端登录页填写服务器地址（如 `http://192.168.1.5:8080`）。
 

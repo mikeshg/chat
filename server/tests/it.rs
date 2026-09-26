@@ -13,7 +13,7 @@ use tokio_tungstenite::tungstenite::Message as WsMsg;
 
 fn base_db_url() -> String {
     std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://chat:chat@localhost:5432/postgres".into())
+        .unwrap_or_else(|_| "postgres://chat:chat@localhost:15432/postgres".into())
 }
 
 fn test_db_url() -> String {
@@ -21,7 +21,7 @@ fn test_db_url() -> String {
     // 把库名替换为 chat_test
     match base.rfind('/') {
         Some(i) => format!("{}/chat_test", &base[..i]),
-        None => "postgres://chat:chat@localhost:5432/chat_test".into(),
+        None => "postgres://chat:chat@localhost:15432/chat_test".into(),
     }
 }
 
@@ -621,7 +621,7 @@ async fn spawn_named_state(db_name: &str) -> (String, chat_server::state::Shared
     }
     let url = match base_db_url().rfind('/') {
         Some(i) => format!("{}/{db_name}", &base_db_url()[..i]),
-        None => format!("postgres://chat:chat@localhost:5432/{db_name}"),
+        None => format!("postgres://chat:chat@localhost:15432/{db_name}"),
     };
     let pool = PgPoolOptions::new().connect(&url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
@@ -1616,7 +1616,7 @@ async fn admin_role_safety() {
     // 终态：恰好一名可用管理员（查该测试库，避免误数到共享库）
     let named_url = match base_db_url().rfind('/') {
         Some(i) => format!("{}/{db_name}", &base_db_url()[..i]),
-        None => format!("postgres://chat:chat@localhost:5432/{db_name}"),
+        None => format!("postgres://chat:chat@localhost:15432/{db_name}"),
     };
     let pool = PgPoolOptions::new().connect(&named_url).await.unwrap();
     let admins: i64 = sqlx::query_scalar(
@@ -7940,7 +7940,7 @@ async fn spawn_backup_env(
     }
     let url = match base_db_url().rfind('/') {
         Some(i) => format!("{}/{db_name}", &base_db_url()[..i]),
-        None => format!("postgres://chat:chat@localhost:5432/{db_name}"),
+        None => format!("postgres://chat:chat@localhost:15432/{db_name}"),
     };
     let pool = PgPoolOptions::new().connect(&url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();

@@ -6,7 +6,7 @@ use uuid::Uuid;
 #[tokio::test]
 async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
     let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://chat:chat@localhost:5432/postgres".into());
+        .unwrap_or_else(|_| "postgres://chat:chat@localhost:15432/postgres".into());
     let options = PgConnectOptions::from_str(&database_url).unwrap();
     let admin = PgPoolOptions::new()
         .max_connections(1)
@@ -201,7 +201,7 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
 #[tokio::test]
 async fn upgrade_backfills_self_conversations() {
     let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://chat:chat@localhost:5432/postgres".into());
+        .unwrap_or_else(|_| "postgres://chat:chat@localhost:15432/postgres".into());
     let options = PgConnectOptions::from_str(&database_url).unwrap();
     let admin = PgPoolOptions::new()
         .max_connections(1)
@@ -316,7 +316,7 @@ async fn upgrade_backfills_self_conversations() {
 #[tokio::test]
 async fn upgrade_creates_search_trgm_index() {
     let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://chat:chat@localhost:5432/postgres".into());
+        .unwrap_or_else(|_| "postgres://chat:chat@localhost:15432/postgres".into());
     let options = PgConnectOptions::from_str(&database_url).unwrap();
     let admin = PgPoolOptions::new()
         .max_connections(1)
