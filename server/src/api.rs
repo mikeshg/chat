@@ -134,6 +134,10 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
             post(crate::agents::reset_context),
         )
         .route(
+            "/agent-invocations/{id}/cancel",
+            post(crate::agents::cancel_invocation),
+        )
+        .route(
             "/files",
             post(upload_file).layer(DefaultBodyLimit::max(
                 cfg.upload_max_bytes + UPLOAD_BODY_MARGIN,

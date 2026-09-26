@@ -14,6 +14,8 @@
 // load 模式恢复时先用 session/update 回放已存的回复正文，再返回 session/load 结果。
 // 指令取 prompt 的最后一个文本块（附加指令放在前面的块里）。
 // session/new 报告两个 mode、两个 model；支持 session/set_mode / session/set_model。
+// session/cancel（通知）：进行中的 sleep 立刻以 stopReason "cancelled" 返回。
+// 启动参数 --ignore-cancel：忽略取消，用来测宿主 5 秒后强制结束子进程。
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -23,6 +25,7 @@ import readline from "node:readline";
 const capArg = process.argv.find((a) => a.startsWith("--caps="));
 const caps = capArg ? capArg.slice("--caps=".length) : "resume";
 const dir = path.join(os.tmpdir(), "chat-fake-acp");
+const ignoreCancel = process.argv.includes("--ignore-cancel");
 
 function fileOf(id) {
   if (typeof id !== "string" || !/^[A-Za-z0-9_-]+$/.test(id)) return null;
@@ -95,6 +98,7 @@ function openSaved(sid) {
   state = loaded;
   return loaded;
 }
+let pendingSleep = null;
 
 rl.on("line", (line) => {
   let m;
@@ -104,7 +108,14 @@ rl.on("line", (line) => {
     return;
   }
   const { id, method, params } = m;
-  if (id === undefined) return; // 通知一律不回
+  if (method === "session/cancel") {
+    if (ignoreCancel || !pendingSleep) return;
+    clearTimeout(pendingSleep.timer);
+    const promptId = pendingSleep.id;
+    pendingSleep = null;
+    return result(promptId, { stopReason: "cancelled" });
+  }
+  if (id === undefined) return; // 其余通知不回
 
   if (method === "initialize") {
     const agentCapabilities = { sessionCapabilities: { additionalDirectories: {} } };
@@ -183,10 +194,12 @@ rl.on("line", (line) => {
     if (text.startsWith("sleep:")) {
       const ms = parseInt(text.slice(6), 10) || 0;
       remember(text, "done");
-      setTimeout(() => {
+      const timer = setTimeout(() => {
+        pendingSleep = null;
         chunk(sessionId, "done");
         result(id, { stopReason: "end_turn" });
       }, ms);
+      pendingSleep = { id, timer };
       return;
     }
     if (text === "fail") {

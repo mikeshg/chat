@@ -133,12 +133,14 @@ async fn read_loop(
                     "invocation_start" => start_invocation(s, out, &v),
                     "agent_probe" => start_probe(s, out, &v),
                     "invocation_cancel" => {
+                        // 不直接 abort：让 ACP 先发 session/cancel，最多再等 5 秒才杀进程。
+                        // 这次调用不再回 invocation_finish。
                         if let Some(id) = v["invocation_id"]
                             .as_str()
                             .and_then(|x| Uuid::parse_str(x).ok())
                         {
-                            if let Some(h) = s.running.lock().unwrap().remove(&id) {
-                                h.abort();
+                            if let Some(tx) = s.cancels.lock().unwrap().get(&id) {
+                                let _ = tx.send(true);
                             }
                         }
                     }
@@ -172,22 +174,32 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     let agent_id = spec.id;
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    // 先登记再 spawn：read_loop 是单线程收帧，取消帧不会插在登记完成之前
+    s.cancels.lock().unwrap().insert(inv_id, cancel_tx);
     let out2 = out.clone();
     let running = s.running.clone();
+    let cancels = s.cancels.clone();
     let dir = s.data_dir.clone();
+    let cancel_flag = cancel_rx.clone();
     let task = tokio::spawn(async move {
         let rt = runtime::runtime_for(&spec);
         // 事件暂不外发（接收端即刻丢弃）；流式输出票把它接到服务端
         let (events, _) = tokio::sync::mpsc::unbounded_channel();
         let mut req = runtime::RunRequest::for_invocation(spec, prompt, dir);
         req.resume_session = resume_session;
+        req.cancel = cancel_rx;
         let r = rt.run(req, events).await;
-        if let Ok(out) = &r {
-            // 正常调用结束后也上报一次可选项（session/new 里有才发）
-            send_options(&out2, agent_id, out, false);
+        // 取消过的调用不回 invocation_finish（服务端已标 cancelled，再回也会被忽略）
+        if !*cancel_flag.borrow() {
+            if let Ok(out) = &r {
+                // 正常调用结束后也上报一次可选项（session/new 里有才发）
+                send_options(&out2, agent_id, out, false);
+            }
+            send_finish(&out2, inv_id, r);
         }
-        send_finish(&out2, inv_id, r);
         running.lock().unwrap().remove(&inv_id);
+        cancels.lock().unwrap().remove(&inv_id);
     });
     s.running.lock().unwrap().insert(inv_id, task);
 }

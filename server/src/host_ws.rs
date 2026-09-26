@@ -4,8 +4,8 @@
 // - 不计入 conns —— 不产生 presence、不被 send_to_user 业务帧打扰；
 // - 首帧 10s 内必须是 host_hello（install_id/label/platform），否则断开；
 // - 同一 (user, install_id) 再连：新连接顶替，旧连接收到 host_superseded 后关闭；
-// - 断开 = 宿主离线：广播 agent_host_status 并把该宿主 running 中的调用
-//   置 failed/host_disconnected。
+// - 断开 = 宿主离线：广播 agent_host_status；running / awaiting_approval
+//   置 failed/host_disconnected。queued 保持排队（A04）。
 
 use crate::agents;
 use crate::error::AppResult;
@@ -84,6 +84,8 @@ pub async fn host_session(
         serde_json::json!({"type": "host_ready", "host_id": host_id}).to_string(),
     ));
     broadcast_status(&st, uid, host_id, true);
+    // host_ready 已入队，再按 created_at 补发排队调用（invocation_start 排在其后）
+    agents::flush_queued(&st, host_id).await;
 
     let (mut sink, mut stream) = socket.split();
     let ping_every = Duration::from_millis(
@@ -168,12 +170,14 @@ fn broadcast_status(st: &SharedState, owner: Uuid, host_id: Uuid, online: bool) 
     st.send_to_user(owner, &p);
 }
 
-/// 宿主断开：该宿主名下 running 的调用全部 failed/host_disconnected，逐条广播。
+/// 宿主断开：只把 running / awaiting_approval 置 failed/host_disconnected。
+/// queued 保持排队，等这个宿主下次 host_ready 再按创建顺序执行。
 async fn fail_running(st: &SharedState, host_id: Uuid) {
     let invs = sqlx::query_as::<_, crate::model::InvocationView>(
         "UPDATE agent_invocations SET status = 'failed', error = 'host_disconnected',
                 finished_at = now()
           WHERE finished_at IS NULL
+            AND status IN ('running', 'awaiting_approval')
             AND agent_id IN (SELECT id FROM agents WHERE host_id = $1)
          RETURNING id, agent_id, conversation_id, trigger_message_id, status, error,
                    created_at, started_at, finished_at",

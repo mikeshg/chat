@@ -84,11 +84,14 @@ pub struct AppState {
     pub backup_busy: AtomicBool,
     /// Agent A01：host_id -> 宿主连接（在线即有此表项）
     pub hosts: DashMap<Uuid, HostConn>,
+    /// Agent A04：排队超时清扫间隔（毫秒），默认 30s。
+    /// 清扫循环每小段重读这个值，测试调小后不用等完原来的 30 秒。
+    pub queue_sweep_interval_ms: AtomicU64,
 }
 
 impl AppState {
     pub fn new(pool: PgPool, cfg: Config) -> SharedState {
-        Arc::new(Self {
+        let st = Arc::new(Self {
             pool,
             cfg,
             conns: DashMap::new(),
@@ -101,7 +104,10 @@ impl AppState {
             maintenance: AtomicBool::new(false),
             backup_busy: AtomicBool::new(false),
             hosts: DashMap::new(),
-        })
+            queue_sweep_interval_ms: AtomicU64::new(30_000),
+        });
+        crate::agents::spawn_queue_sweeper(st.clone());
+        st
     }
 
     fn bump_epoch(&self, uid: Uuid) -> u64 {

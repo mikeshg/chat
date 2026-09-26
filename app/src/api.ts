@@ -351,6 +351,8 @@ export const agents = {
   /** A02：清空本会话的 AgentContext（仅成员；非 agent 会话 400） */
   resetContext: (convId: string) =>
     post<void>(`/conversations/${convId}/agent-context/reset`),
+  /** 取消排队中 / 运行中 / 等待审批的调用。409 = 已经结束 */
+  cancel: (id: string) => post<InvocationView>(`/agent-invocations/${id}/cancel`),
 };
 
 // ---------- 消息生命周期 ----------

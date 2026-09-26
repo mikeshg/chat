@@ -9,7 +9,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 /// invocation_start / agent_probe 帧里 agent 字段的运行时描述。
@@ -115,6 +115,8 @@ pub struct RunRequest {
     pub extra_dirs: Vec<String>,
     /// true：只做 initialize + session/new，不上报 prompt
     pub probe: bool,
+    /// 主人取消：置 true 后 ACP 先发 session/cancel，最多再等 5 秒。
+    pub cancel: watch::Receiver<bool>,
 }
 
 impl RunRequest {
@@ -139,6 +141,8 @@ impl RunRequest {
             prompt,
             data_dir,
             probe,
+            // 默认没人会取消（发送端已丢弃）；普通调用由调用方换成真正的取消信号
+            cancel: watch::channel(false).1,
         }
     }
 }

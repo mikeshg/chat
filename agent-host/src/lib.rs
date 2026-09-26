@@ -48,6 +48,9 @@ where
 /// 调用中子进程登记表：宿主关闭时需要把还在跑的 Agent 进程杀掉。
 pub(crate) type Running = Arc<Mutex<HashMap<Uuid, JoinHandle<()>>>>;
 
+/// 运行中调用的取消信号（invocation_cancel → 置 true，ACP 侧收）
+pub(crate) type Cancels = Arc<Mutex<HashMap<Uuid, watch::Sender<bool>>>>;
+
 pub(crate) struct Shared {
     pub cfg: HostConfig,
     pub tickets: Arc<dyn TicketSource>,
@@ -55,6 +58,8 @@ pub(crate) struct Shared {
     pub host_id: watch::Sender<Option<Uuid>>,
     /// 运行中的 invocation 任务（invocation_id -> JoinHandle）
     pub running: Running,
+    /// 运行中调用的取消入口（不 abort 任务，交给 ACP 发 session/cancel）
+    pub cancels: Cancels,
     /// 收到 host_superseded 后置真：同一 (user,install) 被更新的连接顶替，不再重连
     pub superseded: std::sync::atomic::AtomicBool,
     /// cwd 为空时 Agent 进程的默认工作目录
@@ -116,6 +121,7 @@ pub fn spawn(cfg: HostConfig, tickets: Arc<dyn TicketSource>) -> HostHandle {
         tickets,
         host_id: host_id_tx,
         running: Arc::new(Mutex::new(HashMap::new())),
+        cancels: Arc::new(Mutex::new(HashMap::new())),
         superseded: std::sync::atomic::AtomicBool::new(false),
     });
     let _ = std::fs::create_dir_all(&shared.data_dir);

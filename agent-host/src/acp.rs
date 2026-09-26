@@ -18,16 +18,20 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
+
+/// 收到 session/cancel 后，最多再等这么久让 session/prompt 返回，然后杀进程。
+const CANCEL_GRACE: Duration = Duration::from_secs(5);
 
 /// ACP 运行时：每次调用起一个 agent 子进程。
 pub struct AcpRuntime;
 
 impl AgentRuntime for AcpRuntime {
     fn run(&self, req: RunRequest, events: Events) -> RunFuture {
-        Box::pin(async move { run_invocation(&req, events).await })
+        Box::pin(async move { run_invocation(req, events).await })
     }
 }
 
@@ -51,7 +55,7 @@ struct Pipe {
 
 /// 跑一次调用：起进程、握手、发 prompt、收全部分块文本（同时逐段发 RunEvent::Text）。
 /// Err 为人类可读原因，调用方截断。
-pub async fn run_invocation(req: &RunRequest, events: Events) -> Result<RunOutput, String> {
+pub async fn run_invocation(req: RunRequest, events: Events) -> Result<RunOutput, String> {
     let spec = &req.spec;
     let dir: PathBuf = if spec.cwd.is_empty() {
         req.data_dir.clone()
@@ -129,7 +133,9 @@ pub async fn run_invocation(req: &RunRequest, events: Events) -> Result<RunOutpu
         events,
         suppress_chunks: false,
     };
-    let r = drive(&mut pipe, &dir, req).await;
+    // 取消信号单独克隆一份：drive 只读 req，等待取消需要可变的 Receiver
+    let mut cancel = req.cancel.clone();
+    let r = drive(&mut pipe, &dir, &req, &mut cancel).await;
     let _ = child.kill().await;
     r.map(|d| RunOutput {
         text: std::mem::take(&mut pipe.text),
@@ -140,6 +146,7 @@ pub async fn run_invocation(req: &RunRequest, events: Events) -> Result<RunOutpu
 }
 
 /// drive 的结果：本次使用的会话 id，以及 session/new 报告的可选项（恢复会话时没有）
+#[derive(Default)]
 struct Driven {
     session_id: Option<String>,
     modes: Option<Vec<AgentOption>>,
@@ -200,7 +207,13 @@ fn in_options(id: &str, list: &Option<Vec<AgentOption>>) -> bool {
         .is_some_and(|xs| xs.iter().any(|o| o.id == id))
 }
 
-async fn drive(pipe: &mut Pipe, dir: &Path, req: &RunRequest) -> Result<Driven, String> {
+/// 主人取消时照样返回 Ok（调用方看取消标志决定要不要回 finish）。
+async fn drive(
+    pipe: &mut Pipe,
+    dir: &Path,
+    req: &RunRequest,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<Driven, String> {
     let init = pipe
         .call(
             "initialize",
@@ -211,15 +224,14 @@ async fn drive(pipe: &mut Pipe, dir: &Path, req: &RunRequest) -> Result<Driven, 
         .get("agentCapabilities")
         .cloned()
         .unwrap_or(Value::Null);
+    if *cancel.borrow() {
+        return Ok(Driven::default());
+    }
     // 能续上已有会话就续上（probe 不续）：模式、模型、额外目录、附加指令都沿用那个会话，不再设置
     if !req.probe {
         if let Some(sid) = resume_session(pipe, dir, req.resume_session.as_deref(), &caps).await {
-            pipe.call(
-                "session/prompt",
-                json!({"sessionId": sid,
-                       "prompt": [{"type": "text", "text": req.prompt}]}),
-            )
-            .await?;
+            let prompt = json!([{"type": "text", "text": req.prompt}]);
+            prompt_or_cancel(pipe, &json!(sid), prompt, cancel).await?;
             return Ok(Driven {
                 session_id: Some(sid),
                 modes: None,
@@ -245,6 +257,12 @@ async fn drive(pipe: &mut Pipe, dir: &Path, req: &RunRequest) -> Result<Driven, 
     }
     let sid = session_id_of(&new, None)?;
     let session_id = json!(sid);
+    if *cancel.borrow() {
+        let _ = pipe
+            .notify("session/cancel", json!({"sessionId": session_id}))
+            .await;
+        return Ok(Driven::default());
+    }
     if !req.mode.is_empty() && in_options(&req.mode, &modes) {
         pipe.call(
             "session/set_mode",
@@ -264,16 +282,35 @@ async fn drive(pipe: &mut Pipe, dir: &Path, req: &RunRequest) -> Result<Driven, 
         blocks.push(json!({"type": "text", "text": req.instructions}));
     }
     blocks.push(json!({"type": "text", "text": req.prompt}));
-    pipe.call(
-        "session/prompt",
-        json!({"sessionId": session_id, "prompt": blocks}),
-    )
-    .await?;
+    prompt_or_cancel(pipe, &session_id, json!(blocks), cancel).await?;
     Ok(Driven {
         session_id: Some(sid),
         modes,
         models,
     })
+}
+
+/// 发 session/prompt 并等它返回；期间主人取消 → 通知 session/cancel，最多再等 CANCEL_GRACE，
+/// 之后由调用方结束子进程。
+async fn prompt_or_cancel(
+    pipe: &mut Pipe,
+    session_id: &Value,
+    prompt: Value,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<(), String> {
+    let id = pipe
+        .send_req(
+            "session/prompt",
+            json!({"sessionId": session_id, "prompt": prompt}),
+        )
+        .await?;
+    if pipe.wait_resp_or_cancel(id, cancel).await? {
+        let _ = pipe
+            .notify("session/cancel", json!({"sessionId": session_id}))
+            .await;
+        let _ = tokio::time::timeout(CANCEL_GRACE, pipe.wait_resp(id)).await;
+    }
+    Ok(())
 }
 
 /// 按能力恢复会话；成功返回会话 id。没有能力或恢复失败返回 None（调用方新开，不算失败）。
@@ -302,32 +339,105 @@ async fn resume_session(
 }
 
 impl Pipe {
-    /// 发一个 JSON-RPC 请求并等到它的响应；期间顺带处理
-    /// agent→client 反向请求与 session/update 通知。
-    async fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+    async fn send_req(&mut self, method: &str, params: Value) -> Result<u64, String> {
         let id = self.next_id;
         self.next_id += 1;
         self.write(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
             .await?;
+        Ok(id)
+    }
+
+    /// ACP 通知（无 id，不等响应）。session/cancel 走这里。
+    async fn notify(&mut self, method: &str, params: Value) -> Result<(), String> {
+        self.write(&json!({"jsonrpc":"2.0","method":method,"params":params}))
+            .await
+    }
+
+    /// 发一个 JSON-RPC 请求并等到它的响应；期间顺带处理
+    /// agent→client 反向请求与 session/update 通知。
+    async fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let id = self.send_req(method, params).await?;
+        self.wait_resp(id).await
+    }
+
+    async fn wait_resp(&mut self, id: u64) -> Result<Value, String> {
         loop {
             let msg = match self.rx.recv().await {
                 Some(In::Msg(v)) => v,
                 _ => return Err(self.exited()),
             };
-            if msg.get("id").and_then(Value::as_u64) == Some(id)
-                && (msg.get("result").is_some() || msg.get("error").is_some())
-            {
-                return match msg.get("error") {
-                    Some(e) => Err(trunc(e["message"].as_str().unwrap_or("agent error"))),
-                    None => Ok(msg["result"].clone()),
-                };
-            }
-            if msg.get("id").is_some() && msg.get("method").is_some() {
-                self.answer_request(&msg).await?;
-            } else if let Some(m) = msg.get("method").and_then(Value::as_str) {
-                self.on_notify(m, &msg["params"]);
+            if let Some(r) = self.take_resp(id, msg).await? {
+                return r;
             }
         }
+    }
+
+    /// true = 取消信号已到（prompt 响应还没回来）。
+    /// 发送端已丢（没人会取消）时退回普通等待，避免 changed() 立刻失败把循环转死。
+    async fn wait_resp_or_cancel(
+        &mut self,
+        id: u64,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<bool, String> {
+        let mut cancel_open = true;
+        loop {
+            if cancel_open && *cancel.borrow() {
+                return Ok(true);
+            }
+            if !cancel_open {
+                let msg = match self.rx.recv().await {
+                    Some(In::Msg(v)) => v,
+                    _ => return Err(self.exited()),
+                };
+                if let Some(r) = self.take_resp(id, msg).await? {
+                    r?;
+                    return Ok(false);
+                }
+                continue;
+            }
+            tokio::select! {
+                biased;
+                res = cancel.changed() => {
+                    match res {
+                        Ok(()) if *cancel.borrow() => return Ok(true),
+                        Ok(()) => {}
+                        Err(_) => cancel_open = false,
+                    }
+                }
+                msg = self.rx.recv() => {
+                    let msg = match msg {
+                        Some(In::Msg(v)) => v,
+                        _ => return Err(self.exited()),
+                    };
+                    if let Some(r) = self.take_resp(id, msg).await? {
+                        r?;
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Some = 这帧就是本次请求的响应；None = 已当作旁路消息消化掉。
+    async fn take_resp(
+        &mut self,
+        id: u64,
+        msg: Value,
+    ) -> Result<Option<Result<Value, String>>, String> {
+        if msg.get("id").and_then(Value::as_u64) == Some(id)
+            && (msg.get("result").is_some() || msg.get("error").is_some())
+        {
+            return Ok(Some(match msg.get("error") {
+                Some(e) => Err(trunc(e["message"].as_str().unwrap_or("agent error"))),
+                None => Ok(msg["result"].clone()),
+            }));
+        }
+        if msg.get("id").is_some() && msg.get("method").is_some() {
+            self.answer_request(&msg).await?;
+        } else if let Some(m) = msg.get("method").and_then(Value::as_str) {
+            self.on_notify(m, &msg["params"]);
+        }
+        Ok(None)
     }
 
     /// agent→client 请求：A01 一律不许写盘/跑终端；权限请求也选拒绝项。

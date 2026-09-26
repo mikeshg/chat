@@ -949,3 +949,6 @@ button.icon-btn.chat-head-btn.topic-btn:disabled { opacity: 0.5; }
   background: var(--bg);
 }
 .chat-head .agent-avatar { flex: 0 0 auto; }
+/* ===== Agent A04 ===== */
+.inv-status { display: flex; align-items: center; gap: 8px; }
+.inv-cancel { font-size: 12px; padding: 1px 8px; line-height: 18px; }

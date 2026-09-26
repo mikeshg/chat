@@ -3,16 +3,23 @@
 use agent_host::acp::run_invocation;
 use agent_host::runtime::{AgentSpec, RunEvent, RunOutput, RunRequest};
 use std::path::PathBuf;
-use tokio::sync::mpsc;
+use std::time::Duration;
+use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
+fn script() -> String {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fake-acp-agent.mjs")
+        .to_string_lossy()
+        .to_string()
+}
+
 fn fake() -> AgentSpec {
-    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fake-acp-agent.mjs");
     AgentSpec {
         id: Uuid::new_v4(),
         name: "fake".into(),
         command: "node".into(),
-        args: vec![script.to_string_lossy().to_string()],
+        args: vec![script()],
         cwd: String::new(),
         env: Vec::new(),
         instructions: String::new(),
@@ -30,9 +37,16 @@ fn runtime_req(spec: AgentSpec, prompt: &str) -> RunRequest {
     RunRequest::for_invocation(spec, prompt.into(), std::env::temp_dir())
 }
 
+/// 带取消信号的请求（A04 的取消用例）
+fn cancellable(spec: AgentSpec, prompt: &str, cancel: watch::Receiver<bool>) -> RunRequest {
+    let mut r = runtime_req(spec, prompt);
+    r.cancel = cancel;
+    r
+}
+
 async fn run(prompt: &str) -> Result<RunOutput, String> {
     let (events, _) = mpsc::unbounded_channel();
-    run_invocation(&req(prompt), events).await
+    run_invocation(req(prompt), events).await
 }
 
 #[tokio::test]
@@ -62,7 +76,7 @@ async fn acp_long_chunks_concat() {
 #[tokio::test]
 async fn acp_emits_text_events_in_order() {
     let (events, mut rx) = mpsc::unbounded_channel();
-    let out = run_invocation(&req("echo:hello world"), events)
+    let out = run_invocation(req("echo:hello world"), events)
         .await
         .expect("echo 应成功");
     let mut chunks = Vec::new();
@@ -82,7 +96,7 @@ async fn acp_whoami_applies_config() {
     spec.mode = "code".into();
     spec.extra_dirs = vec!["D:/extra".into()];
     let (events, _) = mpsc::unbounded_channel();
-    let out = run_invocation(&runtime_req(spec, "whoami"), events)
+    let out = run_invocation(runtime_req(spec, "whoami"), events)
         .await
         .expect("whoami 应成功");
     assert!(out.text.contains("mode=code"), "{}", out.text);
@@ -99,7 +113,7 @@ async fn acp_probe_reports_options_without_prompt() {
     let (events, _) = mpsc::unbounded_channel();
     let mut r = req("");
     r.probe = true;
-    let out = run_invocation(&r, events).await.expect("probe 应成功");
+    let out = run_invocation(r, events).await.expect("probe 应成功");
     assert!(
         out.text.is_empty(),
         "probe 不应发 prompt，正文应为空: {}",
@@ -115,7 +129,7 @@ async fn acp_ignores_mode_outside_options() {
     spec.mode = "nope".into();
     spec.model = "nope".into();
     let (events, _) = mpsc::unbounded_channel();
-    let out = run_invocation(&runtime_req(spec, "whoami"), events)
+    let out = run_invocation(runtime_req(spec, "whoami"), events)
         .await
         .expect("越界模式应忽略并继续");
     assert!(out.text.contains("mode=ask"), "{}", out.text);
@@ -136,7 +150,7 @@ async fn invoke(
     let (events, mut rx) = mpsc::unbounded_channel();
     let mut req = runtime_req(spec, prompt);
     req.resume_session = resume.map(str::to_string);
-    let out = run_invocation(&req, events).await?;
+    let out = run_invocation(req, events).await?;
     let mut chunks = Vec::new();
     while let Ok(RunEvent::Text(t)) = rx.try_recv() {
         chunks.push(t);
@@ -205,4 +219,50 @@ async fn acp_resume_error_falls_back_to_new_session() {
     assert_eq!(out.text, "(empty)");
     assert!(out.session_id.is_some());
     assert_ne!(out.session_id.as_deref(), Some("missing-session"));
+}
+
+/// session/cancel 让 sleep 立刻以 cancelled 结束，不等满 sleep。
+#[tokio::test]
+async fn acp_cancel_stops_sleep() {
+    let (tx, rx) = watch::channel(false);
+    let (events, _) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(run_invocation(
+        cancellable(fake(), "sleep:10000", rx),
+        events,
+    ));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let t0 = std::time::Instant::now();
+    tx.send(true).unwrap();
+    let out = tokio::time::timeout(Duration::from_secs(4), handle)
+        .await
+        .expect("合作取消应在 4s 内返回")
+        .unwrap()
+        .expect("取消路径不报错");
+    assert!(t0.elapsed() < Duration::from_secs(4));
+    assert_ne!(out.text, "done");
+}
+
+/// --ignore-cancel：通知无效，约 5 秒后进程被杀掉，调用返回。
+#[tokio::test]
+async fn acp_ignore_cancel_kills_after_grace() {
+    let (tx, rx) = watch::channel(false);
+    let (events, _) = mpsc::unbounded_channel();
+    let mut spec = fake();
+    spec.args.push("--ignore-cancel".into());
+    let handle = tokio::spawn(run_invocation(cancellable(spec, "sleep:30000", rx), events));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let t0 = std::time::Instant::now();
+    tx.send(true).unwrap();
+    let out = tokio::time::timeout(Duration::from_secs(8), handle)
+        .await
+        .expect("5s 宽限后应返回");
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(4500) && elapsed < Duration::from_secs(8),
+        "强制结束应约 5s，实际 {elapsed:?}"
+    );
+    match out.unwrap() {
+        Ok(o) => assert_ne!(o.text, "done"),
+        Err(_) => {}
+    }
 }

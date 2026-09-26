@@ -5,7 +5,8 @@
 //   别人的宿主/Agent 按 id 访问返回 404，不泄露存在性。
 //   POST /v1/conversations/{id}/agent-context/reset —— 成员清空本会话上下文。
 // - 派发挂点在 ws::broadcast_posted：专属会话里的主人文字消息触发一次调用；
-//   宿主在线 → invocation_start 下发宿主连接，离线 → 立即 failed/host_offline。
+//   宿主在线 → running + invocation_start；离线 → queued（queue_deadline = now + 生效超时，
+//   超时 0 则 NULL）。宿主 host_ready 后按 created_at 把排队调用改成 running 再下发。
 
 use crate::auth;
 use crate::domain::{self, PostError};
@@ -25,6 +26,8 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 async fn uid(headers: &HeaderMap, st: &SharedState) -> AppResult<Uuid> {
@@ -858,6 +861,65 @@ pub async fn reset_context(
     Ok(StatusCode::NO_CONTENT)
 }
 
+fn terminal_status(status: &str) -> bool {
+    matches!(status, "succeeded" | "failed" | "cancelled" | "timed_out")
+}
+
+/// POST /v1/agent-invocations/{id}/cancel
+/// 只有该调用所属 Agent 的主人能取消；别人或不存在一律 404。
+/// queued → cancelled；running / awaiting_approval → cancelled，并通知宿主；
+/// 已是终态 → 409 already_finished。
+pub async fn cancel_invocation(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<InvocationView>> {
+    let uid = uid(&headers, &st).await?;
+    let row = sqlx::query_as::<_, (String, Uuid, Uuid, Uuid)>(
+        "SELECT i.status, a.owner_id, a.host_id, i.conversation_id
+           FROM agent_invocations i
+           JOIN agents a ON a.id = i.agent_id
+          WHERE i.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&st.pool)
+    .await?;
+    let Some((status, owner, host_id, conv)) = row else {
+        return Err(AppError::not_found("invocation not found"));
+    };
+    if owner != uid {
+        return Err(AppError::not_found("invocation not found"));
+    }
+    if terminal_status(&status) {
+        return Err(AppError::conflict("already_finished"));
+    }
+    let inv = sqlx::query_as::<_, InvocationView>(
+        "UPDATE agent_invocations
+            SET status = 'cancelled', error = NULL, finished_at = now()
+          WHERE id = $1 AND finished_at IS NULL
+            AND status IN ('queued', 'running', 'awaiting_approval')
+         RETURNING id, agent_id, conversation_id, trigger_message_id, status, error,
+                   created_at, started_at, finished_at",
+    )
+    .bind(id)
+    .fetch_optional(&st.pool)
+    .await?;
+    let Some(inv) = inv else {
+        return Err(AppError::conflict("already_finished"));
+    };
+    if status == "running" || status == "awaiting_approval" {
+        let payload = serde_json::json!({
+            "type": "invocation_cancel",
+            "invocation_id": id,
+        })
+        .to_string();
+        let _ = st.send_to_host(host_id, &payload);
+    }
+    let members = domain::member_ids(&st.pool, conv).await.unwrap_or_default();
+    push_invocation(&st, &members, &inv);
+    Ok(Json(inv))
+}
+
 // ---------- 调用派发（挂在 broadcast_posted 上） ----------
 
 struct AgentRow {
@@ -993,21 +1055,14 @@ async fn dispatch(
     prompt: String,
     member_ids: &[Uuid],
 ) {
-    // 宿主在线 → running 并把 invocation_start 下发宿主连接；离线 → 直接 failed
+    let timeout = queue_timeout_secs(&st.pool, agent.id).await;
     let online = st.host_online(agent.host_id);
+    // 在线先标 running 再下发，客户端看到的第一帧就是 running（不是先闪一下排队）。
+    // 发不出去则改回 queued，与离线同语义。
     let inv = if online {
-        insert_invocation(&st.pool, &agent, conv, trigger, "running", None, true).await
+        insert_running(&st.pool, &agent, conv, trigger).await
     } else {
-        insert_invocation(
-            &st.pool,
-            &agent,
-            conv,
-            trigger,
-            "failed",
-            Some("host_offline"),
-            false,
-        )
-        .await
+        insert_queued(&st.pool, &agent, conv, trigger, timeout).await
     };
     let Ok(inv) = inv else {
         tracing::error!("agent_invocation insert failed");
@@ -1017,48 +1072,210 @@ async fn dispatch(
     if inv.status != "running" {
         return;
     }
-    let session_id = context_session(&st.pool, agent.id, conv).await;
-    let payload = json!({
-        "type": "invocation_start",
-        "invocation_id": inv.id,
-        "agent": agent_snapshot(&agent),
-        "prompt": prompt,
-        "context": {"key": conv.to_string(), "session_id": session_id},
-    })
-    .to_string();
-    // 发不出去（恰在检查后断开等）→ 与离线同语义：failed/host_offline
+    let payload = invocation_start_payload(&st.pool, inv.id, &agent, conv, &prompt).await;
     if !st.send_to_host(agent.host_id, &payload) {
-        let _ = finish_invocation(st, inv.id, "failed", Some("host_offline"), member_ids).await;
+        if let Some(q) = requeue(&st.pool, inv.id, timeout).await {
+            push_invocation(st, member_ids, &q);
+        }
     }
 }
 
-async fn insert_invocation(
+async fn queue_timeout_secs(pool: &PgPool, agent_id: Uuid) -> i32 {
+    effective_settings(pool, agent_id)
+        .await
+        .map(|s| s.queue_timeout_secs)
+        .unwrap_or(86400)
+}
+
+const INV_RETURNING: &str =
+    "RETURNING id, agent_id, conversation_id, trigger_message_id, status, error,
+                   created_at, started_at, finished_at";
+
+async fn insert_running(
     pool: &PgPool,
     agent: &AgentRow,
     conv: Uuid,
     trigger: Uuid,
-    status: &str,
-    error: Option<&str>,
-    started: bool,
 ) -> Result<InvocationView, sqlx::Error> {
-    sqlx::query_as::<_, InvocationView>(
+    sqlx::query_as::<_, InvocationView>(&format!(
         "INSERT INTO agent_invocations
-            (agent_id, conversation_id, trigger_message_id, status, error,
-             started_at, finished_at)
-         VALUES ($1, $2, $3, $4, $5,
-                 CASE WHEN $6 THEN now() END,
-                 CASE WHEN $6 THEN NULL ELSE now() END)
-         RETURNING id, agent_id, conversation_id, trigger_message_id, status, error,
-                   created_at, started_at, finished_at",
-    )
+            (agent_id, conversation_id, trigger_message_id, status, started_at)
+         VALUES ($1, $2, $3, 'running', now())
+         {INV_RETURNING}"
+    ))
     .bind(agent.id)
     .bind(conv)
     .bind(trigger)
-    .bind(status)
-    .bind(error)
-    .bind(started)
     .fetch_one(pool)
     .await
+}
+
+async fn insert_queued(
+    pool: &PgPool,
+    agent: &AgentRow,
+    conv: Uuid,
+    trigger: Uuid,
+    timeout_secs: i32,
+) -> Result<InvocationView, sqlx::Error> {
+    sqlx::query_as::<_, InvocationView>(&format!(
+        "INSERT INTO agent_invocations
+            (agent_id, conversation_id, trigger_message_id, status, queue_deadline)
+         VALUES ($1, $2, $3, 'queued',
+                 CASE WHEN $4 > 0 THEN now() + make_interval(secs => $4::double precision) END)
+         {INV_RETURNING}"
+    ))
+    .bind(agent.id)
+    .bind(conv)
+    .bind(trigger)
+    .bind(timeout_secs)
+    .fetch_one(pool)
+    .await
+}
+
+/// invocation_start 帧：Agent 配置快照（A06）+ 该会话记住的运行时会话（A02）。
+/// 即时派发与宿主上线后清排队共用。
+async fn invocation_start_payload(
+    pool: &PgPool,
+    inv_id: Uuid,
+    agent: &AgentRow,
+    conv: Uuid,
+    prompt: &str,
+) -> String {
+    let session_id = context_session(pool, agent.id, conv).await;
+    json!({
+        "type": "invocation_start",
+        "invocation_id": inv_id,
+        "agent": agent_snapshot(agent),
+        "prompt": prompt,
+        "context": {"key": conv.to_string(), "session_id": session_id},
+    })
+    .to_string()
+}
+
+/// 下发失败：从 running 改回 queued，重新计算截止时间。
+async fn requeue(pool: &PgPool, id: Uuid, timeout_secs: i32) -> Option<InvocationView> {
+    sqlx::query_as::<_, InvocationView>(&format!(
+        "UPDATE agent_invocations
+            SET status = 'queued', error = NULL, started_at = NULL, finished_at = NULL,
+                queue_deadline = CASE WHEN $2 > 0 THEN now() + make_interval(secs => $2::double precision) END
+          WHERE id = $1 AND status = 'running' AND finished_at IS NULL
+         {INV_RETURNING}"
+    ))
+    .bind(id)
+    .bind(timeout_secs)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+}
+
+#[derive(sqlx::FromRow)]
+struct QueuedStart {
+    id: Uuid,
+    conversation_id: Uuid,
+    agent_id: Uuid,
+    prompt: String,
+}
+
+/// host_ready 之后：该宿主上所有 queued 调用按 created_at 逐个改成 running 并下发。
+pub async fn flush_queued(st: &SharedState, host_id: Uuid) {
+    let rows = sqlx::query_as::<_, QueuedStart>(
+        "SELECT i.id, i.conversation_id, a.id AS agent_id, m.content AS prompt
+           FROM agent_invocations i
+           JOIN agents a ON a.id = i.agent_id
+           JOIN messages m ON m.id = i.trigger_message_id
+          WHERE a.host_id = $1 AND i.status = 'queued'
+          ORDER BY i.created_at ASC, i.id ASC",
+    )
+    .bind(host_id)
+    .fetch_all(&st.pool)
+    .await
+    .unwrap_or_default();
+    for row in rows {
+        let inv = match promote_queued(&st.pool, row.id).await {
+            Ok(Some(inv)) => inv,
+            Ok(None) => continue, // 清扫或取消抢先改了状态
+            Err(e) => {
+                tracing::warn!(error = %e, "排队调用转 running 失败");
+                continue;
+            }
+        };
+        let members = domain::member_ids(&st.pool, row.conversation_id)
+            .await
+            .unwrap_or_default();
+        push_invocation(st, &members, &inv);
+        let agent = match load_cfg(&st.pool, row.agent_id).await {
+            Ok(Some(a)) => a,
+            _ => continue,
+        };
+        let payload =
+            invocation_start_payload(&st.pool, inv.id, &agent, row.conversation_id, &row.prompt)
+                .await;
+        if !st.send_to_host(host_id, &payload) {
+            let timeout = queue_timeout_secs(&st.pool, row.agent_id).await;
+            if let Some(q) = requeue(&st.pool, inv.id, timeout).await {
+                push_invocation(st, &members, &q);
+            }
+        }
+    }
+}
+
+async fn promote_queued(pool: &PgPool, id: Uuid) -> Result<Option<InvocationView>, sqlx::Error> {
+    sqlx::query_as::<_, InvocationView>(&format!(
+        "UPDATE agent_invocations
+            SET status = 'running', started_at = now(), error = NULL, queue_deadline = NULL
+          WHERE id = $1 AND status = 'queued' AND finished_at IS NULL
+         {INV_RETURNING}"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// 后台清扫：间隔见 `AppState::queue_sweep_interval_ms`（默认 30s）。
+/// 睡眠按 250ms 切片重读间隔，测试把原子量调小后最多一个切片就能生效。
+pub fn spawn_queue_sweeper(st: SharedState) {
+    tokio::spawn(async move {
+        loop {
+            wait_sweep_interval(&st).await;
+            if let Err(e) = sweep_timed_out(&st).await {
+                tracing::warn!(error = %e, "排队超时清扫失败");
+            }
+        }
+    });
+}
+
+async fn wait_sweep_interval(st: &SharedState) {
+    let started = Instant::now();
+    loop {
+        let ms = st.queue_sweep_interval_ms.load(Ordering::Relaxed).max(50);
+        let target = Duration::from_millis(ms);
+        if started.elapsed() >= target {
+            return;
+        }
+        let left = target.saturating_sub(started.elapsed());
+        tokio::time::sleep(left.min(Duration::from_millis(250))).await;
+    }
+}
+
+async fn sweep_timed_out(st: &SharedState) -> Result<(), sqlx::Error> {
+    let invs = sqlx::query_as::<_, InvocationView>(&format!(
+        "UPDATE agent_invocations
+            SET status = 'timed_out', finished_at = now()
+          WHERE status = 'queued'
+            AND queue_deadline IS NOT NULL
+            AND queue_deadline < now()
+         {INV_RETURNING}"
+    ))
+    .fetch_all(&st.pool)
+    .await?;
+    for inv in invs {
+        let members = domain::member_ids(&st.pool, inv.conversation_id)
+            .await
+            .unwrap_or_default();
+        push_invocation(st, &members, &inv);
+    }
+    Ok(())
 }
 
 /// 状态推进 + 广播 agent_invocation 帧给会话成员。
@@ -1096,8 +1313,8 @@ fn push_invocation(st: &SharedState, member_ids: &[Uuid], inv: &InvocationView) 
 }
 
 /// 宿主回传的 invocation_finish：校验该调用确实派给这条宿主连接。
-/// ok:true → 把正文拆成 ≤4000 字符的 Agent 消息广播，然后置 succeeded；
-/// ok:false → failed + error（截 500 字符）。
+/// 行锁内推进终态。取消已经落库时这里读到的不是 running，直接忽略，不发回复。
+/// ok:true → 先写 Agent 消息再置 succeeded；ok:false → failed + error（截 500 字符）。
 pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Value) {
     let Some(inv_id) = v["invocation_id"]
         .as_str()
@@ -1105,32 +1322,33 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
     else {
         return;
     };
-    let row = sqlx::query_as::<_, (Uuid, String, Option<Uuid>, Uuid, Uuid, String)>(
-        "SELECT i.id, i.status, c.owner_id, i.conversation_id, a.id, a.name
+    let mut tx = match st.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!(error = %e, "invocation_finish 开事务失败");
+            return;
+        }
+    };
+    let row = sqlx::query_as::<_, (String, Option<Uuid>, Uuid, Uuid, Uuid)>(
+        "SELECT i.status, c.owner_id, i.conversation_id, a.id, a.host_id
            FROM agent_invocations i
            JOIN agents a ON a.id = i.agent_id
            JOIN conversations c ON c.id = i.conversation_id
-          WHERE i.id = $1",
+          WHERE i.id = $1
+          FOR UPDATE OF i",
     )
     .bind(inv_id)
-    .fetch_optional(&st.pool)
+    .fetch_optional(&mut *tx)
     .await;
-    let Ok(Some((_, status, owner, conv, agent_id, _name))) = row else {
+    let Ok(Some((status, owner, conv, agent_id, real_host))) = row else {
         return;
     };
-    if status != "running" {
-        return; // 已完成/未开始：重复或乱序的 finish 一律忽略
+    // 已取消 / 已超时 / 已结束，或不是这条宿主的调用：不发回复
+    if status != "running" || real_host != host_id {
+        return;
     }
     let owner = owner.unwrap_or_default();
     let member_ids = vec![owner];
-    // 防伪造：只有派给本宿主的调用才受理其 finish
-    let real_host = sqlx::query_scalar::<_, Uuid>("SELECT host_id FROM agents WHERE id = $1")
-        .bind(agent_id)
-        .fetch_one(&st.pool)
-        .await;
-    if !matches!(real_host, Ok(h) if h == host_id) {
-        return;
-    }
 
     if v["ok"].as_bool() == Some(true) {
         // 失败的 finish 不进这个分支，因此不会覆盖已记住的运行时会话
@@ -1152,12 +1370,42 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
             }
         }
         let text = v["text"].as_str().unwrap_or_default().to_string();
+        // 持锁写回复，取消的 UPDATE 会等这把锁，提交后看到的已是终态
         post_agent_text(st, conv, owner, agent_id, &text).await;
-        let _ = finish_invocation(st, inv_id, "succeeded", None, &member_ids).await;
+        let updated = sqlx::query_as::<_, InvocationView>(&format!(
+            "UPDATE agent_invocations
+                SET status = 'succeeded', error = NULL, finished_at = now()
+              WHERE id = $1 AND status = 'running'
+             {INV_RETURNING}"
+        ))
+        .bind(inv_id)
+        .fetch_optional(&mut *tx)
+        .await;
+        if tx.commit().await.is_err() {
+            return;
+        }
+        if let Ok(Some(inv)) = updated {
+            push_invocation(st, &member_ids, &inv);
+        }
     } else {
         let err = v["error"].as_str().unwrap_or("agent error");
         let err: String = err.chars().take(500).collect();
-        let _ = finish_invocation(st, inv_id, "failed", Some(&err), &member_ids).await;
+        let updated = sqlx::query_as::<_, InvocationView>(&format!(
+            "UPDATE agent_invocations
+                SET status = 'failed', error = $2, finished_at = now()
+              WHERE id = $1 AND status = 'running'
+             {INV_RETURNING}"
+        ))
+        .bind(inv_id)
+        .bind(&err)
+        .fetch_optional(&mut *tx)
+        .await;
+        if tx.commit().await.is_err() {
+            return;
+        }
+        if let Ok(Some(inv)) = updated {
+            push_invocation(st, &member_ids, &inv);
+        }
     }
 }
 

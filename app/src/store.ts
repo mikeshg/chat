@@ -567,6 +567,29 @@ export function applyInvocations(
   return { invocations };
 }
 
+/** 调用状态标签，按 status 查表。failed 的原因另走 invocationErrorText。
+ *  A03 会把这张表收进状态组件；新状态往这里加。
+ */
+export const INVOCATION_STATUS_LABEL: Record<string, string> = {
+  running: "⏳ 正在处理",
+  queued: "⏸ 排队中：Agent 所在电脑不在线",
+  cancelled: "已取消",
+  timed_out: "排队超时，已取消",
+};
+
+export function invocationStatusLabel(
+  status: string,
+  error: string | null | undefined,
+): string | null {
+  if (status === "failed") return `⚠ 失败：${invocationErrorText(error)}`;
+  return INVOCATION_STATUS_LABEL[status] ?? null;
+}
+
+/** 主人可以取消的状态：排队、运行中、等待审批 */
+export function invocationCancellable(status: string): boolean {
+  return status === "queued" || status === "running" || status === "awaiting_approval";
+}
+
 /** 调用失败原因的展示文案（host 侧稳定错误码 → 中文） */
 export function invocationErrorText(error: string | null | undefined): string {
   switch (error) {
