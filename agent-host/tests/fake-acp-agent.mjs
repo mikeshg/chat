@@ -15,6 +15,10 @@
 //   recall       → 本会话之前收到过的全部指令，用 | 连接；没有则 (empty)
 //   whoami       → 当前 mode / model、环境变量 FAKE_ECHO、第一个文本块、额外目录
 //   tool:read_history  → 经注入的 MCP 服务 tools/call read_conversation_history，原样回出文本
+//   tool:list / tool:search:<关键词> / tool:read:<会话id> /
+//   tool:send:<会话id>:<正文> / tool:sendfile:<会话id>:<文件名>:<内容>
+//     → 调 list_conversations / search_messages / read_conversation / send_message，回出工具文本
+//       （sendfile 先把内容写进临时文件，再经 file_paths 发送）
 //   perm:<kind>:<路径> → session/request_permission（kind + locations，选项 allow/always/reject）。
 //                        选定 allow 类回 allowed:<optionId>，拒绝或取消回 rejected
 //   inspect       → 回出收到的每个非文本块（image:<mime>:<字节数> / link:<name>:<存在与否>），
@@ -235,6 +239,18 @@ async function runMcpTool(name, args) {
   return text;
 }
 
+function replyTool(promptId, promise) {
+  promise
+    .then((out) => {
+      chunk(sessionId, out || "(empty)");
+      result(promptId, { stopReason: "end_turn" });
+    })
+    .catch((e) => {
+      chunk(sessionId, `tool error: ${e?.message || e}`);
+      result(promptId, { stopReason: "end_turn" });
+    });
+}
+
 async function runReadHistory() {
   await mcpCall("initialize", {
     protocolVersion: "2025-03-26",
@@ -432,6 +448,63 @@ rl.on("line", (line) => {
           result(id, { stopReason: "end_turn" });
         }
       }, 30);
+      return;
+    }
+    // A16：搜索 / 读取其他会话、以 Agent 身份发消息（含本地文件）
+    if (text === "tool:list") {
+      replyTool(id, runMcpTool("list_conversations", {}));
+      return;
+    }
+    if (text.startsWith("tool:search:")) {
+      replyTool(id, runMcpTool("search_messages", { query: text.slice("tool:search:".length) }));
+      return;
+    }
+    if (text.startsWith("tool:read:")) {
+      replyTool(
+        id,
+        runMcpTool("read_conversation", { conversation_id: text.slice("tool:read:".length) }),
+      );
+      return;
+    }
+    if (text.startsWith("tool:sendfile:")) {
+      const m = /^([^:]+):([^:]+):([\s\S]*)$/.exec(text.slice("tool:sendfile:".length));
+      if (!m) {
+        chunk(sessionId, "tool error: bad sendfile");
+        return result(id, { stopReason: "end_turn" });
+      }
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "a16-"));
+      const fp = path.join(dir, path.basename(m[2]));
+      fs.writeFileSync(fp, m[3]);
+      replyTool(
+        id,
+        runMcpTool("send_message", {
+          conversation_id: m[1],
+          text: "",
+          file_paths: [fp],
+        }).finally(() => {
+          try {
+            fs.rmSync(dir, { recursive: true, force: true });
+          } catch {
+            /* 临时目录清不掉不影响工具结果 */
+          }
+        }),
+      );
+      return;
+    }
+    if (text.startsWith("tool:send:")) {
+      const rest = text.slice("tool:send:".length);
+      const i = rest.indexOf(":");
+      if (i <= 0) {
+        chunk(sessionId, "tool error: bad send");
+        return result(id, { stopReason: "end_turn" });
+      }
+      replyTool(
+        id,
+        runMcpTool("send_message", {
+          conversation_id: rest.slice(0, i),
+          text: rest.slice(i + 1),
+        }),
+      );
       return;
     }
     if (text === "tool:read_history") {

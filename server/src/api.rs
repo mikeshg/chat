@@ -151,6 +151,20 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
             "/agent-tools/history",
             get(crate::agent_tools::tool_history),
         )
+        // Agent A16：主人参与的会话、搜索、读历史、以 Agent 身份发消息
+        .route(
+            "/agent-tools/conversations",
+            get(crate::agent_tools::tool_conversations),
+        )
+        .route(
+            "/agent-tools/conversations/{id}/messages",
+            get(crate::agent_tools::tool_conversation_messages),
+        )
+        .route("/agent-tools/search", get(crate::agent_tools::tool_search))
+        .route(
+            "/agent-tools/messages",
+            post(crate::agent_tools::tool_send_message),
+        )
         // Agent A05：产出文件上传（Invocation 凭据）；body 上限与普通上传一致
         .route(
             "/agent-tools/files",

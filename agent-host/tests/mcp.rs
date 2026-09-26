@@ -100,6 +100,28 @@ async fn mcp_list_and_call_against_fake_backend() {
         .find(|t| t["name"] == "read_conversation_history")
         .expect("应有 read_conversation_history");
     assert!(t["inputSchema"].is_object());
+    for name in [
+        "list_conversations",
+        "search_messages",
+        "read_conversation",
+        "send_message",
+    ] {
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("应有 {name}"));
+        let desc = tool["description"].as_str().unwrap_or("");
+        assert!(
+            desc.contains("主人"),
+            "{name} 的描述应写明只能访问主人的会话：{desc}"
+        );
+    }
+    assert!(
+        tools.iter().find(|t| t["name"] == "send_message").unwrap()["description"]
+            .as_str()
+            .unwrap()
+            .contains("Agent")
+    );
 
     // tools/call → 带调用凭据转发 → 格式化文本
     let (st, v) = rpc(
@@ -266,4 +288,166 @@ async fn acp_stdio_bridge_end_to_end() {
         text.contains("[seq 12] research (Agent): 已整理完毕"),
         "{text}"
     );
+}
+
+const A16_CONV: &str = "11111111-1111-1111-1111-111111111111";
+
+fn push_seen(seen: &Arc<Mutex<Vec<String>>>, method: &str, auth: &str, extra: &str) {
+    seen.lock()
+        .unwrap()
+        .push(format!("{method} {auth} {extra}"));
+}
+
+/// 假服务端：列会话 + 发消息，记下方法、Authorization 和 POST 正文。
+async fn fake_send_backend() -> (String, tokio::task::JoinHandle<()>, Arc<Mutex<Vec<String>>>) {
+    use axum::body::Bytes;
+    use axum::http::HeaderMap;
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen_get = seen.clone();
+    let seen_post = seen.clone();
+    let app = Router::new()
+        .route(
+            "/v1/agent-tools/conversations",
+            get(move |h: HeaderMap| {
+                let seen = seen_get.clone();
+                async move {
+                    let auth = h
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    push_seen(&seen, "GET", &auth, "");
+                    Json(json!([{
+                        "id": A16_CONV,
+                        "kind": "group",
+                        "title": "项目群",
+                        "member_count": 2,
+                        "last_seq": 1,
+                        "readonly": false
+                    }]))
+                }
+            }),
+        )
+        .route(
+            "/v1/agent-tools/messages",
+            post(move |h: HeaderMap, body: Bytes| {
+                let seen = seen_post.clone();
+                async move {
+                    let auth = h
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    push_seen(&seen, "POST", &auth, &String::from_utf8_lossy(&body));
+                    Json(json!({"message_id": "msg-1"}))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let t = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://127.0.0.1:{port}"), t, seen)
+}
+
+/// 只读档：先审批，正文只取前 80 字；拒绝则不 POST，工具错误是「主人拒绝了发送」。
+#[tokio::test]
+async fn send_message_read_only_reject_does_not_post() {
+    let (backend, _bt, seen) = fake_send_backend().await;
+    let mcp = McpServer::start().unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let registry = agent_host::runtime::ApprovalRegistry::new();
+    let link = agent_host::runtime::ApprovalLink {
+        tx,
+        registry: registry.clone(),
+    };
+    let h = mcp.register_with(backend, "TOK".into(), "read_only".into(), Some(link));
+    let url = h.url.clone();
+    let long = "字".repeat(90);
+    let call = tokio::spawn(async move {
+        rpc(
+            &url,
+            json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"send_message","arguments":{
+                    "conversation_id": A16_CONV,
+                    "text": long
+                }}
+            }),
+        )
+        .await
+    });
+    let notice = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("应发出审批")
+        .expect("审批通道未关");
+    assert_eq!(notice.tool_call["kind"], "send_message");
+    let title = notice.tool_call["title"].as_str().unwrap();
+    assert!(title.starts_with("发消息到「项目群」："), "{title}");
+    assert!(title.contains(&"字".repeat(80)), "{title}");
+    assert!(!title.contains(&"字".repeat(81)), "{title}");
+    assert!(notice.tool_call["locations"]
+        .as_array()
+        .is_some_and(|a| a.is_empty()));
+    let opts = notice.options.as_array().unwrap();
+    assert!(opts
+        .iter()
+        .any(|o| o["optionId"] == "allow_once" && o["kind"] == "allow_once"));
+    assert!(opts
+        .iter()
+        .any(|o| o["optionId"] == "reject_once" && o["kind"] == "reject_once"));
+    assert!(
+        seen.lock().unwrap().iter().all(|s| !s.starts_with("POST")),
+        "批准前不应发消息：{:?}",
+        seen.lock().unwrap()
+    );
+    assert!(registry.resolve(&notice.request_id, "reject_once".into()));
+    let (st, v) = call.await.unwrap();
+    assert_eq!(st, 200);
+    let v = v.unwrap();
+    assert_eq!(v["result"]["isError"], true);
+    let text = v["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("主人拒绝了发送"), "{text}");
+    assert!(seen.lock().unwrap().iter().all(|s| !s.starts_with("POST")));
+}
+
+/// workspace / full 不走审批，直接 POST。
+#[tokio::test]
+async fn send_message_workspace_and_full_post_directly() {
+    for tier in ["workspace", "full"] {
+        let (backend, _bt, seen) = fake_send_backend().await;
+        let mcp = McpServer::start().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let registry = agent_host::runtime::ApprovalRegistry::new();
+        let link = agent_host::runtime::ApprovalLink { tx, registry };
+        let h = mcp.register_with(backend, "TOK".into(), tier.into(), Some(link));
+        let (st, v) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            rpc(
+                &h.url,
+                json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":"send_message","arguments":{
+                        "conversation_id": A16_CONV,
+                        "text": "hello"
+                    }}
+                }),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{tier} 不应等待审批"));
+        assert!(rx.try_recv().is_err(), "{tier} 不应发审批");
+        assert_eq!(st, 200, "{tier}");
+        let v = v.unwrap();
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("已发送 message_id=msg-1"), "{tier} {text}");
+        assert!(seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s.starts_with("POST") && s.contains("Invocation TOK")));
+    }
 }

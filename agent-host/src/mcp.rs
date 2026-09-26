@@ -21,11 +21,14 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 
-/// 一次调用的工具绑定：上游服务端地址 + 调用凭据（只在内存里，不出现在 URL）
+/// 一次调用的工具绑定：上游服务端地址 + 调用凭据（只在内存里，不出现在 URL）。
+/// A16：档位和审批通道一起登记，send_message 在只读档要能向主人要批准。
 #[derive(Clone)]
 struct Binding {
     server: String,
     token: String,
+    permission_tier: String,
+    approvals: Option<crate::runtime::ApprovalLink>,
 }
 
 type Routes = Arc<Mutex<HashMap<String, Binding>>>;
@@ -90,12 +93,29 @@ impl McpServer {
 
     /// 为一次调用登记映射，返回随任务存活的 handle（drop = 摘映射）。
     /// server 是 http(s) 基址（conn 侧已把 ws(s) 换算好）。
+    /// 档位缺省按只读，且没有审批通道——只给不发消息的测试用。
     pub fn register(&self, server: String, token: String) -> McpHandle {
+        self.register_with(server, token, "read_only".into(), None)
+    }
+
+    /// 把这次调用的权限档位和审批通道一起登记。send_message 用它们决定要不要先问主人。
+    pub fn register_with(
+        &self,
+        server: String,
+        token: String,
+        permission_tier: String,
+        approvals: Option<crate::runtime::ApprovalLink>,
+    ) -> McpHandle {
         let id = uuid::Uuid::new_v4().simple().to_string();
-        self.routes
-            .lock()
-            .unwrap()
-            .insert(id.clone(), Binding { server, token });
+        self.routes.lock().unwrap().insert(
+            id.clone(),
+            Binding {
+                server,
+                token,
+                permission_tier,
+                approvals,
+            },
+        );
         McpHandle {
             url: format!("http://127.0.0.1:{}/mcp/{id}", self.port),
             id,
@@ -132,6 +152,71 @@ static TOOLS: &[ToolDef] = &[
             })
         },
         call: |st, b, args| Box::pin(read_history(st, b, args)),
+    },
+    ToolDef {
+        name: "list_conversations",
+        description: "列出主人参与的会话（群、私聊、文件传输助手、Agent 专属会话）。\
+                      只能看到主人自己参与的会话，看不到主人没加入的群。\
+                      每行一个：id、kind、title、members、last_seq、readonly。按最近活跃排序，最多 200 个。",
+        schema: || json!({"type": "object", "properties": {}}),
+        call: |st, b, args| Box::pin(list_conversations(st, b, args)),
+    },
+    ToolDef {
+        name: "search_messages",
+        description: "在主人参与的会话里搜索消息。看不到主人没参与的会话里的内容。\
+                      query 是关键词；limit 可选（默认 30，最大 100）。",
+        schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词"},
+                    "limit": {"type": "integer", "description": "最多返回多少条，默认 30，上限 100"}
+                },
+                "required": ["query"]
+            })
+        },
+        call: |st, b, args| Box::pin(search_messages(st, b, args)),
+    },
+    ToolDef {
+        name: "read_conversation",
+        description: "读取主人参与的某个会话的历史。conversation_id 来自 list_conversations。\
+                      主人不是该会话成员时会失败。before_seq / limit 与读取当前会话历史相同（默认 50，最大 200）。\
+                      只能读主人参与的会话。",
+        schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "conversation_id": {"type": "string", "description": "会话 id"},
+                    "before_seq": {"type": "integer", "description": "只返回 seq 小于该值的消息"},
+                    "limit": {"type": "integer", "description": "最多返回多少条，默认 50，上限 200"}
+                },
+                "required": ["conversation_id"]
+            })
+        },
+        call: |st, b, args| Box::pin(read_conversation(st, b, args)),
+    },
+    ToolDef {
+        name: "send_message",
+        description: "以当前 Agent 的身份往主人参与的某个会话发消息，群成员会看到发送者是这个 Agent。\
+                      只能发到主人参与的会话，只读私聊会被拒绝。\
+                      只读档位会先请主人批准；可改工作目录和完全放开直接发送。\
+                      file_paths 是宿主本机文件路径，会先上传再随消息发出。",
+        schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "conversation_id": {"type": "string", "description": "目标会话 id"},
+                    "text": {"type": "string", "description": "正文；只发文件时可以是空字符串"},
+                    "file_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "宿主本地文件路径，先上传再发送"
+                    }
+                },
+                "required": ["conversation_id", "text"]
+            })
+        },
+        call: |st, b, args| Box::pin(send_message(st, b, args)),
     },
     ToolDef {
         name: "create_schedule",
@@ -206,9 +291,14 @@ async fn read_history(st: &McpState, b: &Binding, args: &Value) -> Result<String
         let msg = body["error"].as_str().unwrap_or("?");
         return Err(format!("history {}: {msg}", status.as_u16()));
     }
+    Ok(format_history_body(&body))
+}
+
+/// GET /v1/agent-tools/history 或某个会话历史的结果 → `[seq 12] 张三: …` 行
+fn format_history_body(body: &Value) -> String {
     let msgs = body["messages"].as_array().cloned().unwrap_or_default();
     if msgs.is_empty() {
-        return Ok("（无历史消息）".into());
+        return "（无历史消息）".into();
     }
     let mut out = String::new();
     for m in &msgs {
@@ -229,7 +319,342 @@ async fn read_history(st: &McpState, b: &Binding, args: &Value) -> Result<String
     if body["has_more"] == true {
         out.push_str("（还有更早的消息：用 before_seq 继续往前翻）\n");
     }
+    out
+}
+
+fn sends_directly(tier: &str) -> bool {
+    matches!(tier, "workspace" | "full")
+}
+
+fn preview80(text: &str) -> String {
+    text.chars().take(80).collect()
+}
+
+fn option_allowed(options: &Value, option_id: &str) -> bool {
+    let kind = options
+        .as_array()
+        .and_then(|a| a.iter().find(|o| o["optionId"].as_str() == Some(option_id)))
+        .and_then(|o| o["kind"].as_str())
+        .unwrap_or("");
+    kind.contains("allow") && !kind.contains("reject")
+}
+
+/// 审批等待结束（成功、拒绝、通道断开）都把登记摘掉，避免连接侧一直留着空槽。
+struct ApprovalGuard {
+    registry: std::sync::Arc<crate::runtime::ApprovalRegistry>,
+    request_id: String,
+}
+
+impl Drop for ApprovalGuard {
+    fn drop(&mut self) {
+        self.registry.finish(&self.request_id);
+    }
+}
+
+async fn tool_http(
+    st: &McpState,
+    b: &Binding,
+    method: &str,
+    path: &str,
+    query: &[(&str, &str)],
+    body: Option<&Value>,
+    what: &str,
+) -> Result<Value, String> {
+    let url = format!("{}{path}", b.server);
+    let req = match method {
+        "GET" => st.http.get(&url).query(query),
+        "POST" => st
+            .http
+            .post(&url)
+            .query(query)
+            .json(body.unwrap_or(&Value::Null)),
+        "DELETE" => st.http.delete(&url).query(query),
+        _ => return Err(format!("不支持的方法 {method}")),
+    };
+    let r = req
+        .header("authorization", format!("Invocation {}", b.token))
+        .send()
+        .await
+        .map_err(|e| format!("{what} 请求失败: {e}"))?;
+    let status = r.status();
+    let text = r
+        .text()
+        .await
+        .map_err(|e| format!("{what} 响应读取失败: {e}"))?;
+    if status.as_u16() == 204 || text.trim().is_empty() {
+        if status.is_success() {
+            return Ok(Value::Null);
+        }
+    }
+    let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    if !status.is_success() {
+        let msg =
+            parsed["error"]
+                .as_str()
+                .unwrap_or(if text.is_empty() { "?" } else { text.as_str() });
+        return Err(format!("{what} {}: {msg}", status.as_u16()));
+    }
+    Ok(parsed)
+}
+
+fn format_convs(v: &Value) -> Result<String, String> {
+    let rows = v.as_array().ok_or("conversations 响应不是列表")?;
+    if rows.is_empty() {
+        return Ok("（没有会话）".into());
+    }
+    let mut out = String::new();
+    for c in rows {
+        out.push_str(&format!(
+            "id={} kind={} title={} members={} last_seq={} readonly={}\n",
+            c["id"].as_str().unwrap_or(""),
+            c["kind"].as_str().unwrap_or(""),
+            c["title"].as_str().unwrap_or(""),
+            c["member_count"].as_i64().unwrap_or(0),
+            c["last_seq"].as_i64().unwrap_or(0),
+            c["readonly"].as_bool().unwrap_or(false),
+        ));
+    }
     Ok(out)
+}
+
+async fn list_conversations(st: &McpState, b: &Binding, _args: &Value) -> Result<String, String> {
+    let v = tool_http(
+        st,
+        b,
+        "GET",
+        "/v1/agent-tools/conversations",
+        &[],
+        None,
+        "list",
+    )
+    .await?;
+    format_convs(&v)
+}
+
+async fn search_messages(st: &McpState, b: &Binding, args: &Value) -> Result<String, String> {
+    let query = args
+        .get("query")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or("缺少 query")?;
+    let mut owned = vec![("q", query.to_string())];
+    if let Some(n) = args.get("limit").and_then(Value::as_i64) {
+        owned.push(("limit", n.to_string()));
+    }
+    let query_ref: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let v = tool_http(
+        st,
+        b,
+        "GET",
+        "/v1/agent-tools/search",
+        &query_ref,
+        None,
+        "search",
+    )
+    .await?;
+    let rows = v.as_array().ok_or("search 响应不是列表")?;
+    if rows.is_empty() {
+        return Ok("（没有匹配的消息）".into());
+    }
+    let mut out = String::new();
+    for m in rows {
+        let mut sender = m["sender"].as_str().unwrap_or("?").to_string();
+        if m["is_agent"] == true {
+            sender.push_str(" (Agent)");
+        }
+        out.push_str(&format!(
+            "[seq {}] {} / {sender}: {}\n",
+            m["seq"].as_i64().unwrap_or(0),
+            m["conversation_title"].as_str().unwrap_or("会话"),
+            m["text"].as_str().unwrap_or("")
+        ));
+    }
+    Ok(out)
+}
+
+async fn read_conversation(st: &McpState, b: &Binding, args: &Value) -> Result<String, String> {
+    let id = args
+        .get("conversation_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or("缺少 conversation_id")?;
+    let mut owned = Vec::new();
+    if let Some(n) = args.get("before_seq").and_then(Value::as_i64) {
+        owned.push(("before_seq", n.to_string()));
+    }
+    if let Some(n) = args.get("limit").and_then(Value::as_i64) {
+        owned.push(("limit", n.to_string()));
+    }
+    let query_ref: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let path = format!("/v1/agent-tools/conversations/{id}/messages");
+    let v = tool_http(st, b, "GET", &path, &query_ref, None, "read").await?;
+    Ok(format_history_body(&v))
+}
+
+async fn lookup_title(st: &McpState, b: &Binding, id: &str) -> Result<String, String> {
+    let v = tool_http(
+        st,
+        b,
+        "GET",
+        "/v1/agent-tools/conversations",
+        &[],
+        None,
+        "list",
+    )
+    .await?;
+    let title = v.as_array().and_then(|arr| {
+        arr.iter()
+            .find(|c| c["id"].as_str() == Some(id))
+            .and_then(|c| c["title"].as_str())
+            .map(str::to_string)
+    });
+    Ok(title.unwrap_or_else(|| id.to_string()))
+}
+
+async fn await_send_approval(b: &Binding, title: &str) -> Result<(), String> {
+    let Some(link) = b.approvals.clone() else {
+        return Err("审批通道不可用".into());
+    };
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let tool_call = json!({
+        "title": title,
+        "kind": "send_message",
+        "locations": [],
+    });
+    let options = json!([
+        {"optionId": "allow_once", "name": "本次允许", "kind": "allow_once"},
+        {"optionId": "reject_once", "name": "拒绝", "kind": "reject_once"}
+    ]);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    link.registry.insert(request_id.clone(), tx);
+    let _guard = ApprovalGuard {
+        registry: link.registry.clone(),
+        request_id: request_id.clone(),
+    };
+    if link
+        .tx
+        .send(crate::runtime::ApprovalNotice {
+            request_id,
+            tool_call,
+            options: options.clone(),
+        })
+        .is_err()
+    {
+        return Err("审批通道已关闭".into());
+    }
+    let option_id = rx.await.map_err(|_| "审批等待被中断".to_string())?;
+    if !option_allowed(&options, &option_id) {
+        return Err("主人拒绝了发送".into());
+    }
+    Ok(())
+}
+
+fn file_paths(args: &Value) -> Result<Vec<String>, String> {
+    let Some(raw) = args.get("file_paths").filter(|v| !v.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let arr = raw.as_array().ok_or("file_paths 必须是字符串路径数组")?;
+    let mut out = Vec::new();
+    for item in arr {
+        let s = item.as_str().ok_or("file_paths 必须是字符串路径数组")?;
+        if s.is_empty() {
+            return Err("file_paths 含空路径".into());
+        }
+        out.push(s.to_string());
+    }
+    Ok(out)
+}
+
+async fn upload_local(
+    st: &McpState,
+    b: &Binding,
+    conv: &str,
+    path: &str,
+) -> Result<String, String> {
+    let p = std::path::Path::new(path);
+    let name = p
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("无法识别文件名")?;
+    let data = tokio::fs::read(p)
+        .await
+        .map_err(|e| format!("读文件失败: {e}"))?;
+    let mime = mime_guess::from_path(p).first_or_octet_stream();
+    let part = reqwest::multipart::Part::bytes(data)
+        .file_name(name.to_string())
+        .mime_str(mime.as_ref())
+        .map_err(|e| format!("MIME 非法: {e}"))?;
+    let url = format!("{}/v1/agent-tools/files", b.server);
+    let r = st
+        .http
+        .post(&url)
+        .query(&[("conversation_id", conv)])
+        .header("authorization", format!("Invocation {}", b.token))
+        .multipart(reqwest::multipart::Form::new().part("file", part))
+        .send()
+        .await
+        .map_err(|e| format!("upload 请求失败: {e}"))?;
+    let status = r.status();
+    let text = r
+        .text()
+        .await
+        .map_err(|e| format!("upload 响应读取失败: {e}"))?;
+    let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    if !status.is_success() {
+        let msg =
+            parsed["error"]
+                .as_str()
+                .unwrap_or(if text.is_empty() { "?" } else { text.as_str() });
+        return Err(format!("upload {}: {msg}", status.as_u16()));
+    }
+    parsed["attachment_id"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| "upload 响应没有 attachment_id".into())
+}
+
+async fn send_message(st: &McpState, b: &Binding, args: &Value) -> Result<String, String> {
+    let conv = args
+        .get("conversation_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or("缺少 conversation_id")?;
+    let text = args.get("text").and_then(Value::as_str).unwrap_or("");
+    let paths = file_paths(args)?;
+    let tier = if b.permission_tier.is_empty() {
+        "read_only"
+    } else {
+        b.permission_tier.as_str()
+    };
+    if !sends_directly(tier) {
+        let title_conv = lookup_title(st, b, conv).await?;
+        let title = format!("发消息到「{title_conv}」：{}", preview80(text));
+        await_send_approval(b, &title).await?;
+    }
+    let mut ids = Vec::new();
+    for path in &paths {
+        ids.push(upload_local(st, b, conv, path).await?);
+    }
+    let body = json!({
+        "conversation_id": conv,
+        "text": text,
+        "attachment_ids": ids,
+    });
+    let v = tool_http(
+        st,
+        b,
+        "POST",
+        "/v1/agent-tools/messages",
+        &[],
+        Some(&body),
+        "send",
+    )
+    .await?;
+    Ok(format!(
+        "已发送 message_id={}",
+        v["message_id"].as_str().unwrap_or("")
+    ))
 }
 
 async fn call_server(
