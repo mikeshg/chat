@@ -337,6 +337,9 @@ export const agents = {
   /** 会话最近的调用记录（刷新后恢复状态行；仅成员可读） */
   invocations: (convId: string, limit = 50) =>
     get<InvocationView[]>(`/conversations/${convId}/agent-invocations?limit=${limit}`),
+  /** A02：清空本会话的 AgentContext（仅成员；非 agent 会话 400） */
+  resetContext: (convId: string) =>
+    post<void>(`/conversations/${convId}/agent-context/reset`),
 };
 
 // ---------- 消息生命周期 ----------

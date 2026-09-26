@@ -172,6 +172,12 @@ export default function ChatView() {
   const [pinReload, setPinReload] = useState(0);
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(new Set());
   const [meetingBase, setMeetingBase] = useState("");
+  // A02：开新话题后的本地分隔（不落库）。convId 对不上就不当成当前会话的标记。
+  const [topicState, setTopicState] = useState<{
+    convId: string;
+    marks: { n: number; afterId: string | null }[];
+  }>({ convId: "", marks: [] });
+  const [topicBusy, setTopicBusy] = useState(false);
   const gen = session();
   const viewOwner = useRef<object | null>(null);
   const mutation = useRef<object | null>(null);
@@ -187,6 +193,7 @@ export default function ChatView() {
   const conv = s.conversations.find((c) => c.id === s.activeConv) ?? null;
   const msgs = conv ? (s.messages[conv.id] ?? []) : [];
   const hasMore = conv ? (s.hasMore[conv.id] ?? false) : false;
+  const topicMarks = conv && topicState.convId === conv.id ? topicState.marks : [];
   const current = (token: object | null) => token != null && token === viewOwner.current && gen === session() && getState().activeConv === conv?.id;
 
   // 群聊拉成员列表（@补全用）
@@ -306,12 +313,16 @@ export default function ChatView() {
     };
   }, [conv?.id]);
 
+  useEffect(() => {
+    setTopicBusy(false);
+  }, [conv?.id]);
+
   // 新消息滚到底（若本来就在底部）
   useEffect(() => {
     if (stickBottom.current && scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [msgs.length, conv?.id]);
+  }, [msgs.length, conv?.id, topicMarks.length]);
 
   // V2 P3-1：消费全局搜索跳转 —— 会话打开后定位并闪烁目标消息，随后清空
   useEffect(() => {
@@ -757,6 +768,34 @@ export default function ChatView() {
     }
   };
 
+  const startNewTopic = async () => {
+    if (topicBusy) return;
+    setTopicBusy(true);
+    try {
+      await agentsApi.resetContext(conv.id);
+      const afterId = msgs.length ? msgs[msgs.length - 1].id : null;
+      setTopicState((st) => {
+        const marks = st.convId === conv.id ? st.marks : [];
+        return { convId: conv.id, marks: [...marks, { n: marks.length + 1, afterId }] };
+      });
+      pushToast({ convId: conv.id, title: "已开始新话题", text: "" });
+    } catch (e) {
+      pushToast({
+        convId: conv.id,
+        title: "开新话题失败",
+        text: e instanceof ApiError ? e.message : "请稍后重试",
+      });
+    } finally {
+      setTopicBusy(false);
+    }
+  };
+
+  const topicBreak = (n: number) => (
+    <div key={`topic-${n}`} className="msg-sys" data-topic-break="">
+      —— 新话题 ——
+    </div>
+  );
+
   return (
     <main className="chat-view">
       <header className="chat-head">
@@ -776,6 +815,17 @@ export default function ChatView() {
                   : `${conv.member_count} 名成员`}
           </div>
         </div>
+        {conv.kind === "agent" && (
+          <button
+            className="icon-btn chat-head-btn topic-btn"
+            type="button"
+            title="开新话题"
+            disabled={topicBusy}
+            onClick={() => void startNewTopic()}
+          >
+            开新话题
+          </button>
+        )}
         {meetingBase && conv.kind !== "self" && conv.kind !== "agent" && !readonly && (
           <button className="icon-btn chat-head-btn" title="发起会议" onClick={startMeeting}>
             📹 发起会议
@@ -845,6 +895,7 @@ export default function ChatView() {
       <div className="msg-scroll" ref={scrollRef} onScroll={onScroll}>
         {loadingMore && <div className="msg-sys">加载历史…</div>}
         {!hasMore && msgs.length > 0 && <div className="msg-sys">— 没有更多了 —</div>}
+        {topicMarks.filter((t) => t.afterId == null).map((t) => topicBreak(t.n))}
         {msgs.map((m, i) => {
           // A01：agent 发的消息 sender_id 也是主人 —— 归属判定统一走 isOwnMessage
           const mine = isOwnMessage(m, s.me?.id);
@@ -1091,9 +1142,13 @@ export default function ChatView() {
                     : `⚠ 失败：${invocationErrorText(inv.error)}`}
                 </div>
               )}
+              {topicMarks.filter((t) => t.afterId === m.id).map((t) => topicBreak(t.n))}
             </div>
           );
         })}
+        {topicMarks
+          .filter((t) => t.afterId != null && !msgs.some((m) => m.id === t.afterId))
+          .map((t) => topicBreak(t.n))}
         {typingFresh && <div className="msg-sys">{typing.user.display_name} 正在输入…</div>}
       </div>
 

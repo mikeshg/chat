@@ -1,6 +1,6 @@
 // 宿主 WS 连接循环：连上→host_hello→host_ready→收 invocation_start 起任务。
 
-use crate::runtime::{self, AgentSpec, RunRequest};
+use crate::runtime::{self, AgentSpec, RunOutput, RunRequest};
 use crate::Shared;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -164,6 +164,12 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
         }
     };
     let prompt = v["prompt"].as_str().unwrap_or_default().to_string();
+    // 没有存过运行时会话时 session_id 为 null，宿主就新开
+    let resume_session = v
+        .pointer("/context/session_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     let out2 = out.clone();
     let running = s.running.clone();
     let dir = s.data_dir.clone();
@@ -175,18 +181,20 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
             spec,
             prompt,
             data_dir: dir,
+            resume_session,
         };
-        let r = rt.run(req, events).await.map(|o| o.text);
+        let r = rt.run(req, events).await;
         send_finish(&out2, inv_id, r);
         running.lock().unwrap().remove(&inv_id);
     });
     s.running.lock().unwrap().insert(inv_id, task);
 }
 
-fn send_finish(out: &Out, id: Uuid, r: Result<String, String>) {
+fn send_finish(out: &Out, id: Uuid, r: Result<RunOutput, String>) {
     let v = match r {
-        Ok(text) => json!({"type":"invocation_finish","invocation_id":id,"ok":true,"text":text}),
-        // error 截断 500 字符，避免超长 stderr 刷屏
+        Ok(o) => json!({"type":"invocation_finish","invocation_id":id,"ok":true,
+            "text": o.text, "session_id": o.session_id}),
+        // error 截断 500 字符，避免超长 stderr 刷屏。失败不带 session_id，服务端不更新上下文。
         Err(e) => json!({"type":"invocation_finish","invocation_id":id,"ok":false,
             "error":e.chars().take(500).collect::<String>()}),
     };

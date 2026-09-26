@@ -5,8 +5,47 @@
 //   sleep:<ms>   → 等 ms 毫秒后回 "done"
 //   fail         → JSON-RPC error
 //   crash        → 直接退出（进程码 2）
+//   recall       → 本会话之前收到过的全部指令，用 | 连接；没有则 (empty)
 //   其他          → 回 "ok"
+//
+// 会话跨进程保留：状态写在临时目录 chat-fake-acp/<sessionId>.json。
+// 启动参数 --caps=resume|load|none（默认 resume）决定 initialize 声明的能力。
+// load 模式恢复时先用 session/update 回放已存的回复正文，再返回 session/load 结果。
+import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import readline from "node:readline";
+
+const capArg = process.argv.find((a) => a.startsWith("--caps="));
+const caps = capArg ? capArg.slice("--caps=".length) : "resume";
+const dir = path.join(os.tmpdir(), "chat-fake-acp");
+
+function fileOf(id) {
+  if (typeof id !== "string" || !/^[A-Za-z0-9_-]+$/.test(id)) return null;
+  return path.join(dir, `${id}.json`);
+}
+
+function loadState(id) {
+  const f = fileOf(id);
+  if (!f || !fs.existsSync(f)) return null;
+  try {
+    const j = JSON.parse(fs.readFileSync(f, "utf8"));
+    return {
+      prompts: Array.isArray(j.prompts) ? j.prompts.map(String) : [],
+      replies: Array.isArray(j.replies) ? j.replies.map(String) : [],
+    };
+  } catch {
+    return null;
+  }
+}
+
+function saveState(id, st) {
+  const f = fileOf(id);
+  if (!f) return;
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(f, JSON.stringify(st));
+}
 
 const rl = readline.createInterface({ input: process.stdin });
 const send = (o) => process.stdout.write(JSON.stringify(o) + "\n");
@@ -25,7 +64,22 @@ const chunk = (sessionId, text) =>
     },
   });
 
-let sessionId = "fake-session";
+let sessionId = null;
+let state = { prompts: [], replies: [] };
+
+function remember(text, reply) {
+  state.prompts.push(text);
+  if (reply != null) state.replies.push(reply);
+  saveState(sessionId, state);
+}
+
+function openSaved(sid) {
+  const loaded = loadState(sid);
+  if (!loaded) return null;
+  sessionId = sid;
+  state = loaded;
+  return loaded;
+}
 
 rl.on("line", (line) => {
   let m;
@@ -38,16 +92,36 @@ rl.on("line", (line) => {
   if (id === undefined) return; // 通知一律不回
 
   if (method === "initialize") {
-    return result(id, { protocolVersion: 1, agentCapabilities: {}, authMethods: [] });
+    const agentCapabilities = {};
+    if (caps === "resume") agentCapabilities.sessionCapabilities = { resume: {} };
+    else if (caps === "load") agentCapabilities.loadSession = true;
+    return result(id, { protocolVersion: 1, agentCapabilities, authMethods: [] });
   }
   if (method === "session/new") {
-    sessionId = "fake-session";
+    sessionId = crypto.randomUUID();
+    state = { prompts: [], replies: [] };
+    saveState(sessionId, state);
+    return result(id, { sessionId });
+  }
+  if (method === "session/resume") {
+    if (caps !== "resume") return rpcErr(id, "resume unsupported");
+    if (!openSaved(params?.sessionId)) return rpcErr(id, "unknown session");
+    return result(id, { sessionId });
+  }
+  if (method === "session/load") {
+    if (caps !== "load") return rpcErr(id, "load unsupported");
+    if (!openSaved(params?.sessionId)) return rpcErr(id, "unknown session");
+    // 回放必须发生在 session/load 的响应之前，宿主用这一点把历史和本次回复分开
+    for (const reply of state.replies) {
+      if (reply) chunk(sessionId, reply);
+    }
     return result(id, { sessionId });
   }
   if (method === "session/prompt") {
     const text = (params?.prompt ?? []).map((p) => p?.text ?? "").join("");
     if (text.startsWith("echo:")) {
       const out = text.slice(5);
+      remember(text, out);
       const mid = Math.max(1, Math.floor(out.length / 2));
       chunk(sessionId, out.slice(0, mid));
       chunk(sessionId, out.slice(mid));
@@ -55,6 +129,7 @@ rl.on("line", (line) => {
     }
     if (text.startsWith("long:")) {
       let left = parseInt(text.slice(5), 10) || 0;
+      remember(text, "x".repeat(left));
       while (left > 0) {
         const k = Math.min(997, left);
         chunk(sessionId, "x".repeat(k));
@@ -64,14 +139,29 @@ rl.on("line", (line) => {
     }
     if (text.startsWith("sleep:")) {
       const ms = parseInt(text.slice(6), 10) || 0;
+      remember(text, "done");
       setTimeout(() => {
         chunk(sessionId, "done");
         result(id, { stopReason: "end_turn" });
       }, ms);
       return;
     }
-    if (text === "fail") return rpcErr(id, "fake failure");
-    if (text === "crash") process.exit(2);
+    if (text === "fail") {
+      remember(text, null);
+      return rpcErr(id, "fake failure");
+    }
+    if (text === "crash") {
+      remember(text, null);
+      process.exit(2);
+    }
+    if (text === "recall") {
+      const prev = state.prompts.slice();
+      const out = prev.length ? prev.join("|") : "(empty)";
+      remember(text, out);
+      chunk(sessionId, out);
+      return result(id, { stopReason: "end_turn" });
+    }
+    remember(text, "ok");
     chunk(sessionId, "ok");
     return result(id, { stopReason: "end_turn" });
   }

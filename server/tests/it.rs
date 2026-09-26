@@ -9788,3 +9788,232 @@ async fn agent_settings_defaults_and_overrides() {
     assert_eq!(list[0]["queue_timeout_secs"], 600);
     h.shutdown().await;
 }
+
+// ===== Agent A02 =====
+// 同一 AgentConversation 接着聊：运行时会话 id 由成功的 finish 记住，重置后不再带上。
+
+struct A02Boot {
+    base: String,
+    user: TestUser,
+    host: agent_host::HostHandle,
+    host_id: String,
+}
+
+async fn a02_boot(tag: &str) -> A02Boot {
+    let base = spawn_named_db(&format!("chat_t_a02{tag}_{}", uniq())).await;
+    let user = register(&base, &format!("a02{tag}_{}", uniq())).await;
+    let (host, host_id) = spawn_host(&base, &user, uuid::Uuid::new_v4()).await;
+    A02Boot {
+        base,
+        user,
+        host,
+        host_id,
+    }
+}
+
+/// 带 `--caps=` 的变体。不改 create_agent 的签名。
+async fn create_agent_caps(
+    base: &str,
+    u: &TestUser,
+    host_id: &str,
+    name: &str,
+    caps: &str,
+) -> (u16, Value) {
+    let mut args = fake_acp_args();
+    args.push(format!("--caps={caps}"));
+    let r = http()
+        .post(format!("{base}/v1/agents"))
+        .header("authorization", authz(&u.access))
+        .json(&json!({
+            "name": name,
+            "host_id": host_id,
+            "runtime": {"command": "node", "args": args},
+            "cwd": "",
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = r.status().as_u16();
+    let body = r.json().await.unwrap_or(json!(null));
+    (status, body)
+}
+
+async fn a02_agent(b: &A02Boot, name: &str, caps: Option<&str>) -> String {
+    let (st, agent) = match caps {
+        Some(c) => create_agent_caps(&b.base, &b.user, &b.host_id, name, c).await,
+        None => create_agent(&b.base, &b.user, &b.host_id, name).await,
+    };
+    assert_eq!(st, 200, "create agent {name}: {agent}");
+    agent["conversation_id"].as_str().unwrap().to_string()
+}
+
+async fn a02_conn(
+    base: &str,
+    u: &TestUser,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    tokio_tungstenite::connect_async(ws_url(base, u).await)
+        .await
+        .unwrap()
+        .0
+}
+
+/// 等到这次调用进入终态，返回 (status, Agent 回复拼接)。
+async fn await_agent_turn<S>(sock: &mut S) -> (String, String)
+where
+    S: StreamExt<Item = Result<WsMsg, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let mut frames: Vec<Value> = Vec::new();
+    let mut status = String::new();
+    for _ in 0..6 {
+        frames.extend(until_frame(sock, "agent_invocation", A01Dur::from_secs(20)).await);
+        if let Some(st) = frames.iter().rev().find_map(|f| {
+            if f["type"] != "agent_invocation" {
+                return None;
+            }
+            let s = f["invocation"]["status"].as_str()?;
+            if matches!(s, "succeeded" | "failed" | "cancelled" | "timed_out") {
+                Some(s.to_string())
+            } else {
+                None
+            }
+        }) {
+            status = st;
+            break;
+        }
+    }
+    assert!(!status.is_empty(), "调用未进入终态: {frames:?}");
+    let reply: String = frames
+        .iter()
+        .filter(|f| f["type"] == "message" && f["message"]["agent"].is_object())
+        .map(|f| f["message"]["content"].as_str().unwrap_or(""))
+        .collect();
+    (status, reply)
+}
+
+async fn a02_say<S>(sock: &mut S, conv: &str, cmid: &str, content: &str) -> (String, String)
+where
+    S: StreamExt<Item = Result<WsMsg, tokio_tungstenite::tungstenite::Error>>
+        + SinkExt<WsMsg>
+        + Unpin,
+    <S as futures_util::Sink<WsMsg>>::Error: std::fmt::Debug,
+{
+    send_ws(sock, conv, cmid, content).await;
+    await_agent_turn(sock).await
+}
+
+async fn reset_context(base: &str, u: &TestUser, conv: &str) -> u16 {
+    http()
+        .post(format!(
+            "{base}/v1/conversations/{conv}/agent-context/reset"
+        ))
+        .header("authorization", authz(&u.access))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// 1. 同一专属会话先 echo 再 recall，回复带上之前的指令。
+#[tokio::test]
+async fn agent_context_continues_in_same_conversation() {
+    let b = a02_boot("go").await;
+    let conv = a02_agent(&b, "cont", None).await;
+    let mut sa = a02_conn(&b.base, &b.user).await;
+    let (st, reply) = a02_say(&mut sa, &conv, "e1", "echo:one").await;
+    assert_eq!(st, "succeeded");
+    assert_eq!(reply, "one");
+    let (st, reply) = a02_say(&mut sa, &conv, "e2", "recall").await;
+    assert_eq!(st, "succeeded");
+    assert_eq!(reply, "echo:one");
+    b.host.shutdown().await;
+}
+
+/// 2. 重置后再 recall 是空会话；非成员被拒；非 agent 会话 400。
+#[tokio::test]
+async fn agent_context_reset_clears_and_rejects() {
+    let b = a02_boot("rs").await;
+    let other = register(&b.base, &format!("a02rsb_{}", uniq())).await;
+    let conv = a02_agent(&b, "rst", None).await;
+    let mut sa = a02_conn(&b.base, &b.user).await;
+    let (st, reply) = a02_say(&mut sa, &conv, "e1", "echo:one").await;
+    assert_eq!((st.as_str(), reply.as_str()), ("succeeded", "one"));
+
+    assert_eq!(reset_context(&b.base, &b.user, &conv).await, 204);
+    let (st, reply) = a02_say(&mut sa, &conv, "e2", "recall").await;
+    assert_eq!(st, "succeeded");
+    assert_eq!(reply, "(empty)");
+
+    assert_eq!(reset_context(&b.base, &other, &conv).await, 403);
+    befriend(&b.base, &b.user, &other).await;
+    let dm = dm_conv(&b.base, &b.user).await;
+    assert_eq!(reset_context(&b.base, &b.user, &dm).await, 400);
+    b.host.shutdown().await;
+}
+
+/// 3. load 能力同样能续上，且回放的旧回复正文不混进这次回复。
+#[tokio::test]
+async fn agent_context_load_drops_replay() {
+    let b = a02_boot("ld").await;
+    let conv = a02_agent(&b, "loader", Some("load")).await;
+    let mut sa = a02_conn(&b.base, &b.user).await;
+    let (st, reply) = a02_say(&mut sa, &conv, "e1", "echo:one").await;
+    assert_eq!((st.as_str(), reply.as_str()), ("succeeded", "one"));
+    let (st, reply) = a02_say(&mut sa, &conv, "e2", "recall").await;
+    assert_eq!(st, "succeeded");
+    // 回放出来的旧回复是 "one"；混进来会变成 "oneecho:one"
+    assert_eq!(reply, "echo:one");
+    b.host.shutdown().await;
+}
+
+/// 4. 不声明恢复能力时退回新会话，第二次调用仍然成功，recall 为空。
+#[tokio::test]
+async fn agent_context_without_caps_starts_fresh() {
+    let b = a02_boot("no").await;
+    let conv = a02_agent(&b, "fresh", Some("none")).await;
+    let mut sa = a02_conn(&b.base, &b.user).await;
+    let (st, reply) = a02_say(&mut sa, &conv, "e1", "echo:one").await;
+    assert_eq!((st.as_str(), reply.as_str()), ("succeeded", "one"));
+    let (st, reply) = a02_say(&mut sa, &conv, "e2", "recall").await;
+    assert_eq!(st, "succeeded");
+    assert_eq!(reply, "(empty)");
+    b.host.shutdown().await;
+}
+
+/// 5. 两个 Agent 的上下文互不影响。
+#[tokio::test]
+async fn agent_context_isolated_per_agent() {
+    let b = a02_boot("iso").await;
+    let c1 = a02_agent(&b, "iso1", None).await;
+    let c2 = a02_agent(&b, "iso2", None).await;
+    let mut sa = a02_conn(&b.base, &b.user).await;
+    let (st, reply) = a02_say(&mut sa, &c1, "a1", "echo:alpha").await;
+    assert_eq!((st.as_str(), reply.as_str()), ("succeeded", "alpha"));
+    let (st, reply) = a02_say(&mut sa, &c2, "b1", "echo:beta").await;
+    assert_eq!((st.as_str(), reply.as_str()), ("succeeded", "beta"));
+    let (st, reply) = a02_say(&mut sa, &c1, "a2", "recall").await;
+    assert_eq!(st, "succeeded");
+    assert_eq!(reply, "echo:alpha");
+    let (st, reply) = a02_say(&mut sa, &c2, "b2", "recall").await;
+    assert_eq!(st, "succeeded");
+    assert_eq!(reply, "echo:beta");
+    b.host.shutdown().await;
+}
+
+/// 6. 失败的调用不覆盖已记住的运行时会话，之后 recall 仍能接上。
+#[tokio::test]
+async fn agent_context_failed_invocation_keeps_session() {
+    let b = a02_boot("fl").await;
+    let conv = a02_agent(&b, "keep", None).await;
+    let mut sa = a02_conn(&b.base, &b.user).await;
+    let (st, reply) = a02_say(&mut sa, &conv, "e1", "echo:one").await;
+    assert_eq!((st.as_str(), reply.as_str()), ("succeeded", "one"));
+    let (st, reply) = a02_say(&mut sa, &conv, "e2", "fail").await;
+    assert_eq!(st, "failed");
+    assert!(reply.is_empty(), "失败调用不应产生回复: {reply}");
+    let (st, reply) = a02_say(&mut sa, &conv, "e3", "recall").await;
+    assert_eq!(st, "succeeded");
+    assert!(reply.contains("echo:one"), "失败后应仍接上旧会话: {reply}");
+    assert_ne!(reply, "(empty)");
+    b.host.shutdown().await;
+}

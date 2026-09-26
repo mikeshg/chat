@@ -1,8 +1,11 @@
 // ACP（Agent Client Protocol）客户端：子进程 stdio 上的 JSON-RPC 2.0（NDJSON）。
 //
-// 每次调用拉起一个全新 Agent 进程：
-//   initialize → session/new → session/prompt（收 session/update 流式分块）
-//   → 等到 prompt 响应后杀进程。A01 不支持多轮续上下文，保持最简单实现。
+// 每次调用仍拉起一个全新 Agent 进程：
+//   initialize → 恢复已有会话或 session/new → session/prompt
+//   → 等到 prompt 响应后杀进程。
+// 恢复：agent 声明 sessionCapabilities.resume 时用 session/resume；
+// 否则 loadSession=true 时用 session/load（响应返回前的回放不计入正文）；
+// 都不支持或恢复调用失败则退回 session/new，不把恢复失败当成这次调用失败。
 //
 // 宿主作为 ACP client 声明空 clientCapabilities：理论上 agent 不应发起
 // fs/terminal 等反向请求；万一发起（含 session/request_permission）一律拒绝。
@@ -40,6 +43,8 @@ struct Pipe {
     /// stderr 尾（诊断用，封顶 ~2KB）
     err: Arc<Mutex<String>>,
     events: Events,
+    /// session/load 响应返回前的历史回放，不能算进本次回复
+    suppress_chunks: bool,
 }
 
 /// 跑一次调用：起进程、握手、发 prompt、收全部分块文本（同时逐段发 RunEvent::Text）。
@@ -115,31 +120,93 @@ pub async fn run_invocation(req: &RunRequest, events: Events) -> Result<RunOutpu
         text: String::new(),
         err,
         events,
+        suppress_chunks: false,
     };
-    let r = drive(&mut pipe, &dir, &req.prompt).await;
+    let session_id = drive(&mut pipe, &dir, &req.prompt, req.resume_session.as_deref()).await;
     let _ = child.kill().await;
-    r.map(|_| RunOutput {
+    session_id.map(|session_id| RunOutput {
         text: std::mem::take(&mut pipe.text),
+        session_id: Some(session_id),
     })
 }
 
-async fn drive(pipe: &mut Pipe, dir: &Path, prompt: &str) -> Result<(), String> {
-    pipe.call(
-        "initialize",
-        json!({"protocolVersion": 1, "clientCapabilities": {}}),
-    )
-    .await?;
-    let new = pipe
-        .call("session/new", json!({"cwd": dir, "mcpServers": []}))
+fn cap_resume(caps: &Value) -> bool {
+    match caps.pointer("/sessionCapabilities/resume") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => false,
+        Some(_) => true,
+    }
+}
+
+fn cap_load(caps: &Value) -> bool {
+    caps.get("loadSession").and_then(Value::as_bool) == Some(true)
+}
+
+fn session_id_of(result: &Value, fallback: Option<&str>) -> Result<String, String> {
+    if let Some(s) = result.get("sessionId").and_then(Value::as_str) {
+        if !s.is_empty() {
+            return Ok(s.to_string());
+        }
+    }
+    if let Some(s) = fallback {
+        if !s.is_empty() {
+            return Ok(s.to_string());
+        }
+    }
+    Err("缺少 sessionId".into())
+}
+
+async fn drive(
+    pipe: &mut Pipe,
+    dir: &Path,
+    prompt: &str,
+    resume: Option<&str>,
+) -> Result<String, String> {
+    let init = pipe
+        .call(
+            "initialize",
+            json!({"protocolVersion": 1, "clientCapabilities": {}}),
+        )
         .await?;
-    let session_id = new["sessionId"].clone();
+    let caps = init
+        .get("agentCapabilities")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let session_id = open_session(pipe, dir, resume, &caps).await?;
     pipe.call(
         "session/prompt",
         json!({"sessionId": session_id,
                "prompt": [{"type": "text", "text": prompt}]}),
     )
     .await?;
-    Ok(())
+    Ok(session_id)
+}
+
+/// 按能力恢复会话；失败或没有能力时新开，不把恢复失败往外抛。
+async fn open_session(
+    pipe: &mut Pipe,
+    dir: &Path,
+    resume: Option<&str>,
+    caps: &Value,
+) -> Result<String, String> {
+    if let Some(sid) = resume.filter(|s| !s.is_empty()) {
+        let params = json!({"sessionId": sid, "cwd": dir, "mcpServers": []});
+        if cap_resume(caps) {
+            if let Ok(r) = pipe.call("session/resume", params).await {
+                return session_id_of(&r, Some(sid));
+            }
+        } else if cap_load(caps) {
+            pipe.suppress_chunks = true;
+            let loaded = pipe.call("session/load", params).await;
+            pipe.suppress_chunks = false;
+            if let Ok(r) = loaded {
+                return session_id_of(&r, Some(sid));
+            }
+        }
+    }
+    let new = pipe
+        .call("session/new", json!({"cwd": dir, "mcpServers": []}))
+        .await?;
+    session_id_of(&new, None)
 }
 
 impl Pipe {
@@ -205,6 +272,10 @@ impl Pipe {
                 .and_then(Value::as_str)
                 == Some("agent_message_chunk")
         {
+            // load 的历史回放发生在响应返回之前，不能混进本次回复
+            if self.suppress_chunks {
+                return;
+            }
             if let Some(t) = params
                 .pointer("/update/content/text")
                 .and_then(Value::as_str)
