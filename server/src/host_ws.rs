@@ -56,12 +56,13 @@ pub async fn host_session(
         .take(60)
         .collect();
 
-    // install_id 是桌面端永久标识：(user_id, install_id) 唯一 → 重连复用同一 host 记录
+    // install_id 是桌面端永久标识：(user_id, install_id) 唯一 → 重连复用同一 host 记录。
+    // label 只在第一次登记时写入；改名走 PATCH，重连不再覆盖。platform / last_seen_at 仍更新。
     let host_id = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO agent_hosts (user_id, install_id, label, platform)
          VALUES ($1, $2, $3, $4)
          ON CONFLICT (user_id, install_id)
-         DO UPDATE SET label = $3, platform = $4, last_seen_at = now()
+         DO UPDATE SET platform = EXCLUDED.platform, last_seen_at = now()
          RETURNING id",
     )
     .bind(uid)
@@ -166,7 +167,12 @@ where
 
 /// 宿主上下线只通知主人的普通连接（别的用户无感知）
 fn broadcast_status(st: &SharedState, owner: Uuid, host_id: Uuid, online: bool) {
-    let p = serde_json::to_string(&WsOut::AgentHostStatus { host_id, online }).unwrap();
+    let p = serde_json::to_string(&WsOut::AgentHostStatus {
+        host_id,
+        online,
+        label: None,
+    })
+    .unwrap();
     st.send_to_user(owner, &p);
 }
 

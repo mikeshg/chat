@@ -1,6 +1,6 @@
 // Agent A01：Agent / AgentHost / AgentInvocation 的 REST 与派发。
 //
-// - REST：GET /v1/agent-hosts、GET|POST /v1/agents、
+// - REST：GET /v1/agent-hosts、PATCH /v1/agent-hosts/{id}、GET|POST /v1/agents、
 //   GET /v1/conversations/{id}/agent-invocations —— 一律只作用于本人资源，
 //   别人的宿主/Agent 按 id 访问返回 404，不泄露存在性。
 //   POST /v1/conversations/{id}/agent-context/reset —— 成员清空本会话上下文。
@@ -59,6 +59,56 @@ pub async fn list_hosts(
             })
             .collect(),
     ))
+}
+
+#[derive(Deserialize)]
+pub struct PatchHostReq {
+    label: String,
+}
+
+/// 主人给自己的宿主改名。去首尾空白，1–60 字；别人的或不存在的宿主 404。
+/// 成功后给主人的普通连接推 agent_host_status（带新 label）。
+pub async fn patch_host(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(req): Json<PatchHostReq>,
+) -> AppResult<Json<AgentHostView>> {
+    let uid = uid(&headers, &st).await?;
+    let label = req.label.trim();
+    let n = label.chars().count();
+    if !(1..=60).contains(&n) {
+        return Err(AppError::bad_request("bad_label"));
+    }
+    let label = label.to_string();
+    let row = sqlx::query_as::<_, (Uuid, String, String, DateTime<Utc>)>(
+        "UPDATE agent_hosts SET label = $1
+          WHERE id = $2 AND user_id = $3
+          RETURNING id, label, platform, last_seen_at",
+    )
+    .bind(&label)
+    .bind(id)
+    .bind(uid)
+    .fetch_optional(&st.pool)
+    .await?;
+    let Some((id, label, platform, last_seen_at)) = row else {
+        return Err(AppError::not_found("host not found"));
+    };
+    let online = st.host_online(id);
+    let payload = serde_json::to_string(&WsOut::AgentHostStatus {
+        host_id: id,
+        online,
+        label: Some(label.clone()),
+    })
+    .unwrap();
+    st.send_to_user(uid, &payload);
+    Ok(Json(AgentHostView {
+        id,
+        label,
+        platform,
+        online,
+        last_seen_at,
+    }))
 }
 
 /// AgentView 的查询列（list / patch 共用）

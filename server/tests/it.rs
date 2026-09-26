@@ -11206,3 +11206,162 @@ async fn a13_history_scoped_to_invoking_conversation() {
     assert_eq!(msgs[0]["content"], "echo:hold");
     host_finish(&mut sh, &inv_id).await;
 }
+
+// ===== Agent A09 =====
+// 宿主名称只在第一次 host_hello 写入；之后改名走 PATCH，重连不再覆盖。
+
+async fn spawn_host_labeled(
+    base: &str,
+    u: &TestUser,
+    install_id: uuid::Uuid,
+    label: &str,
+    platform: &str,
+) -> (agent_host::HostHandle, String) {
+    let h = agent_host::spawn(
+        agent_host::HostConfig {
+            server_url: base.into(),
+            install_id,
+            label: label.into(),
+            platform: platform.into(),
+            mcp_bridge: None,
+        },
+        std::sync::Arc::new(AgentTickets {
+            base: base.into(),
+            access: u.access.clone(),
+        }),
+    );
+    let id = tokio::time::timeout(A01Dur::from_secs(10), h.wait_host_id())
+        .await
+        .expect("host_ready 超时")
+        .expect("未能拿到 host_id");
+    (h, id.to_string())
+}
+
+async fn patch_host(base: &str, u: &TestUser, host_id: &str, label: &str) -> (u16, Value) {
+    let r = http()
+        .patch(format!("{base}/v1/agent-hosts/{host_id}"))
+        .header("authorization", authz(&u.access))
+        .json(&json!({ "label": label }))
+        .send()
+        .await
+        .unwrap();
+    let status = r.status().as_u16();
+    let body = r.json().await.unwrap_or(json!(null));
+    (status, body)
+}
+
+async fn agent_hosts_of(base: &str, u: &TestUser) -> Value {
+    http()
+        .get(format!("{base}/v1/agent-hosts"))
+        .header("authorization", authz(&u.access))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// 首次 host_hello 写入 label；改名后重连带另一个 label，名称保持改后的值，平台仍更新。
+#[tokio::test]
+async fn agent_a09_label_written_once() {
+    let base = spawn_named_db(&format!("chat_it_a09lab_{}", uniq())).await;
+    let a = register(&base, &format!("a09a_{}", uniq())).await;
+    let install = uuid::Uuid::new_v4();
+    let (h1, host_id) = spawn_host_labeled(&base, &a, install, "first-pc", "windows").await;
+
+    let hosts = agent_hosts_of(&base, &a).await;
+    assert_eq!(hosts[0]["id"], host_id.as_str());
+    assert_eq!(hosts[0]["label"], "first-pc");
+    assert_eq!(hosts[0]["platform"], "windows");
+
+    let (st, body) = patch_host(&base, &a, &host_id, "  家里 Windows  ").await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(body["label"], "家里 Windows");
+    let hosts = agent_hosts_of(&base, &a).await;
+    assert_eq!(hosts[0]["label"], "家里 Windows");
+
+    h1.shutdown().await;
+    let (h2, host_id2) = spawn_host_labeled(&base, &a, install, "other-label", "linux").await;
+    assert_eq!(host_id2, host_id);
+    let hosts = agent_hosts_of(&base, &a).await;
+    assert_eq!(hosts.as_array().unwrap().len(), 1);
+    assert_eq!(hosts[0]["id"], host_id.as_str());
+    assert_eq!(
+        hosts[0]["label"], "家里 Windows",
+        "重连的 host_hello 不得覆盖已改名称"
+    );
+    assert_eq!(hosts[0]["platform"], "linux", "重连仍更新 platform");
+    h2.shutdown().await;
+}
+
+/// PATCH：空 / 超长 400；别人的宿主 404；改名后主人的普通连接收到带新 label 的更新。
+#[tokio::test]
+async fn agent_a09_patch_host_label() {
+    let base = spawn_named_db(&format!("chat_it_a09pat_{}", uniq())).await;
+    let a = register(&base, &format!("a09c_{}", uniq())).await;
+    let b = register(&base, &format!("a09d_{}", uniq())).await;
+    // 主人先连上，才能收到随后的上线帧和改名帧
+    let (mut sa, _) = tokio_tungstenite::connect_async(ws_url(&base, &a).await)
+        .await
+        .unwrap();
+    let (h, host_id) = spawn_host_labeled(&base, &a, uuid::Uuid::new_v4(), "pc", "windows").await;
+    until_frame(&mut sa, "agent_host_status", A01Dur::from_secs(5)).await;
+    let (mut sb, _) = tokio_tungstenite::connect_async(ws_url(&base, &b).await)
+        .await
+        .unwrap();
+    next_of(&mut sb, "presence_init").await;
+
+    let (st, body) = patch_host(&base, &a, &host_id, "书房").await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(body["label"], "书房");
+    assert_eq!(body["id"], host_id.as_str());
+    assert_eq!(body["online"], true);
+
+    let frames = until_frame(&mut sa, "agent_host_status", A01Dur::from_secs(5)).await;
+    let upd = frames
+        .iter()
+        .rev()
+        .find(|f| f["type"] == "agent_host_status")
+        .unwrap();
+    assert_eq!(upd["host_id"], host_id.as_str());
+    assert_eq!(upd["online"], true);
+    assert_eq!(upd["label"], "书房");
+
+    let others = frames_for(&mut sb, A01Dur::from_millis(400)).await;
+    assert!(
+        !others.iter().any(|f| f["type"] == "agent_host_status"),
+        "改名只推给主人: {others:?}"
+    );
+
+    let too_long = "x".repeat(61);
+    let too_long_han = "测".repeat(61);
+    for bad in ["", "   ", too_long.as_str(), too_long_han.as_str()] {
+        let (st, body) = patch_host(&base, &a, &host_id, bad).await;
+        assert_eq!(st, 400, "label {bad:?} 应 400: {body}");
+        assert_eq!(body["error"], "bad_label");
+    }
+    let hosts = agent_hosts_of(&base, &a).await;
+    assert_eq!(hosts[0]["label"], "书房", "非法改名不得落库");
+
+    let sixty = "测".repeat(60);
+    let (st, body) = patch_host(&base, &a, &host_id, &sixty).await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(body["label"], sixty);
+
+    let padded = format!("  {}  ", "y".repeat(60));
+    let (st, body) = patch_host(&base, &a, &host_id, &padded).await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(body["label"], "y".repeat(60));
+
+    let (st, body) = patch_host(&base, &b, &host_id, "stolen").await;
+    assert_eq!(st, 404, "别人的宿主应 404: {body}");
+    let (st, body) = patch_host(&base, &a, &uuid::Uuid::new_v4().to_string(), "nope").await;
+    assert_eq!(st, 404, "不存在的宿主应 404: {body}");
+
+    let hosts = agent_hosts_of(&base, &a).await;
+    assert_eq!(hosts[0]["label"], "y".repeat(60));
+    let b_hosts = agent_hosts_of(&base, &b).await;
+    assert!(b_hosts.as_array().unwrap().is_empty());
+    h.shutdown().await;
+}

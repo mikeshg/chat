@@ -106,6 +106,7 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
         .route("/conversations/{id}/transfer", post(transfer_ownership))
         // ---------- Agent A01 ----------
         .route("/agent-hosts", get(crate::agents::list_hosts))
+        .route("/agent-hosts/{id}", patch(crate::agents::patch_host))
         .route(
             "/agents",
             get(crate::agents::list_agents).post(crate::agents::create_agent),

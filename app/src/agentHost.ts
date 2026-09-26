@@ -5,7 +5,7 @@
 // （自带 access token 刷新）调 GET /v1/ws/ticket → invoke
 // agent_host_ticket 把 ticket 或 error 回填给 Rust 的 oneshot。
 
-import { convs, deviceLabel, getServer } from "./api";
+import { convs, getServer } from "./api";
 
 /** 仅 Tauri 桌面壳：浏览器与 Android WebView 都不启动宿主 */
 export function isDesktopShell(): boolean {
@@ -60,7 +60,8 @@ export async function startAgentHost(): Promise<void> {
     const { invoke } = await import("@tauri-apps/api/core");
     await invoke("agent_host_start", {
       serverUrl: getServer() || location.origin,
-      label: deviceLabel(),
+      // 空串由 Rust 填机器名（拿不到则「桌面端」）。服务端只在首次登记写入，之后改名以服务器为准。
+      label: "",
     });
   } catch (e) {
     console.warn("agent_host_start failed", e);
