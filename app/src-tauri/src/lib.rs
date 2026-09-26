@@ -7,6 +7,11 @@ mod tray;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(desktop)]
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
+        .with_writer(std::io::stderr)
+        .try_init();
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init());

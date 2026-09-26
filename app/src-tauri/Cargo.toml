@@ -25,3 +25,5 @@ tokio = { version = "1", features = ["sync"] }
 # 开机自启只有桌面平台（Android 不编译这个插件）
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-autostart = "2"
+# 宿主日志写 stderr：从终端启动 Chat 就能看到连接失败等原因
+tracing-subscriber = "0.3"

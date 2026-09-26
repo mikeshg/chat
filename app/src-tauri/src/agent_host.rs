@@ -80,10 +80,24 @@ fn default_host_label() -> String {
     let name = std::env::var("COMPUTERNAME")
         .ok()
         .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(machine_name)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "桌面端".into());
     name.chars().take(60).collect()
+}
+
+/// 图形程序里通常没有 HOSTNAME（macOS / Linux）：macOS 取「电脑名称」，其余用 hostname 命令。
+fn machine_name() -> Option<String> {
+    let (cmd, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
+        ("scutil", &["--get", "ComputerName"])
+    } else {
+        ("hostname", &[])
+    };
+    let out = std::process::Command::new(cmd).args(args).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// 登录后由前端调用：启动（或重启）本机宿主。
