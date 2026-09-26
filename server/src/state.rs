@@ -43,6 +43,16 @@ impl Conn {
 /// user_id -> (conn_id -> 连接)
 pub type ConnMap = DashMap<Uuid, DashMap<Uuid, Conn>>;
 
+/// Agent A01：一条宿主连接。与 Conn 分表登记——宿主连接不计 presence、
+/// 不在 send_to_user 的扇出里。
+pub struct HostConn {
+    pub tx: mpsc::Sender<ConnMsg>,
+    /// 防陈旧注销：同 (user, install_id) 重连顶替后，旧连接的清理不得摘掉新连接
+    pub conn_id: Uuid,
+    /// 宿主所属用户（agent_hosts.user_id 快照，状态广播用）
+    pub user_id: Uuid,
+}
+
 /// 一次性 WS ticket 的内容：签发时的用户、凭据版本与登录会话
 pub struct TicketGrant {
     pub uid: Uuid,
@@ -72,6 +82,8 @@ pub struct AppState {
     pub maintenance: AtomicBool,
     /// V2 P4-1：备份/恢复互斥锁（同一时间只允许一个备份生成或一次恢复进行）。
     pub backup_busy: AtomicBool,
+    /// Agent A01：host_id -> 宿主连接（在线即有此表项）
+    pub hosts: DashMap<Uuid, HostConn>,
 }
 
 impl AppState {
@@ -88,6 +100,7 @@ impl AppState {
             ws_ping_interval_ms: AtomicU64::new(30_000),
             maintenance: AtomicBool::new(false),
             backup_busy: AtomicBool::new(false),
+            hosts: DashMap::new(),
         })
     }
 
@@ -273,6 +286,50 @@ impl AppState {
 
     pub fn conn_count(&self, uid: Uuid) -> usize {
         self.conns.get(&uid).map(|m| m.len()).unwrap_or(0)
+    }
+
+    // ---------- Agent A01：宿主连接表 ----------
+
+    /// 登记宿主连接；同 host 已有连接时给旧连接发 host_superseded 并断开。
+    pub fn register_host(
+        &self,
+        host_id: Uuid,
+        user_id: Uuid,
+        conn_id: Uuid,
+        tx: mpsc::Sender<ConnMsg>,
+    ) {
+        if let Some(old) = self.hosts.insert(
+            host_id,
+            HostConn {
+                tx,
+                conn_id,
+                user_id,
+            },
+        ) {
+            let _ = old.tx.try_send(ConnMsg::Shutdown(
+                serde_json::json!({"type": "host_superseded"}).to_string(),
+            ));
+        }
+    }
+
+    /// 移除宿主连接；仅当表里的仍是这条连接时才移除（顶替保护）。
+    /// 返回 true = 本连接确实在册，调用方负责离线收尾。
+    pub fn unregister_host(&self, host_id: Uuid, conn_id: Uuid) -> bool {
+        self.hosts
+            .remove_if(&host_id, |_, c| c.conn_id == conn_id)
+            .is_some()
+    }
+
+    /// 宿主当前在线（连接表里有登记）
+    pub fn host_online(&self, host_id: Uuid) -> bool {
+        self.hosts.contains_key(&host_id)
+    }
+
+    /// 向宿主连接投递一帧；宿主离线或队列满返回 false
+    pub fn send_to_host(&self, host_id: Uuid, payload: &str) -> bool {
+        self.hosts
+            .get(&host_id)
+            .is_some_and(|c| c.tx.try_send(ConnMsg::Frame(payload.to_string())).is_ok())
     }
 
     pub fn issue_ticket(&self, uid: Uuid, session_version: i64, sid: Option<Uuid>) -> String {

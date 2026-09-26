@@ -1,12 +1,15 @@
 import { useEffect, useRef, useState } from "react";
-import { ApiError, convs, files, msgs as msgsApi, serverInfo, session } from "../api";
+import { agents as agentsApi, ApiError, convs, files, msgs as msgsApi, serverInfo, session } from "../api";
 import {
+  applyInvocations,
   applyLiveMessage,
   applyRefreshed,
   applyUpdatedMessage,
   convTitle,
   getState,
   fetchForward,
+  invocationErrorText,
+  isOwnMessage,
   prependMessages,
   pushToast,
   setDraft,
@@ -288,6 +291,21 @@ export default function ChatView() {
       .finally(() => historyInflight.delete(conv.id));
   }, [conv?.id]);
 
+  // A01：agent 会话打开时拉调用历史，恢复每条触发消息下的状态行（实时推进靠 agent_invocation 帧）
+  useEffect(() => {
+    if (!conv || conv.kind !== "agent") return;
+    let alive = true;
+    agentsApi
+      .invocations(conv.id)
+      .then((rows) => {
+        if (alive) setState((st) => applyInvocations(st, rows));
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [conv?.id]);
+
   // 新消息滚到底（若本来就在底部）
   useEffect(() => {
     if (stickBottom.current && scrollRef.current) {
@@ -314,15 +332,21 @@ export default function ChatView() {
 
   const title = convTitle(conv, s.me?.id);
   const peerOnline = conv.kind === "dm" && conv.peer ? !!s.online[conv.peer.id] : false;
+  // A01：agent 会话副标题 = 宿主名 + 在线态；消息 id → 调用记录（状态行）
+  const agentHost = conv.kind === "agent" && conv.agent
+    ? s.agentHosts.find((h) => h.id === conv.agent!.host_id)
+    : undefined;
+  const invs = conv.kind === "agent" ? (s.invocations[conv.id] ?? {}) : {};
   const typing = s.typing[conv.id];
   const typingFresh = typing && Date.now() - typing.ts < 5000;
   const readonly = conv.kind === "dm" && conv.peer && !s.friends.some((f) => f.user.id === conv.peer!.id);
 
   // 生命周期入口可见性（服务端在锁内二次校验；这里只做 UI 层收敛）
+  // A01：Agent 消息 sender_id 是主人但归属 Agent —— 不可编辑；删除仍允许（主人的会话）
   const canEditMsg = (m: MessageView) =>
     !m.id.startsWith("client:") &&
     !m.deleted_at &&
-    m.sender_id === s.me?.id &&
+    isOwnMessage(m, s.me?.id) &&
     m.kind === "text" &&
     withinEditWindow(m);
   const canDeleteMsg = (m: MessageView) =>
@@ -726,8 +750,8 @@ export default function ChatView() {
         : null,
     );
     const now = Date.now();
-    // self 会话不广播 typing（服务端同样短路兜底）
-    if (conv.kind !== "self" && now - lastTypingSent.current > 2500) {
+    // self/agent 会话不广播 typing（服务端同样短路兜底）
+    if (conv.kind !== "self" && conv.kind !== "agent" && now - lastTypingSent.current > 2500) {
       lastTypingSent.current = now;
       sendTyping(conv.id);
     }
@@ -741,16 +765,18 @@ export default function ChatView() {
           <div className="chat-status">
             {conv.kind === "self"
               ? "在你的设备间同步消息与文件"
-              : conv.kind === "dm"
-                ? peerOnline
-                  ? "在线"
-                  : conv.peer?.last_seen_at
-                    ? `最后在线 ${new Date(conv.peer.last_seen_at).toLocaleString()}`
-                    : "离线"
-                : `${conv.member_count} 名成员`}
+              : conv.kind === "agent"
+                ? `${agentHost ? (agentHost.label || "宿主") + (agentHost.platform ? ` (${agentHost.platform})` : "") : "宿主"} · ${conv.agent?.host_online ? "在线" : "离线"}`
+                : conv.kind === "dm"
+                  ? peerOnline
+                    ? "在线"
+                    : conv.peer?.last_seen_at
+                      ? `最后在线 ${new Date(conv.peer.last_seen_at).toLocaleString()}`
+                      : "离线"
+                  : `${conv.member_count} 名成员`}
           </div>
         </div>
-        {meetingBase && conv.kind !== "self" && !readonly && (
+        {meetingBase && conv.kind !== "self" && conv.kind !== "agent" && !readonly && (
           <button className="icon-btn chat-head-btn" title="发起会议" onClick={startMeeting}>
             📹 发起会议
           </button>
@@ -766,14 +792,16 @@ export default function ChatView() {
         >
           🔍
         </button>
-        {/* V2 P3-1：群=群信息（含文件与图片页签）；私聊/文件传输助手=文件与图片入口 */}
-        <button
-          className="icon-btn chat-head-btn"
-          title={conv.kind === "group" ? "群信息" : "文件与图片"}
-          onClick={() => setShowInfo(!showInfo)}
-        >
-          ⋯
-        </button>
+        {/* V2 P3-1：群=群信息（含文件与图片页签）；私聊/文件传输助手=文件与图片入口；A01：agent 会话无群信息入口 */}
+        {conv.kind !== "agent" && (
+          <button
+            className="icon-btn chat-head-btn"
+            title={conv.kind === "group" ? "群信息" : "文件与图片"}
+            onClick={() => setShowInfo(!showInfo)}
+          >
+            ⋯
+          </button>
+        )}
       </header>
 
       {conv.kind === "group" && (
@@ -818,8 +846,10 @@ export default function ChatView() {
         {loadingMore && <div className="msg-sys">加载历史…</div>}
         {!hasMore && msgs.length > 0 && <div className="msg-sys">— 没有更多了 —</div>}
         {msgs.map((m, i) => {
-          const mine = m.sender_id === s.me?.id;
+          // A01：agent 发的消息 sender_id 也是主人 —— 归属判定统一走 isOwnMessage
+          const mine = isOwnMessage(m, s.me?.id);
           const pending = m.id.startsWith("client:");
+          const inv = invs[m.id];
           const prev = msgs[i - 1];
           const showTime =
             !prev || new Date(m.created_at).getTime() - new Date(prev.created_at).getTime() > 300000;
@@ -832,15 +862,20 @@ export default function ChatView() {
                 className={`msg-row ${mine ? "mine" : ""}`}
                 data-mid={m.id}
               >
-                {!mine && (
-                  <Avatar
-                    userId={m.sender_id}
-                    name={m.sender_name}
-                    avatarVersion={m.sender_avatar_version}
-                    hasAvatar={m.sender_has_avatar}
-                    size="sm"
-                  />
-                )}
+                {!mine &&
+                  (m.agent ? (
+                    <div className="avatar sm agent-avatar" title={m.agent.name}>
+                      🤖
+                    </div>
+                  ) : (
+                    <Avatar
+                      userId={m.sender_id}
+                      name={m.sender_name}
+                      avatarVersion={m.sender_avatar_version}
+                      hasAvatar={m.sender_has_avatar}
+                      size="sm"
+                    />
+                  ))}
                 <div
                   className="msg-body"
                   onContextMenu={(e) => {
@@ -849,8 +884,16 @@ export default function ChatView() {
                     setMsgMenu({ x: e.clientX, y: e.clientY, m });
                   }}
                 >
-                  {!mine && conv.kind === "group" && (
-                    <div className="msg-sender">{m.sender_name}</div>
+                  {!mine && m.agent ? (
+                    <div className="msg-sender">
+                      {m.agent.name}
+                      <span className="agent-tag">Agent</span>
+                    </div>
+                  ) : (
+                    !mine &&
+                    conv.kind === "group" && (
+                      <div className="msg-sender">{m.sender_name}</div>
+                    )
                   )}
                   <div className="bubble-wrap">
                     {(canActMsg(m) || canForwardMsg(m) || canPinMsg(m)) && (
@@ -1040,6 +1083,14 @@ export default function ChatView() {
                   </div>
                 </div>
               </div>
+              {/* A01：主人这条消息触发的 Agent 调用状态行 */}
+              {inv && (inv.status === "running" || inv.status === "failed") && (
+                <div className={`inv-status ${inv.status}`}>
+                  {inv.status === "running"
+                    ? "⏳ 正在处理"
+                    : `⚠ 失败：${invocationErrorText(inv.error)}`}
+                </div>
+              )}
             </div>
           );
         })}
@@ -1190,7 +1241,7 @@ export default function ChatView() {
           onPreview={openPreview}
         />
       )}
-      {showInfo && conv.kind !== "group" && (
+      {showInfo && conv.kind !== "group" && conv.kind !== "agent" && (
         <aside className="group-info">
           <div className="gi-head">
             <h3>{conv.kind === "self" ? "文件传输助手" : "文件与图片"}</h3>

@@ -209,6 +209,9 @@ pub struct MsgViewRow {
     pub sender_avatar_version: i32,
     pub sender_has_avatar: bool,
     pub forwarded_from: Option<String>,
+    // Agent A01（0019）：非空 = 该消息由 Agent 发出
+    pub agent_id: Option<Uuid>,
+    pub agent_name: Option<String>,
 }
 
 impl MsgViewRow {
@@ -254,6 +257,10 @@ impl MsgViewRow {
             sender_avatar_version: self.sender_avatar_version,
             sender_has_avatar: self.sender_has_avatar,
             forwarded_from: self.forwarded_from,
+            agent: self.agent_id.map(|id| crate::model::AgentRef {
+                id,
+                name: self.agent_name.unwrap_or_default(),
+            }),
         }
     }
 }
@@ -528,6 +535,9 @@ pub struct PostMessage<'a> {
     /// 转发专用「已校验附件」：源消息上的 attachment id，事务内在目标会话克隆一行。
     /// 与 attachment_id 互斥——attachment_id 仍要求 uploader=发送者，此路径不可达普通发送。
     pub forward_attachment: Option<Uuid>,
+    /// Agent A01：Some(agent) 表示本条由该 Agent 发出（sender_id 仍是主人）。
+    /// 仅服务端宿主回写路径可达；写入时校验该 Agent 恰属于目标会话。
+    pub agent_id: Option<Uuid>,
 }
 
 /// 已整形的投票定义（随消息同事务落库）
@@ -646,15 +656,15 @@ async fn write_message(
     msg: &PostMessage<'_>,
     client_msg_id: Option<&str>,
 ) -> Result<Posted, WriteError> {
-    let conv = sqlx::query_as::<_, (String, bool)>(
-        "SELECT type, dissolved_at IS NOT NULL
+    let conv = sqlx::query_as::<_, (String, bool, Option<Uuid>)>(
+        "SELECT type, dissolved_at IS NOT NULL, agent_id
            FROM conversations WHERE id = $1 FOR UPDATE",
     )
     .bind(msg.conversation_id)
     .fetch_optional(&mut **tx)
     .await?
     .ok_or_else(|| PostError::deny("forbidden", "not a member of this conversation"))?;
-    let (kind_name, dissolved) = conv;
+    let (kind_name, dissolved, conv_agent) = conv;
 
     let disabled =
         sqlx::query_scalar::<_, bool>("SELECT disabled_at IS NOT NULL FROM users WHERE id = $1")
@@ -682,6 +692,16 @@ async fn write_message(
 
     if kind_name == "dm" && !dm_writable(tx, msg.conversation_id, msg.sender_id).await? {
         return Err(PostError::deny("not_friends", "好友关系已解除，会话只读").into());
+    }
+
+    // Agent 消息只能写进该 Agent 的专属会话（A01：宿主回写路径在锁外已验主，
+    // 这里再锁内核对会话绑定关系，防跨会话/伪造 agent_id）
+    if let Some(aid) = msg.agent_id {
+        if kind_name != "agent" || conv_agent != Some(aid) {
+            return Err(
+                PostError::deny("bad_request", "agent message outside its conversation").into(),
+            );
+        }
     }
 
     // 权限通过后再认幂等键，避免被移出或禁用的连接靠重放把旧消息再广播一遍。
@@ -783,8 +803,8 @@ async fn write_message(
     let message_id = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO messages
             (conversation_id, seq, sender_id, content, kind, attachment_id,
-             client_msg_id, reply_to_id, forwarded_from)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             client_msg_id, reply_to_id, forwarded_from, agent_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          RETURNING id",
     )
     .bind(msg.conversation_id)
@@ -796,19 +816,23 @@ async fn write_message(
     .bind(client_msg_id)
     .bind(msg.reply_to_id)
     .bind(msg.forwarded_from)
+    .bind(msg.agent_id)
     .fetch_one(&mut **tx)
     .await?;
 
-    // 发言即读到这里：自己的消息不算未读（否则刷新/换设备后自己发的消息显示成未读）
-    sqlx::query(
-        "UPDATE memberships SET last_read_seq = $3
-          WHERE conversation_id = $1 AND user_id = $2 AND last_read_seq < $3",
-    )
-    .bind(msg.conversation_id)
-    .bind(msg.sender_id)
-    .bind(seq)
-    .execute(&mut **tx)
-    .await?;
+    // 发言即读到这里：自己的消息不算未读（否则刷新/换设备后自己发的消息显示成未读）。
+    // Agent 消息例外：sender_id 是主人但作者是 Agent——按「别人发来的消息」计未读。
+    if msg.agent_id.is_none() {
+        sqlx::query(
+            "UPDATE memberships SET last_read_seq = $3
+              WHERE conversation_id = $1 AND user_id = $2 AND last_read_seq < $3",
+        )
+        .bind(msg.conversation_id)
+        .bind(msg.sender_id)
+        .bind(seq)
+        .execute(&mut **tx)
+        .await?;
+    }
 
     for uid in &mentions {
         sqlx::query(
@@ -1159,6 +1183,8 @@ struct LockedMessage {
     edit_version: i32,
     edit_op_id: Option<String>,
     attachment_id: Option<Uuid>,
+    /// Agent A01：非空 = Agent 所写（sender_id 是主人，但主人也不能编辑）
+    agent_id: Option<Uuid>,
     edit_expired: bool,
 }
 
@@ -1199,11 +1225,12 @@ async fn lock_message_for_mutation(
             i32,
             Option<String>,
             Option<Uuid>,
+            Option<Uuid>,
             bool,
         ),
     >(
         "SELECT sender_id, kind, deleted_at, edit_version, edit_op_id, attachment_id,
-                created_at + $2::interval <= now() AS edit_expired
+                agent_id, created_at + $2::interval <= now() AS edit_expired
            FROM messages WHERE id = $1 FOR UPDATE",
     )
     .bind(message_id)
@@ -1221,7 +1248,8 @@ async fn lock_message_for_mutation(
         edit_version: row.3,
         edit_op_id: row.4,
         attachment_id: row.5,
-        edit_expired: row.6,
+        agent_id: row.6,
+        edit_expired: row.7,
     })
 }
 
@@ -1288,6 +1316,10 @@ async fn edit_in_tx(
     // 幂等回放：该 op 已应用过 → 返回现状，不重复递增版本
     if op_key.is_some() && m.edit_op_id.as_deref() == op_key.as_deref() {
         return finish_edit(tx, m.conversation_id, message_id).await;
+    }
+    // Agent 消息不可编辑：作者栏是 Agent，sender_id 只是承载用的主人 id
+    if m.agent_id.is_some() {
+        return Err(PostError::deny("bad_request", "agent messages cannot be edited").into());
     }
     if m.sender_id != editor {
         return Err(PostError::deny("forbidden", "only the author can edit").into());
@@ -2023,6 +2055,7 @@ pub async fn create_poll(
             reply_to_id: None,
             forwarded_from: None,
             forward_attachment: None,
+            agent_id: None,
             poll: Some(PollSpec {
                 question,
                 options,
@@ -2318,6 +2351,7 @@ pub async fn forward_message(
                 poll: None,
                 forwarded_from: Some(&src.sender_name),
                 forward_attachment: src.att_id,
+                agent_id: None,
             },
         )
         .await;

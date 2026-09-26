@@ -104,6 +104,16 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
         .route("/conversations/{id}/members/me", delete(leave_conversation))
         .route("/conversations/{id}/members/{uid}", delete(kick_member))
         .route("/conversations/{id}/transfer", post(transfer_ownership))
+        // ---------- Agent A01 ----------
+        .route("/agent-hosts", get(crate::agents::list_hosts))
+        .route(
+            "/agents",
+            get(crate::agents::list_agents).post(crate::agents::create_agent),
+        )
+        .route(
+            "/conversations/{id}/agent-invocations",
+            get(crate::agents::list_invocations),
+        )
         .route(
             "/files",
             post(upload_file).layer(DefaultBodyLimit::max(
@@ -159,7 +169,7 @@ async fn uid_of(headers: &HeaderMap, st: &SharedState) -> AppResult<Uuid> {
     Ok(auth::require_user(st, headers).await?.id)
 }
 
-fn notify(st: &SharedState, uids: &[Uuid], what: &'static str) {
+pub(crate) fn notify(st: &SharedState, uids: &[Uuid], what: &'static str) {
     let payload = serde_json::to_string(&WsOut::Invalidate { what }).unwrap();
     st.send_to_users(uids, &payload);
 }
@@ -924,6 +934,13 @@ struct ConvRow {
     m_sender_avatar_version: Option<i32>,
     m_sender_has_avatar: Option<bool>,
     m_forwarded_from: Option<String>,
+    // Agent A01：末条消息的 Agent 归属（非空 = Agent 所写）
+    m_agent_id: Option<Uuid>,
+    m_agent_name: Option<String>,
+    // Agent A01：专属会话的 Agent 摘要（kind='agent' 时有值）
+    c_agent_id: Option<Uuid>,
+    c_agent_name: Option<String>,
+    c_agent_host_id: Option<Uuid>,
     // 本人偏好（conversation_preferences 左连接，无行则全 NULL/false）
     p_pinned_at: Option<DateTime<Utc>>,
     p_archived_at: Option<DateTime<Utc>>,
@@ -963,12 +980,15 @@ async fn list_conversations(
                 lm.att_has_thumb AS m_att_has_thumb, lm.att_duration_ms AS m_att_duration_ms,
                 lm.sender_avatar_version AS m_sender_avatar_version,
                 lm.sender_has_avatar AS m_sender_has_avatar, lm.forwarded_from AS m_forwarded_from,
+                lm.agent_id AS m_agent_id, lm.agent_name AS m_agent_name,
+                ag.id AS c_agent_id, ag.name AS c_agent_name, ag.host_id AS c_agent_host_id,
                 cp.pinned_at AS p_pinned_at, cp.archived_at AS p_archived_at,
                 cp.muted_until AS p_muted_until, cp.mute_forever AS p_mute_forever,
                 cp.updated_at AS p_updated_at,
                 c.announcement, au.display_name AS announcement_by_name, c.announcement_at
            FROM memberships m
            JOIN conversations c ON c.id = m.conversation_id
+           LEFT JOIN agents ag ON ag.id = c.agent_id
            LEFT JOIN users au ON au.id = c.announcement_by
            LEFT JOIN conversation_preferences cp
                   ON cp.conversation_id = c.id AND cp.user_id = m.user_id
@@ -995,7 +1015,8 @@ async fn list_conversations(
                       att_id, att_name, att_mime, att_size, mentions,
                       reply_to_id, reply_to, edited_at, edit_version, deleted_at, reactions, poll,
                       att_width, att_height, att_has_thumb, att_duration_ms,
-                      sender_avatar_version, sender_has_avatar, forwarded_from
+                      sender_avatar_version, sender_has_avatar, forwarded_from,
+                      agent_id, agent_name
                  FROM message_views
                 WHERE conversation_id = c.id
                 ORDER BY seq DESC
@@ -1065,6 +1086,10 @@ async fn list_conversations(
                 sender_avatar_version: r.m_sender_avatar_version.unwrap_or(0),
                 sender_has_avatar: r.m_sender_has_avatar.unwrap_or(false),
                 forwarded_from: r.m_forwarded_from.clone(),
+                agent: r.m_agent_id.map(|id| crate::model::AgentRef {
+                    id,
+                    name: r.m_agent_name.clone().unwrap_or_default(),
+                }),
             });
             ConversationView {
                 id: r.id,
@@ -1088,6 +1113,15 @@ async fn list_conversations(
                     text,
                     updated_by_name: r.announcement_by_name.clone(),
                     updated_at: r.announcement_at,
+                }),
+                agent: r.c_agent_id.map(|id| crate::model::ConvAgentRef {
+                    id,
+                    name: r.c_agent_name.clone().unwrap_or_default(),
+                    host_id: r.c_agent_host_id.unwrap_or_default(),
+                    host_online: r
+                        .c_agent_host_id
+                        .map(|h| st.host_online(h))
+                        .unwrap_or(false),
                 }),
                 created_at: r.created_at,
             }
@@ -1773,11 +1807,11 @@ async fn kick_member(
     let Some((kind, _, _)) = domain::lock_conversation(&mut tx, conv).await? else {
         return Err(AppError::forbidden("not a member of this conversation"));
     };
-    // self 会话单人不可变：把成员操作与 dm 一样拒绝，但统一 400（群主身份本是唯一成员，
+    // self/agent 会话单人不可变：成员操作与 dm 一样拒绝，但统一 400（群主身份本是唯一成员，
     // 不做类型守卫会落到 member not found 的 404）
-    if kind == "self" {
+    if kind == "self" || kind == "agent" {
         return Err(AppError::bad_request(
-            "self conversation has no members to manage",
+            "this conversation has no members to manage",
         ));
     }
     let me = domain::membership(&mut *tx, conv, uid)
@@ -1815,9 +1849,12 @@ async fn rename_conversation(
     if me.role != "owner" {
         return Err(AppError::forbidden("only the owner can rename"));
     }
-    // self 会话 name 恒 NULL（客户端按 kind 显示「文件传输助手」），改名无意义 → 400
-    if domain::conv_kind(&st.pool, conv).await?.as_deref() == Some("self") {
-        return Err(AppError::bad_request("self conversation cannot be renamed"));
+    // self/agent 会话 name 恒 NULL（客户端按 kind 显示标题），改名无意义 → 400
+    if matches!(
+        domain::conv_kind(&st.pool, conv).await?.as_deref(),
+        Some("self") | Some("agent")
+    ) {
+        return Err(AppError::bad_request("this conversation cannot be renamed"));
     }
     let name = req.name.trim();
     if name.is_empty() || name.len() > 100 {
@@ -1980,10 +2017,10 @@ async fn dissolve_conversation(
     let Some((kind, _, _)) = domain::lock_conversation(&mut tx, conv).await? else {
         return Err(AppError::forbidden("not a member of this conversation"));
     };
-    // self 会话不可解散：唯一成员即 owner，不做类型守卫会把助手连同成员一起删掉
-    if kind == "self" {
+    // self/agent 会话不可解散：唯一成员即 owner，不做类型守卫会把会话连同成员一起删掉
+    if kind == "self" || kind == "agent" {
         return Err(AppError::bad_request(
-            "self conversation cannot be dissolved",
+            "this conversation cannot be dissolved",
         ));
     }
     let me = domain::membership(&mut *tx, conv, uid)
@@ -2567,10 +2604,10 @@ async fn transfer_ownership(
     let Some((kind, _, _)) = domain::lock_conversation(&mut tx, conv).await? else {
         return Err(AppError::forbidden("not a member of this conversation"));
     };
-    // self 会话归属本人不可转让（唯一成员即 owner）
-    if kind == "self" {
+    // self/agent 会话归属本人不可转让（唯一成员即 owner）
+    if kind == "self" || kind == "agent" {
         return Err(AppError::bad_request(
-            "self conversation cannot be transferred",
+            "this conversation cannot be transferred",
         ));
     }
     let me = domain::membership(&mut *tx, conv, uid)

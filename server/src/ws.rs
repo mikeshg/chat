@@ -54,6 +54,12 @@ pub async fn ws_handler(
         session_version: grant.session_version,
         sid: grant.sid,
     };
+    // Agent A01：role=host 走宿主会话（不计 presence、收 invocation_start）
+    if q.role.as_deref() == Some("host") {
+        return Ok(ws.on_upgrade(move |socket| async move {
+            let _ = crate::host_ws::host_session(socket, st, access).await;
+        }));
+    }
     Ok(ws.on_upgrade(move |socket| handle_session(socket, st, access)))
 }
 
@@ -264,16 +270,21 @@ pub async fn broadcast_posted(st: &SharedState, conv: Uuid, posted: &domain::Pos
             message: posted.message.clone(),
         });
         st.send_to_users(&posted.member_ids, &p);
-        // 发送者已读位置在事务内推进到这条：同步给他的其他设备清角标
-        st.send_to_user(
-            posted.message.sender_id,
-            &frame(&WsOut::ReadSync {
-                conversation_id: conv,
-                seq: posted.message.seq,
-            }),
-        );
+        // 发送者已读位置在事务内推进到这条：同步给他的其他设备清角标。
+        // Agent 消息没有推进主人 last_read_seq（对主人是「别人发来的」），不发 read_sync。
+        if posted.message.agent.is_none() {
+            st.send_to_user(
+                posted.message.sender_id,
+                &frame(&WsOut::ReadSync {
+                    conversation_id: conv,
+                    seq: posted.message.seq,
+                }),
+            );
+        }
         // V2 P3-3：离线推送（ntfy）——判定与发送全在 spawned 任务里，不拖慢广播
         crate::push::schedule(st, conv, posted);
+        // Agent A01：专属会话里主人的文字消息触发一次 Agent 调用
+        crate::agents::maybe_invoke(st, conv, posted).await;
     }
     // 新 @本人消息已在事务内解除其归档：偏好帧只发给本人全部连接（其他成员不可见）
     for target in &posted.unarchived {
@@ -454,6 +465,8 @@ async fn send_message(
             // 转发字段仅服务端转发端点可达：WS 发送不能伪造转发来源/克隆附件
             forwarded_from: None,
             forward_attachment: None,
+            // agent_id 仅服务端宿主回写路径可达：用户 WS 不能伪造 Agent 身份
+            agent_id: None,
         },
     )
     .await
@@ -526,13 +539,14 @@ async fn reaction(
 }
 
 async fn typing(st: &SharedState, uid: Uuid, conv: Uuid) -> WsResult {
-    // self 会话不广播 typing（唯一成员即本人；成员循环本就发不出去，这里显式短路）
-    if domain::conv_kind(&st.pool, conv)
-        .await
-        .map_err(|_| ws_err("internal", "db error"))?
-        .as_deref()
-        == Some("self")
-    {
+    // self/agent 会话不广播 typing（唯一成员即本人；显式短路，省得查成员再空转）
+    if matches!(
+        domain::conv_kind(&st.pool, conv)
+            .await
+            .map_err(|_| ws_err("internal", "db error"))?
+            .as_deref(),
+        Some("self") | Some("agent")
+    ) {
         return Ok(());
     }
     domain::membership(&st.pool, conv, uid)

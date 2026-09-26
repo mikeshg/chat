@@ -1,9 +1,11 @@
 import { useSyncExternalStore } from "react";
 import { writeDrafts } from "./drafts";
 import type {
+  AgentHostView,
   ConversationPref,
   ConversationView,
   FriendView,
+  InvocationView,
   MessageView,
   RequestsView,
   UserPublic,
@@ -48,6 +50,10 @@ export interface AppState {
   avatars: Record<string, AvatarInfo>;
   /** 全局搜索跳转目标（V2 P3-1）：打开会话后由 ChatView 消费并清空 */
   pendingJump: { convId: string; messageId: string; seq: number } | null;
+  /** Agent A01：本人宿主列表（AgentsPanel 拉取 / agent_host_status 帧更新 online） */
+  agentHosts: AgentHostView[];
+  /** Agent A01：conv_id -> trigger_message_id -> 调用记录（状态行展示用） */
+  invocations: Record<string, Record<string, InvocationView>>;
 }
 
 /** 头像缓存条目：版本较大的那组才有效。 */
@@ -76,6 +82,8 @@ let state: AppState = {
   drafts: {},
   avatars: {},
   pendingJump: null,
+  agentHosts: [],
+  invocations: {},
 };
 
 const listeners = new Set<() => void>();
@@ -110,7 +118,18 @@ export function convTitle(c: ConversationView, meId?: string): string {
   if (c.kind === "group") return c.name ?? `群聊(${c.member_count})`;
   // V2 P2-4：self 会话 name 恒 NULL、peer 恒空，标题固定
   if (c.kind === "self") return "文件传输助手";
+  // Agent A01：专属会话 name 恒 NULL，标题是 Agent 名
+  if (c.kind === "agent") return c.agent?.name ?? "Agent";
   return c.peer?.display_name ?? c.name ?? "会话";
+}
+
+/**
+ * 「这条消息是不是我发的」唯一判定（Agent A01）：
+ * Agent 消息的 sender_id 仍是主人，但带 m.agent —— 对主人它是「别人发来的」
+ * （气泡在左、计未读、可触发通知、不可编辑）。各处一律走这个纯函数。
+ */
+export function isOwnMessage(m: MessageView, meId?: string | null): boolean {
+  return !!meId && m.sender_id === meId && !m.agent;
 }
 
 /** 把一批 UserPublic 合并进头像表，只接受更大的版本。 */
@@ -305,7 +324,7 @@ export function applyPrefUpdate(
  * 静音会话抑制提示，但 @本人 可突破静音（§8.3）。
  */
 export function shouldNotify(s: AppState, m: MessageView): boolean {
-  if (s.me == null || m.sender_id === s.me.id) return false;
+  if (s.me == null || isOwnMessage(m, s.me.id)) return false;
   if (s.activeConv === m.conversation_id && s.tab === "chats") return false;
   const conv = s.conversations.find((c) => c.id === m.conversation_id);
   if (conv && isMuted(conv) && !m.mentions.includes(s.me.id)) return false;
@@ -397,7 +416,8 @@ export function applyLiveMessage(s: AppState, m: MessageView, foreground = true)
   const exists = list.some((x) => x.id === m.id) || s.conversations.some((c) => c.last_message?.id === m.id);
   const refreshed = applyRefreshed(s, m.conversation_id, [m]);
   const isActive = s.activeConv === m.conversation_id && s.tab === "chats" && foreground;
-  const mine = m.sender_id === s.me?.id;
+  // Agent 消息对主人按「别人发来的」计未读（sender_id 仍是主人，由 m.agent 区分）
+  const mine = isOwnMessage(m, s.me?.id);
   const { [m.conversation_id]: _typing, ...typing } = s.typing;
   return {
     ...refreshed,
@@ -513,6 +533,50 @@ export function dropConversationCache(s: AppState, convId: string): Partial<AppS
   const typing = { ...s.typing };
   delete typing[convId];
   return { messages, hasMore, historyLoaded, typing };
+}
+
+// ---------- Agent A01：宿主在线态 / 调用记录 ----------
+
+/** agent_host_status 帧：更新宿主列表与所有挂在该宿主上的 agent 会话在线点 */
+export function applyHostStatus(
+  s: AppState,
+  hostId: string,
+  online: boolean,
+): Partial<AppState> {
+  return {
+    agentHosts: s.agentHosts.map((h) => (h.id === hostId ? { ...h, online } : h)),
+    conversations: s.conversations.map((c) =>
+      c.agent?.host_id === hostId && c.agent.host_online !== online
+        ? { ...c, agent: { ...c.agent, host_online: online } }
+        : c,
+    ),
+  };
+}
+
+/** agent_invocation 帧 / 历史 GET 共用合并入口：按 trigger_message_id 归档最新状态 */
+export function applyInvocations(
+  s: AppState,
+  incoming: InvocationView[],
+): Partial<AppState> {
+  if (incoming.length === 0) return {};
+  const invocations = { ...s.invocations };
+  for (const inv of incoming) {
+    const cur = invocations[inv.conversation_id] ?? {};
+    invocations[inv.conversation_id] = { ...cur, [inv.trigger_message_id]: inv };
+  }
+  return { invocations };
+}
+
+/** 调用失败原因的展示文案（host 侧稳定错误码 → 中文） */
+export function invocationErrorText(error: string | null | undefined): string {
+  switch (error) {
+    case "host_offline":
+      return "Agent 所在电脑不在线";
+    case "host_disconnected":
+      return "Agent 所在电脑断开了";
+    default:
+      return error ?? "未知原因";
+  }
 }
 
 /** ack 到达：用服务端消息替换乐观副本（message 回显可能先于 ack，需按 id 去重） */

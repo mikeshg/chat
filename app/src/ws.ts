@@ -1,5 +1,6 @@
 import {
   ApiError,
+  agents as agentsApi,
   clearSession,
   convs,
   friends as friendsApi,
@@ -10,6 +11,8 @@ import {
 import { notifyIncoming } from "./notify";
 import {
   absorbAvatarUsers,
+  applyHostStatus,
+  applyInvocations,
   applyLiveMessage,
   applyPrefUpdate,
   applyRefreshed,
@@ -19,6 +22,7 @@ import {
   dropConversationCache,
   dropOptimistic,
   getState,
+  isOwnMessage,
   mergeConversationLists,
   pushToast,
   replyPreview,
@@ -125,10 +129,12 @@ export async function startWs() {
 export async function refreshCatalogs(): Promise<void> {
   const gen = ++catalogGen;
   const sess = session();
-  const [conversations, friends, requests] = await Promise.all([
+  const [conversations, friends, requests, agentHosts] = await Promise.all([
     convs.list(),
     friendsApi.list(),
     friendsApi.requests(),
+    // A01：老服务端没有 /agent-hosts（404）→ 保留现有列表不清空
+    agentsApi.hosts().catch(() => getState().agentHosts),
   ]);
   if (gen !== catalogGen || sess !== session()) return;
   setState((s) => {
@@ -137,6 +143,7 @@ export async function refreshCatalogs(): Promise<void> {
       conversations: mergeConversationLists(s.conversations, conversations),
       friends,
       requests,
+      agentHosts,
       avatars: absorbAvatarUsers(s.avatars, [
         s.me,
         ...conversations.map((c) => c.peer),
@@ -428,6 +435,13 @@ function dispatch(f: WsOut) {
         new CustomEvent("chat:pins", { detail: f.conversation_id }),
       );
       break;
+    case "agent_host_status":
+      // Agent A01：宿主上下线 → 宿主列表与 agent 会话的在线点同步翻转
+      setState((cur) => applyHostStatus(cur, f.host_id, f.online));
+      break;
+    case "agent_invocation":
+      setState((cur) => applyInvocations(cur, [f.invocation]));
+      break;
     case "force_logout": {
       // 被踢下线（禁用/重置密码/改密/移出设备）：记录原因 → 停连接 → 回登录页
       sessionStorage.setItem("chat_kick_reason", kickReasonText(f.reason));
@@ -471,7 +485,7 @@ function onMessage(m: MessageView) {
   const s = getState();
   const fg = inForeground();
   const isActive = s.activeConv === m.conversation_id && s.tab === "chats" && fg;
-  const mine = m.sender_id === s.me?.id;
+  const mine = isOwnMessage(m, s.me?.id);
   setState((cur) => applyLiveMessage(cur, m, fg));
   if (!known) void refreshCatalogs().catch((e) => console.warn("refresh failed", e));
   // 当前打开且在前台的会话收到别人消息 → 上报已读
@@ -493,7 +507,8 @@ function onMessage(m: MessageView) {
     pushToast({
       convId: m.conversation_id,
       title: c ? convTitle(c) : "新消息",
-      text: `${tag}${m.sender_name}: ${excerpt}`,
+      // Agent 消息的 sender_name 仍是主人，展示用 Agent 名
+      text: `${tag}${m.agent?.name ?? m.sender_name}: ${excerpt}`,
     });
   }
   // P1-1 系统通知：窗口不在前台时弹出（与 toast 共用 !existed 去重；开关/权限/静音在内部判定）

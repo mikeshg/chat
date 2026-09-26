@@ -145,6 +145,72 @@ export interface MessageView {
   sender_has_avatar?: boolean;
   /** 转发消息：原发送者展示名 */
   forwarded_from?: string | null;
+  /** Agent A01：Agent 发出的消息携带归属（sender_id 仍是主人）；旧服务端缺省 */
+  agent?: AgentRef | null;
+}
+
+/** 消息上的 Agent 归属（A01） */
+export interface AgentRef {
+  id: string;
+  name: string;
+}
+
+/** 会话上的 Agent 归属（kind='agent' 时出现，A01） */
+export interface ConvAgentRef {
+  id: string;
+  name: string;
+  host_id: string;
+  /** 宿主实时在线态（随 agent_host_status 帧更新） */
+  host_online: boolean;
+}
+
+/** GET /agent-hosts 单条宿主视图（A01） */
+export interface AgentHostView {
+  id: string;
+  label: string;
+  platform: string;
+  online: boolean;
+  last_seen_at: string;
+}
+
+/** Agent 运行描述（A01 只有 command + args 一种形状） */
+export interface AgentRuntime {
+  command: string;
+  args: string[];
+}
+
+/** GET /agents 单条 Agent 视图（A01） */
+export interface AgentView {
+  id: string;
+  name: string;
+  host_id: string;
+  host_online: boolean;
+  runtime: AgentRuntime;
+  cwd: string;
+  conversation_id: string;
+  created_at: string;
+}
+
+/** POST /agents 请求体（A01） */
+export interface CreateAgentReq {
+  name: string;
+  host_id: string;
+  runtime: AgentRuntime;
+  cwd?: string;
+}
+
+/** 一次 Agent 调用记录（A01；本票只用 running / succeeded / failed） */
+export interface InvocationView {
+  id: string;
+  agent_id: string;
+  conversation_id: string;
+  /** 触发这条调用的主人消息 id */
+  trigger_message_id: string;
+  status: string;
+  error: string | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
 }
 
 /** 会话偏好（用户维度；旧服务端无此字段 → 视为全默认） */
@@ -172,7 +238,7 @@ export interface ConversationPrefEntry {
 
 export interface ConversationView {
   id: string;
-  kind: string; // "dm" | "group" | "self"（文件传输助手）
+  kind: string; // "dm" | "group" | "self"（文件传输助手）| "agent"（A01 专属会话）
   name: string | null;
   owner_id: string | null;
   peer: UserPublic | null;
@@ -185,6 +251,8 @@ export interface ConversationView {
   preference?: ConversationPref | null;
   /** 群公告；未设置 / 旧服务端缺省为 null */
   announcement?: AnnouncementView | null;
+  /** kind='agent' 时的 Agent 归属（旧服务端缺省） */
+  agent?: ConvAgentRef | null;
   created_at: string;
 }
 
@@ -266,6 +334,17 @@ export type WsOut =
     }
   | { type: "invalidate"; what: string }
   | { type: "pins_updated"; conversation_id: string }
+  | {
+      /** Agent A01：本人宿主上/下线（只发主人普通连接） */
+      type: "agent_host_status";
+      host_id: string;
+      online: boolean;
+    }
+  | {
+      /** Agent A01：调用状态变化（发给会话成员的普通连接） */
+      type: "agent_invocation";
+      invocation: InvocationView;
+    }
   | { type: "force_logout"; reason: string }
   | {
       type: "error";

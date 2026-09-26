@@ -160,6 +160,8 @@ export default function ConvList() {
         {list.map((c) => {
           const title = convTitle(c, s.me?.id);
           const peerOnline = c.kind === "dm" && c.peer ? !!s.online[c.peer.id] : false;
+          // A01：agent 会话的在线点 = 宿主在线（随 agent_host_status 帧翻转）
+          const hostOnline = c.kind === "agent" && (c.agent?.host_online ?? false);
           const typing = s.typing[c.id];
           const typingFresh = typing && Date.now() - typing.ts < 5000;
           const muted = isMuted(c);
@@ -187,8 +189,11 @@ export default function ConvList() {
                   {peerOnline && <i className="online-dot" />}
                 </Avatar>
               ) : (
-                <div className={`avatar ${c.kind === "self" ? "self-avatar" : ""}`}>
-                  {c.kind === "self" ? "🗂" : convAvatarText(c)}
+                <div
+                  className={`avatar ${c.kind === "self" ? "self-avatar" : ""} ${c.kind === "agent" ? "agent-avatar" : ""}`}
+                >
+                  {c.kind === "self" ? "🗂" : c.kind === "agent" ? "🤖" : convAvatarText(c)}
+                  {hostOnline && <i className="online-dot" />}
                 </div>
               )}
               <div className="conv-mid">

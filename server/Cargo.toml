@@ -31,6 +31,8 @@ tokio-util = { version = "0.7", features = ["io"] }
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 tokio-tungstenite = "0.26"
+# Agent A01：集成测试用真实宿主库连真 WS
+agent-host = { path = "../agent-host" }
 # V2 P4-1：测试里解包/篡改备份文件
 tar = "0.4"
 flate2 = "1"
