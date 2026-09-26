@@ -5,7 +5,7 @@
   "identifier": "com.chat.app",
   "build": {
     "frontendDist": "../dist",
-    "beforeBuildCommand": "node_modules\\.bin\\tsc.cmd -b && node_modules\\.bin\\vite.cmd build"
+    "beforeBuildCommand": "npm run build"
   },
   "app": {
     "windows": [
