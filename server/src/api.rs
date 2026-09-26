@@ -130,6 +130,29 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
         .route("/admin/users/{id}/enable", post(admin_enable))
         .route("/admin/users/{id}/role", post(admin_set_role))
         .route("/admin/users/{id}/password", post(admin_reset_password))
+        // ---------- V2 P4-1：备份/恢复 ----------
+        .route(
+            "/admin/backups",
+            get(crate::backup::list_backups).post(crate::backup::create_backup),
+        )
+        .route(
+            "/admin/backups/{name}/download-ticket",
+            post(crate::backup::download_ticket),
+        )
+        .route(
+            "/admin/backups/{name}/download",
+            get(crate::backup::download_backup),
+        )
+        .route(
+            "/admin/backups/{name}",
+            delete(crate::backup::delete_backup),
+        )
+        .route(
+            "/admin/restore",
+            // 备份包远大于默认 2MB 上限：走路由级放大；内容流式落盘不整包进内存
+            post(crate::backup::restore).layer(DefaultBodyLimit::disable()),
+        )
+    // （维护模式闸在 build_router 里 .layer 到 /v1 子路由上：from_fn_with_state 需要 state）
 }
 
 async fn uid_of(headers: &HeaderMap, st: &SharedState) -> AppResult<Uuid> {

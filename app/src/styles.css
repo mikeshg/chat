@@ -881,3 +881,32 @@ button.icon-btn.chat-head-btn { flex: 0 0 auto; width: auto; height: 32px; white
 .gi-ann { margin: 12px 0; }
 .gi-ann h4 { margin: 0 0 6px; }
 .pin-row .pin-excerpt { color: var(--text); }
+
+/* ===== V2 P4-1 ===== */
+.bk-panel h4 { margin: 14px 0 6px; }
+.bk-toolbar { gap: 10px; margin-bottom: 10px; }
+.bk-list { display: flex; flex-direction: column; }
+.bk-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 7px 0; border-bottom: 1px solid var(--line);
+  font-size: 13px;
+}
+.bk-row:last-child { border-bottom: none; }
+.bk-name {
+  flex: 1; min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+  font-family: ui-monospace, monospace; font-size: 12px;
+}
+.bk-actions { display: flex; gap: 6px; }
+.bk-restore { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 4px; }
+.bk-warn { color: var(--danger); font-size: 12px; margin: 0 0 8px; }
+.bk-confirm { display: flex; gap: 8px; margin-top: 8px; }
+.bk-confirm input { flex: 1; }
+.bk-progress {
+  margin-top: 8px; height: 6px; border-radius: 3px;
+  background: var(--hover); overflow: hidden;
+}
+.bk-progress-bar {
+  height: 100%; background: var(--accent);
+  transition: width 0.15s ease-out;
+}

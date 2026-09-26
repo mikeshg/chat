@@ -1,5 +1,6 @@
 pub mod api;
 pub mod auth;
+pub mod backup;
 pub mod config;
 pub mod db;
 pub mod domain;
@@ -23,8 +24,13 @@ use tracing_subscriber::EnvFilter;
 
 /// 构建完整路由（API + 可选静态托管）。测试复用。
 pub fn build_router(state: SharedState, cfg: &Config) -> Router {
+    // V2 P4-1：维护模式闸。恢复进行中除当前恢复请求外所有 /v1 请求（含 WS 升级）503。
+    let v1 = api::router(cfg).layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        backup::maintenance_gate,
+    ));
     let mut app = Router::new()
-        .nest("/v1", api::router(cfg))
+        .nest("/v1", v1)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);

@@ -313,6 +313,8 @@ export function kickReasonText(reason: string): string {
       return "密码已在其他设备修改，请重新登录";
     case "session_revoked":
       return "该设备已被移出登录，请重新登录";
+    case "maintenance":
+      return "服务器维护中，请稍后重新登录";
     default:
       return "登录已失效，请重新登录";
   }

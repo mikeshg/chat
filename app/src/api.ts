@@ -4,6 +4,10 @@ import type {
   AdminUserView,
   AttachmentView,
   AuthResponse,
+  BackupCreated,
+  BackupList,
+  BackupTicket,
+  RestoreResult,
   ConversationDetail,
   ConversationPref,
   ConversationPrefEntry,
@@ -442,4 +446,49 @@ export const admin = {
     post(`/admin/users/${id}/role`, { role }),
   resetPassword: (id: string, password: string) =>
     post(`/admin/users/${id}/password`, { password }),
+  // ---------- V2 P4-1 备份/恢复 ----------
+  backups: () => get<BackupList>("/admin/backups"),
+  createBackup: () => post<BackupCreated>("/admin/backups"),
+  deleteBackup: (name: string) =>
+    del<void>(`/admin/backups/${encodeURIComponent(name)}`),
+  /** 浏览器 <a href> 不能带 Authorization：换一次性下载票据 */
+  backupDownloadTicket: (name: string) =>
+    post<BackupTicket>(
+      `/admin/backups/${encodeURIComponent(name)}/download-ticket`,
+    ),
+  /**
+   * 上传备份包恢复（confirm=RESTORE 由面板收口）。
+   * 用 XMLHttpRequest 是为了 upload.onprogress 的进度回调。
+   */
+  restore: (file: File, onProgress?: (pct: number) => void) =>
+    new Promise<RestoreResult>((resolve, reject) => {
+      const fd = new FormData();
+      fd.append("file", file, "backup.tar.gz");
+      fd.append("confirm", "RESTORE");
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", `${getServer()}/v1/admin/restore`);
+      const at = localStorage.getItem(LS_ACCESS);
+      if (at) xhr.setRequestHeader("authorization", `Bearer ${at}`);
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable && onProgress)
+          onProgress(Math.round((e.loaded / e.total) * 100));
+      };
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            resolve(JSON.parse(xhr.responseText) as RestoreResult);
+          } catch {
+            resolve({ tables: [], files: 0 });
+          }
+          return;
+        }
+        let msg = xhr.responseText;
+        try {
+          msg = (JSON.parse(xhr.responseText).error as string) ?? msg;
+        } catch {}
+        reject(new ApiError(xhr.status, msg || "恢复失败"));
+      };
+      xhr.onerror = () => reject(new ApiError(0, "网络错误"));
+      xhr.send(fd);
+    }),
 };

@@ -23,7 +23,14 @@ futures-util = "0.3"
 dashmap = "6"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# V2 P4-1：备份打包/解包与流式上传下载
+tar = "0.4"
+flate2 = "1"
+tokio-util = { version = "0.7", features = ["io"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 tokio-tungstenite = "0.26"
+# V2 P4-1：测试里解包/篡改备份文件
+tar = "0.4"
+flate2 = "1"
