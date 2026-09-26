@@ -31,6 +31,7 @@ import { meetingMessage } from "./meeting";
 import PinnedBar from "./PinnedBar";
 import NewPollModal from "./NewPollModal";
 import PollCard from "./PollCard";
+import ApprovalCard from "./ApprovalCard";
 import { imageBubbleSize } from "./mediaFormat";
 import AgentAvatar from "./AgentAvatar";
 import Avatar from "./Avatar";
@@ -104,6 +105,7 @@ function kindLabel(kind: string): string {
   if (kind === "file") return "[文件]";
   if (kind === "audio") return "[语音]";
   if (kind === "poll") return "[投票]";
+  if (kind === "approval") return "[审批]";
   return "";
 }
 
@@ -1228,6 +1230,8 @@ export default function ChatView() {
                             }
                             onErr={setMutErr}
                           />
+                        ) : m.kind === "approval" && m.approval ? (
+                          <ApprovalCard approval={m.approval} content={m.content} />
                         ) : (
                           showText(m) && <RichText text={m.content} />
                         )}
@@ -1276,6 +1280,18 @@ export default function ChatView() {
                         conv.kind === "agent" || myAgents.some((a) => a.id === inv.agent_id)
                       }
                       onCancel={cancelInvocation}
+                      onOpenApproval={
+                        conv.kind === "agent"
+                          ? () => {
+                              const card = msgs.find(
+                                (x) =>
+                                  x.kind === "approval" &&
+                                  x.approval?.request?.invocation_id === inv.id,
+                              );
+                              if (card) jumpToRef(card.id, card.seq);
+                            }
+                          : undefined
+                      }
                     />
                   </div>
                 );

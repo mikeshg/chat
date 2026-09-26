@@ -2,6 +2,7 @@ pub mod agent_access;
 pub mod agent_tools;
 pub mod agents;
 pub mod api;
+pub mod approvals;
 pub mod auth;
 pub mod backup;
 pub mod config;

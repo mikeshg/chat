@@ -20,6 +20,8 @@ export interface AgentFormInput {
   envRows: EnvRow[];
   outputMode: string;
   queueTimeout: string;
+  /** read_only / workspace / full */
+  permissionTier: string;
 }
 
 function lines(text: string): string[] {
@@ -48,5 +50,6 @@ export function shapeAgentPatch(input: AgentFormInput): PatchAgentReq {
     env,
     output_mode: input.outputMode === "" ? null : (input.outputMode as AgentOutputMode),
     queue_timeout_secs: input.queueTimeout === "" ? null : Number(input.queueTimeout),
+    permission_tier: input.permissionTier || "read_only",
   };
 }

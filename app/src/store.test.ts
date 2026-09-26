@@ -540,7 +540,7 @@ describe("Agent A01：宿主状态与调用记录", () => {
       "⚠ 失败：Agent 所在电脑断开了",
     );
     expect(invocationStatusLabel("succeeded", null)).toBeNull();
-    expect(invocationStatusLabel("awaiting_approval", null)).toBeNull();
+    expect(invocationStatusLabel("awaiting_approval", null)).toBe("⏸ 等待主人批准");
   });
 
   it("invocationCancellable：排队、运行中、等待审批可取消", () => {

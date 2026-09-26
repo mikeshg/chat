@@ -1,6 +1,8 @@
 // 宿主 WS 连接循环：连上→host_hello→host_ready→收 invocation_start 起任务。
 
-use crate::runtime::{self, AgentOption, AgentSpec, InjectedMcp, RunEvent, RunOutput};
+use crate::runtime::{
+    self, AgentOption, AgentSpec, ApprovalLink, ApprovalNotice, InjectedMcp, RunEvent, RunOutput,
+};
 use crate::Shared;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -107,6 +109,8 @@ async fn connect_once(s: &Arc<Shared>) -> Result<(), String> {
 
     let res = read_loop(s, &mut stream, &out_tx).await;
     writer.abort();
+    // 连接没了：还在等审批的调用以错误醒来，不要一直占着 agent 进程。
+    s.approvals.clear();
     res
 }
 
@@ -149,6 +153,15 @@ async fn read_loop(
                             if let Some(tx) = s.cancels.lock().unwrap().get(&id) {
                                 let _ = tx.send(true);
                             }
+                        }
+                    }
+                    // A12：主人对超档操作的决定。request_id 对不上就忽略。
+                    "approval_decision" => {
+                        if let (Some(rid), Some(oid)) = (
+                            v["request_id"].as_str(),
+                            v["option_id"].as_str().filter(|s| !s.is_empty()),
+                        ) {
+                            s.approvals.resolve(rid, oid.to_string());
                         }
                     }
                     _ => {}
@@ -210,9 +223,16 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
     let cancels = s.cancels.clone();
     let dir = s.data_dir.clone();
     let cancel_flag = cancel_rx.clone();
+    let (ask_tx, ask_rx) = tokio::sync::mpsc::unbounded_channel::<ApprovalNotice>();
+    let approvals = ApprovalLink {
+        tx: ask_tx,
+        registry: s.approvals.clone(),
+    };
+    let ask_out = out.clone();
     let task = tokio::spawn(async move {
         // 映射的生命周期钉在这次调用上：任务结束/被 abort 时 drop
         let _mcp_handle = mcp_handle;
+        let bridge = tokio::spawn(forward_approvals(ask_rx, ask_out, inv_id));
         let rt = runtime::runtime_for(&spec);
         // A03：事件经 invocation_event 帧外发；文本段 ~100ms 窗口合并
         let (events, ev_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -221,7 +241,9 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
         req.resume_session = resume_session;
         req.cancel = cancel_rx;
         req.mcp_servers = mcp_servers;
+        req.approvals = Some(approvals);
         let r = rt.run(req, events).await;
+        bridge.abort();
         // run 结束 = events sender 释放，转发循环冲刷剩余文本后自行退出
         let _ = fwd.await;
         // 取消过的调用不回 invocation_finish（服务端已标 cancelled，再回也会被忽略）
@@ -336,6 +358,26 @@ fn send_event(out: &Out, inv_id: Uuid, buf: &mut String, ev: Value) {
     }
     if !ev.is_null() {
         send_event_frame(out, inv_id, ev);
+    }
+}
+
+/// 把超档请求原样转成 approval_request 帧。通道关闭 = 这次调用结束。
+async fn forward_approvals(
+    mut rx: mpsc::UnboundedReceiver<ApprovalNotice>,
+    out: Out,
+    inv_id: Uuid,
+) {
+    while let Some(ask) = rx.recv().await {
+        let frame = json!({
+            "type": "approval_request",
+            "invocation_id": inv_id,
+            "request_id": ask.request_id,
+            "tool_call": ask.tool_call,
+            "options": ask.options,
+        });
+        if out.send(Message::Text(frame.to_string().into())).is_err() {
+            break;
+        }
     }
 }
 

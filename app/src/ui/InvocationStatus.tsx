@@ -7,15 +7,23 @@ export default function InvocationStatus({
   inv,
   allowCancel,
   onCancel,
+  onOpenApproval,
 }: {
   inv: InvocationView;
   allowCancel: boolean;
   onCancel: (id: string) => void;
+  /** 专属会话里跳到审批卡片。群里不传，只显示状态文字。 */
+  onOpenApproval?: () => void;
 }) {
   const showCancel = allowCancel && invocationCancellable(inv.status);
   return (
     <div className="inv-status-row">
       <InvocationStatusLine inv={inv} />
+      {onOpenApproval && inv.status === "awaiting_approval" && (
+        <button type="button" className="inv-approval-jump" onClick={onOpenApproval}>
+          去审批
+        </button>
+      )}
       {showCancel && (
         <button type="button" className="inv-cancel" onClick={() => onCancel(inv.id)}>
           取消

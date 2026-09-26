@@ -151,6 +151,10 @@ pub async fn host_session(
                                 "agent_options" => {
                                     agents::handle_options(&st, host_id, &v).await;
                                 }
+                                // A12：超档审批。归属校验在 handler 里。
+                                "approval_request" => {
+                                    crate::approvals::handle_request(&st, host_id, &v).await;
+                                }
                                 _ => {}
                             }
                         }
@@ -215,7 +219,11 @@ async fn fail_running(st: &SharedState, host_id: Uuid) {
         let members = crate::domain::member_ids(&st.pool, inv.conversation_id)
             .await
             .unwrap_or_default();
-        let p = serde_json::to_string(&WsOut::AgentInvocation { invocation: inv }).unwrap();
+        let p = serde_json::to_string(&WsOut::AgentInvocation {
+            invocation: inv.clone(),
+        })
+        .unwrap();
         st.send_to_users(&members, &p);
+        crate::approvals::expire_invocation(st, inv.id).await;
     }
 }

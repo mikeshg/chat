@@ -626,6 +626,8 @@ export function invocationStatusView(
       return { icon: "", text: "已取消" };
     case "timed_out":
       return { icon: "", text: "排队超时，已取消" };
+    case "awaiting_approval":
+      return { icon: "⏸", text: "等待主人批准" };
     default:
       return null;
   }

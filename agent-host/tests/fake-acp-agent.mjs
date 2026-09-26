@@ -15,6 +15,8 @@
 //   recall       → 本会话之前收到过的全部指令，用 | 连接；没有则 (empty)
 //   whoami       → 当前 mode / model、环境变量 FAKE_ECHO、第一个文本块、额外目录
 //   tool:read_history  → 经注入的 MCP 服务 tools/call read_conversation_history，原样回出文本
+//   perm:<kind>:<路径> → session/request_permission（kind + locations，选项 allow/always/reject）。
+//                        选定 allow 类回 allowed:<optionId>，拒绝或取消回 rejected
 //   其他          → 回 "ok"
 //
 // 会话跨进程保留：状态写在临时目录 chat-fake-acp/<sessionId>.json。
@@ -127,6 +129,14 @@ function openSaved(sid) {
   return loaded;
 }
 let pendingSleep = null;
+// A12：session/request_permission 的应答还没回来时，prompt 先挂起。
+let permSeq = 0;
+let pendingPerm = null;
+const permOptions = () => [
+  { optionId: "allow", name: "Allow once", kind: "allow_once" },
+  { optionId: "always", name: "Always allow", kind: "allow_always" },
+  { optionId: "reject", name: "Reject", kind: "reject_once" },
+];
 const mcpMode = (process.argv.find((a) => a.startsWith("--mcp=")) || "").slice(6);
 let mcpServers = [];
 
@@ -220,6 +230,21 @@ rl.on("line", (line) => {
     return;
   }
   const { id, method, params } = m;
+  // 权限请求的响应（id 是我们发出去的，没有 method）
+  if (pendingPerm && id === pendingPerm.reqId) {
+    const { promptId, options, text } = pendingPerm;
+    pendingPerm = null;
+    const outcome = m.result?.outcome;
+    let reply = "rejected";
+    if (outcome && outcome.outcome === "selected") {
+      const opt = options.find((o) => o.optionId === outcome.optionId);
+      const kind = opt?.kind || "";
+      reply = String(kind).includes("reject") ? "rejected" : `allowed:${outcome.optionId}`;
+    }
+    remember(text, reply);
+    chunk(sessionId, reply);
+    return result(promptId, { stopReason: "end_turn" });
+  }
   if (method === "session/cancel") {
     if (ignoreCancel || !pendingSleep) return;
     clearTimeout(pendingSleep.timer);
@@ -289,6 +314,29 @@ rl.on("line", (line) => {
       remember(text, out);
       chunk(sessionId, out);
       return result(id, { stopReason: "end_turn" });
+    }
+    const perm = /^perm:([^:]+):(.*)$/.exec(text);
+    if (perm) {
+      const kind = perm[1];
+      const path = perm[2];
+      const options = permOptions();
+      const reqId = ++permSeq;
+      pendingPerm = { reqId, promptId: id, options, text };
+      return send({
+        jsonrpc: "2.0",
+        id: reqId,
+        method: "session/request_permission",
+        params: {
+          sessionId,
+          toolCall: {
+            toolCallId: `perm-${reqId}`,
+            title: path,
+            kind,
+            locations: path ? [{ path }] : [],
+          },
+          options,
+        },
+      });
     }
     if (text.startsWith("echo:")) {
       const out = text.slice(5);

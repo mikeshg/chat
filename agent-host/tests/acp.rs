@@ -26,6 +26,7 @@ fn fake() -> AgentSpec {
         model: String::new(),
         mode: String::new(),
         extra_dirs: Vec::new(),
+        permission_tier: "read_only".into(),
     }
 }
 
@@ -351,4 +352,65 @@ async fn acp_stepfail_emits_failed_end() {
     }
     assert!(saw_fail, "应收到 StepEnd(ok=false)");
     assert!(out.text.contains("done"));
+}
+
+// ===== Agent A12：没有服务端通道时，档位内自动放行，超档回 cancelled → rejected =====
+
+#[tokio::test]
+async fn acp_perm_read_only_auto_allows_read_and_rejects_edit() {
+    let out = run("perm:read:/x").await.expect("read 应自动放行");
+    assert_eq!(out.text, "allowed:allow");
+    let out = run("perm:edit:C:/outside/a.rs")
+        .await
+        .expect("超档应取消而不是挂起");
+    assert_eq!(out.text, "rejected");
+}
+
+#[tokio::test]
+async fn acp_perm_workspace_allows_edit_inside_only() {
+    let dir = std::env::temp_dir().join(format!("chat-a12-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let inside = dir.join("note.txt");
+    let mut spec = fake();
+    spec.permission_tier = "workspace".into();
+    spec.cwd = dir.to_string_lossy().to_string();
+    let (events, _) = mpsc::unbounded_channel();
+    let out = run_invocation(
+        runtime_req(spec.clone(), &format!("perm:edit:{}", inside.display())),
+        events,
+    )
+    .await
+    .expect("目录内 edit 应自动放行");
+    assert_eq!(out.text, "allowed:allow");
+
+    let outside = std::env::temp_dir().join(format!("chat-a12-out-{}", uuid::Uuid::new_v4()));
+    let (events, _) = mpsc::unbounded_channel();
+    let out = run_invocation(
+        runtime_req(spec.clone(), &format!("perm:edit:{}", outside.display())),
+        events,
+    )
+    .await
+    .expect("目录外 edit 无审批通道时应取消");
+    assert_eq!(out.text, "rejected");
+
+    let (events, _) = mpsc::unbounded_channel();
+    let out = run_invocation(
+        runtime_req(spec, &format!("perm:execute:{}", inside.display())),
+        events,
+    )
+    .await
+    .expect("execute 无审批通道时应取消");
+    assert_eq!(out.text, "rejected");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn acp_perm_full_allows_execute() {
+    let mut spec = fake();
+    spec.permission_tier = "full".into();
+    let (events, _) = mpsc::unbounded_channel();
+    let out = run_invocation(runtime_req(spec, "perm:execute:C:/anywhere"), events)
+        .await
+        .expect("full 应自动放行");
+    assert_eq!(out.text, "allowed:allow");
 }

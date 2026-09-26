@@ -151,6 +151,33 @@ export interface MessageView {
   agent?: AgentRef | null;
   /** Agent A03：该消息附带的已完成步骤记录（仅 Agent 消息；旧服务端缺省） */
   agent_steps?: AgentStep[] | null;
+  /** Agent A12：kind='approval' 时的审批卡片（旧服务端缺省） */
+  approval?: ApprovalView | null;
+}
+
+/** 审批卡片上 agent 给的一个选项 */
+export interface ApprovalOption {
+  optionId: string;
+  name: string;
+  kind: string;
+}
+
+/** 审批请求摘要。invocation_id 用来从状态行跳到这张卡片。 */
+export interface ApprovalRequest {
+  title?: string;
+  kind?: string;
+  locations?: string[];
+  request_id?: string;
+  invocation_id?: string;
+}
+
+/** kind='approval' 消息上的卡片 */
+export interface ApprovalView {
+  id: string;
+  status: string;
+  request: ApprovalRequest;
+  options: ApprovalOption[];
+  decision?: string | null;
 }
 
 /** 一条已完成步骤的持久化形状（messages.agent_steps 元素，A03） */
@@ -231,6 +258,8 @@ export interface AgentView {
   reported_options?: ReportedOptions;
   avatar_version?: number;
   deleted?: boolean;
+  /** read_only / workspace / full。旧服务端缺省时按只读 */
+  permission_tier?: "read_only" | "workspace" | "full" | string;
 }
 
 /** 输出方式：实时流式 / 状态 + 最终结果 / 每步一条消息 */
@@ -255,6 +284,7 @@ export interface PatchAgentReq {
   mode?: string;
   instructions?: string;
   env?: Record<string, string>;
+  permission_tier?: string;
 }
 
 /** POST /agents 请求体（A01） */
@@ -263,6 +293,7 @@ export interface CreateAgentReq {
   host_id: string;
   runtime: AgentRuntime;
   cwd?: string;
+  permission_tier?: string;
 }
 
 /** 一次 Agent 调用记录。status：queued / running / awaiting_approval / succeeded / failed / cancelled / timed_out */

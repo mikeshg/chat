@@ -8,6 +8,7 @@ pub mod acp;
 mod conn;
 pub mod mcp;
 pub mod mcp_bridge;
+pub mod permission;
 pub mod runtime;
 
 use std::collections::HashMap;
@@ -72,6 +73,8 @@ pub(crate) struct Shared {
     pub data_dir: std::path::PathBuf,
     /// Agent A13：本地 MCP 服务；起不来的话本次运行不注入工具（仅告警）
     pub mcp: Option<mcp::McpServer>,
+    /// Agent A12：进行中的审批等待（跨本次进程的各次连接共用，断线时清空）
+    pub approvals: Arc<runtime::ApprovalRegistry>,
 }
 
 pub struct HostHandle {
@@ -132,6 +135,7 @@ pub fn spawn(cfg: HostConfig, tickets: Arc<dyn TicketSource>) -> HostHandle {
         cancels: Arc::new(Mutex::new(HashMap::new())),
         superseded: std::sync::atomic::AtomicBool::new(false),
         mcp: mcp::McpServer::start(),
+        approvals: runtime::ApprovalRegistry::new(),
     });
     let _ = std::fs::create_dir_all(&shared.data_dir);
     let s2 = shared.clone();

@@ -12935,3 +12935,426 @@ async fn agent_a03_event_forgery_ignored() {
     assert_eq!(agent_msg["message"]["content"], "done");
     ha.shutdown().await;
 }
+
+// ===== Agent A12 =====
+// 权限档位 + 审批卡片。真宿主 + 假 ACP agent 的 perm:<kind>:<路径>。
+
+async fn decide_approval(base: &str, u: &TestUser, id: &str, option_id: &str) -> (u16, Value) {
+    let r = http()
+        .post(format!("{base}/v1/agent-approvals/{id}/decide"))
+        .header("authorization", authz(&u.access))
+        .json(&json!({"option_id": option_id}))
+        .send()
+        .await
+        .unwrap();
+    let status = r.status().as_u16();
+    let body = r.json().await.unwrap_or(json!(null));
+    (status, body)
+}
+
+fn reply_count(msgs: &[Value], text: &str) -> usize {
+    msgs.iter()
+        .filter(|m| m["kind"] != "approval" && m["agent"].is_object() && m["content"] == text)
+        .count()
+}
+
+async fn wait_reply_count(base: &str, u: &TestUser, conv: &str, text: &str, n: usize) {
+    let deadline = std::time::Instant::now() + A01Dur::from_secs(20);
+    loop {
+        let msgs = conv_messages(base, u, conv).await;
+        let got = reply_count(&msgs, text);
+        if got >= n {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "等回复 {text} ×{n} 超时，当前 {got}：{msgs:?}"
+        );
+        tokio::time::sleep(A01Dur::from_millis(80)).await;
+    }
+}
+
+async fn wait_pending_approval(base: &str, u: &TestUser, conv: &str) -> Value {
+    let deadline = std::time::Instant::now() + A01Dur::from_secs(20);
+    loop {
+        let msgs = conv_messages(base, u, conv).await;
+        if let Some(m) = msgs
+            .iter()
+            .rev()
+            .find(|m| m["kind"] == "approval" && m["approval"]["status"] == "pending")
+        {
+            return m.clone();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "等审批卡片超时：{msgs:?}"
+        );
+        tokio::time::sleep(A01Dur::from_millis(80)).await;
+    }
+}
+
+async fn wait_approval_status(
+    base: &str,
+    u: &TestUser,
+    conv: &str,
+    id: &str,
+    status: &str,
+) -> Value {
+    let deadline = std::time::Instant::now() + A01Dur::from_secs(15);
+    loop {
+        let msgs = conv_messages(base, u, conv).await;
+        if let Some(m) = msgs.iter().find(|m| m["approval"]["id"] == id) {
+            if m["approval"]["status"] == status {
+                return m.clone();
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "等审批 {id} 变成 {status} 超时：{msgs:?}"
+        );
+        tokio::time::sleep(A01Dur::from_millis(80)).await;
+    }
+}
+
+fn latest_inv_status(rows: &Value) -> Option<&str> {
+    rows.as_array()?.first()?.get("status")?.as_str()
+}
+
+/// 1 + 7：只读档位 read 自动放行且没有卡片；edit 出卡片、调用变 awaiting_approval，并计入未读。
+#[tokio::test]
+async fn a12_read_only_auto_read_and_approval_card_counts_unread() {
+    let base = spawn_named_db(&format!("chat_it_a12ro_{}", uniq())).await;
+    let a = register(&base, &format!("a12o_{}", uniq())).await;
+    let (host, host_id) = spawn_host(&base, &a, uuid::Uuid::new_v4()).await;
+    let (st, agent) = create_agent(&base, &a, &host_id, "permbot").await;
+    assert_eq!(st, 200, "{agent}");
+    assert_eq!(agent["permission_tier"], "read_only");
+    let agent_id = agent["id"].as_str().unwrap();
+    let conv = agent["conversation_id"].as_str().unwrap().to_string();
+
+    let (mut sa, _) = tokio_tungstenite::connect_async(ws_url(&base, &a).await)
+        .await
+        .unwrap();
+    send_ws(&mut sa, &conv, "r1", "perm:read:/x").await;
+    wait_reply_count(&base, &a, &conv, "allowed:allow", 1).await;
+    let msgs = conv_messages(&base, &a, &conv).await;
+    assert!(
+        msgs.iter().all(|m| m["kind"] != "approval"),
+        "只读档位的 read 不应产生审批卡片: {msgs:?}"
+    );
+    assert_eq!(
+        a11_unread(&base, &a, &conv).await,
+        1,
+        "自动放行的回复计入未读"
+    );
+
+    send_ws(&mut sa, &conv, "e1", "perm:edit:C:/outside/secret.txt").await;
+    let card = wait_pending_approval(&base, &a, &conv).await;
+    assert_eq!(card["agent"]["id"], agent_id);
+    assert!(
+        card["content"].as_str().unwrap_or("").contains("写入"),
+        "卡片正文应是可读摘要: {card}"
+    );
+    assert!(
+        card["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("secret.txt"),
+        "摘要应带上路径: {card}"
+    );
+    let options = card["approval"]["options"].as_array().unwrap();
+    assert!(options
+        .iter()
+        .any(|o| o["optionId"] == "allow" && o["kind"] == "allow_once"));
+    let rows = list_inv(&base, &a, &conv).await;
+    assert_eq!(
+        latest_inv_status(&rows),
+        Some("awaiting_approval"),
+        "edit 应停在等待审批: {rows}"
+    );
+    // 第二条是主人自己发的，已读游标推过它（也盖过上一条回复）。
+    // 卡片是 Agent 发的，所以未读正好回到 1；若卡片被当成自己的消息，这里会是 0。
+    assert_eq!(
+        a11_unread(&base, &a, &conv).await,
+        1,
+        "审批卡片计入主人未读"
+    );
+    host.shutdown().await;
+}
+
+/// 2：主人允许 → allowed:allow 且调用成功、卡片 decided；拒绝 → rejected。
+#[tokio::test]
+async fn a12_owner_allow_and_reject() {
+    let base = spawn_named_db(&format!("chat_it_a12dec_{}", uniq())).await;
+    let a = register(&base, &format!("a12d_{}", uniq())).await;
+    let (host, host_id) = spawn_host(&base, &a, uuid::Uuid::new_v4()).await;
+    let (st, agent) = create_agent(&base, &a, &host_id, "decider").await;
+    assert_eq!(st, 200, "{agent}");
+    let conv = agent["conversation_id"].as_str().unwrap().to_string();
+    let (mut sa, _) = tokio_tungstenite::connect_async(ws_url(&base, &a).await)
+        .await
+        .unwrap();
+
+    send_ws(&mut sa, &conv, "a1", "perm:edit:C:/outside/a.txt").await;
+    let card = wait_pending_approval(&base, &a, &conv).await;
+    let id = card["approval"]["id"].as_str().unwrap().to_string();
+    let (st, body) = decide_approval(&base, &a, &id, "allow").await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(body["approval"]["status"], "decided");
+    assert_eq!(body["approval"]["decision"], "allow");
+    wait_reply_count(&base, &a, &conv, "allowed:allow", 1).await;
+    let rows = list_inv(&base, &a, &conv).await;
+    assert_eq!(latest_inv_status(&rows), Some("succeeded"), "{rows}");
+    let updated = wait_approval_status(&base, &a, &conv, &id, "decided").await;
+    assert_eq!(updated["approval"]["decision"], "allow");
+
+    send_ws(&mut sa, &conv, "a2", "perm:edit:C:/outside/b.txt").await;
+    let card = wait_pending_approval(&base, &a, &conv).await;
+    let id = card["approval"]["id"].as_str().unwrap().to_string();
+    let (st, body) = decide_approval(&base, &a, &id, "reject").await;
+    assert_eq!(st, 200, "{body}");
+    wait_reply_count(&base, &a, &conv, "rejected", 1).await;
+    let rows = list_inv(&base, &a, &conv).await;
+    assert_eq!(latest_inv_status(&rows), Some("succeeded"), "{rows}");
+    let updated = wait_approval_status(&base, &a, &conv, &id, "decided").await;
+    assert_eq!(updated["approval"]["decision"], "reject");
+    host.shutdown().await;
+}
+
+/// 3：workspace 目录内 edit 自动放行，目录外 edit 与 execute 走审批；full 全部自动放行。
+#[tokio::test]
+async fn a12_workspace_and_full_tiers() {
+    let base = spawn_named_db(&format!("chat_it_a12ws_{}", uniq())).await;
+    let a = register(&base, &format!("a12w_{}", uniq())).await;
+    let (host, host_id) = spawn_host(&base, &a, uuid::Uuid::new_v4()).await;
+    let (st, agent) = create_agent(&base, &a, &host_id, "worker").await;
+    assert_eq!(st, 200, "{agent}");
+    let agent_id = agent["id"].as_str().unwrap();
+    let conv = agent["conversation_id"].as_str().unwrap().to_string();
+    let dir = std::env::temp_dir().join(format!("chat_a12_ws_{}", uniq()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let inside = dir.join("note.txt");
+    let outside = std::env::temp_dir().join(format!("chat_a12_out_{}", uniq()));
+    let patched_res = patch_agent(
+        &base,
+        &a,
+        agent_id,
+        json!({
+            "permission_tier": "workspace",
+            "cwd": dir.to_string_lossy(),
+        }),
+    )
+    .await;
+    let st = patched_res.status().as_u16();
+    let patched: Value = patched_res.json().await.unwrap_or(json!(null));
+    assert_eq!(st, 200, "{patched}");
+    assert_eq!(patched["permission_tier"], "workspace");
+    assert_eq!(patched["cwd"], dir.to_string_lossy().as_ref());
+
+    let (mut sa, _) = tokio_tungstenite::connect_async(ws_url(&base, &a).await)
+        .await
+        .unwrap();
+    let inside_prompt = format!("perm:edit:{}", inside.display());
+    send_ws(&mut sa, &conv, "w1", &inside_prompt).await;
+    wait_reply_count(&base, &a, &conv, "allowed:allow", 1).await;
+    let msgs = conv_messages(&base, &a, &conv).await;
+    assert!(
+        msgs.iter().all(|m| m["kind"] != "approval"),
+        "工作目录内的 edit 不应审批: {msgs:?}"
+    );
+
+    let outside_prompt = format!("perm:edit:{}", outside.display());
+    send_ws(&mut sa, &conv, "w2", &outside_prompt).await;
+    let card = wait_pending_approval(&base, &a, &conv).await;
+    assert!(
+        card["content"].as_str().unwrap_or("").contains("写入"),
+        "{card}"
+    );
+    // 先决定掉，避免后面的断言被这张 pending 卡片挡住
+    let (st, _) = decide_approval(
+        &base,
+        &a,
+        card["approval"]["id"].as_str().unwrap(),
+        "reject",
+    )
+    .await;
+    assert_eq!(st, 200);
+    wait_reply_count(&base, &a, &conv, "rejected", 1).await;
+
+    let exec_prompt = format!("perm:execute:{}", inside.display());
+    send_ws(&mut sa, &conv, "w3", &exec_prompt).await;
+    let card = wait_pending_approval(&base, &a, &conv).await;
+    assert!(
+        card["approval"]["request"]["kind"] == "execute",
+        "execute 即使在目录内也要审批: {card}"
+    );
+    let (st, _) = decide_approval(
+        &base,
+        &a,
+        card["approval"]["id"].as_str().unwrap(),
+        "reject",
+    )
+    .await;
+    assert_eq!(st, 200);
+    wait_reply_count(&base, &a, &conv, "rejected", 2).await;
+
+    let patched_res = patch_agent(&base, &a, agent_id, json!({"permission_tier": "full"})).await;
+    let st = patched_res.status().as_u16();
+    let patched: Value = patched_res.json().await.unwrap_or(json!(null));
+    assert_eq!(st, 200, "{patched}");
+    assert_eq!(patched["permission_tier"], "full");
+    let before = conv_messages(&base, &a, &conv).await;
+    let cards_before = before.iter().filter(|m| m["kind"] == "approval").count();
+    send_ws(&mut sa, &conv, "w4", &exec_prompt).await;
+    wait_reply_count(&base, &a, &conv, "allowed:allow", 2).await;
+    let after = conv_messages(&base, &a, &conv).await;
+    let cards_after = after.iter().filter(|m| m["kind"] == "approval").count();
+    assert_eq!(cards_after, cards_before, "full 不应再生成审批卡片");
+    host.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 4：群里调用要审批时，卡片只在专属会话；群成员只有 awaiting_approval，历史里没有审批摘要。
+#[tokio::test]
+async fn a12_group_approval_stays_in_agent_conversation() {
+    let base = spawn_named_db(&format!("chat_it_a12g_{}", uniq())).await;
+    let owner = register(&base, &format!("a12go_{}", uniq())).await;
+    let member = register(&base, &format!("a12gm_{}", uniq())).await;
+    let (host, host_id) = spawn_host(&base, &owner, uuid::Uuid::new_v4()).await;
+    let (st, agent) = create_agent(&base, &owner, &host_id, "bot").await;
+    assert_eq!(st, 200, "{agent}");
+    let agent_conv = agent["conversation_id"].as_str().unwrap().to_string();
+    let gid = a11_group(&base, &owner, &[&member]).await;
+
+    let (mut so, _) = tokio_tungstenite::connect_async(ws_url(&base, &owner).await)
+        .await
+        .unwrap();
+    let (mut sm, _) = tokio_tungstenite::connect_async(ws_url(&base, &member).await)
+        .await
+        .unwrap();
+    send_ws(&mut so, &gid, "g1", "@bot perm:edit:A12SECRET/tool.sh").await;
+    let frame = wait_inv(
+        &mut sm,
+        |f| {
+            f["invocation"]["status"] == "awaiting_approval"
+                && f["invocation"]["conversation_id"] == gid
+        },
+        A01Dur::from_secs(20),
+    )
+    .await;
+    assert_eq!(frame["invocation"]["status"], "awaiting_approval");
+    let extra = frames_for(&mut sm, A01Dur::from_millis(600)).await;
+    let mut seen = vec![frame];
+    seen.extend(extra);
+    assert!(
+        !seen
+            .iter()
+            .any(|f| { f["type"] == "message" && f["message"]["kind"] == "approval" }),
+        "群成员不应收到审批卡片: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|f| {
+            f["type"] == "message"
+                && f["message"]["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("请求写入")
+        }),
+        "群成员的帧里不应有审批摘要: {seen:?}"
+    );
+
+    let group_msgs = conv_messages(&base, &member, &gid).await;
+    assert!(
+        group_msgs.iter().all(|m| m["kind"] != "approval"),
+        "群历史不应有审批卡片: {group_msgs:?}"
+    );
+    assert!(
+        group_msgs
+            .iter()
+            .all(|m| !m["content"].as_str().unwrap_or("").contains("请求写入")),
+        "群历史不应出现审批摘要: {group_msgs:?}"
+    );
+    let card = wait_pending_approval(&base, &owner, &agent_conv).await;
+    assert!(
+        card["content"].as_str().unwrap_or("").contains("A12SECRET"),
+        "卡片应在专属会话且带上路径: {card}"
+    );
+    assert_eq!(card["conversation_id"], agent_conv.as_str());
+    host.shutdown().await;
+}
+
+/// 5：别人决定 404；非法 option 400；重复决定 409。
+#[tokio::test]
+async fn a12_decide_permissions() {
+    let base = spawn_named_db(&format!("chat_it_a12p_{}", uniq())).await;
+    let owner = register(&base, &format!("a12po_{}", uniq())).await;
+    let other = register(&base, &format!("a12px_{}", uniq())).await;
+    let (host, host_id) = spawn_host(&base, &owner, uuid::Uuid::new_v4()).await;
+    let (st, agent) = create_agent(&base, &owner, &host_id, "guard").await;
+    assert_eq!(st, 200, "{agent}");
+    let conv = agent["conversation_id"].as_str().unwrap().to_string();
+    let (mut sa, _) = tokio_tungstenite::connect_async(ws_url(&base, &owner).await)
+        .await
+        .unwrap();
+    send_ws(&mut sa, &conv, "p1", "perm:edit:C:/outside/c.txt").await;
+    let card = wait_pending_approval(&base, &owner, &conv).await;
+    let id = card["approval"]["id"].as_str().unwrap();
+
+    let (st, body) = decide_approval(&base, &other, id, "allow").await;
+    assert_eq!(st, 404, "别人决定应 404: {body}");
+    let missing = uuid::Uuid::new_v4().to_string();
+    let (st, _) = decide_approval(&base, &owner, &missing, "allow").await;
+    assert_eq!(st, 404);
+
+    let (st, body) = decide_approval(&base, &owner, id, "nope").await;
+    assert_eq!(st, 400, "非法选项应 400: {body}");
+    assert_eq!(body["error"], "bad_option");
+    let still = wait_approval_status(&base, &owner, &conv, id, "pending").await;
+    assert_eq!(still["approval"]["status"], "pending");
+
+    let (st, body) = decide_approval(&base, &owner, id, "allow").await;
+    assert_eq!(st, 200, "{body}");
+    let (st, body) = decide_approval(&base, &owner, id, "allow").await;
+    assert_eq!(st, 409, "重复决定应 409: {body}");
+    assert_eq!(body["error"], "not_pending");
+    wait_reply_count(&base, &owner, &conv, "allowed:allow", 1).await;
+    host.shutdown().await;
+}
+
+/// 6：等待审批时取消 → 审批 expired，卡片更新，没有 Agent 回复。
+#[tokio::test]
+async fn a12_cancel_while_awaiting_expires_approval() {
+    let base = spawn_named_db(&format!("chat_it_a12c_{}", uniq())).await;
+    let a = register(&base, &format!("a12c_{}", uniq())).await;
+    let (host, host_id) = spawn_host(&base, &a, uuid::Uuid::new_v4()).await;
+    let (st, agent) = create_agent(&base, &a, &host_id, "canceler").await;
+    assert_eq!(st, 200, "{agent}");
+    let conv = agent["conversation_id"].as_str().unwrap().to_string();
+    let (mut sa, _) = tokio_tungstenite::connect_async(ws_url(&base, &a).await)
+        .await
+        .unwrap();
+    send_ws(&mut sa, &conv, "c1", "perm:execute:C:/tmp/run.sh").await;
+    let card = wait_pending_approval(&base, &a, &conv).await;
+    let id = card["approval"]["id"].as_str().unwrap().to_string();
+    let rows = list_inv(&base, &a, &conv).await;
+    let inv_id = rows.as_array().unwrap()[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(rows.as_array().unwrap()[0]["status"], "awaiting_approval");
+
+    let (st, body) = cancel_inv(&base, &a, &inv_id).await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(body["status"], "cancelled");
+    let updated = wait_approval_status(&base, &a, &conv, &id, "expired").await;
+    assert_eq!(updated["approval"]["status"], "expired");
+    assert!(updated["approval"]["decision"].is_null());
+    // 给宿主一点时间，确认取消后没有把 rejected/allowed 写进历史
+    tokio::time::sleep(A01Dur::from_millis(800)).await;
+    let msgs = conv_messages(&base, &a, &conv).await;
+    assert_eq!(reply_count(&msgs, "rejected"), 0, "{msgs:?}");
+    assert_eq!(reply_count(&msgs, "allowed:allow"), 0, "{msgs:?}");
+    let rows = list_inv(&base, &a, &conv).await;
+    assert_eq!(rows.as_array().unwrap()[0]["status"], "cancelled");
+    host.shutdown().await;
+}

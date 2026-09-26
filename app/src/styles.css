@@ -1014,3 +1014,16 @@ button.agent-host-name:hover { background: transparent; color: var(--link); }
 
 /* ===== Agent A03+A04 合并：状态行容器 ===== */
 .inv-status-row { display: flex; align-items: center; gap: 8px; }
+
+/* ===== Agent A12 ===== */
+.approval-card { display: flex; flex-direction: column; gap: 6px; min-width: 180px; }
+.approval-title { white-space: pre-wrap; word-break: break-word; }
+.approval-meta { color: var(--muted); font-size: 12px; word-break: break-all; }
+.approval-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.approval-result { color: var(--muted); font-size: 13px; }
+.approval-tier-hint { display: block; margin-top: 4px; font-size: 12px; line-height: 1.4; }
+.inv-approval-jump {
+  background: none; border: none; padding: 0; cursor: pointer;
+  color: var(--link); font-size: 12px;
+}
+.inv-approval-jump:hover { text-decoration: underline; }

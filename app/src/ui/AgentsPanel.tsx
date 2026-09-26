@@ -7,6 +7,7 @@ import { groupAgentsByHost, hostDisplayName } from "./agentHosts";
 import AgentAvatar from "./AgentAvatar";
 import AgentEditor from "./AgentEditor";
 import AgentSettings from "./AgentSettings";
+import PermissionTierField from "./PermissionTierField";
 
 /** Agent A01：「我」页的 Agent 管理面板（宿主列表 / Agent 列表 / 添加 Agent） */
 export default function AgentsPanel({ onClose }: { onClose: () => void }) {
@@ -18,6 +19,7 @@ export default function AgentsPanel({ onClose }: { onClose: () => void }) {
   const [command, setCommand] = useState("");
   const [args, setArgs] = useState("");
   const [cwd, setCwd] = useState("");
+  const [permissionTier, setPermissionTier] = useState("read_only");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
   const [showForm, setShowForm] = useState(false);
@@ -125,12 +127,14 @@ export default function AgentsPanel({ onClose }: { onClose: () => void }) {
             .filter(Boolean),
         },
         cwd: cwd.trim(),
+        permission_tier: permissionTier,
       });
       setList((l) => [...l, a]);
       setName("");
       setCommand("");
       setArgs("");
       setCwd("");
+      setPermissionTier("read_only");
       setShowForm(false);
     } catch (e) {
       // 400 bad_name / 409 name_taken / 404 宿主不存在 —— 保留服务端文案
@@ -277,6 +281,7 @@ export default function AgentsPanel({ onClose }: { onClose: () => void }) {
               value={cwd}
               onChange={(e) => setCwd(e.target.value)}
             />
+            <PermissionTierField value={permissionTier} onChange={setPermissionTier} />
             {err && <div className="auth-err">{err}</div>}
             <div className="row end">
               <button onClick={() => setShowForm(false)}>取消</button>

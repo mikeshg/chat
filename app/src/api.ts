@@ -356,6 +356,9 @@ export const agents = {
     post<void>(`/conversations/${convId}/agent-context/reset`),
   /** 取消排队中 / 运行中 / 等待审批的调用。409 = 已经结束 */
   cancel: (id: string) => post<InvocationView>(`/agent-invocations/${id}/cancel`),
+  /** 主人决定一张审批卡片。404 不是主人，409 已不是 pending，400 选项不对 */
+  decideApproval: (id: string, optionId: string) =>
+    post<MessageView>(`/agent-approvals/${id}/decide`, { option_id: optionId }),
 };
 
 // ---------- 消息生命周期 ----------

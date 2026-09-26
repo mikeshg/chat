@@ -117,6 +117,12 @@ describe("Agent A03：invocationStatusView 查表", () => {
     expect(invocationStatusView(inv({ status: "cancelled" }), 0)?.text).toBe("已取消");
     expect(invocationStatusView(inv({ status: "timed_out" }), 0)?.text).toBe("排队超时，已取消");
   });
+
+  it("A12 awaiting_approval → 等待主人批准", () => {
+    const v = invocationStatusView(inv({ status: "awaiting_approval" }), 0);
+    expect(v?.icon).toBe("⏸");
+    expect(v?.text).toBe("等待主人批准");
+  });
 });
 
 describe("Agent A03：fmtElapsed", () => {

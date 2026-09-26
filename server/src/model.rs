@@ -248,6 +248,19 @@ pub struct MessageView {
     pub agent: Option<AgentRef>,
     /// Agent A03：该消息附带的已完成步骤记录（仅 Agent 消息可能有值）
     pub agent_steps: Option<Vec<AgentStepView>>,
+    /// Agent A12：kind='approval' 时的审批卡片。旧客户端忽略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ApprovalView>,
+}
+
+/// 审批卡片（挂在 Agent 专属会话的消息上）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalView {
+    pub id: Uuid,
+    pub status: String,
+    pub request: serde_json::Value,
+    pub options: serde_json::Value,
+    pub decision: Option<String>,
 }
 
 /// 一条已完成步骤的持久化形状（messages.agent_steps jsonb 元素）。
@@ -607,6 +620,8 @@ pub struct AgentView {
     pub avatar_version: i32,
     /// 软删除后列表不再返回；字段留给已经拿到的视图
     pub deleted: bool,
+    /// read_only / workspace / full。新建默认只读。
+    pub permission_tier: String,
 }
 
 /// 个人 Agent 默认设置（GET/PUT /v1/users/me/agent-settings）；也用作「生效值」
@@ -641,6 +656,8 @@ pub struct PatchAgentReq {
     pub mode: Option<String>,
     pub instructions: Option<String>,
     pub env: Option<serde_json::Value>,
+    /// read_only / workspace / full。缺省 = 不改。
+    pub permission_tier: Option<String>,
     /// 只要 JSON 里带了这个键就为 true（值本身忽略）
     #[serde(default, deserialize_with = "flag_present")]
     pub host_id: bool,
@@ -671,6 +688,9 @@ pub struct CreateAgentReq {
     pub runtime: AgentRuntimeReq,
     #[serde(default)]
     pub cwd: String,
+    /// 缺省 = read_only。
+    #[serde(default)]
+    pub permission_tier: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

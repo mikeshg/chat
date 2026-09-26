@@ -75,6 +75,7 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
         include_str!("../migrations/0023_agent_config.sql"),
         include_str!("../migrations/0024_agent_steps.sql"),
         include_str!("../migrations/0025_agent_access.sql"),
+        include_str!("../migrations/0028_agent_approvals.sql"),
     ] {
         sqlx::raw_sql(script).execute(&pool).await.unwrap();
     }
@@ -144,6 +145,24 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
     .await
     .unwrap();
     assert_eq!(enabled, Some(true));
+    let tier_col = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+            SELECT 1 FROM information_schema.columns
+             WHERE table_name = 'agents' AND column_name = 'permission_tier')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(tier_col, "0028 adds agents.permission_tier");
+    let approvals = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+            SELECT 1 FROM information_schema.tables
+             WHERE table_name = 'agent_approvals')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(approvals, "0028 creates agent_approvals");
 
     pool.close().await;
     sqlx::query(&format!("DROP DATABASE {name}"))
