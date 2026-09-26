@@ -962,15 +962,22 @@ export default function ChatView() {
                   : `${conv.member_count} 名成员`}
           </div>
         </div>
-        {conv.kind === "agent" && (
+        {(conv.kind === "agent" ||
+          ((conv.kind === "dm" || conv.kind === "group") &&
+            myAgents.length > 0 &&
+            canUseAgent(s.me))) && (
           <button
             className="icon-btn chat-head-btn topic-btn"
             type="button"
-            title="开新话题"
+            title={
+              conv.kind === "agent"
+                ? "开新话题"
+                : "让你的 Agent 在这个会话里从头开始（不影响别人的 Agent）"
+            }
             disabled={topicBusy || agentClosed}
             onClick={() => void startNewTopic()}
           >
-            开新话题
+            {conv.kind === "agent" ? "开新话题" : "Agent 新话题"}
           </button>
         )}
         {meetingBase && conv.kind !== "self" && conv.kind !== "agent" && !readonly && (

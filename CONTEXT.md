@@ -43,7 +43,7 @@
 - **AgentHost（Agent 宿主）**：运行 Agent 的一个桌面端安装（Windows / macOS / Linux），有自己的永久标识，重新登录、改密码后不变。_避免_：客户端、设备（与 Session 混淆）。
 - **AgentConversation（Agent 专属会话）**：每个 Agent 恰好一个、只有主人和它的会话。审批卡片和被调用的记录都在这里。
 - **AgentInvocation（Agent 调用）**：让一个 Agent 干一次活的请求。来源是主人（在专属会话里发消息，或在私聊 / 群里 @）、另一个 Agent，或定时调用。状态：排队 / 运行中 / 等待审批 / 完成 / 失败 / 已取消 / 已超时。_避免_：任务、job。
-- **AgentContext（Agent 上下文）**：Agent 记住的一段连续对话。专属会话有一条，主人可以重置。私聊、群、定时调用各自另有一条。Agent 互调时由调用方决定续用还是新开。_避免_：Session（与登录会话冲突）。
+- **AgentContext（Agent 上下文）**：Agent 记住的一段连续对话。专属会话、每个私聊、每个群、每个定时调用各有一条。主人可以在专属会话、私聊或群里「开新话题」，清掉自己的 Agent 在这个会话里的上下文，别人的 Agent 不受影响。Agent 互调时由调用方决定续用还是新开。_避免_：Session（与登录会话冲突）。
 - **PermissionTier（权限档位）**：Agent 不经审批就能做的操作范围：只读、可改工作目录（含额外标明的目录）、完全放开。
 - **Approval（审批）**：Agent 想做超出权限档位的操作时发给主人的请求。主人在任意客户端从该请求给出的选项里决定。
 - **ScheduledInvocation（定时调用）**：按时间表自动发起的 AgentInvocation。

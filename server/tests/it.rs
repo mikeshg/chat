@@ -16701,3 +16701,52 @@ async fn a15_group_child_preview() {
     env.h1.shutdown().await;
     env.h2.shutdown().await;
 }
+
+// ===== Agent 验收补丁：私聊 / 群里也能开新话题（spec Q6） =====
+
+#[tokio::test]
+async fn agent_reset_context_in_group_only_touches_own_agents() {
+    let base = spawn_named_db(&format!("chat_it_rstg_{}", uniq())).await;
+    let owner = register(&base, &format!("rsto_{}", uniq())).await;
+    let member = register(&base, &format!("rstm_{}", uniq())).await;
+    let (host, host_id) = spawn_host(&base, &owner, uuid::Uuid::new_v4()).await;
+    let (st, agent) = create_agent(&base, &owner, &host_id, "bot").await;
+    assert_eq!(st, 200, "{agent}");
+    let gid = a11_group(&base, &owner, &[&member]).await;
+    let (mut so, _) = tokio_tungstenite::connect_async(ws_url(&base, &owner).await)
+        .await
+        .unwrap();
+    let reset = |u: &TestUser, conv: &str| {
+        http()
+            .post(format!(
+                "{base}/v1/conversations/{conv}/agent-context/reset"
+            ))
+            .header("authorization", authz(&u.access))
+            .send()
+    };
+
+    send_ws(&mut so, &gid, "r1", "@bot echo:one").await;
+    wait_agent_reply(&base, &owner, &gid, &["one"]).await;
+
+    // 群里别的成员重置：只清他自己的 Agent（他没有），主人的上下文还在
+    assert_eq!(reset(&member, &gid).await.unwrap().status().as_u16(), 204);
+    send_ws(&mut so, &gid, "r2", "@bot recall").await;
+    let texts = wait_agent_reply(&base, &owner, &gid, &["one", "echo:one"]).await;
+    assert!(texts.iter().any(|t| t.contains("echo:one")), "{texts:?}");
+
+    // 主人重置后，bot 在这个群里从头开始
+    assert_eq!(reset(&owner, &gid).await.unwrap().status().as_u16(), 204);
+    send_ws(&mut so, &gid, "r3", "@bot recall").await;
+    let texts = wait_agent_reply(&base, &owner, &gid, &["one", "echo:one", "(empty)"]).await;
+    assert!(texts.contains(&"(empty)".to_string()), "{texts:?}");
+
+    // 文件传输助手不支持；非成员被拒
+    let selfc = self_conv(&base, &owner).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(reset(&owner, &selfc).await.unwrap().status().as_u16(), 400);
+    let outsider = register(&base, &format!("rstx_{}", uniq())).await;
+    assert_eq!(reset(&outsider, &gid).await.unwrap().status().as_u16(), 403);
+    host.shutdown().await;
+}

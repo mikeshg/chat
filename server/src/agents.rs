@@ -979,7 +979,7 @@ pub async fn list_invocations(
     Ok(Json(rows))
 }
 
-/// POST /conversations/{id}/agent-context/reset
+/// POST /conversations/{id}/agent-context/reset（专属会话，或请求者自己的 Agent 在私聊 / 群里的上下文）
 /// 删掉这个会话对应的 AgentContext。仅成员；非 agent 会话 400；没有记录也 204。
 pub async fn reset_context(
     State(st): State<SharedState>,
@@ -999,17 +999,29 @@ pub async fn reset_context(
     let Some((ty, agent_id)) = row else {
         return Err(AppError::bad_request("not an agent conversation"));
     };
-    if ty != "agent" {
-        return Err(AppError::bad_request("not an agent conversation"));
+    match (ty.as_str(), agent_id) {
+        // 专属会话：清它那个 Agent 在本会话的上下文
+        ("agent", Some(agent_id)) => {
+            sqlx::query("DELETE FROM agent_contexts WHERE agent_id = $1 AND context_key = $2")
+                .bind(agent_id)
+                .bind(conv.to_string())
+                .execute(&st.pool)
+                .await?;
+        }
+        // 私聊 / 群：只清请求者自己的 Agent 在本会话的上下文，别人的 Agent 不受影响
+        ("dm" | "group", _) => {
+            sqlx::query(
+                "DELETE FROM agent_contexts
+                  WHERE context_key = $1
+                    AND agent_id IN (SELECT id FROM agents WHERE owner_id = $2)",
+            )
+            .bind(conv.to_string())
+            .bind(uid)
+            .execute(&st.pool)
+            .await?;
+        }
+        _ => return Err(AppError::bad_request("not an agent conversation")),
     }
-    let Some(agent_id) = agent_id else {
-        return Err(AppError::bad_request("not an agent conversation"));
-    };
-    sqlx::query("DELETE FROM agent_contexts WHERE agent_id = $1 AND context_key = $2")
-        .bind(agent_id)
-        .bind(conv.to_string())
-        .execute(&st.pool)
-        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
