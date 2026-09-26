@@ -926,8 +926,19 @@ pub struct InvQuery {
     limit: Option<i64>,
 }
 
+/// 子调用成功帧 / 历史里带的回复摘要。按 Unicode 标量截断，和库里的 left() 对齐。
+const RESULT_PREVIEW_CHARS: usize = 2000;
+
+fn result_preview_text(parent: Option<Uuid>, status: &str, text: &str) -> Option<String> {
+    if parent.is_none() || status != "succeeded" {
+        return None;
+    }
+    Some(text.chars().take(RESULT_PREVIEW_CHARS).collect())
+}
+
 /// GET /conversations/{id}/agent-invocations：刷新后找回「跑完了吗」。
 /// 仅成员可读（专属会话成员=主人）；按 created_at DESC、limit 默认 50。
+/// 同时返回 root_conversation_id 等于该会话的子调用，刷新后能把嵌套卡片补回来。
 pub async fn list_invocations(
     State(st): State<SharedState>,
     headers: HeaderMap,
@@ -941,10 +952,15 @@ pub async fn list_invocations(
     let mut rows = sqlx::query_as::<_, InvocationView>(
         "SELECT i.id, i.agent_id, i.conversation_id, i.trigger_message_id, i.schedule_id,
                 i.status, i.error, i.attachment_ids, i.created_at, i.started_at, i.finished_at,
-                i.parent_invocation_id, i.root_conversation_id, a.name AS agent_name
+                i.parent_invocation_id, i.root_conversation_id, a.name AS agent_name,
+                CASE
+                  WHEN i.parent_invocation_id IS NOT NULL AND i.status = 'succeeded'
+                  THEN left(i.result_text, 2000)
+                  ELSE NULL
+                END AS result_preview
            FROM agent_invocations i
            JOIN agents a ON a.id = i.agent_id
-          WHERE i.conversation_id = $1
+          WHERE i.conversation_id = $1 OR i.root_conversation_id = $1
           ORDER BY i.created_at DESC, i.id DESC LIMIT $2",
     )
     .bind(conv)
@@ -1129,6 +1145,7 @@ pub async fn revoke_access(st: &SharedState, user_ids: &[Uuid]) {
             parent_invocation_id: inv.parent_invocation_id,
             root_conversation_id: inv.root_conversation_id,
             agent_name: inv.agent_name.clone(),
+            result_preview: None,
         };
         let members = domain::member_ids(&st.pool, inv.conversation_id)
             .await
@@ -2151,6 +2168,7 @@ impl Cascaded {
             parent_invocation_id: self.parent_invocation_id,
             root_conversation_id: self.root_conversation_id,
             agent_name: self.agent_name,
+            result_preview: None,
         }
     }
 }
@@ -2617,7 +2635,9 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
         if tx.commit().await.is_err() {
             return;
         }
-        if let Ok(Some(inv)) = updated {
+        if let Ok(Some(mut inv)) = updated {
+            inv.result_preview =
+                result_preview_text(inv.parent_invocation_id, &inv.status, &stored);
             let member_ids = domain::member_ids(&st.pool, conv)
                 .await
                 .unwrap_or_else(|_| vec![owner]);

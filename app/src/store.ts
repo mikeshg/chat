@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
 import { applyStreamFrame, dropRun, fmtElapsed, type AgentRuns, type AgentStreamFrame } from "./agentRun";
+import { mergeChildIndex, type ChildIndex } from "./invocationTree";
 import { writeDrafts } from "./drafts";
 import type {
   AgentHostView,
@@ -57,6 +58,8 @@ export interface AppState {
   invocations: Record<string, Record<string, InvocationView[]>>;
   /** Agent A03：conv_id -> invocation_id -> 进行中调用的临时输出（不落库、不跨设备） */
   agentRuns: AgentRuns;
+  /** Agent A15：parent_invocation_id -> 子调用（派出顺序）。帧和历史列表一起维护。 */
+  childInvocations: ChildIndex;
 }
 
 /** 头像缓存条目：版本较大的那组才有效。 */
@@ -88,6 +91,7 @@ let state: AppState = {
   agentHosts: [],
   invocations: {},
   agentRuns: {},
+  childInvocations: {},
 };
 
 const listeners = new Set<() => void>();
@@ -561,7 +565,8 @@ export function applyHostStatus(
 }
 
 /** agent_invocation 帧 / 历史 GET 共用合并入口：同一触发消息下按调用 id 覆盖，不同调用都保留。
- *  A03：调用进终态时顺手摘除它的临时流式输出（定稿消息已含全部内容）。 */
+ *  A03：调用进终态时顺手摘除它的临时流式输出（定稿消息已含全部内容）。
+ *  A15：有父调用的同时写进 childInvocations（按 id 覆盖，派出顺序由纯函数排）。 */
 export function applyInvocations(
   s: AppState,
   incoming: InvocationView[],
@@ -569,6 +574,7 @@ export function applyInvocations(
   if (incoming.length === 0) return {};
   const invocations = { ...s.invocations };
   let agentRuns = s.agentRuns;
+  const childInvocations = mergeChildIndex(s.childInvocations, incoming);
   let touched = false;
   for (const inv of incoming) {
     // 定时调用没有触发消息，状态不挂在某一条消息下面（回复本身会出现在会话里）
@@ -591,8 +597,11 @@ export function applyInvocations(
       }
     }
   }
-  if (!touched && agentRuns === s.agentRuns) return {};
-  return agentRuns === s.agentRuns ? { invocations } : { invocations, agentRuns };
+  const patch: Partial<AppState> = {};
+  if (touched) patch.invocations = invocations;
+  if (agentRuns !== s.agentRuns) patch.agentRuns = agentRuns;
+  if (childInvocations !== s.childInvocations) patch.childInvocations = childInvocations;
+  return patch;
 }
 
 /** agent_stream 帧：临时输出追加；调用已知终态后迟到的帧丢弃（防状态残留）。 */

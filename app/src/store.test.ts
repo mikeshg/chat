@@ -95,6 +95,7 @@ function state(patch: Partial<AppState> = {}): AppState {
     agentHosts: [],
     invocations: {},
     agentRuns: {},
+    childInvocations: {},
     ...patch,
   };
 }
@@ -525,6 +526,36 @@ describe("Agent A01：宿主状态与调用记录", () => {
     expect(
       applyInvocations(s, [{ ...running, id: "sched", trigger_message_id: null, schedule_id: "s1" }]),
     ).toEqual({});
+  });
+
+  it("applyInvocations：子调用按父 id 覆盖进索引，并保持派出顺序", () => {
+    const child = {
+      id: "c2",
+      agent_id: "b",
+      conversation_id: "b-conv",
+      trigger_message_id: "rec",
+      status: "running",
+      error: null,
+      created_at: "2026-01-02T00:00:00Z",
+      started_at: "2026-01-02T00:00:00Z",
+      finished_at: null,
+      parent_invocation_id: "p",
+      agent_name: "b",
+    };
+    const earlier = { ...child, id: "c1", created_at: "2026-01-01T00:00:00Z", agent_name: "c" };
+    let s = state();
+    // 后派出的先到
+    s = { ...s, ...applyInvocations(s, [child]) };
+    s = { ...s, ...applyInvocations(s, [earlier]) };
+    expect(s.childInvocations.p.map((i) => i.id)).toEqual(["c1", "c2"]);
+    // 子调用的流式输出仍挂在它自己的会话上
+    expect(s.invocations["b-conv"].rec.map((i) => i.id).sort()).toEqual(["c1", "c2"]);
+    s = {
+      ...s,
+      ...applyInvocations(s, [{ ...child, status: "succeeded", finished_at: "t2", result_preview: "hi" }]),
+    };
+    expect(s.childInvocations.p.map((i) => i.id)).toEqual(["c1", "c2"]);
+    expect(s.childInvocations.p[1].result_preview).toBe("hi");
   });
 
   it("invocationErrorText：稳定错误码 → 中文文案", () => {

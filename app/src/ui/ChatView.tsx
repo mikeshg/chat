@@ -44,6 +44,7 @@ import AgentAvatar from "./AgentAvatar";
 import Avatar from "./Avatar";
 import VoiceRecorder from "./VoiceRecorder";
 import InvocationStatus from "./InvocationStatus";
+import { NestedInvocations } from "./NestedInvocation";
 import { LiveRunBubble, StepRecord } from "./AgentRun";
 
 function fmtSize(n: number): string {
@@ -1328,6 +1329,7 @@ export default function ChatView() {
                           : undefined
                       }
                     />
+                    <NestedInvocations parentId={inv.id} />
                   </div>
                 );
               })}

@@ -750,6 +750,10 @@ pub struct InvocationView {
     pub root_conversation_id: Option<Uuid>,
     /// 被调 Agent 的名字（给嵌套展示用，不落在调用行上）。
     pub agent_name: String,
+    /// 子调用进入 succeeded 时的回复前 2000 字。其余调用和非终态为 null。
+    /// 不落库：历史查询现算，避免把完整 result_text 放进帧。
+    #[sqlx(default)]
+    pub result_preview: Option<String>,
 }
 
 // ---------- 消息生命周期 REST ----------
