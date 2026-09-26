@@ -17,7 +17,8 @@ import {
   useApp,
 } from "../store";
 import { unsentText } from "../drafts";
-import type { AttachmentView, MemberView, MessageView, ReplyPreview } from "../types";
+import type { AgentView, AttachmentView, MemberView, MessageView, ReplyPreview } from "../types";
+import { resolveMentions, retainExplicit, type ExplicitTarget } from "../mentionResolve";
 import { sendChat, sendTyping } from "../ws";
 import RichText from "../richText";
 import AnnouncementBar from "./AnnouncementBar";
@@ -144,6 +145,9 @@ export default function ChatView() {
   const draftBeforeEdit = useRef(""); // 编辑态接管 composer 前的草稿
   const prevConv = useRef<string | null>(null); // 上一次渲染的会话（草稿归属判定）
   const [members, setMembers] = useState<MemberView[]>([]);
+  // A11：私聊/群补全用的本人 Agent；显式选中随正文里的 @名字 存在
+  const [myAgents, setMyAgents] = useState<AgentView[]>([]);
+  const [agentPicks, setAgentPicks] = useState<ExplicitTarget[]>([]);
   const [ac, setAc] = useState<{ start: number; prefix: string } | null>(null);
   const [showSearch, setShowSearch] = useState(false);
   const [searchQ, setSearchQ] = useState("");
@@ -209,6 +213,7 @@ export default function ChatView() {
         .catch(() => { if (current(token)) setMembers([]); });
     }
     setAc(null);
+    setAgentPicks([]);
     setShowSearch(false);
     setSearchRes(null);
     setFlashId(null);
@@ -299,9 +304,9 @@ export default function ChatView() {
       .finally(() => historyInflight.delete(conv.id));
   }, [conv?.id]);
 
-  // A01：agent 会话打开时拉调用历史，恢复每条触发消息下的状态行（实时推进靠 agent_invocation 帧）
+  // A11：任意会话打开时拉一次调用历史（实时推进仍靠 agent_invocation 帧）
   useEffect(() => {
-    if (!conv || conv.kind !== "agent") return;
+    if (!conv) return;
     let alive = true;
     agentsApi
       .invocations(conv.id)
@@ -313,6 +318,31 @@ export default function ChatView() {
       alive = false;
     };
   }, [conv?.id]);
+
+  // 私聊和群的 @ 补全要带上本人未删除的 Agent
+  useEffect(() => {
+    if (!conv || (conv.kind !== "group" && conv.kind !== "dm")) {
+      setMyAgents([]);
+      return;
+    }
+    let alive = true;
+    const load = () => {
+      agentsApi
+        .list()
+        .then((rows) => {
+          if (alive) setMyAgents(rows.filter((a) => !a.deleted));
+        })
+        .catch(() => {
+          if (alive) setMyAgents([]);
+        });
+    };
+    load();
+    window.addEventListener("chat:agents", load);
+    return () => {
+      alive = false;
+      window.removeEventListener("chat:agents", load);
+    };
+  }, [conv?.id, conv?.kind]);
 
   useEffect(() => {
     setTopicBusy(false);
@@ -348,7 +378,7 @@ export default function ChatView() {
   const agentHost = conv.kind === "agent" && conv.agent
     ? s.agentHosts.find((h) => h.id === conv.agent!.host_id)
     : undefined;
-  const invs = conv.kind === "agent" ? (s.invocations[conv.id] ?? {}) : {};
+  const invs = s.invocations[conv.id] ?? {};
   // A04：409 = 调用已经结束，静默拉一次历史把标签对齐
   const cancelInvocation = (id: string) => {
     void (async () => {
@@ -459,6 +489,7 @@ export default function ChatView() {
     draftBeforeEdit.current = text; // 暂存草稿，取消/保存后还原
     setState({ editingMessage: m, replyingTo: null });
     setText(m.content);
+    setAgentPicks([]);
     setMutErr(null);
     taRef.current?.focus();
   };
@@ -620,15 +651,30 @@ export default function ChatView() {
         atts.push(await files.upload(conv.id, f));
       }
       const rt = rt0 ?? undefined;
+      const targets = resolveMentions({
+        text: t,
+        explicit: agentPicks,
+        myAgents: myAgents.map((a) => ({ id: a.id, name: a.name })),
+        members: members
+          .filter((m) => m.user.id !== s.me?.id)
+          .map((m) => ({ id: m.user.id, username: m.user.username })),
+      }).agentTargets;
       atts.forEach((att, i) =>
-        sendChat(conv.id, i === atts.length - 1 ? t : "", att, i === atts.length - 1 ? rt : undefined),
+        sendChat(
+          conv.id,
+          i === atts.length - 1 ? t : "",
+          att,
+          i === atts.length - 1 ? rt : undefined,
+          i === atts.length - 1 ? targets : undefined,
+        ),
       );
-      if (atts.length === 0 && t) sendChat(conv.id, t, undefined, rt);
+      if (atts.length === 0 && t) sendChat(conv.id, t, undefined, rt, targets);
       const draft = getState().drafts[conv.id] ?? "";
       if (unsentText(draft, sentText) !== draft) setDraft(conv.id, unsentText(draft, sentText)); // 发送即清该会话草稿
       if (getState().replyingTo === rt0) setState({ replyingTo: null });
       if (still()) {
         setText((cur) => unsentText(cur, sentText));
+        setAgentPicks([]);
         setPendingFiles((p) => p.filter((f) => !sentFiles.includes(f)));
         setAc(null);
         stickBottom.current = true;
@@ -645,24 +691,52 @@ export default function ChatView() {
     setPendingFiles((p) => [...p, ...Array.from(list)]);
   };
 
-  // @补全候选：群成员中用户名前缀/昵称包含匹配，排除自己
-  const acList = ac
-    ? members
-        .filter(
-          (x) =>
-            x.user.id !== s.me?.id &&
-            (x.user.username.toLowerCase().startsWith(ac.prefix.toLowerCase()) ||
-              x.user.display_name.toLowerCase().includes(ac.prefix.toLowerCase())),
-        )
-        .slice(0, 8)
+  type AcItem =
+    | { kind: "agent"; id: string; name: string; online: boolean }
+    | { kind: "member"; id: string; username: string; displayName: string };
+  // @补全：私聊只有本人 Agent；群里 Agent 排在成员前面（同名时先点到 Agent）
+  const acItems: AcItem[] = ac
+    ? [
+        ...myAgents
+          .filter((a) => a.name.toLowerCase().startsWith(ac.prefix.toLowerCase()))
+          .map((a) => ({
+            kind: "agent" as const,
+            id: a.id,
+            name: a.name,
+            online: s.agentHosts.find((h) => h.id === a.host_id)?.online ?? a.host_online,
+          })),
+        ...(conv.kind === "group"
+          ? members
+              .filter(
+                (x) =>
+                  x.user.id !== s.me?.id &&
+                  (x.user.username.toLowerCase().startsWith(ac.prefix.toLowerCase()) ||
+                    x.user.display_name.toLowerCase().includes(ac.prefix.toLowerCase())),
+              )
+              .map((x) => ({
+                kind: "member" as const,
+                id: x.user.id,
+                username: x.user.username,
+                displayName: x.user.display_name,
+              }))
+          : []),
+      ].slice(0, 8)
     : [];
 
-  const pickAc = (uname: string) => {
+  const pickAc = (item: AcItem) => {
     if (!ac) return;
+    const token = item.kind === "agent" ? item.name : item.username;
     const caret = taRef.current?.selectionStart ?? text.length;
-    const next = text.slice(0, ac.start) + "@" + uname + " " + text.slice(caret);
+    const next = text.slice(0, ac.start) + "@" + token + " " + text.slice(caret);
     setText(next);
-    if (!s.editingMessage) setDraft(conv.id, next);
+    if (!s.editingMessage) {
+      setDraft(conv.id, next);
+      const pick: ExplicitTarget =
+        item.kind === "agent"
+          ? { kind: "agent", id: item.id, token }
+          : { kind: "member", id: item.id, token };
+      setAgentPicks((prev) => retainExplicit(next, [...prev, pick]));
+    }
     setAc(null);
     taRef.current?.focus();
   };
@@ -772,14 +846,21 @@ export default function ChatView() {
     setText(v);
     // V2 P1-3：编辑态下输入框是被编辑消息内容，不能当草稿存
     if (!s.editingMessage) setDraft(conv.id, v);
-    // @补全：光标前最近的 @ 前缀（群聊才启用）
+    setAgentPicks((prev) => {
+      const next = retainExplicit(v, prev);
+      if (
+        next.length === prev.length &&
+        next.every((p, i) => p.kind === prev[i].kind && p.id === prev[i].id && p.token === prev[i].token)
+      ) {
+        return prev;
+      }
+      return next;
+    });
+    // @补全：光标前最近的 @ 前缀。群里含成员；私聊只有 Agent
     const caret = taRef.current?.selectionStart ?? v.length;
-    const mm = /(^|[\s\n])@([A-Za-z0-9_]*)$/.exec(v.slice(0, caret));
-    setAc(
-      conv.kind === "group" && mm
-        ? { start: caret - mm[2].length - 1, prefix: mm[2] }
-        : null,
-    );
+    const mm = /(^|[\s\n])@([A-Za-z0-9_-]*)$/.exec(v.slice(0, caret));
+    const mentionable = conv.kind === "group" || conv.kind === "dm";
+    setAc(mentionable && mm ? { start: caret - mm[2].length - 1, prefix: mm[2] } : null);
     const now = Date.now();
     // self/agent 会话不广播 typing（服务端同样短路兜底）
     if (conv.kind !== "self" && conv.kind !== "agent" && now - lastTypingSent.current > 2500) {
@@ -927,7 +1008,7 @@ export default function ChatView() {
           // A01：agent 发的消息 sender_id 也是主人 —— 归属判定统一走 isOwnMessage
           const mine = isOwnMessage(m, s.me?.id);
           const pending = m.id.startsWith("client:");
-          const inv = invs[m.id];
+          const rowInvs = invs[m.id] ?? [];
           const prev = msgs[i - 1];
           const showTime =
             !prev || new Date(m.created_at).getTime() - new Date(prev.created_at).getTime() > 300000;
@@ -1164,14 +1245,17 @@ export default function ChatView() {
                   </div>
                 </div>
               </div>
-              {/* A01/A04：主人这条消息触发的调用状态；取消按钮只在专属会话（主人）出现 */}
-              {inv && (
+              {/* A11：触发消息下的调用状态。群成员看得到，取消只给该 Agent 的主人 */}
+              {rowInvs.map((inv) => (
                 <InvocationStatus
+                  key={inv.id}
                   inv={inv}
-                  allowCancel={conv.kind === "agent"}
+                  allowCancel={
+                    conv.kind === "agent" || myAgents.some((a) => a.id === inv.agent_id)
+                  }
                   onCancel={cancelInvocation}
                 />
-              )}
+              ))}
               {topicMarks.filter((t) => t.afterId === m.id).map((t) => topicBreak(t.n))}
             </div>
           );
@@ -1224,19 +1308,31 @@ export default function ChatView() {
               </div>
             )}
             {mutErr && <div className="mut-err">{mutErr}</div>}
-            {acList.length > 0 && (
+            {acItems.length > 0 && (
               <div className="ac-list">
-                {acList.map((x) => (
+                {acItems.map((item) => (
                   <div
-                    key={x.user.id}
-                    className="ac-item"
+                    key={item.kind + item.id}
+                    className={`ac-item ${item.kind === "agent" ? "ac-agent" : ""}`}
                     onMouseDown={(e) => {
                       e.preventDefault();
-                      pickAc(x.user.username);
+                      pickAc(item);
                     }}
                   >
-                    <span className="ac-name">@{x.user.username}</span>
-                    <span className="ac-disp">{x.user.display_name}</span>
+                    {item.kind === "agent" ? (
+                      <>
+                        <span className="ac-mark">🤖</span>
+                        <span className="ac-name">@{item.name}</span>
+                        <span className={item.online ? "ac-online" : "ac-offline"}>
+                          {item.online ? "在线" : "离线"}
+                        </span>
+                      </>
+                    ) : (
+                      <>
+                        <span className="ac-name">@{item.username}</span>
+                        <span className="ac-disp">{item.displayName}</span>
+                      </>
+                    )}
                   </div>
                 ))}
               </div>
@@ -1294,8 +1390,8 @@ export default function ChatView() {
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
-                    if (acList.length > 0) {
-                      pickAc(acList[0].user.username);
+                    if (acItems.length > 0) {
+                      pickAc(acItems[0]);
                     } else {
                       send();
                     }

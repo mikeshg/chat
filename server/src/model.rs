@@ -388,6 +388,9 @@ pub enum WsIn {
         /// 回复目标：必须是同会话消息
         #[serde(default)]
         reply_to_id: Option<Uuid>,
+        /// A11：输入框补全里选中的 Agent。缺省为空；不属于发送者或已删除的 id 会被忽略。
+        #[serde(default)]
+        agent_targets: Vec<Uuid>,
     },
     EditMessage {
         message_id: Uuid,

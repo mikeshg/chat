@@ -972,3 +972,7 @@ button.agent-host-name:hover { background: transparent; color: var(--link); }
 .agent-host-edit { display: flex; flex-wrap: wrap; gap: 6px; flex: 1 1 180px; min-width: 0; }
 .agent-host-edit input { flex: 1 1 120px; min-width: 0; }
 .agent-host-empty { padding: 4px 2px 8px; }
+/* ===== Agent A11 ===== */
+.ac-item.ac-agent .ac-mark { flex: 0 0 auto; }
+.ac-item .ac-online { margin-left: auto; color: var(--green); font-size: 12px; }
+.ac-item .ac-offline { margin-left: auto; color: var(--muted); font-size: 12px; }

@@ -78,6 +78,8 @@ type Outgoing = {
   content: string;
   attachment?: AttachmentView;
   replyToId?: string;
+  /** A11：补全 / 手打解析出的 Agent id。空则不带字段，旧服务端忽略。 */
+  agentTargets?: string[];
   sentOn?: WebSocket;
 };
 
@@ -540,16 +542,16 @@ function flushOutbox() {
   if (wsGen !== session() || ws?.readyState !== WebSocket.OPEN) return;
   for (const item of outbox) {
     if (item.sentOn === ws) continue;
-    ws.send(
-      JSON.stringify({
-        type: "send_message",
-        conversation_id: item.convId,
-        client_msg_id: item.clientMsgId,
-        content: item.content,
-        attachment_id: item.attachment?.id,
-        reply_to_id: item.replyToId,
-      }),
-    );
+    const frame: Record<string, unknown> = {
+      type: "send_message",
+      conversation_id: item.convId,
+      client_msg_id: item.clientMsgId,
+      content: item.content,
+      attachment_id: item.attachment?.id,
+      reply_to_id: item.replyToId,
+    };
+    if (item.agentTargets && item.agentTargets.length > 0) frame.agent_targets = item.agentTargets;
+    ws.send(JSON.stringify(frame));
     item.sentOn = ws;
   }
 }
@@ -564,6 +566,7 @@ export function sendChat(
   content: string,
   attachment?: AttachmentView,
   replyTo?: MessageView,
+  agentTargets?: string[],
 ) {
   const clientMsgId = crypto.randomUUID();
   const me = getState().me;
@@ -601,7 +604,14 @@ export function sendChat(
     reactions: [],
     created_at: new Date().toISOString(),
   };
-  outbox.push({ convId, clientMsgId, content, attachment, replyToId: replyTo?.id });
+  outbox.push({
+    convId,
+    clientMsgId,
+    content,
+    attachment,
+    replyToId: replyTo?.id,
+    agentTargets: agentTargets?.filter((id) => id),
+  });
   setState((s) => ({
     messages: {
       ...s.messages,

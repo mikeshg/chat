@@ -499,7 +499,7 @@ describe("Agent A01：宿主状态与调用记录", () => {
     expect(s.agentHosts[0].online).toBe(true);
   });
 
-  it("applyInvocations：按 trigger_message_id 归档，后到的状态覆盖先到的", () => {
+  it("applyInvocations：同一触发消息下按调用 id 覆盖，不同调用都保留", () => {
     const running = {
       id: "i1",
       agent_id: "a1",
@@ -511,10 +511,13 @@ describe("Agent A01：宿主状态与调用记录", () => {
       started_at: "t",
       finished_at: null,
     };
-    let s = state({ invocations: { ac: { m1: running } } });
+    let s = state({ invocations: { ac: { m1: [running] } } });
     const done = { ...running, status: "succeeded", finished_at: "t2" };
     s = { ...s, ...applyInvocations(s, [done]) };
-    expect(s.invocations.ac.m1.status).toBe("succeeded");
+    expect(s.invocations.ac.m1.map((i) => i.status)).toEqual(["succeeded"]);
+    const other = { ...running, id: "i2" };
+    s = { ...s, ...applyInvocations(s, [other]) };
+    expect(s.invocations.ac.m1.map((i) => i.id)).toEqual(["i1", "i2"]);
     // 空批量不动状态
     expect(applyInvocations(s, [])).toEqual({});
   });

@@ -283,7 +283,7 @@ pub async fn broadcast_posted(st: &SharedState, conv: Uuid, posted: &domain::Pos
         }
         // V2 P3-3：离线推送（ntfy）——判定与发送全在 spawned 任务里，不拖慢广播
         crate::push::schedule(st, conv, posted);
-        // Agent A01：专属会话里主人的文字消息触发一次 Agent 调用
+        // Agent A01/A11：文字消息落库后的唯一调用挂点（专属会话，或私聊/群里的 @）
         crate::agents::maybe_invoke(st, conv, posted).await;
     }
     // 新 @本人消息已在事务内解除其归档：偏好帧只发给本人全部连接（其他成员不可见）
@@ -351,6 +351,7 @@ async fn on_text(
             content,
             attachment_id,
             reply_to_id,
+            agent_targets,
             ..
         }) => {
             let res = send_message(
@@ -362,6 +363,7 @@ async fn on_text(
                 &content,
                 attachment_id,
                 reply_to_id,
+                agent_targets,
             )
             .await;
             (res, client_msg_id, None)
@@ -450,8 +452,9 @@ async fn send_message(
     content: &str,
     attachment_id: Option<Uuid>,
     reply_to_id: Option<Uuid>,
+    agent_targets: Vec<Uuid>,
 ) -> WsResult {
-    let posted = domain::post_message(
+    let mut posted = domain::post_message(
         &st.pool,
         domain::PostMessage {
             conversation_id: conv,
@@ -471,6 +474,7 @@ async fn send_message(
     )
     .await
     .map_err(domain::PostError::into_ws)?;
+    posted.agent_targets = agent_targets;
 
     broadcast_posted(st, conv, &posted).await;
     // ack 只回发起连接：携带 client_msg_id 完成乐观替换
