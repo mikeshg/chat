@@ -1,12 +1,12 @@
 # Chat V2 接手文档
 
-**更新于：2026-09-25 22:40（Asia/Shanghai）**
+**更新于：2026-09-26 09:25（Asia/Shanghai）**
 
 新会话先读本文件，再读 [plan.md](plan.md)（总计划）和 [devin-rules.md](devin-rules.md)（派给 Devin 的通用规则）。
 
 ## 1. 一句话现状
 
-第 1、2 阶段全部完成、合并、验收并提交（第 2 阶段还用 cua-driver 补测了 Tauri 桌面端）。下一步是第 3 阶段：按 [phase3-4-draft.md](phase3-4-draft.md) 写正式任务单，然后派发。
+第 1–3 阶段全部完成、合并、验收并提交（第 2 阶段还用 cua-driver 补测了 Tauri 桌面端）。下一步是第 4 阶段（备份/恢复 + E2E 扩展与文档）：按 [phase3-4-draft.md](phase3-4-draft.md) 写正式任务单，然后派发。
 
 ## 2. 用户的决定与偏好（原话要点）
 
@@ -36,7 +36,11 @@
 | `1b2616d` | **P2-0**：迁移 `0012_v2_media.sql` + 模型/TS 字段 + 第 2 阶段 4 份任务单 + devin-rules 更新 |
 | `7e149cd` | 编排脚本 `scripts/v2/`、第 3/4 阶段草稿、本文件初版 |
 | `f831451` … `cb34787` | 合并 P2-1、P2-2、P2-3、P2-4 |
-| 本文件所在提交 | 第 2 阶段验收记录 [acceptance-p2.md](acceptance-p2.md)、复选框布局修复、合并脚本 |
+| `4d2998f` | 第 2 阶段验收记录 [acceptance-p2.md](acceptance-p2.md)、复选框布局修复、合并脚本 |
+| `662daca` | 第 3 阶段任务单 |
+| `0cec2cd` | Grok Build 运行脚本、后端启停脚本、测试库恢复脚本、端口调整 |
+| `b8bab0d` … `017ef2b` | 合并 P3-1、P3-3、P3-2 |
+| 本文件所在提交 | 第 3 阶段验收记录 [acceptance-p3.md](acceptance-p3.md)、`run-devin.sh` 额度用完即停 |
 
 ## 4. 阶段进度
 
@@ -44,33 +48,33 @@
 |---|---|---|
 | 1 | P1-1 系统通知、P1-2 注册开关+邀请码、P1-3 草稿+暗色、P1-4 富文本、P1-5 改密+设备管理 | ✅ 验收见 acceptance-p1.md |
 | 2 | P2-0 共用 schema、P2-1 缩略图+配额、P2-2 头像、P2-3 语音、P2-4 文件传输助手+转发 | ✅ 验收见 acceptance-p2.md（cargo 83+2、vitest 134、E2E 58/58 + 重启后 9/9、浏览器实测、Tauri 桌面实测） |
-| 3 | P3-1 全局搜索+文件列表、P3-2 公告+置顶+会议链接、P3-3 ntfy 推送+心跳 | 📝 只有设计草稿 [phase3-4-draft.md](phase3-4-draft.md)，下一步写正式任务单 |
-| 4 | P4-1 备份/恢复、P4-2 E2E 扩展+文档 | 📝 同上 |
+| 3 | P3-1 全局搜索+文件列表、P3-2 公告+置顶+会议链接、P3-3 ntfy 推送+心跳 | ✅ 验收见 acceptance-p3.md（cargo 104+3、vitest 154、E2E 58/58 + 重启后 9/9、浏览器实测含假 ntfy 推送） |
+| 4 | P4-1 备份/恢复、P4-2 E2E 扩展+文档 | 📝 只有设计草稿 [phase3-4-draft.md](phase3-4-draft.md)，下一步写正式任务单 |
 
 仍未覆盖：Android APK 构建；真实麦克风录音（WebView2 权限没点允许）；本机开着「请勿打扰」，系统通知横幅没看到，只确认了通知中心收到。
 
 ## 5. 下一步（按顺序）
 
-1. **写第 3 阶段任务单**：按 phase3-4-draft.md，参照 `tasks/P2-*.md` 的写法（背景 / 规则 / 接口 / 客户端 / 测试 / 不做）。P3-3 的推送要挂在 P2-4 建好的 `ws::broadcast_posted` 上。迁移号 0016–0018。
-2. **确认模型可用**（几秒钟）：
+1. **写第 4 阶段任务单**：按 phase3-4-draft.md 的 P4-1（备份 / 恢复）和 P4-2（E2E 扩展 + README / CONTEXT 更新），参照 `tasks/P3-*.md` 的写法。P4-1 要覆盖到迁移 0018 为止的全部表，表清单从 information_schema 动态读取，恢复只接受迁移版本一致的备份。
+2. **WSL 保活**（后台常驻）：`wsl -d Debian -- sh -c "exec sleep 86400"`
+3. **确认执行者可用**（几秒钟）：
 
    ```bash
    devin -p "只回复 ok" --model swe-2-max --respect-workspace-trust false
-   devin -p "只回复 ok" --model grok-4-7-xhigh --respect-workspace-trust false
+   grok -p "只回复 ok" -m grok-4.7-build-fast --reasoning-effort xhigh
    ```
 
-3. **建 worktree**（仓库根目录，约 1 分钟）：`node scripts/v2/wt-setup.mjs P3-1,P3-2,P3-3`
-4. **派发**：2 个 swe-2-max + 1 个 grok，每个任务用 Bash 工具 `run_in_background: true` 单独起一条：
+4. **建 worktree**（仓库根目录）：`node scripts/v2/wt-setup.mjs P4-1,P4-2`
+5. **派发**（Bash 工具 `run_in_background: true`，每个任务一条）：
 
    ```bash
-   bash scripts/v2/run-devin.sh P3-1 new
-   DEVIN_MODEL=grok-4-7-xhigh bash scripts/v2/run-devin.sh P3-3 new
+   bash scripts/v2/run-devin.sh P4-1 new
+   bash scripts/v2/run-grok.sh P4-2 C:/Users/xie_f/projects/other/chat-wt/_runtime/devin/P4-2.prompt.md
    ```
 
-4. **每 15 分钟检查**：后台起 `sleep 900` 当计时器，到点看 `../chat-wt/_runtime/devin/<任务>.run*.log` 的末尾、`<任务>.resume.log`、各 worktree 的 `git status --short | wc -l`。
-5. **逐个审查 → 在任务分支提交 → 合并进 `v2`**（流程和注意事项见第 7 节）。
-6. **验收**：见第 8 节。需要桌面端实测时先问用户能否用 cua-driver。
-7. 写 `acceptance-p3.md` 提交；清理 worktree 与容器；写第 4 阶段任务单，继续。
+6. **每 15 分钟检查**：后台 `sleep 900` 当计时器；Devin 看 `../chat-wt/_runtime/devin/<任务>.run*.log` 与 `<任务>.resume.log`，Grok 看 `<任务>.grok-run*.log`（NDJSON，`"type":"text"` 行是它的说明文字）。
+7. **逐个审查 → 在任务分支提交 → 合并进 `v2`**（第 7 节），**验收**（第 8 节），写 `acceptance-p4.md` 提交，清理 worktree 与容器。
+8. 全部完成后：更新 README 功能列表与 CONTEXT.md 词汇（若 P4-2 未完成这部分），向用户汇报整个 V2；是否合入 `main`、是否推送由用户决定。
 
 ## 6. 编排工具（`scripts/v2/`，已提交）
 

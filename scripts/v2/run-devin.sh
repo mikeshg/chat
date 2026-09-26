@@ -7,6 +7,7 @@
 # - .env.local 注入进程环境（Devin 不需要也不能去读它，读含口令文件会触发强制确认）
 # - 被拒 / 结束时没写交付文档 → -r 续跑（最多 15 次）
 # - 模型容量不足（capacity issues，可重试）→ 等 3 分钟再试（单独计数，最多 40 次 ≈ 2 小时）
+# - 账户当日额度用完（usage quota has been exhausted）→ 直接停
 # - 看门狗：被拒后 60s 无新输出、或 10 分钟无新输出 → 结束整棵进程树（Devin 起的后台 vite/后端会让进程挂住）
 # - 每轮结束释放本槽位端口；日志与续跑记录在 ../chat-wt/_runtime/devin/
 set -u
@@ -73,6 +74,11 @@ while :; do
   n=$((n+1))
   # 已经建过会话就一律续跑（保留上下文）
   [ -n "$(sid)" ] && mode=resume
+  # 账户当日额度用完：重试没有意义，直接停（额度要用户自己在 Devin 后台处理）
+  if grep -q "usage quota has been exhausted" "$log"; then
+    echo "$(date +%H:%M) $T quota exhausted: stopping" >> "$S/$T.resume.log"
+    break
+  fi
   if grep -q "capacity issues" "$log"; then
     cap=$((cap+1)); [ $cap -ge 40 ] && { echo "$(date +%H:%M) $T capacity: giving up" >> "$S/$T.resume.log"; break; }
     echo "$(date +%H:%M) $T capacity backoff #$cap" >> "$S/$T.resume.log"
