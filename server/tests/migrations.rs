@@ -65,6 +65,7 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
         include_str!("../migrations/0011_sessions.sql"),
         include_str!("../migrations/0012_v2_media.sql"),
         include_str!("../migrations/0015_self_conversations.sql"),
+        include_str!("../migrations/0017_announcements_pins.sql"),
     ] {
         sqlx::raw_sql(script).execute(&pool).await.unwrap();
     }

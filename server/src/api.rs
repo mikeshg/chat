@@ -13,7 +13,7 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::time::Instant;
@@ -75,6 +75,12 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
             post(refresh_messages),
         )
         .route("/conversations/{id}/preferences", put(put_preferences))
+        .route("/conversations/{id}/announcement", put(put_announcement))
+        .route("/conversations/{id}/pins", get(list_pins))
+        .route(
+            "/conversations/{id}/pins/{message_id}",
+            put(pin_message).delete(unpin_message),
+        )
         .route(
             "/messages/{id}",
             axum::routing::patch(edit_message).delete(delete_message),
@@ -126,6 +132,17 @@ async fn uid_of(headers: &HeaderMap, st: &SharedState) -> AppResult<Uuid> {
 fn notify(st: &SharedState, uids: &[Uuid], what: &'static str) {
     let payload = serde_json::to_string(&WsOut::Invalidate { what }).unwrap();
     st.send_to_users(uids, &payload);
+}
+
+fn notify_pins(st: &SharedState, change: &domain::PinChange) {
+    if !change.changed {
+        return;
+    }
+    let payload = serde_json::to_string(&WsOut::PinsUpdated {
+        conversation_id: change.conversation_id,
+    })
+    .unwrap();
+    st.send_to_users(&change.member_ids, &payload);
 }
 
 /// 消息 mutation 的领域拒绝 → HTTP 状态（WS 侧走 PostError::into_ws 错误帧）。
@@ -872,6 +889,9 @@ struct ConvRow {
     p_muted_until: Option<DateTime<Utc>>,
     p_mute_forever: Option<bool>,
     p_updated_at: Option<DateTime<Utc>>,
+    announcement: Option<String>,
+    announcement_by_name: Option<String>,
+    announcement_at: Option<DateTime<Utc>>,
 }
 
 async fn list_conversations(
@@ -904,9 +924,11 @@ async fn list_conversations(
                 lm.sender_has_avatar AS m_sender_has_avatar, lm.forwarded_from AS m_forwarded_from,
                 cp.pinned_at AS p_pinned_at, cp.archived_at AS p_archived_at,
                 cp.muted_until AS p_muted_until, cp.mute_forever AS p_mute_forever,
-                cp.updated_at AS p_updated_at
+                cp.updated_at AS p_updated_at,
+                c.announcement, au.display_name AS announcement_by_name, c.announcement_at
            FROM memberships m
            JOIN conversations c ON c.id = m.conversation_id
+           LEFT JOIN users au ON au.id = c.announcement_by
            LEFT JOIN conversation_preferences cp
                   ON cp.conversation_id = c.id AND cp.user_id = m.user_id
            LEFT JOIN LATERAL (
@@ -1021,6 +1043,11 @@ async fn list_conversations(
                     mute_forever: r.p_mute_forever.unwrap_or(false),
                     updated_at: r.p_updated_at,
                 },
+                announcement: r.announcement.map(|text| AnnouncementView {
+                    text,
+                    updated_by_name: r.announcement_by_name.clone(),
+                    updated_at: r.announcement_at,
+                }),
                 created_at: r.created_at,
             }
         })
@@ -1331,6 +1358,16 @@ async fn delete_message(
         .await
         .map_err(post_err)?;
     ws::broadcast_message_deleted(&st, &d);
+    if d.pins_dropped {
+        notify_pins(
+            &st,
+            &domain::PinChange {
+                conversation_id: d.conversation_id,
+                member_ids: d.member_ids.clone(),
+                changed: true,
+            },
+        );
+    }
     spawn_file_cleanup(&st, d.orphan_files);
     Ok(Json(d.row.into_view(uid)))
 }
@@ -1684,6 +1721,142 @@ async fn rename_conversation(
         .await?;
     let members = domain::member_ids(&st.pool, conv).await?;
     notify(&st, &members, "conversations");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 群公告：仅群主可改。空字符串 / null 清空三列。变更后 invalidate conversations。
+async fn put_announcement(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(conv): Path<Uuid>,
+    Json(req): Json<AnnouncementReq>,
+) -> AppResult<Json<Value>> {
+    let uid = uid_of(&headers, &st).await?;
+    let me = require_member(&st, conv, uid).await?;
+    let kind = domain::conv_kind(&st.pool, conv).await?.unwrap_or_default();
+    if kind != "group" {
+        return Err(AppError::bad_request("只有群聊可以设置公告"));
+    }
+    if me.role != "owner" {
+        return Err(AppError::forbidden(
+            "only the owner can set the announcement",
+        ));
+    }
+    let text = req
+        .text
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if let Some(t) = &text {
+        if t.chars().count() > 2000 {
+            return Err(AppError::bad_request("announcement must be 1-2000 chars"));
+        }
+    }
+    sqlx::query(
+        "UPDATE conversations
+            SET announcement = $2, announcement_by = $3, announcement_at = CASE WHEN $2 IS NULL THEN NULL ELSE now() END
+          WHERE id = $1",
+    )
+    .bind(conv)
+    .bind(&text)
+    .bind(text.as_ref().map(|_| uid))
+    .execute(&st.pool)
+    .await?;
+    let members = domain::member_ids(&st.pool, conv).await?;
+    notify(&st, &members, "conversations");
+    let view = announcement_of(&st, conv).await?;
+    Ok(Json(match view {
+        Some(v) => serde_json::to_value(v).unwrap_or(Value::Null),
+        None => json!({"text": null, "updated_by_name": null, "updated_at": null}),
+    }))
+}
+
+async fn announcement_of(st: &SharedState, conv: Uuid) -> AppResult<Option<AnnouncementView>> {
+    let row = sqlx::query_as::<_, (Option<String>, Option<String>, Option<DateTime<Utc>>)>(
+        "SELECT c.announcement, u.display_name, c.announcement_at
+           FROM conversations c
+           LEFT JOIN users u ON u.id = c.announcement_by
+          WHERE c.id = $1",
+    )
+    .bind(conv)
+    .fetch_optional(&st.pool)
+    .await?;
+    Ok(row.and_then(|(text, name, at)| {
+        text.map(|text| AnnouncementView {
+            text,
+            updated_by_name: name,
+            updated_at: at,
+        })
+    }))
+}
+
+#[derive(Serialize)]
+struct PinEntry {
+    message: MessageView,
+    pinned_by_name: Option<String>,
+    pinned_at: DateTime<Utc>,
+}
+
+/// 置顶列表：只返回未删除消息，按 pinned_at 倒序。非成员 403。
+async fn list_pins(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(conv): Path<Uuid>,
+) -> AppResult<Json<Vec<PinEntry>>> {
+    let uid = uid_of(&headers, &st).await?;
+    require_member(&st, conv, uid).await?;
+    let rows = sqlx::query_as::<_, (Uuid, Option<String>, DateTime<Utc>)>(
+        "SELECT p.message_id, u.display_name, p.pinned_at
+           FROM conversation_pins p
+           JOIN messages m ON m.id = p.message_id AND m.deleted_at IS NULL
+           LEFT JOIN users u ON u.id = p.pinned_by
+          WHERE p.conversation_id = $1
+          ORDER BY p.pinned_at DESC, p.message_id",
+    )
+    .bind(conv)
+    .fetch_all(&st.pool)
+    .await?;
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
+    let views = domain::pinned_message_views(&st.pool, conv, uid, &ids).await?;
+    let mut by_id: std::collections::HashMap<Uuid, MessageView> =
+        views.into_iter().map(|m| (m.id, m)).collect();
+    let out = rows
+        .into_iter()
+        .filter_map(|(id, name, pinned_at)| {
+            by_id.remove(&id).map(|message| PinEntry {
+                message,
+                pinned_by_name: name,
+                pinned_at,
+            })
+        })
+        .collect();
+    Ok(Json(out))
+}
+
+async fn pin_message(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path((conv, message_id)): Path<(Uuid, Uuid)>,
+) -> AppResult<StatusCode> {
+    let uid = uid_of(&headers, &st).await?;
+    let change = domain::pin_message(&st.pool, conv, message_id, uid)
+        .await
+        .map_err(post_err)?;
+    notify_pins(&st, &change);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn unpin_message(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path((conv, message_id)): Path<(Uuid, Uuid)>,
+) -> AppResult<StatusCode> {
+    let uid = uid_of(&headers, &st).await?;
+    let change = domain::unpin_message(&st.pool, conv, message_id, uid)
+        .await
+        .map_err(post_err)?;
+    notify_pins(&st, &change);
     Ok(StatusCode::NO_CONTENT)
 }
 

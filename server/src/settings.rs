@@ -27,11 +27,17 @@ const CODE_LEN: usize = 10;
 /// 每用户附件存储上限（MB）的合法区间；0 = 不限
 pub const QUOTA_MAX_MB: i64 = 1_048_576;
 
+/// 未配置会议地址时的默认服务；空字符串表示关闭会议按钮
+pub const DEFAULT_MEETING_BASE_URL: &str = "https://meet.jit.si";
+const MEETING_URL_MAX: usize = 200;
+
 #[derive(Debug, Serialize)]
 pub struct ServerSettings {
     pub registration_mode: String,
     /// 每用户附件总量上限（MB）；0 = 不限
     pub storage_quota_mb: i64,
+    /// 视频会议地址前缀；空字符串 = 关闭会议按钮
+    pub meeting_base_url: String,
 }
 
 impl Default for ServerSettings {
@@ -39,6 +45,7 @@ impl Default for ServerSettings {
         Self {
             registration_mode: MODE_OPEN.into(),
             storage_quota_mb: 0,
+            meeting_base_url: DEFAULT_MEETING_BASE_URL.into(),
         }
     }
 }
@@ -63,9 +70,44 @@ pub async fn load(executor: impl sqlx::PgExecutor<'_>) -> AppResult<ServerSettin
                     s.storage_quota_mb = q;
                 }
             }
+        } else if k == "meeting_base_url" {
+            if let Some(url) = v.as_str() {
+                if let Ok(url) = normalize_meeting_base_url(url) {
+                    s.meeting_base_url = url;
+                }
+            }
         }
     }
     Ok(s)
+}
+
+/// 空字符串表示关闭；否则必须是 http(s)、无空白、去掉路径末尾斜杠后 ≤ 200。
+/// 只剥路径末尾的 `/`，保留 scheme 的 `//`（否则 `https://` 会被收成 `https:`）。
+pub fn normalize_meeting_base_url(raw: &str) -> Result<String, &'static str> {
+    let url = raw.trim();
+    if url.is_empty() {
+        return Ok(String::new());
+    }
+    if url.chars().any(char::is_whitespace) {
+        return Err("meeting_base_url 不能含空白");
+    }
+    let scheme_len = if url.starts_with("https://") {
+        8
+    } else if url.starts_with("http://") {
+        7
+    } else {
+        return Err("meeting_base_url 必须以 http:// 或 https:// 开头");
+    };
+    let mut end = url.len();
+    let bytes = url.as_bytes();
+    while end > scheme_len && bytes[end - 1] == b'/' {
+        end -= 1;
+    }
+    let url = &url[..end];
+    if url.chars().count() > MEETING_URL_MAX {
+        return Err("meeting_base_url 不能超过 200 字符");
+    }
+    Ok(url.to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +116,8 @@ pub struct UpdateSettingsReq {
     pub registration_mode: Option<String>,
     /// 每用户附件存储上限（MB，0 = 不限）；带值时必须为合法整数
     pub storage_quota_mb: Option<serde_json::Value>,
+    /// 视频会议地址；空字符串关闭。缺省不改
+    pub meeting_base_url: Option<String>,
 }
 
 /// 按 patch 逐键 UPSERT（记录 updated_by），返回完整设置
@@ -111,6 +155,19 @@ pub async fn update(
                 SET value = EXCLUDED.value, updated_at = now(), updated_by = EXCLUDED.updated_by",
         )
         .bind(q)
+        .bind(updated_by)
+        .execute(&mut **tx)
+        .await?;
+    }
+    if let Some(raw) = &req.meeting_base_url {
+        let url = normalize_meeting_base_url(raw).map_err(AppError::bad_request)?;
+        sqlx::query(
+            "INSERT INTO server_settings (key, value, updated_by)
+             VALUES ('meeting_base_url', to_jsonb($1::text), $2)
+             ON CONFLICT (key) DO UPDATE
+                SET value = EXCLUDED.value, updated_at = now(), updated_by = EXCLUDED.updated_by",
+        )
+        .bind(&url)
         .bind(updated_by)
         .execute(&mut **tx)
         .await?;
@@ -153,7 +210,8 @@ pub async fn consume_invite(executor: impl sqlx::PgExecutor<'_>, code: &str) -> 
 #[derive(Debug, Serialize)]
 pub struct ServerInfo {
     pub registration_mode: String,
-    // 只放可公开字段；后续阶段按需加
+    /// 视频会议地址前缀；空字符串表示客户端不显示会议按钮
+    pub meeting_base_url: String,
 }
 
 /// GET /server-info：公共端点，供登录页决定注册入口形态
@@ -161,6 +219,7 @@ pub async fn server_info(State(st): State<SharedState>) -> AppResult<Json<Server
     let s = load(&st.pool).await?;
     Ok(Json(ServerInfo {
         registration_mode: s.registration_mode,
+        meeting_base_url: s.meeting_base_url,
     }))
 }
 

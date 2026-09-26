@@ -31,6 +31,8 @@ export default function AdminSettings() {
   // V2 P2-1：每用户存储配额（MB 输入框字符串；0 = 不限）
   const [quota, setQuota] = useState("0");
   const [quotaSaving, setQuotaSaving] = useState(false);
+  const [meetingUrl, setMeetingUrl] = useState("");
+  const [meetingSaving, setMeetingSaving] = useState(false);
   // 创建表单
   const [maxUses, setMaxUses] = useState<number | null>(1);
   const [expHours, setExpHours] = useState<number | null>(24 * 7);
@@ -44,6 +46,7 @@ export default function AdminSettings() {
       const [s, list] = await Promise.all([admin.settings(), admin.invites()]);
       setMode(s.registration_mode);
       setQuota(String(s.storage_quota_mb ?? 0));
+      setMeetingUrl(s.meeting_base_url ?? "");
       setInvites(list);
       setErr("");
     } catch (e) {
@@ -91,6 +94,22 @@ export default function AdminSettings() {
       setErr(e instanceof Error ? e.message : "保存失败");
     } finally {
       setQuotaSaving(false);
+    }
+  };
+
+  const saveMeeting = async () => {
+    setMeetingSaving(true);
+    setErr("");
+    setSaved(false);
+    try {
+      const s = await admin.updateSettings({ meeting_base_url: meetingUrl.trim() });
+      setMeetingUrl(s.meeting_base_url ?? "");
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "保存失败");
+    } finally {
+      setMeetingSaving(false);
     }
   };
 
@@ -185,6 +204,24 @@ export default function AdminSettings() {
           onClick={() => void saveQuota()}
         >
           {quotaSaving ? "保存中…" : "保存配额"}
+        </button>
+      </div>
+
+      <h3>视频会议地址</h3>
+      <div className="row ad-quota">
+        <input
+          className="grow"
+          value={meetingUrl}
+          disabled={meetingSaving}
+          placeholder="https://meet.jit.si（留空 = 关闭）"
+          onChange={(e) => setMeetingUrl(e.target.value)}
+        />
+        <button
+          className="primary"
+          disabled={meetingSaving}
+          onClick={() => void saveMeeting()}
+        >
+          {meetingSaving ? "保存中…" : "保存"}
         </button>
       </div>
 

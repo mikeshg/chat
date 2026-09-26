@@ -386,6 +386,11 @@ function dispatch(f: WsOut) {
     case "invalidate":
       void refreshByWhat(f.what);
       break;
+    case "pins_updated":
+      window.dispatchEvent(
+        new CustomEvent("chat:pins", { detail: f.conversation_id }),
+      );
+      break;
     case "force_logout": {
       // 被踢下线（禁用/重置密码/改密/移出设备）：记录原因 → 停连接 → 回登录页
       sessionStorage.setItem("chat_kick_reason", kickReasonText(f.reason));

@@ -1294,6 +1294,8 @@ pub struct Deleted {
     pub member_ids: Vec<Uuid>,
     /// 已无其他 attachments 行引用的物理文件（storage_path），提交后由调用方异步删除
     pub orphan_files: Vec<String>,
+    /// 这次删除摘掉了置顶行。软删除不删 messages 行，外键不会级联，调用方据此发 pins_updated。
+    pub pins_dropped: bool,
 }
 
 /// 软删除：本人可删自己的；群主可删群内任意消息；DM 只能删自己的。
@@ -1337,6 +1339,7 @@ async fn delete_in_tx(
             row,
             member_ids,
             orphan_files: vec![],
+            pins_dropped: false,
         });
     }
 
@@ -1366,6 +1369,12 @@ async fn delete_in_tx(
         .bind(message_id)
         .execute(&mut **tx)
         .await?;
+    // 软删除不删 messages 行，外键不会级联。摘掉 pin 行，列表查询再滤一次 deleted_at。
+    let dropped = sqlx::query("DELETE FROM conversation_pins WHERE message_id = $1")
+        .bind(message_id)
+        .execute(&mut **tx)
+        .await?;
+    let pins_dropped = dropped.rows_affected() > 0;
 
     // 附件：删行使下载立即 404。历史重复引用可能共享同一 storage_path，
     // 仍有其他有效 attachment 引用时不得删物理文件（转发副本共享 storage_path
@@ -1404,7 +1413,177 @@ async fn delete_in_tx(
         row,
         member_ids,
         orphan_files,
+        pins_dropped,
     })
+}
+
+const PIN_CAP: i64 = 20;
+
+/// 置顶结果：无变化（重复置顶 / 取消不存在的行）不广播。
+pub struct PinChange {
+    pub conversation_id: Uuid,
+    pub member_ids: Vec<Uuid>,
+    pub changed: bool,
+}
+
+/// 置顶本会话未删除的消息。任何成员可操作；只读私聊拒绝。
+/// 已置顶再置顶幂等，不改 pinned_at、不广播。
+pub async fn pin_message(
+    pool: &PgPool,
+    conv: Uuid,
+    message_id: Uuid,
+    uid: Uuid,
+) -> Result<PinChange, PostError> {
+    let mut tx = pool.begin().await.map_err(PostError::Db)?;
+    let result = pin_in_tx(&mut tx, conv, message_id, uid).await;
+    finish_pin(tx, conv, result).await
+}
+
+async fn pin_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    conv: Uuid,
+    message_id: Uuid,
+    uid: Uuid,
+) -> Result<bool, WriteError> {
+    ensure_pin_writable(tx, conv, uid).await?;
+    let msg = sqlx::query_as::<_, (Uuid, Option<DateTime<Utc>>)>(
+        "SELECT conversation_id, deleted_at FROM messages WHERE id = $1",
+    )
+    .bind(message_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| PostError::deny("not_found", "message not found"))?;
+    if msg.0 != conv {
+        return Err(PostError::deny("bad_request", "message is not in this conversation").into());
+    }
+    if msg.1.is_some() {
+        return Err(PostError::deny("bad_request", "已删除的消息不能置顶").into());
+    }
+    let exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM conversation_pins WHERE conversation_id = $1 AND message_id = $2)",
+    )
+    .bind(conv)
+    .bind(message_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if exists {
+        return Ok(false);
+    }
+    let n = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM conversation_pins WHERE conversation_id = $1",
+    )
+    .bind(conv)
+    .fetch_one(&mut **tx)
+    .await?;
+    if n >= PIN_CAP {
+        return Err(PostError::deny("bad_request", "最多置顶 20 条").into());
+    }
+    sqlx::query(
+        "INSERT INTO conversation_pins (conversation_id, message_id, pinned_by)
+         VALUES ($1, $2, $3)",
+    )
+    .bind(conv)
+    .bind(message_id)
+    .bind(uid)
+    .execute(&mut **tx)
+    .await?;
+    Ok(true)
+}
+
+/// 取消置顶。行不存在也成功，且不广播。
+pub async fn unpin_message(
+    pool: &PgPool,
+    conv: Uuid,
+    message_id: Uuid,
+    uid: Uuid,
+) -> Result<PinChange, PostError> {
+    let mut tx = pool.begin().await.map_err(PostError::Db)?;
+    let result = unpin_in_tx(&mut tx, conv, message_id, uid).await;
+    finish_pin(tx, conv, result).await
+}
+
+async fn unpin_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    conv: Uuid,
+    message_id: Uuid,
+    uid: Uuid,
+) -> Result<bool, WriteError> {
+    ensure_pin_writable(tx, conv, uid).await?;
+    let res =
+        sqlx::query("DELETE FROM conversation_pins WHERE conversation_id = $1 AND message_id = $2")
+            .bind(conv)
+            .bind(message_id)
+            .execute(&mut **tx)
+            .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+async fn ensure_pin_writable(
+    tx: &mut Transaction<'_, Postgres>,
+    conv: Uuid,
+    uid: Uuid,
+) -> Result<(), WriteError> {
+    let Some((kind, _, dissolved)) = lock_conversation(tx, conv).await? else {
+        return Err(PostError::deny("forbidden", "not a member of this conversation").into());
+    };
+    let member = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM memberships WHERE conversation_id = $1 AND user_id = $2)",
+    )
+    .bind(conv)
+    .bind(uid)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !member || dissolved {
+        return Err(PostError::deny("forbidden", "not a member of this conversation").into());
+    }
+    if kind == "dm" && !dm_writable(tx, conv, uid).await? {
+        return Err(PostError::deny("not_friends", "好友关系已解除，会话只读").into());
+    }
+    Ok(())
+}
+
+/// 置顶列表的消息视图：过滤已删除，顺序由调用方按 pinned_at 保持。
+pub async fn pinned_message_views(
+    pool: &PgPool,
+    conv: Uuid,
+    viewer: Uuid,
+    ids: &[Uuid],
+) -> AppResult<Vec<MessageView>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query_as::<_, MsgViewRow>(
+        "SELECT * FROM message_views
+          WHERE conversation_id = $1 AND id = ANY($2) AND deleted_at IS NULL",
+    )
+    .bind(conv)
+    .bind(ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.into_view(viewer)).collect())
+}
+
+async fn finish_pin(
+    mut tx: Transaction<'_, Postgres>,
+    conv: Uuid,
+    result: Result<bool, WriteError>,
+) -> Result<PinChange, PostError> {
+    match result {
+        Ok(changed) => {
+            let member_ids = member_ids(&mut *tx, conv).await.map_err(PostError::Db)?;
+            tx.commit().await.map_err(PostError::Db)?;
+            Ok(PinChange {
+                conversation_id: conv,
+                member_ids,
+                changed,
+            })
+        }
+        Err(WriteError::Fail(e)) => {
+            let _ = tx.rollback().await;
+            Err(e)
+        }
+        Err(WriteError::IdempotentHit) => unreachable!(),
+    }
 }
 
 pub struct ReactionChange {

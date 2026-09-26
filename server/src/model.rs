@@ -231,6 +231,20 @@ pub struct MessageView {
     pub forwarded_from: Option<String>,
 }
 
+/// 群公告（会话列表随 ConversationView 下发；清空时整字段为 null）。
+#[derive(Debug, Clone, Serialize)]
+pub struct AnnouncementView {
+    pub text: String,
+    pub updated_by_name: Option<String>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+/// PUT /conversations/{id}/announcement：null 或空字符串表示清空。
+#[derive(Debug, Deserialize)]
+pub struct AnnouncementReq {
+    pub text: Option<String>,
+}
+
 /// 会话偏好（用户维度，仅本人可见、同步本人全部设备）。
 /// 无偏好行时全默认；updated_at 为 NULL 表示从未写入。
 #[derive(Debug, Clone, Default, Serialize, sqlx::FromRow)]
@@ -257,6 +271,8 @@ pub struct ConversationView {
     pub last_message: Option<MessageView>,
     /// 本人对该会话的偏好（置顶/静音/归档）；旧客户端可忽略
     pub preference: ConversationPref,
+    /// 群公告；私聊 / 文件传输助手 / 未设置时为 null。旧客户端忽略
+    pub announcement: Option<AnnouncementView>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -439,6 +455,10 @@ pub enum WsOut {
     },
     Invalidate {
         what: &'static str, // "friends" | "conversations" | "requests"
+    },
+    /// 置顶列表变更：成员收到后重新拉 GET /conversations/{id}/pins
+    PinsUpdated {
+        conversation_id: Uuid,
     },
     Error {
         code: &'static str,
