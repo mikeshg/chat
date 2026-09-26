@@ -8832,3 +8832,72 @@ async fn review_avatar_concurrent_upload_keeps_winner_file() {
         assert_eq!(r.status(), 200, "round {round}: 赢家的头像文件被删了");
     }
 }
+
+/// 自己发的消息不算未读：发言即把本人已读推进到这条，并给本人其他设备推 read_sync
+#[tokio::test]
+async fn review_own_messages_not_unread() {
+    let base = spawn().await;
+    let a = register(&base, &format!("rvun_{}", uniq())).await;
+    let b = register(&base, &format!("rvuo_{}", uniq())).await;
+    befriend(&base, &a, &b).await;
+    let conv = dm_conv(&base, &a).await;
+    let (mut sa, _) = tokio_tungstenite::connect_async(ws_url(&base, &a).await)
+        .await
+        .unwrap();
+    next_of(&mut sa, "presence_init").await;
+    let (mut sb, _) = tokio_tungstenite::connect_async(ws_url(&base, &b).await)
+        .await
+        .unwrap();
+    next_of(&mut sb, "presence_init").await;
+    // A 的第二台设备
+    let a2 = login_device(&base, &a.username, "secret123", "A2").await;
+    let (mut sa2, _) = tokio_tungstenite::connect_async(ws_url(&base, &a2).await)
+        .await
+        .unwrap();
+    next_of(&mut sa2, "presence_init").await;
+
+    ws_send(
+        &mut sb,
+        &conv,
+        json!({"client_msg_id": "b1", "content": "from b"}),
+    )
+    .await;
+    for i in 0..3 {
+        ws_send(
+            &mut sa,
+            &conv,
+            json!({"client_msg_id": format!("a{i}"), "content": "from a"}),
+        )
+        .await;
+    }
+    let unread = |tok: String| {
+        let base = base.clone();
+        let conv = conv.clone();
+        async move {
+            let list: Value = http()
+                .get(format!("{base}/v1/conversations"))
+                .header("authorization", authz(&tok))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            list.as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["id"] == conv.as_str())
+                .unwrap()["unread_count"]
+                .as_i64()
+                .unwrap()
+        }
+    };
+    assert_eq!(
+        unread(a.access.clone()).await,
+        0,
+        "自己发言后本会话不应有未读"
+    );
+    assert_eq!(unread(b.access.clone()).await, 3, "对方的未读不受影响");
+    let rs = next_of(&mut sa2, "read_sync").await;
+    assert_eq!(rs["conversation_id"], conv.as_str());
+}

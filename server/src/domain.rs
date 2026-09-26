@@ -799,6 +799,17 @@ async fn write_message(
     .fetch_one(&mut **tx)
     .await?;
 
+    // 发言即读到这里：自己的消息不算未读（否则刷新/换设备后自己发的消息显示成未读）
+    sqlx::query(
+        "UPDATE memberships SET last_read_seq = $3
+          WHERE conversation_id = $1 AND user_id = $2 AND last_read_seq < $3",
+    )
+    .bind(msg.conversation_id)
+    .bind(msg.sender_id)
+    .bind(seq)
+    .execute(&mut **tx)
+    .await?;
+
     for uid in &mentions {
         sqlx::query(
             "INSERT INTO message_mentions (message_id, user_id) VALUES ($1, $2)

@@ -264,6 +264,14 @@ pub async fn broadcast_posted(st: &SharedState, conv: Uuid, posted: &domain::Pos
             message: posted.message.clone(),
         });
         st.send_to_users(&posted.member_ids, &p);
+        // 发送者已读位置在事务内推进到这条：同步给他的其他设备清角标
+        st.send_to_user(
+            posted.message.sender_id,
+            &frame(&WsOut::ReadSync {
+                conversation_id: conv,
+                seq: posted.message.seq,
+            }),
+        );
         // V2 P3-3：离线推送（ntfy）——判定与发送全在 spawned 任务里，不拖慢广播
         crate::push::schedule(st, conv, posted);
     }

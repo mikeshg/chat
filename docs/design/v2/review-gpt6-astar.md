@@ -15,6 +15,13 @@
 | 8 | 并发换头像时两边写同一个文件名，乐观锁输掉的一方会删掉赢家的文件 | 属实 | 文件名改为 `{uid}-{版本}-{随机 8 位}.{扩展名}` | `review_avatar_concurrent_upload_keeps_winner_file` |
 | 9 | 跳转到缓存之外的旧消息时，把不连续的窗口合并进缓存，中间出现断档且永远补不上 | 属实 | `fetchForward` 从目标前 25 条逐页（200 条/页）补到缓存里最早的一条；缓存为空时补到最新。保证缓存连续 | Vitest `fetchForward` 用例 + 浏览器实测（400 条缓存里只有 351–400，跳到第 5 条后 1–400 连续） |
 
+## 追加：自己发的消息算成未读（实测时发现）
+
+- **现象**：用另一条连接（手机或脚本）发消息后，网页端刷新或登录时，自己发的消息显示为未读（400 条显示 99+）。
+- **根因**：服务端的未读数 = `last_seq - last_read_seq`，但发消息时不推进发送者的 `last_read_seq`；客户端也从不为自己的消息上报已读（`isActive && !mine`）。
+- **修法**：在 `post_message` 事务里把发送者的已读位置推进到这条消息（发言即视为读到这里，和常见聊天软件一致）；`broadcast_posted` 同时给发送者所有设备推一条 `read_sync`，清掉其他设备上的角标。
+- **回归**：`review_own_messages_not_unread`（旧代码下未读为 4，修复后为 0，对方的未读不受影响）；浏览器里重新登录后不再有未读角标。
+
 ## 已知上限
 
 - 第 9 条：跳得越远，逐页补齐的量越大。历史到万级时，应改成独立窗口加向下加载（代码里有 `ponytail:` 注释）。
@@ -23,4 +30,4 @@
 
 ## 验证
 
-`cargo fmt --check` 通过。`cargo test --tests`：it 116 passed，migrations 3 passed。Vitest 165 passed，tsc 和 build 通过。E2E phase1 105 passed，真实重启后 phase2 13 passed。
+`cargo fmt --check` 通过。`cargo test --tests`：it 117 passed，migrations 3 passed。Vitest 165 passed，tsc 和 build 通过。E2E phase1 105 passed，真实重启后 phase2 13 passed。
