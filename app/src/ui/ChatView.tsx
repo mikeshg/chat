@@ -8,7 +8,6 @@ import {
   convTitle,
   getState,
   fetchForward,
-  invocationErrorText,
   isOwnMessage,
   prependMessages,
   pushToast,
@@ -33,6 +32,7 @@ import PollCard from "./PollCard";
 import { imageBubbleSize } from "./mediaFormat";
 import Avatar from "./Avatar";
 import VoiceRecorder from "./VoiceRecorder";
+import InvocationStatus from "./InvocationStatus";
 
 function fmtSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -337,6 +337,23 @@ export default function ChatView() {
     ? s.agentHosts.find((h) => h.id === conv.agent!.host_id)
     : undefined;
   const invs = conv.kind === "agent" ? (s.invocations[conv.id] ?? {}) : {};
+  // A04：409 = 调用已经结束，静默拉一次历史把标签对齐
+  const cancelInvocation = (id: string) => {
+    void (async () => {
+      try {
+        const row = await agentsApi.cancel(id);
+        setState((st) => applyInvocations(st, [row]));
+      } catch (e) {
+        if (!(e instanceof ApiError) || e.status !== 409) return;
+        try {
+          const rows = await agentsApi.invocations(conv.id);
+          setState((st) => applyInvocations(st, rows));
+        } catch {
+          /* 刷新失败也保持安静 */
+        }
+      }
+    })();
+  };
   const typing = s.typing[conv.id];
   const typingFresh = typing && Date.now() - typing.ts < 5000;
   const readonly = conv.kind === "dm" && conv.peer && !s.friends.some((f) => f.user.id === conv.peer!.id);
@@ -1083,13 +1100,13 @@ export default function ChatView() {
                   </div>
                 </div>
               </div>
-              {/* A01：主人这条消息触发的 Agent 调用状态行 */}
-              {inv && (inv.status === "running" || inv.status === "failed") && (
-                <div className={`inv-status ${inv.status}`}>
-                  {inv.status === "running"
-                    ? "⏳ 正在处理"
-                    : `⚠ 失败：${invocationErrorText(inv.error)}`}
-                </div>
+              {/* A01/A04：主人这条消息触发的调用状态；取消按钮只在专属会话（主人）出现 */}
+              {inv && (
+                <InvocationStatus
+                  inv={inv}
+                  allowCancel={conv.kind === "agent"}
+                  onCancel={cancelInvocation}
+                />
               )}
             </div>
           );

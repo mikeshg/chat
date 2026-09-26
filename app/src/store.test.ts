@@ -9,7 +9,9 @@ import {
   applyUpdatedMessage,
   convTitle,
   fetchForward,
+  invocationCancellable,
   invocationErrorText,
+  invocationStatusLabel,
   isOwnMessage,
   mergeConversationLists,
   resolveAck,
@@ -508,6 +510,28 @@ describe("Agent A01：宿主状态与调用记录", () => {
     expect(invocationErrorText("host_disconnected")).toBe("Agent 所在电脑断开了");
     expect(invocationErrorText("boom")).toBe("boom");
     expect(invocationErrorText(null)).toBe("未知原因");
+  });
+
+  it("invocationStatusLabel：排队 / 取消 / 超时按 status 查表", () => {
+    expect(invocationStatusLabel("queued", null)).toBe("⏸ 排队中：Agent 所在电脑不在线");
+    expect(invocationStatusLabel("cancelled", null)).toBe("已取消");
+    expect(invocationStatusLabel("timed_out", null)).toBe("排队超时，已取消");
+    expect(invocationStatusLabel("running", null)).toBe("⏳ 正在处理");
+    expect(invocationStatusLabel("failed", "host_disconnected")).toBe(
+      "⚠ 失败：Agent 所在电脑断开了",
+    );
+    expect(invocationStatusLabel("succeeded", null)).toBeNull();
+    expect(invocationStatusLabel("awaiting_approval", null)).toBeNull();
+  });
+
+  it("invocationCancellable：排队、运行中、等待审批可取消", () => {
+    expect(invocationCancellable("queued")).toBe(true);
+    expect(invocationCancellable("running")).toBe(true);
+    expect(invocationCancellable("awaiting_approval")).toBe(true);
+    expect(invocationCancellable("succeeded")).toBe(false);
+    expect(invocationCancellable("cancelled")).toBe(false);
+    expect(invocationCancellable("timed_out")).toBe(false);
+    expect(invocationCancellable("failed")).toBe(false);
   });
 });
 

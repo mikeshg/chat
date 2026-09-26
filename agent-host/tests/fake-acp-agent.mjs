@@ -6,7 +6,11 @@
 //   fail         → JSON-RPC error
 //   crash        → 直接退出（进程码 2）
 //   其他          → 回 "ok"
+// session/cancel（通知）：进行中的 sleep 立刻以 stopReason "cancelled" 返回。
+// 启动参数 --ignore-cancel：忽略取消，用来测宿主 5 秒后强制结束子进程。
 import readline from "node:readline";
+
+const ignoreCancel = process.argv.includes("--ignore-cancel");
 
 const rl = readline.createInterface({ input: process.stdin });
 const send = (o) => process.stdout.write(JSON.stringify(o) + "\n");
@@ -26,6 +30,7 @@ const chunk = (sessionId, text) =>
   });
 
 let sessionId = "fake-session";
+let pendingSleep = null;
 
 rl.on("line", (line) => {
   let m;
@@ -35,7 +40,14 @@ rl.on("line", (line) => {
     return;
   }
   const { id, method, params } = m;
-  if (id === undefined) return; // 通知一律不回
+  if (method === "session/cancel") {
+    if (ignoreCancel || !pendingSleep) return;
+    clearTimeout(pendingSleep.timer);
+    const promptId = pendingSleep.id;
+    pendingSleep = null;
+    return result(promptId, { stopReason: "cancelled" });
+  }
+  if (id === undefined) return; // 其余通知不回
 
   if (method === "initialize") {
     return result(id, { protocolVersion: 1, agentCapabilities: {}, authMethods: [] });
@@ -64,10 +76,12 @@ rl.on("line", (line) => {
     }
     if (text.startsWith("sleep:")) {
       const ms = parseInt(text.slice(6), 10) || 0;
-      setTimeout(() => {
+      const timer = setTimeout(() => {
+        pendingSleep = null;
         chunk(sessionId, "done");
         result(id, { stopReason: "end_turn" });
       }, ms);
+      pendingSleep = { id, timer };
       return;
     }
     if (text === "fail") return rpcErr(id, "fake failure");

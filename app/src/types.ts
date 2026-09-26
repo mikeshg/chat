@@ -218,7 +218,7 @@ export interface CreateAgentReq {
   cwd?: string;
 }
 
-/** 一次 Agent 调用记录（A01；本票只用 running / succeeded / failed） */
+/** 一次 Agent 调用记录。status：queued / running / awaiting_approval / succeeded / failed / cancelled / timed_out */
 export interface InvocationView {
   id: string;
   agent_id: string;

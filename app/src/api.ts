@@ -337,6 +337,8 @@ export const agents = {
   /** 会话最近的调用记录（刷新后恢复状态行；仅成员可读） */
   invocations: (convId: string, limit = 50) =>
     get<InvocationView[]>(`/conversations/${convId}/agent-invocations?limit=${limit}`),
+  /** 取消排队中 / 运行中 / 等待审批的调用。409 = 已经结束 */
+  cancel: (id: string) => post<InvocationView>(`/agent-invocations/${id}/cancel`),
 };
 
 // ---------- 消息生命周期 ----------

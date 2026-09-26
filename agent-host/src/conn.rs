@@ -132,12 +132,14 @@ async fn read_loop(
                     }
                     "invocation_start" => start_invocation(s, out, &v),
                     "invocation_cancel" => {
+                        // 不直接 abort：让 ACP 先发 session/cancel，最多再等 5 秒才杀进程。
+                        // 这次调用不再回 invocation_finish。
                         if let Some(id) = v["invocation_id"]
                             .as_str()
                             .and_then(|x| Uuid::parse_str(x).ok())
                         {
-                            if let Some(h) = s.running.lock().unwrap().remove(&id) {
-                                h.abort();
+                            if let Some(tx) = s.cancels.lock().unwrap().get(&id) {
+                                let _ = tx.send(true);
                             }
                         }
                     }
@@ -164,9 +166,14 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
         }
     };
     let prompt = v["prompt"].as_str().unwrap_or_default().to_string();
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    // 先登记再 spawn：read_loop 是单线程收帧，取消帧不会插在登记完成之前
+    s.cancels.lock().unwrap().insert(inv_id, cancel_tx);
     let out2 = out.clone();
     let running = s.running.clone();
+    let cancels = s.cancels.clone();
     let dir = s.data_dir.clone();
+    let cancel_flag = cancel_rx.clone();
     let task = tokio::spawn(async move {
         let rt = runtime::runtime_for(&spec);
         // 事件暂不外发（接收端即刻丢弃）；流式输出票把它接到服务端
@@ -175,10 +182,15 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
             spec,
             prompt,
             data_dir: dir,
+            cancel: cancel_rx,
         };
         let r = rt.run(req, events).await.map(|o| o.text);
-        send_finish(&out2, inv_id, r);
+        // 取消过的调用不回 invocation_finish（服务端已标 cancelled，再回也会被忽略）
+        if !*cancel_flag.borrow() {
+            send_finish(&out2, inv_id, r);
+        }
         running.lock().unwrap().remove(&inv_id);
+        cancels.lock().unwrap().remove(&inv_id);
     });
     s.running.lock().unwrap().insert(inv_id, task);
 }

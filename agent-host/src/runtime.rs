@@ -9,7 +9,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 /// invocation_start 帧里 agent 字段的运行时描述。
@@ -51,6 +51,8 @@ pub struct RunRequest {
     pub prompt: String,
     /// spec.cwd 为空时的工作目录
     pub data_dir: PathBuf,
+    /// 主人取消：置 true 后 ACP 先发 session/cancel，最多再等 5 秒。
+    pub cancel: watch::Receiver<bool>,
 }
 
 /// 运行过程中的事件（按发生顺序）。
