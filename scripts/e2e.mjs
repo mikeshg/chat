@@ -1,10 +1,12 @@
 // E2E 真实用户旅程测试 —— 直接打运行中的部署（默认 docker :8080）
 // 用法:
-//   node scripts/e2e.mjs            # phase1: 完整用户旅程
+//   E2E_ADMIN_USER=... E2E_ADMIN_PASS=... node scripts/e2e.mjs
 //   node scripts/e2e.mjs phase2     # phase2: 重启后持久化验证（读 .e2e-state.json）
 // 环境: BASE_URL=http://localhost:8080
+// 前提: 库里已有管理员。未提供 E2E_ADMIN_USER、且脚本注册的第一个用户成了管理员时退出 2。
 import { readFileSync, writeFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { deflateSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -64,6 +66,75 @@ class Ws {
 const rid = Math.random().toString(36).slice(2, 8);
 const mk = (n) => ({ username: `e2e${rid}${n}`, password: 'pass123456' });
 
+// PNG CRC-32（ISO 3309），只用于手写测试图片
+function crc32(buf) {
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    c ^= buf[i];
+    for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xedb88320 & -(c & 1));
+  }
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type, data) {
+  const body = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+  const out = Buffer.alloc(12 + data.length);
+  out.writeUInt32BE(data.length, 0);
+  body.copy(out, 4);
+  out.writeUInt32BE(crc32(body), 8 + data.length);
+  return out;
+}
+
+// 8-bit RGB PNG。最长边 > 480 时服务端会生成 JPEG 缩略图。
+function pngRgb(width, height, rgb = [12, 80, 160]) {
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 2;
+  const stride = 1 + width * 3;
+  const raw = Buffer.alloc(stride * height);
+  for (let y = 0; y < height; y++) {
+    const row = y * stride;
+    raw[row] = 0;
+    for (let x = 0; x < width; x++) {
+      const o = row + 1 + x * 3;
+      raw[o] = rgb[0];
+      raw[o + 1] = rgb[1];
+      raw[o + 2] = rgb[2];
+    }
+  }
+  return Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', deflateSync(raw)),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+// 1×1 PNG，头像只认魔数
+const TINY_PNG = Buffer.from([
+  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+  0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+  0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63, 0xf8,
+  0xcf, 0xc0, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x05, 0xfe, 0x02, 0xfe, 0x00, 0x00,
+  0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+]);
+
+async function uploadMultipart(token, method, path, fields, file) {
+  const fd = new FormData();
+  for (const [k, v] of Object.entries(fields)) fd.append(k, v);
+  fd.append('file', new Blob([file.bytes], { type: file.type }), file.name);
+  const res = await fetch(BASE + path, {
+    method,
+    headers: { authorization: `Bearer ${token}` },
+    body: fd,
+  });
+  let json = null;
+  try { json = await res.json(); } catch {}
+  return { status: res.status, json, res };
+}
+
 async function phase1() {
   const [A, B, C] = [mk('a'), mk('b'), mk('c')];
   const attachments = [];
@@ -74,6 +145,18 @@ async function phase1() {
     const r = await api(null, 'POST', '/auth/register', { username: u.username, password: u.password });
     ok(`register ${u.username}`, r.status === 200 && r.json.access_token, `got ${r.status}`);
     Object.assign(u, r.json);
+    // 空库时第一个注册用户就是管理员，「非管理员 403」会整批误报。先停下来。
+    if (u === A && !process.env.E2E_ADMIN_USER && u.user?.role === 'admin') {
+      console.error(`
+E2E 停止（退出码 2）：未设置 E2E_ADMIN_USER，且当前库还没有其他用户。
+本脚本注册的第一个用户 ${A.username} 已自动成为管理员。
+继续跑会让「非管理员访问后台应 403」整批误报失败。
+
+请先注册一个管理员，再执行：
+  E2E_ADMIN_USER=<管理员用户名> E2E_ADMIN_PASS=<密码> BASE_URL=... node scripts/e2e.mjs
+`);
+      process.exit(2);
+    }
   }
   {
     const r = await api(null, 'POST', '/auth/login', { username: A.username, password: A.password });
@@ -357,7 +440,8 @@ async function phase1() {
     console.log('  (skip admin-flow asserts: set E2E_ADMIN_USER/E2E_ADMIN_PASS to enable)');
   }
 
-  writeFileSync(STATE, JSON.stringify({ base: BASE, A, B, C, dmId: A.dmId, attachments }, null, 2));
+  const v2 = await runV2(A, C);
+  writeFileSync(STATE, JSON.stringify({ base: BASE, A, B, C, dmId: A.dmId, attachments, v2 }, null, 2));
   console.log(`state saved -> ${STATE}`);
 }
 
@@ -389,6 +473,294 @@ async function phase2() {
   const fr = await api(lb.json.access_token, 'GET', '/friends');
   ok('bob still registered', lb.status === 200);
   console.log(`  (bob friends now: ${(fr.json || []).map((f) => f.user.username).join(',') || 'none — unfriended in phase1'})`);
+
+  console.log('== V2 重启后持久化 ==');
+  const v = s.v2 || {};
+  {
+    const av = await fetch(`${BASE}/users/${v.avatarUserId}/avatar?v=${v.avatarVersion}`);
+    ok('avatar persisted after restart', av.status === 200, `got ${av.status}`);
+    const convs = await api(t, 'GET', '/conversations');
+    const self = (convs.json || []).find((c) => c.id === v.selfConvId);
+    ok('self conversation persisted', self?.kind === 'self', `kind=${self?.kind}`);
+    const grp = (convs.json || []).find((c) => c.id === v.announceConvId);
+    ok('announcement persisted', grp?.announcement?.text === v.announceText, JSON.stringify(grp?.announcement));
+    const pins = await api(t, 'GET', `/conversations/${v.pinConvId}/pins`);
+    const pinned = Array.isArray(pins.json) && pins.json.some((p) => p.message?.id === v.pinMessageId);
+    ok('pin persisted', pins.status === 200 && pinned, `got ${pins.status} ${JSON.stringify(pins.json)?.slice(0, 160)}`);
+  }
+}
+
+// ---------- V2 ----------
+
+async function selfConvs(token) {
+  const r = await api(token, 'GET', '/conversations');
+  const list = r.json || [];
+  return { status: r.status, list, selves: list.filter((c) => c.kind === 'self') };
+}
+
+async function runV2(A, C) {
+  const v2 = {};
+
+  console.log('== V2 注册开关 / 邀请码 ==');
+  if (!process.env.E2E_ADMIN_USER || !process.env.E2E_ADMIN_PASS) {
+    console.log('  (skip: set E2E_ADMIN_USER/E2E_ADMIN_PASS)');
+  } else {
+    const la = await api(null, 'POST', '/auth/login', {
+      username: process.env.E2E_ADMIN_USER,
+      password: process.env.E2E_ADMIN_PASS,
+    });
+    ok('admin login for registration settings', la.status === 200 && la.json?.user?.role === 'admin', `got ${la.status}`);
+    if (la.status === 200) {
+      const at = la.json.access_token;
+      const cur = await api(at, 'GET', '/admin/settings');
+      const prev = cur.json?.registration_mode;
+      ok('read current registration mode', cur.status === 200 && typeof prev === 'string', `got ${cur.status}`);
+      if (typeof prev === 'string') {
+        try {
+          const set = await api(at, 'PUT', '/admin/settings', { registration_mode: 'invite' });
+          ok('switch registration to invite', set.status === 200 && set.json?.registration_mode === 'invite', `got ${set.status}`);
+          const bare = mk('n');
+          const noCode = await api(null, 'POST', '/auth/register', { username: bare.username, password: bare.password });
+          ok('register without invite 403', noCode.status === 403, `got ${noCode.status}`);
+          const inv = await api(at, 'POST', '/admin/invites', { max_uses: 1 });
+          ok('create one-time invite', inv.status === 200 && !!inv.json?.code, `got ${inv.status}`);
+          const invited = mk('i');
+          const yes = await api(null, 'POST', '/auth/register', {
+            username: invited.username, password: invited.password, invite_code: inv.json?.code,
+          });
+          ok('register with invite', yes.status === 200 && !!yes.json?.access_token, `got ${yes.status}`);
+          const reuse = mk('j');
+          const again = await api(null, 'POST', '/auth/register', {
+            username: reuse.username, password: reuse.password, invite_code: inv.json?.code,
+          });
+          ok('reused invite 403', again.status === 403, `got ${again.status}`);
+        } finally {
+          const back = await api(at, 'PUT', '/admin/settings', { registration_mode: prev });
+          const check = await api(at, 'GET', '/admin/settings');
+          ok('registration mode restored', back.status === 200 && check.json?.registration_mode === prev,
+            `put ${back.status} now=${check.json?.registration_mode} want=${prev}`);
+          if (check.json?.registration_mode !== prev) {
+            throw new Error(`failed to restore registration_mode to ${prev}`);
+          }
+        }
+      }
+    }
+  }
+
+  console.log('== V2 登录设备 / 改密 ==');
+  {
+    // 注册也会建一条 session。先登出它，再登录两次，列表才恰好是这两台设备。
+    const S = mk('s');
+    const reg = await api(null, 'POST', '/auth/register', {
+      username: S.username, password: S.password, device_label: '注册设备',
+    });
+    ok('session user registered', reg.status === 200, `got ${reg.status}`);
+    const out = await api(null, 'POST', '/auth/logout', { refresh_token: reg.json?.refresh_token });
+    ok('logout register session', out.status === 204, `got ${out.status}`);
+    const d1 = await api(null, 'POST', '/auth/login', {
+      username: S.username, password: S.password, device_label: '设备甲',
+    });
+    const d2 = await api(null, 'POST', '/auth/login', {
+      username: S.username, password: S.password, device_label: '设备乙',
+    });
+    ok('two device logins', d1.status === 200 && d2.status === 200, `got ${d1.status}/${d2.status}`);
+    const list = await api(d1.json.access_token, 'GET', '/users/me/sessions');
+    const rows = list.json || [];
+    ok('two logins → two sessions', list.status === 200 && rows.length === 2, `got ${list.status} n=${rows.length}`);
+    const other = rows.find((s) => s.device_label === '设备乙');
+    const rev = await api(d1.json.access_token, 'DELETE', `/users/me/sessions/${other?.id}`);
+    ok('revoke other session', rev.status === 204, `got ${rev.status}`);
+    const dead = await api(d2.json.access_token, 'GET', '/users/me');
+    ok('revoked device token 401', dead.status === 401, `got ${dead.status}`);
+    const d3 = await api(null, 'POST', '/auth/login', {
+      username: S.username, password: S.password, device_label: '设备丙',
+    });
+    ok('third device login', d3.status === 200, `got ${d3.status}`);
+    const nextPw = 'pass654321';
+    const ch = await api(d1.json.access_token, 'POST', '/users/me/password', {
+      old_password: S.password, new_password: nextPw,
+    });
+    ok('change password', ch.status === 200 && !!ch.json?.access_token, `got ${ch.status}`);
+    const otherDead = await api(d3.json.access_token, 'GET', '/users/me');
+    ok('other device token 401 after password change', otherDead.status === 401, `got ${otherDead.status}`);
+    const curOk = await api(ch.json?.access_token, 'GET', '/users/me');
+    ok('current device new token works', curOk.status === 200, `got ${curOk.status}`);
+    const nl = await api(null, 'POST', '/auth/login', { username: S.username, password: nextPw });
+    ok('new password can login', nl.status === 200, `got ${nl.status}`);
+    const old = await api(null, 'POST', '/auth/login', { username: S.username, password: S.password });
+    ok('old password rejected', old.status === 401, `got ${old.status}`);
+  }
+
+  console.log('== V2 头像 ==');
+  {
+    const before = A.user?.avatar_version ?? 0;
+    const up = await uploadMultipart(A.access_token, 'PUT', '/users/me/avatar', {}, {
+      bytes: TINY_PNG, type: 'image/png', name: 'a.png',
+    });
+    ok('upload avatar', up.status === 200 && up.json?.avatar_version === before + 1 && up.json?.has_avatar === true,
+      `got ${up.status} v=${up.json?.avatar_version}`);
+    const version = up.json?.avatar_version;
+    const got = await fetch(`${BASE}/users/${A.user.id}/avatar?v=${version}`);
+    ok('get avatar 200', got.status === 200, `got ${got.status}`);
+    const spoof = await uploadMultipart(A.access_token, 'PUT', '/users/me/avatar', {}, {
+      bytes: Buffer.from('<html><script>alert(1)</script></html>'), type: 'image/png', name: 'a.png',
+    });
+    ok('spoofed avatar type 400', spoof.status === 400, `got ${spoof.status}`);
+    v2.avatarUserId = A.user.id;
+    v2.avatarVersion = version;
+  }
+
+  const mine = await selfConvs(A.access_token);
+  const selfId = mine.selves[0]?.id;
+  ok('alice has one self conversation', mine.selves.length === 1 && !!selfId, `n=${mine.selves.length}`);
+  v2.selfConvId = selfId;
+
+  console.log('== V2 缩略图 ==');
+  {
+    const big = pngRgb(481, 2);
+    const up = await uploadMultipart(A.access_token, 'POST', '/files', { conversation_id: selfId }, {
+      bytes: big, type: 'image/png', name: 'big.png',
+    });
+    ok('large png has_thumb', up.status === 200 && up.json?.has_thumb === true,
+      `got ${up.status} ${JSON.stringify(up.json)?.slice(0, 160)}`);
+    const thumb = await fetch(`${BASE}/files/${up.json?.id}?thumb=1`);
+    const ctype = thumb.headers.get('content-type') || '';
+    ok('thumb is image/jpeg', thumb.status === 200 && ctype.startsWith('image/jpeg'),
+      `got ${thumb.status} ${ctype}`);
+  }
+
+  console.log('== V2 语音 ==');
+  {
+    const up = await uploadMultipart(A.access_token, 'POST', '/files', {
+      conversation_id: selfId, duration_ms: '3200',
+    }, { bytes: Buffer.from('webm-bytes'), type: 'audio/webm', name: 'voice.webm' });
+    ok('upload voice', up.status === 200 && up.json?.duration_ms === 3200, `got ${up.status} ${JSON.stringify(up.json)?.slice(0, 160)}`);
+    const w = new Ws();
+    await w.connect(A.access_token);
+    await w.waitType('presence_init');
+    w.send({
+      type: 'send_message', conversation_id: selfId, client_msg_id: 'v2voice',
+      content: '', attachment_id: up.json?.id,
+    });
+    const ack = await w.waitType('message_ack', (m) => m.client_msg_id === 'v2voice');
+    ok('voice message kind=audio', ack.message?.kind === 'audio' && ack.message?.content === '[语音]',
+      JSON.stringify({ kind: ack.message?.kind, content: ack.message?.content }));
+    w.close();
+  }
+
+  console.log('== V2 文件传输助手 / 转发 ==');
+  {
+    const F = mk('f');
+    const reg = await api(null, 'POST', '/auth/register', { username: F.username, password: F.password });
+    ok('forward user registered', reg.status === 200, `got ${reg.status}`);
+    Object.assign(F, reg.json);
+    const convs = await selfConvs(F.access_token);
+    ok('new user has exactly one self conversation',
+      convs.status === 200 && convs.selves.length === 1 && convs.list.length === 1,
+      `status=${convs.status} self=${convs.selves.length} all=${convs.list.length}`);
+    const fid = convs.selves[0].id;
+    const w = new Ws();
+    await w.connect(F.access_token);
+    await w.waitType('presence_init');
+    const body = `fwd-${rid}`;
+    w.send({ type: 'send_message', conversation_id: fid, client_msg_id: 'v2fwd', content: body });
+    const ack = await w.waitType('message_ack', (m) => m.client_msg_id === 'v2fwd');
+    const src = ack.message?.id;
+    const op = randomUUID();
+    const fwd = await api(F.access_token, 'POST', `/messages/${src}/forward`, {
+      conversation_ids: [fid], client_op_id: op,
+    });
+    const item = fwd.json?.results?.[0];
+    ok('forward to self', fwd.status === 200 && item?.ok === true,
+      `got ${fwd.status} ${JSON.stringify(fwd.json)?.slice(0, 200)}`);
+    ok('forwarded_from is sender display name', item?.message?.forwarded_from === F.user.display_name,
+      `got ${item?.message?.forwarded_from}`);
+    const mid = item?.message?.id;
+    const retry = await api(F.access_token, 'POST', `/messages/${src}/forward`, {
+      conversation_ids: [fid], client_op_id: op,
+    });
+    ok('same client_op_id does not duplicate',
+      retry.status === 200 && retry.json?.results?.[0]?.message?.id === mid,
+      `got ${retry.status} id=${retry.json?.results?.[0]?.message?.id}`);
+    const hist = await api(F.access_token, 'GET', `/conversations/${fid}/messages`);
+    const copies = (hist.json?.messages || []).filter((m) => m.forwarded_from);
+    ok('history has one forwarded copy', copies.length === 1 && copies[0].id === mid, `n=${copies.length}`);
+    w.close();
+  }
+
+  console.log('== V2 全局搜索 ==');
+  let gid = null;
+  {
+    const req = await api(A.access_token, 'POST', '/friends/requests', { username: C.username, message: 'v2' });
+    ok('friend request A->C', req.status === 200 || req.status === 201, `got ${req.status}`);
+    const incoming = await api(C.access_token, 'GET', '/friends/requests');
+    const hit = (incoming.json?.incoming || []).find((x) => x.user?.username === A.username);
+    const acc = await api(C.access_token, 'POST', `/friends/requests/${hit?.id}/accept`);
+    ok('C accepts A', acc.status === 200 || acc.status === 204, `got ${acc.status}`);
+    const convs = await api(A.access_token, 'GET', '/conversations');
+    const dm = (convs.json || []).find((c) => c.kind === 'dm' && c.peer?.username === C.username);
+    ok('DM A-C exists', !!dm?.id);
+    const g = await api(A.access_token, 'POST', '/conversations/group', { name: `v2群${rid}`, member_ids: [C.user.id] });
+    ok('create v2 group', g.status === 200 || g.status === 201, `got ${g.status}`);
+    gid = g.json?.id;
+    const kw = `zq${rid}kw`;
+    const w = new Ws();
+    await w.connect(A.access_token);
+    await w.waitType('presence_init');
+    w.send({ type: 'send_message', conversation_id: gid, client_msg_id: 'v2pin', content: `pin-${rid}` });
+    const pinAck = await w.waitType('message_ack', (m) => m.client_msg_id === 'v2pin');
+    w.send({ type: 'send_message', conversation_id: dm.id, client_msg_id: 'v2s1', content: kw });
+    await w.waitType('message_ack', (m) => m.client_msg_id === 'v2s1');
+    w.send({ type: 'send_message', conversation_id: gid, client_msg_id: 'v2s2', content: kw });
+    const m2 = await w.waitType('message_ack', (m) => m.client_msg_id === 'v2s2');
+    const q = encodeURIComponent(kw);
+    const found = await api(A.access_token, 'GET', `/search?q=${q}`);
+    const hits = (found.json?.messages || []).filter((m) => (m.content || '').includes(kw));
+    ok('global search returns two hits', found.status === 200 && hits.length === 2,
+      `got ${found.status} n=${hits.length}`);
+    const del = await api(A.access_token, 'DELETE', `/messages/${m2.message?.id}`);
+    ok('delete one search hit', del.status === 200, `got ${del.status}`);
+    const found2 = await api(A.access_token, 'GET', `/search?q=${q}`);
+    const hits2 = (found2.json?.messages || []).filter((m) => (m.content || '').includes(kw));
+    ok('global search returns one hit after delete', found2.status === 200 && hits2.length === 1,
+      `got ${found2.status} n=${hits2.length}`);
+    w.close();
+    v2.pinMessageId = pinAck.message?.id;
+  }
+
+  console.log('== V2 公告 / 置顶 ==');
+  {
+    const text = `公告${rid}`;
+    const ann = await api(A.access_token, 'PUT', `/conversations/${gid}/announcement`, { text });
+    ok('owner sets announcement', ann.status === 200 && ann.json?.text === text, `got ${ann.status}`);
+    const listed = await api(C.access_token, 'GET', '/conversations');
+    const grp = (listed.json || []).find((c) => c.id === gid);
+    ok('member list has announcement', grp?.announcement?.text === text, JSON.stringify(grp?.announcement));
+    const pin = await api(C.access_token, 'PUT', `/conversations/${gid}/pins/${v2.pinMessageId}`);
+    ok('member pins a message', pin.status === 204, `got ${pin.status}`);
+    const pins = await api(C.access_token, 'GET', `/conversations/${gid}/pins`);
+    const hit = Array.isArray(pins.json) && pins.json.some((p) => p.message?.id === v2.pinMessageId);
+    ok('pins list returns it', pins.status === 200 && hit, `got ${pins.status} ${JSON.stringify(pins.json)?.slice(0, 180)}`);
+    v2.announceConvId = gid;
+    v2.announceText = text;
+    v2.pinConvId = gid;
+  }
+
+  console.log('== V2 会议地址 ==');
+  {
+    const info = await api(null, 'GET', '/server-info');
+    ok('server-info has meeting_base_url', info.status === 200 && typeof info.json?.meeting_base_url === 'string',
+      `got ${info.status} ${JSON.stringify(info.json)?.slice(0, 160)}`);
+  }
+
+  console.log('== V2 推送 ==');
+  {
+    const push = await api(A.access_token, 'GET', '/users/me/push');
+    ok('push settings expose available', push.status === 200 && typeof push.json?.available === 'boolean',
+      `got ${push.status} ${JSON.stringify(push.json)?.slice(0, 160)}`);
+  }
+
+  return v2;
 }
 
 (PHASE === 'phase2' ? phase2() : phase1())
