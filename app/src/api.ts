@@ -335,6 +335,31 @@ export const polls = {
     ),
 };
 
+// ---------- 全局搜索（V2 P3-1） ----------
+/** GET /v1/search 的查询参数：全部可选，但 q 或至少一个筛选必填（服务端强制 400） */
+export interface SearchParams {
+  q?: string;
+  conversation_id?: string;
+  sender_id?: string;
+  kind?: "text" | "image" | "file" | "audio";
+  /** RFC3339；含 from、不含 to */
+  from?: string;
+  to?: string;
+  /** 翻页游标：上一页末条的 created_at + id */
+  before?: string;
+  before_id?: string;
+  limit?: number;
+}
+export const searchApi = {
+  messages: (p: SearchParams) => {
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(p)) {
+      if (v !== undefined && v !== "") qs.set(k, String(v));
+    }
+    return get<MessagesPage>(`/search?${qs}`);
+  },
+};
+
 // ---------- files ----------
 export const files = {
   /** 附件地址（能力 URL）：dl=true 强制下载；thumb=true 取 JPEG 缩略图（有则返回），默认 inline */

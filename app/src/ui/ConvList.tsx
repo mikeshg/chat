@@ -14,6 +14,7 @@ import type { ConversationView, PrefUpdate } from "../types";
 import { openConversation } from "../ws";
 import { convPreview } from "./convPreview";
 import NewGroupModal from "./NewGroupModal";
+import SearchPanel from "./SearchPanel";
 import Avatar from "./Avatar";
 
 function fmtTime(iso?: string | null): string {
@@ -111,6 +112,10 @@ export default function ConvList() {
           placeholder="搜索"
           value={q}
           onChange={(e) => setQ(e.target.value)}
+          onKeyDown={(e) => {
+            // V2 P3-1：Esc 退出搜索态，回到普通会话列表
+            if (e.key === "Escape") setQ("");
+          }}
         />
         <button className="icon-btn" title="发起群聊" onClick={() => setShowNewGroup(true)}>
           +
@@ -134,6 +139,10 @@ export default function ConvList() {
           归档{archivedCount > 0 ? ` (${archivedCount})` : ""}
         </button>
       </div>
+      {/* V2 P3-1：输入搜索词进入全局搜索态（本地会话 + 服务端聊天记录） */}
+      {q.trim() ? (
+        <SearchPanel q={q} />
+      ) : (
       <div className="conv-scroll">
         {list.length === 0 && (
           <div className="empty-hint">
@@ -218,6 +227,7 @@ export default function ConvList() {
           );
         })}
       </div>
+      )}
       {showNewGroup && <NewGroupModal onClose={() => setShowNewGroup(false)} />}
 
       {/* 会话偏好菜单：置顶 / 静音 / 归档（右键或 ⋯ 按钮打开） */}

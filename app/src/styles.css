@@ -761,3 +761,62 @@ button.ctx-item:hover { background: var(--bg); }
 .fwd-result { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
 .fwd-ok { color: var(--green); font-size: 14px; }
 .fwd-fail { color: var(--danger); font-size: 13px; }
+
+/* ===== V2 P3-1 全局搜索 + 会话「文件与图片」 ===== */
+/* 搜索态列表（替换 conv-scroll）：类型 chip + 更多筛选 + 分区结果 */
+.conv-scroll.search-mode { padding: 4px 6px; }
+.gs-chips { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px 2px 8px; }
+.gs-chip {
+  border: 1px solid var(--line); background: var(--panel); color: var(--text);
+  border-radius: 12px; padding: 2px 10px; font-size: 12px; cursor: pointer;
+}
+.gs-chip.on { background: var(--accent); color: var(--on-accent); border-color: transparent; }
+.gs-filters {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  padding: 0 2px 8px; font-size: 12px; color: var(--muted);
+}
+.gs-filters select, .gs-filters input {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+  color: var(--text); font-size: 12px; padding: 3px 6px; max-width: 130px;
+}
+.gs-sec-title {
+  color: var(--muted); font-size: 11px; padding: 6px 6px 2px;
+  text-transform: none;
+}
+.gs-item-main { flex: 1; min-width: 0; }
+.gs-item-top { display: flex; gap: 6px; align-items: baseline; }
+.gs-conv {
+  font-weight: 600; font-size: 12px; flex-shrink: 0; max-width: 110px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.gs-empty { color: var(--muted); text-align: center; padding: 24px 0; font-size: 13px; }
+.sr-item mark { background: var(--warn-bg); color: var(--warn-fg); border-radius: 2px; padding: 0 1px; }
+
+/* 群信息页签行 + 文件与图片面板（群 / 私聊 / 文件传输助手共用） */
+.gi-tabs { display: flex; gap: 4px; padding: 0 12px 8px; }
+.cm-panel { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.cm-tabs { display: flex; gap: 4px; padding: 0 12px 8px; }
+.cm-body { flex: 1; overflow-y: auto; padding: 0 12px 12px; }
+.cm-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
+.cm-thumb {
+  width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 6px;
+  cursor: zoom-in; background: var(--bg);
+}
+.cm-file {
+  display: flex; align-items: center; gap: 8px; padding: 7px 4px;
+  border-radius: 6px; font-size: 13px;
+}
+.cm-file:hover { background: var(--bg); }
+.cm-file .file-meta { flex: 1; min-width: 0; }
+.cm-file .file-meta b {
+  display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cm-file .file-meta i { color: var(--muted); font-size: 12px; font-style: normal; }
+.cm-dl {
+  flex: none; padding: 2px 8px; border-radius: 6px; border: 1px solid var(--line);
+  color: var(--text); text-decoration: none; font-size: 14px;
+}
+.cm-dl:hover { background: var(--bg); }
+.cm-audio { padding: 6px 4px; }
+.cm-audio-meta { color: var(--muted); font-size: 11px; margin-bottom: 2px; }
+.cm-empty { color: var(--muted); text-align: center; padding: 24px 0; font-size: 13px; }

@@ -321,6 +321,16 @@ pub async fn messages_latest(
     Ok(rows.into_iter().map(|r| r.into_view(viewer)).collect())
 }
 
+/// ILIKE 子串匹配的字面量转义（% _ \ 不当通配符），两处搜索共用
+fn like_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// 会话内搜索（V2 P3-1 改为两阶段）：先在 messages 表取候选 id
+/// （deleted_at IS NULL 排除墓碑——搜「消息已删除」不再命中占位文本；
+/// 正文上的 trgm 部分索引可用），再按 id 回读 message_views 组装视图。
 pub async fn search_messages(
     pool: &PgPool,
     conv: Uuid,
@@ -328,23 +338,92 @@ pub async fn search_messages(
     needle: &str,
     limit: i64,
 ) -> AppResult<Vec<MessageView>> {
-    let esc = needle
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_");
-    let rows = sqlx::query_as::<_, MsgViewRow>(
-        "SELECT * FROM message_views
-          WHERE conversation_id = $1
+    let ids = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM messages
+          WHERE conversation_id = $1 AND deleted_at IS NULL
             AND content ILIKE '%' || $2 || '%' ESCAPE '\\'
           ORDER BY seq DESC
           LIMIT $3",
     )
     .bind(conv)
-    .bind(esc)
+    .bind(like_escape(needle))
     .bind(limit)
     .fetch_all(pool)
     .await?;
-    Ok(rows.into_iter().map(|r| r.into_view(viewer)).collect())
+    // messages_by_ids 按 seq ASC 返回，倒序恢复候选顺序
+    let mut msgs = messages_by_ids(pool, conv, viewer, &ids).await?;
+    msgs.reverse();
+    Ok(msgs)
+}
+
+/// GET /v1/search 的筛选条件；api 层已校验形状，q 与筛选至少有一个才会走到这里。
+#[derive(Default)]
+pub struct SearchFilter {
+    /// 已 trim 的非空关键词
+    pub q: Option<String>,
+    pub conversation_id: Option<Uuid>,
+    pub sender_id: Option<Uuid>,
+    pub kind: Option<String>,
+    /// 含 from、不含 to
+    pub from: Option<DateTime<Utc>>,
+    pub to: Option<DateTime<Utc>>,
+    /// 翻页游标：(created_at, id) 严格小于该点；before_id 缺省按最小 uuid
+    pub before: Option<DateTime<Utc>>,
+    pub before_id: Option<Uuid>,
+}
+
+/// 全局消息搜索：只在 viewer 当前是成员的会话里搜未删除消息，按 created_at DESC, id DESC。
+/// 先在 messages 表取候选 id（成员 JOIN + 筛选 + 游标），多取一条探测 has_more；
+/// 再回读 message_views 逐条按 viewer 个性化（成员身份已在候选查询中强制）。
+pub async fn search_global(
+    pool: &PgPool,
+    viewer: Uuid,
+    f: &SearchFilter,
+    limit: i64,
+) -> AppResult<(Vec<MessageView>, bool)> {
+    let ids = sqlx::query_scalar::<_, Uuid>(
+        "SELECT m.id FROM messages m
+          JOIN memberships mb
+            ON mb.conversation_id = m.conversation_id AND mb.user_id = $1
+          WHERE m.deleted_at IS NULL
+            AND ($2::text IS NULL OR m.content ILIKE '%' || $2 || '%' ESCAPE '\\')
+            AND ($3::uuid IS NULL OR m.conversation_id = $3)
+            AND ($4::uuid IS NULL OR m.sender_id = $4)
+            AND ($5::text IS NULL OR m.kind = $5)
+            AND ($6::timestamptz IS NULL OR m.created_at >= $6)
+            AND ($7::timestamptz IS NULL OR m.created_at < $7)
+            AND ($8::timestamptz IS NULL OR (m.created_at, m.id) < ($8, $9::uuid))
+          ORDER BY m.created_at DESC, m.id DESC
+          LIMIT $10",
+    )
+    .bind(viewer)
+    .bind(f.q.as_deref().map(like_escape))
+    .bind(f.conversation_id)
+    .bind(f.sender_id)
+    .bind(f.kind.as_deref())
+    .bind(f.from)
+    .bind(f.to)
+    .bind(f.before)
+    .bind(f.before_id.unwrap_or(Uuid::nil()))
+    .bind(limit + 1)
+    .fetch_all(pool)
+    .await?;
+    let has_more = ids.len() as i64 > limit;
+    let ids = &ids[..ids.len().min(limit.max(0) as usize)];
+    if ids.is_empty() {
+        return Ok((vec![], false));
+    }
+    let mut rows =
+        sqlx::query_as::<_, MsgViewRow>("SELECT * FROM message_views WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(pool)
+            .await?;
+    // ANY 不保序：按候选口径重排（created_at DESC, id DESC）
+    rows.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+    Ok((
+        rows.into_iter().map(|r| r.into_view(viewer)).collect(),
+        has_more,
+    ))
 }
 
 /// 重连批量刷新：按 id 回读当前读模型（墓碑/正文/reaction/回复预览均以库为准）。

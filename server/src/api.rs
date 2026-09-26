@@ -54,6 +54,7 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
             delete(crate::sessions::revoke_session),
         )
         .route("/users/search", get(search_user))
+        .route("/search", get(global_search))
         .route("/friends", get(list_friends))
         .route("/friends/{user_id}", delete(delete_friend))
         .route("/friends/requests", get(list_requests).post(create_request))
@@ -1251,6 +1252,74 @@ async fn list_messages(
 struct MsgSearchQuery {
     q: String,
     limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct GlobalSearchQuery {
+    q: Option<String>,
+    conversation_id: Option<Uuid>,
+    sender_id: Option<Uuid>,
+    kind: Option<String>,
+    /// RFC3339；含 from、不含 to
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+    /// 翻页游标：上一页末条的 created_at + id（同毫秒时 id 兜底）
+    before: Option<DateTime<Utc>>,
+    before_id: Option<Uuid>,
+    limit: Option<i64>,
+}
+
+/// 全局消息搜索（V2 P3-1）：只在当前是成员的会话里搜未删除消息。
+/// q 或至少一个筛选条件必填；conversation_id 定向搜索要求成员身份。
+async fn global_search(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Query(q): Query<GlobalSearchQuery>,
+) -> AppResult<Json<MessagesPage>> {
+    let uid = uid_of(&headers, &st).await?;
+    let needle = q.q.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    if let Some(n) = &needle {
+        if n.chars().count() > 100 {
+            return Err(AppError::bad_request("q must be 1-100 characters"));
+        }
+    }
+    if let Some(k) = &q.kind {
+        if !matches!(k.as_str(), "text" | "image" | "file" | "audio") {
+            return Err(AppError::bad_request("kind must be text/image/file/audio"));
+        }
+    }
+    if needle.is_none()
+        && q.conversation_id.is_none()
+        && q.sender_id.is_none()
+        && q.kind.is_none()
+        && q.from.is_none()
+        && q.to.is_none()
+    {
+        return Err(AppError::bad_request(
+            "q or at least one filter is required",
+        ));
+    }
+    if let Some(conv) = q.conversation_id {
+        require_member(&st, conv, uid).await?;
+    }
+    let limit = q.limit.unwrap_or(30).clamp(1, 100);
+    let (messages, has_more) = domain::search_global(
+        &st.pool,
+        uid,
+        &domain::SearchFilter {
+            q: needle,
+            conversation_id: q.conversation_id,
+            sender_id: q.sender_id,
+            kind: q.kind,
+            from: q.from,
+            to: q.to,
+            before: q.before,
+            before_id: q.before_id,
+        },
+        limit,
+    )
+    .await?;
+    Ok(Json(MessagesPage { messages, has_more }))
 }
 
 /// 会话内消息搜索：content ILIKE 子串匹配（转义通配符），按 seq 倒序
