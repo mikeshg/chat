@@ -1,6 +1,6 @@
 # Agent 接入 — 接手文档
 
-**更新于：2026-09-26 20:15（Asia/Shanghai）**
+**更新于：2026-09-26 21:45（Asia/Shanghai）**
 
 新会话先读本文件，再读 [spec.md](spec.md)（需求，来自 Gitea xiefan/chat#1）、`CONTEXT.md` 的「Agent」小节、`docs/adr/001-decisions.md` §12。
 
@@ -13,10 +13,9 @@
 ## 2. 还没做的
 
 1. **A10**（用户在 Mac 上做）：Tauri 打包目标加 macOS / Linux，Mac 上编包、登录后成为宿主并跑通一次调用；README 补打包说明。
-2. **阶段验收**（主会话做，完成后写 `acceptance.md`）：
-   - Tauri 桌面实机（Windows）：托盘 / 关窗隐藏 / 首次隐藏通知 / 托盘退出先停宿主、开机自启开关、宿主默认名、登录后自动上线、审批卡片与嵌套卡片在窗口里的显示。需要 cua-driver，**用前先问用户**（memory：cua-driver-ask-first）。
-   - 真 agent 冒烟：`CHAT_REAL_AGENT_SMOKE=1 cargo test -p agent-host --test smoke -- --nocapture --test-threads=1`（本机要已登录 Claude Code 与 Codex、有 Node；会消耗 token，跑前问用户）。
-   - 一次完整的验收库全量检查（见 V2 handover 第 8 节的步骤，验收库 `node scripts/v2/acc-env.mjs up`）。
+2. **Claude Code 真 agent 冒烟**：本机 Claude Code 登录过期，重新登录后跑 `CHAT_REAL_AGENT_SMOKE=claude cargo test -p agent-host --test smoke -- --nocapture --test-threads=1`（会消耗 token，跑前问用户）。Codex 已通过。
+
+阶段验收（验收库全量检查、Windows 桌面实机、Codex 真 agent 冒烟）已完成，记录在 [acceptance.md](acceptance.md)，验收中修掉的三个问题也在里面。
 
 ## 3. 用户在需求讨论中的决定
 
@@ -37,6 +36,8 @@
   - 迁移里重建 `message_views` 必须以最新一版视图为底（A03 差点丢掉 A06 的列）；
   - 各模块自带的调用行 RETURNING 列表会漏新列 → 已统一用 `agents::INV_RETURNING`，`InvocationView` 的后加列用 `#[sqlx(default)]`（A12 审批曾因此被静默丢弃）；
   - 冲突块拼接时注意两边是否都缺同一个收尾的 `}`。
+- **桌面验收**：WebView 内容不在 UIA 树里，只能按截图像素点；窗口被别的窗口完全挡住时 WebView 不绘制也不处理输入。托盘菜单是 Win32 弹出菜单，cua-driver 的桌面点击会先把它关掉，要右键打开后按窗口范围给 chat-app 发方向键和回车。托盘图标位置会随任务栏图标增减移动，右键前先截图确认。
+- Git Bash 里给 node 脚本传 `/v1/...` 这类参数会被改写成 Windows 路径，前面加 `MSYS_NO_PATHCONV=1`。
 - 桌面端 `app/src-tauri/gen/schemas/*.json` 构建后只有换行变化，提交前 `git checkout --` 还原（A09 那次是真改动：自启权限）。
 
 ## 6. 资源状态

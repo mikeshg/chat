@@ -127,7 +127,7 @@ cd agent-host
 CHAT_REAL_AGENT_SMOKE=1 cargo test -p agent-host --test smoke -- --nocapture --test-threads=1
 ```
 
-每个适配器发一次「只回复 pong」，再发一次会在当前目录创建文件的指令。权限请求按当前规则拒绝，并断言至少拒绝过一次。
+每个适配器发一次「只回复 pong」，再发一次往工作目录外写文件的指令。冒烟里权限请求一律拒绝，断言至少拒绝过一次且文件没有写出来。只跑其中一个：`CHAT_REAL_AGENT_SMOKE=codex`（或 `claude`）。
 
 已知限制：Agent 的环境变量和密钥以明文存在服务器上，管理员和备份都能看到。档位只能管到 agent 来请求批准的操作：Codex 的沙箱总是允许写它自己的工作目录，所以 Codex 在「只读」档位下仍能改工作目录里的文件（目录外的写入和联网照样要审批）。macOS / Linux 的桌面安装包要在对应系统上编译，仓库里不附带现成的包。
 
