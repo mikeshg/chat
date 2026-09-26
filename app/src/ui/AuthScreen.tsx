@@ -46,9 +46,16 @@ export default function AuthScreen() {
   // 关闭注册时注册入口整体消失（含已在注册页的情况）
   const effMode = regMode === "closed" ? "login" : mode;
 
+  // 桌面壳的页面来自 tauri://localhost，没有「同源服务器」，地址留空只会连到自己
+  const desktop = "__TAURI_INTERNALS__" in window;
+
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErr("");
+    if (desktop && !server.trim()) {
+      setErr("请填写服务器地址，如 http://192.168.1.5:28080");
+      return;
+    }
     setBusy(true);
     try {
       setServer(server);
@@ -66,7 +73,14 @@ export default function AuthScreen() {
       void startWs();
       void syncAgentHost(r.user);
     } catch (ex) {
-      setErr(ex instanceof Error ? ex.message : "请求失败");
+      // fetch 连不上时只抛 TypeError（Safari 写作 "Load failed"），带上地址才好排查
+      setErr(
+        ex instanceof TypeError
+          ? `连不上服务器 ${server.trim() || location.origin}`
+          : ex instanceof Error
+            ? ex.message
+            : "请求失败",
+      );
     } finally {
       setBusy(false);
     }
@@ -118,7 +132,11 @@ export default function AuthScreen() {
           required
         />
         <input
-          placeholder="服务器地址（同源部署可留空，如 http://192.168.1.5:28080）"
+          placeholder={
+            desktop
+              ? "服务器地址，如 http://192.168.1.5:28080"
+              : "服务器地址（同源部署可留空，如 http://192.168.1.5:28080）"
+          }
           value={server}
           onChange={(e) => setServerUrl(e.target.value)}
         />
