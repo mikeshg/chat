@@ -946,7 +946,7 @@ export default function ChatView() {
             version={conv.agent.avatar_version}
           />
         )}
-        <div>
+        <div className="chat-head-main">
           <div className="chat-title">{title}</div>
           <div className="chat-status">
             {conv.kind === "self"

@@ -879,7 +879,7 @@ button.ctx-item:hover { background: var(--bg); }
 
 /* ===== V2 P3-2 ===== */
 .chat-head { gap: 8px; }
-.chat-head > div:first-child { flex: 1; min-width: 0; }
+.chat-head-main { flex: 1; min-width: 0; }
 button.icon-btn.chat-head-btn { flex: 0 0 auto; width: auto; height: 32px; white-space: nowrap; padding: 0 8px; }
 .ann-bar, .pin-bar {
   background: var(--panel); border-bottom: 1px solid var(--line); flex-shrink: 0;
