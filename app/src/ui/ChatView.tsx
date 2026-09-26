@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { canUseAgent } from "../agentAccess";
 import { agents as agentsApi, ApiError, convs, files, msgs as msgsApi, serverInfo, session } from "../api";
 import {
   applyInvocations,
@@ -400,6 +401,8 @@ export default function ChatView() {
   const typingFresh = typing && Date.now() - typing.ts < 5000;
   const readonly = conv.kind === "dm" && conv.peer && !s.friends.some((f) => f.user.id === conv.peer!.id);
   const agentDeleted = conv.kind === "agent" && !!conv.agent?.deleted;
+  const agentClosed = conv.kind === "agent" && !canUseAgent(s.me);
+  const composerLocked = agentDeleted || agentClosed;
 
   // 生命周期入口可见性（服务端在锁内二次校验；这里只做 UI 层收敛）
   // A01：Agent 消息 sender_id 是主人但归属 Agent —— 不可编辑；删除仍允许（主人的会话）
@@ -631,7 +634,7 @@ export default function ChatView() {
   const send = async () => {
     const t = text.trim();
     if (readonly || sending || mutBusy) return;
-    if (conv?.kind === "agent" && conv.agent?.deleted) return;
+    if (conv?.kind === "agent" && (conv.agent?.deleted || !canUseAgent(s.me))) return;
     if (s.editingMessage) {
       await submitEdit();
       return;
@@ -697,7 +700,7 @@ export default function ChatView() {
   // @补全：私聊只有本人 Agent；群里 Agent 排在成员前面（同名时先点到 Agent）
   const acItems: AcItem[] = ac
     ? [
-        ...myAgents
+        ...(canUseAgent(s.me) ? myAgents : [])
           .filter((a) => a.name.toLowerCase().startsWith(ac.prefix.toLowerCase()))
           .map((a) => ({
             kind: "agent" as const,
@@ -928,7 +931,7 @@ export default function ChatView() {
             className="icon-btn chat-head-btn topic-btn"
             type="button"
             title="开新话题"
-            disabled={topicBusy}
+            disabled={topicBusy || agentClosed}
             onClick={() => void startNewTopic()}
           >
             开新话题
@@ -1271,7 +1274,10 @@ export default function ChatView() {
           <div className="readonly-hint">对方已不是你的好友，会话只读</div>
         ) : (
           <>
-            {agentDeleted && <div className="readonly-hint">该 Agent 已删除</div>}
+            {agentClosed && (
+              <div className="readonly-hint">管理员已关闭你的 Agent 功能</div>
+            )}
+            {agentDeleted && !agentClosed && <div className="readonly-hint">该 Agent 已删除</div>}
             <input ref={fileInput} type="file" hidden multiple onChange={onFile} />
             {s.replyingTo && (
               <div className="composer-banner">
@@ -1360,14 +1366,14 @@ export default function ChatView() {
               <button
                 className="icon-btn attach-btn"
                 title="发送图片/文件（也可直接粘贴）"
-                disabled={agentDeleted}
+                disabled={composerLocked}
                 onClick={() => fileInput.current?.click()}
               >
                 📎
               </button>
               <VoiceRecorder
                 convId={conv.id}
-                disabled={sending || mutBusy || agentDeleted}
+                disabled={sending || mutBusy || composerLocked}
                 onError={setMutErr}
               />
               {conv.kind === "group" && (
@@ -1383,8 +1389,14 @@ export default function ChatView() {
               <textarea
                 ref={taRef}
                 value={text}
-                disabled={agentDeleted}
-                placeholder={agentDeleted ? "该 Agent 已删除" : "输入消息，Enter 发送，Shift+Enter 换行"}
+                disabled={composerLocked}
+                placeholder={
+                  agentClosed
+                    ? "管理员已关闭你的 Agent 功能"
+                    : agentDeleted
+                      ? "该 Agent 已删除"
+                      : "输入消息，Enter 发送，Shift+Enter 换行"
+                }
                 onChange={(e) => onInput(e.target.value)}
                 onPaste={onPaste}
                 onKeyDown={(e) => {
@@ -1409,7 +1421,7 @@ export default function ChatView() {
                 className="primary send-btn"
                 onClick={send}
                 disabled={
-                  agentDeleted || sending || mutBusy || (!text.trim() && pendingFiles.length === 0)
+                  composerLocked || sending || mutBusy || (!text.trim() && pendingFiles.length === 0)
                 }
               >
                 {s.editingMessage ? (mutBusy ? "保存中…" : "保存") : sending ? "发送中…" : "发送"}

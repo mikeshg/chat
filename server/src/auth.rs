@@ -274,11 +274,13 @@ pub async fn create_session(
 /// 签发 access + refresh 令牌并落库（access 绑定当前 session_version 与登录会话 sid）。
 /// 调用方须在同一事务内持有该用户行锁（或新插入行），从鉴权直到签发提交。
 pub async fn issue_tokens(
-    executor: impl sqlx::PgExecutor<'_>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     cfg: &Config,
     user: &UserRow,
     session_id: Uuid,
 ) -> AppResult<AuthResponse> {
+    // 同一事务里读：注册刚插入的用户行，别的连接还看不见
+    let allowed = crate::agent_access::user_allows(&mut **tx, user.id).await?;
     let (access, expires_in) = mint_access(
         user.id,
         user.session_version as i64,
@@ -294,12 +296,12 @@ pub async fn issue_tokens(
     .bind(hash)
     .bind(session_id)
     .bind(Utc::now() + Duration::days(REFRESH_TTL_DAYS))
-    .execute(executor)
+    .execute(&mut **tx)
     .await?;
     Ok(AuthResponse {
         access_token: access,
         refresh_token: raw,
         access_expires_in: expires_in,
-        user: UserPublic::from(user),
+        user: UserPublic::from(user).with_agent_access(allowed),
     })
 }

@@ -712,6 +712,15 @@ async fn write_message(
         if gone {
             return Err(PostError::deny("agent_deleted", "agent_deleted").into());
         }
+        // 用户自己发的消息：没使用权就不落库。Agent 回写（带 agent_id）不在这里拦。
+        if msg.agent_id.is_none() {
+            let allowed = crate::agent_access::user_allows(&mut **tx, msg.sender_id)
+                .await
+                .map_err(PostError::Db)?;
+            if !allowed {
+                return Err(PostError::deny("agent_access_denied", "agent_access_denied").into());
+            }
+        }
     }
 
     // Agent 消息只能写进主人仍是成员的会话（专属会话、私聊、群）。

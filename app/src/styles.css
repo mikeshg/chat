@@ -976,3 +976,15 @@ button.agent-host-name:hover { background: transparent; color: var(--link); }
 .ac-item.ac-agent .ac-mark { flex: 0 0 auto; }
 .ac-item .ac-online { margin-left: auto; color: var(--green); font-size: 12px; }
 .ac-item .ac-offline { margin-left: auto; color: var(--muted); font-size: 12px; }
+/* ===== Agent A08 ===== */
+.ad-row { grid-template-columns: 1.6fr 1.1fr 1fr 1fr 0.7fr 1.5fr 1.7fr; }
+.ad-agent { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ad-agent select {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 4px 6px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12px;
+}
+.ad-agent small { color: var(--muted); font-size: 11px; }

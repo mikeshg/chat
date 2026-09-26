@@ -649,6 +649,7 @@ async fn user_public(st: &SharedState, uid: Uuid) -> Result<UserPublic, (&'stati
             last_seen_at,
             avatar_version,
             has_avatar,
+            agent_access: None,
         },
     )
     .map_err(|_| ws_err("internal", "db error"))

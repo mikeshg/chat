@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { canUseAgent } from "../agentAccess";
 import { auth, getServer } from "../api";
 import { setState, useApp } from "../store";
 import { stopWs } from "../ws";
@@ -60,14 +61,16 @@ export default function MePanel() {
         {hint && <div className="muted">{hint}</div>}
       </section>
 
-      {/* Agent A01：宿主/Agent 管理入口 */}
-      <section className="card">
-        <div className="row me-entry" onClick={() => setShowAgents(true)}>
-          <span className="agent-face">🤖</span>
-          <span className="grow">Agent</span>
-          <span className="muted">›</span>
-        </div>
-      </section>
+      {/* Agent A01：宿主/Agent 管理入口。A08：没使用权就不显示 */}
+      {canUseAgent(s.me) && (
+        <section className="card">
+          <div className="row me-entry" onClick={() => setShowAgents(true)}>
+            <span className="agent-face">🤖</span>
+            <span className="grow">Agent</span>
+            <span className="muted">›</span>
+          </div>
+        </section>
+      )}
 
       <AutostartSetting />
 
@@ -90,7 +93,7 @@ export default function MePanel() {
         </button>
       </section>
 
-      {showAgents && <AgentsPanel onClose={() => setShowAgents(false)} />}
+      {showAgents && canUseAgent(s.me) && <AgentsPanel onClose={() => setShowAgents(false)} />}
     </main>
   );
 }

@@ -166,6 +166,10 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
         .route("/admin/invites/{id}", delete(settings::revoke_invite))
         .route("/admin/users", get(admin_users))
         .route("/admin/users/{id}/disable", post(admin_disable))
+        .route(
+            "/admin/users/{id}/agent-access",
+            put(admin_set_agent_access),
+        )
         .route("/admin/users/{id}/enable", post(admin_enable))
         .route("/admin/users/{id}/role", post(admin_set_role))
         .route("/admin/users/{id}/password", post(admin_reset_password))
@@ -196,6 +200,12 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
 
 async fn uid_of(headers: &HeaderMap, st: &SharedState) -> AppResult<Uuid> {
     Ok(auth::require_user(st, headers).await?.id)
+}
+
+/// 自己的公开资料带上生效后的 Agent 使用权（A08）
+async fn self_public(st: &SharedState, row: &UserRow) -> AppResult<UserPublic> {
+    let allowed = crate::agent_access::user_allows(&st.pool, row.id).await?;
+    Ok(UserPublic::from(row).with_agent_access(allowed))
 }
 
 pub(crate) fn notify(st: &SharedState, uids: &[Uuid], what: &'static str) {
@@ -369,7 +379,7 @@ async fn register(
         &crate::sessions::user_agent_of(&headers),
     )
     .await?;
-    let res = auth::issue_tokens(&mut *tx, &st.cfg, &row, sid).await?;
+    let res = auth::issue_tokens(&mut tx, &st.cfg, &row, sid).await?;
     tx.commit().await?;
     Ok(Json(res))
 }
@@ -402,7 +412,7 @@ async fn login(
         &crate::sessions::user_agent_of(&headers),
     )
     .await?;
-    let res = auth::issue_tokens(&mut *tx, &st.cfg, &row, sid).await?;
+    let res = auth::issue_tokens(&mut tx, &st.cfg, &row, sid).await?;
     tx.commit().await?;
     Ok(Json(res))
 }
@@ -481,7 +491,7 @@ async fn refresh(
             .await?
         }
     };
-    let res = auth::issue_tokens(&mut *tx, &st.cfg, &row, sid).await?;
+    let res = auth::issue_tokens(&mut tx, &st.cfg, &row, sid).await?;
     tx.commit().await?;
     Ok(Json(res))
 }
@@ -550,7 +560,7 @@ async fn get_me(State(st): State<SharedState>, headers: HeaderMap) -> AppResult<
         .bind(uid)
         .fetch_one(&st.pool)
         .await?;
-    Ok(Json(UserPublic::from(&row)))
+    Ok(Json(self_public(&st, &row).await?))
 }
 
 /// GET /users/me/storage（V2 P2-1）：本人附件用量与配额；quota_bytes 为 null 表示不限
@@ -584,7 +594,7 @@ async fn update_me(
     .bind(name)
     .fetch_one(&st.pool)
     .await?;
-    Ok(Json(UserPublic::from(&row)))
+    Ok(Json(self_public(&st, &row).await?))
 }
 
 #[derive(Deserialize)]
@@ -664,6 +674,7 @@ async fn list_friends(
                     last_seen_at: r.last_seen_at,
                     avatar_version: r.avatar_version,
                     has_avatar: r.has_avatar,
+                    agent_access: None,
                 },
                 since: r.since,
             })
@@ -760,6 +771,7 @@ async fn list_requests(
                     last_seen_at: r.cp_last_seen,
                     avatar_version: r.cp_avatar_version,
                     has_avatar: r.cp_has_avatar,
+                    agent_access: None,
                 },
                 message: r.message,
                 direction: dir,
@@ -1077,6 +1089,7 @@ async fn list_conversations(
                 last_seen_at: r.peer_last_seen,
                 avatar_version: r.peer_avatar_version.unwrap_or(0),
                 has_avatar: r.peer_has_avatar.unwrap_or(false),
+                agent_access: None,
             });
             let last_message = r.m_id.map(|id| MessageView {
                 id,
@@ -1336,6 +1349,7 @@ async fn conversation_detail(st: &SharedState, conv: Uuid) -> AppResult<Conversa
                     last_seen_at: r.last_seen_at,
                     avatar_version: r.avatar_version,
                     has_avatar: r.has_avatar,
+                    agent_access: None,
                 },
                 role: r.role,
                 joined_at: r.joined_at,
@@ -2233,7 +2247,7 @@ async fn put_avatar(
     spawn_avatar_cleanup(&st, me.avatar_path);
     notify_avatar_changed(&st, uid).await;
     let row = load_user_row(&st, uid).await?;
-    Ok(Json(UserPublic::from(&row)))
+    Ok(Json(self_public(&st, &row).await?))
 }
 
 async fn delete_avatar(
@@ -2254,7 +2268,7 @@ async fn delete_avatar(
         notify_avatar_changed(&st, uid).await;
     }
     let row = load_user_row(&st, uid).await?;
-    Ok(Json(UserPublic::from(&row)))
+    Ok(Json(self_public(&st, &row).await?))
 }
 
 #[derive(Deserialize)]
@@ -2812,6 +2826,7 @@ async fn admin_users(
     .await?
     .into_iter()
     .collect();
+    let policy = crate::agent_access::load_policy(&st.pool).await?;
     Ok(Json(
         rows.iter()
             .map(|u| AdminUserView {
@@ -2826,9 +2841,58 @@ async fn admin_users(
                 storage_bytes: usage.get(&u.id).copied().unwrap_or(0),
                 avatar_version: u.avatar_version,
                 has_avatar: u.avatar_path.is_some(),
+                agent_access: u.agent_access,
+                agent_access_effective: crate::agent_access::effective(
+                    &u.role,
+                    policy.enabled,
+                    policy.default_allowed,
+                    u.agent_access,
+                ),
             })
             .collect(),
     ))
+}
+
+#[derive(Deserialize)]
+struct SetAgentAccessReq {
+    /// true 允许 / false 禁止 / null 跟随全局默认
+    allowed: Option<bool>,
+}
+
+/// PUT /admin/users/{id}/agent-access
+async fn admin_set_agent_access(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(target): Path<Uuid>,
+    Json(req): Json<SetAgentAccessReq>,
+) -> AppResult<StatusCode> {
+    auth::require_admin(&st, &headers).await?;
+    let row = sqlx::query_as::<_, (String, Option<bool>)>(
+        "SELECT role, agent_access FROM users WHERE id = $1",
+    )
+    .bind(target)
+    .fetch_optional(&st.pool)
+    .await?;
+    let Some((role, old_ov)) = row else {
+        return Err(AppError::not_found("user not found"));
+    };
+    let policy = crate::agent_access::load_policy(&st.pool).await?;
+    let before =
+        crate::agent_access::effective(&role, policy.enabled, policy.default_allowed, old_ov);
+    sqlx::query("UPDATE users SET agent_access = $2 WHERE id = $1")
+        .bind(target)
+        .bind(req.allowed)
+        .execute(&st.pool)
+        .await?;
+    let after =
+        crate::agent_access::effective(&role, policy.enabled, policy.default_allowed, req.allowed);
+    if before && !after {
+        crate::agents::revoke_access(&st, &[target]).await;
+    }
+    if before != after {
+        notify(&st, &[target], "me");
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// 禁用：顾问锁 + 行锁串行化 → 置标记并 bump 凭据版本 → 撤 refresh → 踢下线（帧 + 主动断连）
@@ -2865,6 +2929,9 @@ async fn admin_disable(
     revoke_all_refresh(&mut tx, target).await?;
     revoke_all_sessions(&mut tx, target).await?;
     tx.commit().await?;
+    // 先取消进行中的调用并断开宿主，再踢普通连接（帧先于 force_logout）
+    crate::agents::revoke_access(&st, &[target]).await;
+    notify(&st, &[target], "me");
     if let Some(epoch) = st.kick_user(target, "disabled") {
         ws::publish_offline(&st, target, epoch).await;
     }
@@ -2911,8 +2978,8 @@ async fn admin_set_role(
         .bind(ADMIN_LOCK_KEY)
         .execute(&mut *tx)
         .await?;
-    let (cur, disabled) = sqlx::query_as::<_, (String, bool)>(
-        "SELECT role, disabled_at IS NOT NULL FROM users WHERE id = $1 FOR UPDATE",
+    let (cur, disabled, access_ov) = sqlx::query_as::<_, (String, bool, Option<bool>)>(
+        "SELECT role, disabled_at IS NOT NULL, agent_access FROM users WHERE id = $1 FOR UPDATE",
     )
     .bind(target)
     .fetch_optional(&mut *tx)
@@ -2941,6 +3008,23 @@ async fn admin_set_role(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    // 降成普通用户时，全局关 / 默认禁止会让生效值从有变无
+    if let Ok(policy) = crate::agent_access::load_policy(&st.pool).await {
+        let before =
+            crate::agent_access::effective(&cur, policy.enabled, policy.default_allowed, access_ov);
+        let after = crate::agent_access::effective(
+            &req.role,
+            policy.enabled,
+            policy.default_allowed,
+            access_ov,
+        );
+        if before && !after {
+            crate::agents::revoke_access(&st, &[target]).await;
+        }
+        if before != after {
+            notify(&st, &[target], "me");
+        }
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

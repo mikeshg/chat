@@ -32,7 +32,12 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 async fn uid(headers: &HeaderMap, st: &SharedState) -> AppResult<Uuid> {
-    Ok(auth::require_user(st, headers).await?.id)
+    let id = auth::require_user(st, headers).await?.id;
+    // 头像 GET 不走这里。其余 Agent REST 无权一律 403。
+    if !crate::agent_access::user_allows(&st.pool, id).await? {
+        return Err(AppError::forbidden("agent_access_denied"));
+    }
+    Ok(id)
 }
 
 // ---------- REST ----------
@@ -974,6 +979,127 @@ pub async fn cancel_invocation(
     Ok(Json(inv))
 }
 
+// ---------- 使用权收回（A08） ----------
+
+#[derive(sqlx::FromRow)]
+struct RevokedInv {
+    id: Uuid,
+    agent_id: Uuid,
+    conversation_id: Uuid,
+    trigger_message_id: Uuid,
+    status: String,
+    error: Option<String>,
+    created_at: DateTime<Utc>,
+    started_at: Option<DateTime<Utc>>,
+    finished_at: Option<DateTime<Utc>>,
+    host_id: Uuid,
+}
+
+/// 进行中的调用改为 cancelled/agent_access_revoked，推帧，通知宿主取消，并断开这些用户的宿主。
+pub async fn revoke_access(st: &SharedState, user_ids: &[Uuid]) {
+    if user_ids.is_empty() {
+        return;
+    }
+    let invs = sqlx::query_as::<_, RevokedInv>(
+        "UPDATE agent_invocations i
+            SET status = 'cancelled', error = 'agent_access_revoked', finished_at = now()
+           FROM agents a
+          WHERE i.agent_id = a.id
+            AND a.owner_id = ANY($1)
+            AND i.finished_at IS NULL
+            AND i.status IN ('queued', 'running', 'awaiting_approval')
+         RETURNING i.id, i.agent_id, i.conversation_id, i.trigger_message_id,
+                   i.status, i.error, i.created_at, i.started_at, i.finished_at, a.host_id",
+    )
+    .bind(user_ids)
+    .fetch_all(&st.pool)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::error!(error = %e, "revoke agent access failed");
+        Vec::new()
+    });
+    for inv in &invs {
+        let payload = json!({
+            "type": "invocation_cancel",
+            "invocation_id": inv.id,
+        })
+        .to_string();
+        st.send_to_host(inv.host_id, &payload);
+        let members = domain::member_ids(&st.pool, inv.conversation_id)
+            .await
+            .unwrap_or_default();
+        push_invocation(
+            st,
+            &members,
+            &InvocationView {
+                id: inv.id,
+                agent_id: inv.agent_id,
+                conversation_id: inv.conversation_id,
+                trigger_message_id: inv.trigger_message_id,
+                status: inv.status.clone(),
+                error: inv.error.clone(),
+                created_at: inv.created_at,
+                started_at: inv.started_at,
+                finished_at: inv.finished_at,
+            },
+        );
+    }
+    for uid in user_ids {
+        st.disconnect_user_hosts(*uid);
+    }
+}
+
+/// 全局开关或默认变了：谁的生效值从有到无，就收回；变了的人重拉 /users/me。
+pub async fn on_settings_saved(
+    st: &SharedState,
+    before: &crate::settings::ServerSettings,
+    after: &crate::settings::ServerSettings,
+) {
+    if before.agent_enabled == after.agent_enabled
+        && before.agent_default_allowed == after.agent_default_allowed
+    {
+        return;
+    }
+    let rows = match sqlx::query_as::<_, (Uuid, String, Option<bool>)>(
+        "SELECT id, role, agent_access FROM users",
+    )
+    .fetch_all(&st.pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, "agent access policy diff failed");
+            return;
+        }
+    };
+    let mut lost = Vec::new();
+    let mut changed = Vec::new();
+    for (id, role, ov) in rows {
+        let old = crate::agent_access::effective(
+            &role,
+            before.agent_enabled,
+            before.agent_default_allowed,
+            ov,
+        );
+        let new = crate::agent_access::effective(
+            &role,
+            after.agent_enabled,
+            after.agent_default_allowed,
+            ov,
+        );
+        if old != new {
+            changed.push(id);
+        }
+        if old && !new {
+            lost.push(id);
+        }
+    }
+    revoke_access(st, &lost).await;
+    if !changed.is_empty() {
+        crate::api::notify(st, &changed, "me");
+    }
+}
+
 // ---------- 调用派发（挂在 broadcast_posted 上） ----------
 
 #[derive(Clone)]
@@ -1215,6 +1341,15 @@ async fn dispatch(
     prompt: String,
     member_ids: &[Uuid],
 ) {
+    // 专属会话在落库前就拒绝了。群 / 私聊里的 @ 走到这里时只是不建调用。
+    match crate::agent_access::user_allows(&st.pool, agent.owner).await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            tracing::error!(error = %e, "agent access check failed");
+            return;
+        }
+    }
     let timeout = queue_timeout_secs(&st.pool, agent.id).await;
     let online = st.host_online(agent.host_id);
     // 在线先标 running 再下发，客户端看到的第一帧就是 running（不是先闪一下排队）。
@@ -1370,7 +1505,22 @@ async fn prompt_for_flushed(pool: &PgPool, conv: Uuid, trigger: Uuid, content: &
 }
 
 /// host_ready 之后：该宿主上所有 queued 调用按 created_at 逐个改成 running 并下发。
+/// 主人已没有使用权时整批跳过（进行中的应已取消，这里是兜底）。
 pub async fn flush_queued(st: &SharedState, host_id: Uuid) {
+    let owner = sqlx::query_scalar::<_, Uuid>("SELECT user_id FROM agent_hosts WHERE id = $1")
+        .bind(host_id)
+        .fetch_optional(&st.pool)
+        .await
+        .ok()
+        .flatten();
+    if let Some(owner) = owner {
+        if !crate::agent_access::user_allows(&st.pool, owner)
+            .await
+            .unwrap_or(false)
+        {
+            return;
+        }
+    }
     let rows = sqlx::query_as::<_, QueuedStart>(
         "SELECT i.id, i.conversation_id, a.id AS agent_id, m.content AS prompt,
                 i.trigger_message_id

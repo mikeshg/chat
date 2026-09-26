@@ -46,6 +46,10 @@ pub struct ServerSettings {
     pub public_url: String,
     /// 视频会议地址前缀；空字符串 = 关闭会议按钮
     pub meeting_base_url: String,
+    /// 全局是否允许使用 Agent（管理员始终可用）
+    pub agent_enabled: bool,
+    /// 没有逐用户覆盖时，普通用户默认能否使用 Agent
+    pub agent_default_allowed: bool,
 }
 
 impl Default for ServerSettings {
@@ -58,6 +62,8 @@ impl Default for ServerSettings {
             push_ntfy_token_set: false,
             public_url: String::new(),
             meeting_base_url: DEFAULT_MEETING_BASE_URL.into(),
+            agent_enabled: true,
+            agent_default_allowed: true,
         }
     }
 }
@@ -100,6 +106,14 @@ pub async fn load(executor: impl sqlx::PgExecutor<'_>) -> AppResult<ServerSettin
                 if let Ok(url) = normalize_meeting_base_url(url) {
                     s.meeting_base_url = url;
                 }
+            }
+        } else if k == "agent_enabled" {
+            if let Some(b) = v.as_bool() {
+                s.agent_enabled = b;
+            }
+        } else if k == "agent_default_allowed" {
+            if let Some(b) = v.as_bool() {
+                s.agent_default_allowed = b;
             }
         }
     }
@@ -149,6 +163,10 @@ pub struct UpdateSettingsReq {
     pub push_ntfy_token: Option<String>,
     /// 本服务对外地址（同 push_ntfy_base 的校验规则）；空 = 通知不带 Click
     pub public_url: Option<String>,
+    /// 全局 Agent 开关。缺省不改
+    pub agent_enabled: Option<bool>,
+    /// 新用户 / 未覆盖用户的默认。缺省不改
+    pub agent_default_allowed: Option<bool>,
 }
 
 /// 管理员写入的地址类字段：http/https 且 ≤200 字符；空串合法（= 关闭/清除）。
@@ -157,6 +175,26 @@ fn normalize_http_url(v: &str) -> Option<String> {
     let v = v.trim().trim_end_matches('/').to_string();
     (v.is_empty() || (v.len() <= 200 && (v.starts_with("http://") || v.starts_with("https://"))))
         .then_some(v)
+}
+
+async fn upsert_bool(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    key: &str,
+    value: bool,
+    updated_by: Uuid,
+) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO server_settings (key, value, updated_by)
+         VALUES ($1, to_jsonb($2::bool), $3)
+         ON CONFLICT (key) DO UPDATE
+            SET value = EXCLUDED.value, updated_at = now(), updated_by = EXCLUDED.updated_by",
+    )
+    .bind(key)
+    .bind(value)
+    .bind(updated_by)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// 字符串值键的 UPSERT（设置仅存 jsonb 标量，文本经 to_jsonb 落库）
@@ -247,6 +285,12 @@ pub async fn update(
         .execute(&mut **tx)
         .await?;
     }
+    if let Some(v) = req.agent_enabled {
+        upsert_bool(tx, "agent_enabled", v, updated_by).await?;
+    }
+    if let Some(v) = req.agent_default_allowed {
+        upsert_bool(tx, "agent_default_allowed", v, updated_by).await?;
+    }
     load(&mut **tx).await
 }
 
@@ -316,8 +360,11 @@ pub async fn put_settings(
 ) -> AppResult<Json<ServerSettings>> {
     let admin = auth::require_admin(&st, &headers).await?;
     let mut tx = st.pool.begin().await?;
+    let before = load(&mut *tx).await?;
     let s = update(&mut tx, &req, admin.id).await?;
     tx.commit().await?;
+    // 全局开关 / 默认变了：收回使用权、通知受影响的人重拉 /users/me
+    crate::agents::on_settings_saved(&st, &before, &s).await;
     Ok(Json(s))
 }
 

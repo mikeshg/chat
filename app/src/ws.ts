@@ -1,6 +1,7 @@
 import {
   ApiError,
   agents as agentsApi,
+  auth,
   clearSession,
   convs,
   friends as friendsApi,
@@ -8,6 +9,7 @@ import {
   session,
   wsBase,
 } from "./api";
+import { syncAgentHost } from "./agentHost";
 import { notifyIncoming } from "./notify";
 import {
   absorbAvatarUsers,
@@ -94,6 +96,7 @@ const PERMANENT_SEND_ERRORS = new Set([
   "not_found",
   "bad_frame",
   "agent_deleted",
+  "agent_access_denied",
 ]);
 
 export function stopWs() {
@@ -525,6 +528,10 @@ async function refreshByWhat(what: string) {
     } else if (what === "agents") {
       // Agent 面板自己重拉列表（可选项 / 删除）
       window.dispatchEvent(new Event("chat:agents"));
+    } else if (what === "me") {
+      const me = await auth.me();
+      setState({ me });
+      await syncAgentHost(me);
     }
   } catch (e) {
     console.warn("refresh failed", e);
