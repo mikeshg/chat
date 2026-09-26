@@ -39,7 +39,7 @@
 | 适配器 | 结果 |
 |---|---|
 | Codex（`codex-acp` 1.13.1，npx 安装） | 通过：pong 有正文；往工作目录外写文件触发权限请求，拒绝后文件没写出来 |
-| Claude Code（`claude-acp` 0.81.2，npx 安装） | 没跑完：安装成功，调用时报 `OAuth session expired`。本机 Claude Code 登录已过期，重新登录后再跑 `CHAT_REAL_AGENT_SMOKE=claude` |
+| Claude Code（`claude-acp` 0.81.2，npx 安装） | 通过：同上两项。第一次跑时本机登录已过期（`OAuth session expired`），重新登录后通过 |
 
 ## 4. 验收中发现并修掉的问题
 
@@ -50,6 +50,5 @@
 ## 5. 已知限制和遗留
 
 - Codex 的沙箱在任何模式下都允许写它自己的工作目录，所以「只读」档位管不住 Codex 对工作目录的修改（README 已写明）。目录外的写入和联网照样走审批。
-- Claude Code 真 agent 冒烟待本机重新登录后补跑。
 - A10（macOS / Linux 打包）由主人在 Mac 上做；#19 等 #12 完成后一起关。
 - 工具备注：cua-driver 的桌面点击会先激活窗口，把 Win32 弹出菜单关掉，托盘菜单项点不中。验收时改为右键打开菜单后，按窗口范围给 chat-app 发方向键和回车。

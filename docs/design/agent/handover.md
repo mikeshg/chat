@@ -13,9 +13,8 @@
 ## 2. 还没做的
 
 1. **A10**（用户在 Mac 上做）：Tauri 打包目标加 macOS / Linux，Mac 上编包、登录后成为宿主并跑通一次调用；README 补打包说明。
-2. **Claude Code 真 agent 冒烟**：本机 Claude Code 登录过期，重新登录后跑 `CHAT_REAL_AGENT_SMOKE=claude cargo test -p agent-host --test smoke -- --nocapture --test-threads=1`（会消耗 token，跑前问用户）。Codex 已通过。
 
-阶段验收（验收库全量检查、Windows 桌面实机、Codex 真 agent 冒烟）已完成，记录在 [acceptance.md](acceptance.md)，验收中修掉的三个问题也在里面。
+阶段验收（验收库全量检查、Windows 桌面实机、Claude Code 与 Codex 真 agent 冒烟）已完成，记录在 [acceptance.md](acceptance.md)，验收中修掉的三个问题也在里面。
 
 ## 3. 用户在需求讨论中的决定
 
