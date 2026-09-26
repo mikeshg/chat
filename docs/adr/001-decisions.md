@@ -62,3 +62,13 @@
 **决策**：`users.role`（admin/user）+ `users.disabled_at`。最早注册用户自动成为管理员（Gitea 式零配置引导），之后管理员在后台互相任命/撤销；**末位保护**——最后一个管理员不可撤销；管理员账号不可被禁用。禁用 = 置标记 + 撤销全部 refresh token + `force_logout` 帧踢下线 + 每请求 `require_user` 查用户行拒绝（即时生效，不等 access token 过期）。
 
 **理由**：自部署产品不想引入"谁是第一个 admin"的配置项；角色判断走 DB 而非 JWT claim——admin 撤销/禁用必须即时生效，JWT 15 分钟 TTL 内仍放行不可接受，代价是每请求一次主键查询（本规模可忽略）。踢人经 `conns` 表发 `force_logout` 帧后移除发送端：客户端收到即主动断开回登录页，服务端写路径同时被掐断。已知取舍：并发首注册理论上可产双 admin（无害）；`UserPublic.role` 对所有人可见（谁是管理员非秘密）。
+
+## 12. Agent 接入：ACP 为主、原生兜底
+
+**决策**：宿主运行时定义一个 Agent 抽象（开始/恢复上下文、发指令、事件流、权限请求、取消），首个实现是 ACP（Agent Client Protocol）客户端。只有当某个 CLI 的关键能力 ACP 适配器没暴露时，才给它写原生对接。将来的内置 agent 也按 ACP agent 实现。
+
+**理由**：ACP 官方登记表约 50 个 agent（Claude Code、Codex、Gemini CLI、Grok Build、Qoder CLI、Copilot 等），对接一次全部可用。协议自带本功能要的四样东西：`session/new` 的 mcpServers 用来注入聊天工具，`session/request_permission` 对应审批，`session/update` 对应三种输出方式，`session/load` / `session/resume` 对应上下文延续。每个 CLI 单独对接（Claude Code stream-json、Codex app-server 等）意味着每加一种 agent 写一套，只支持写过的那几个。
+
+**代价**：功能受各适配器完整度限制；Claude Code 的适配器是 npm 包，宿主机要装 Node；多一层适配进程。原生兜底路径让抽象层多一个实现要维护。
+
+**升级路径**：遇到 ACP 缺口时，为该 CLI 在同一抽象下加原生实现，上层（调用分发、审批、输出）不变。
