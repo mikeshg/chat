@@ -119,6 +119,11 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
             "/conversations/{id}/agent-invocations",
             get(crate::agents::list_invocations),
         )
+        // Agent A13：调用期凭据专用工具端点（与普通用户鉴权互不通用）
+        .route(
+            "/agent-tools/history",
+            get(crate::agent_tools::tool_history),
+        )
         .route(
             "/files",
             post(upload_file).layer(DefaultBodyLimit::max(

@@ -454,11 +454,21 @@ async fn dispatch(
     if inv.status != "running" {
         return;
     }
+    // Agent A13：随调用下发一次性工具凭据（不落库；调用状态变化即失效）。
+    // 签发失败当发不出去处理——宿主拿不到凭据也跑不了工具。
+    let tools_token =
+        crate::auth::mint_invocation(inv.id, agent.owner, agent.id, 0, &st.cfg.jwt_secret);
+    let Ok(tools_token) = tools_token else {
+        let _ =
+            finish_invocation(st, inv.id, "failed", Some("token_mint_failed"), member_ids).await;
+        return;
+    };
     let payload = serde_json::json!({
         "type": "invocation_start",
         "invocation_id": inv.id,
         "agent": {"id": agent.id, "name": agent.name, "runtime": agent.runtime, "cwd": agent.cwd},
         "prompt": prompt,
+        "tools_token": tools_token,
     })
     .to_string();
     // 发不出去（恰在检查后断开等）→ 与离线同语义：failed/host_offline

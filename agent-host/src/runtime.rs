@@ -44,6 +44,16 @@ impl AgentSpec {
     }
 }
 
+/// Agent A13：注入给 Agent 的一个 MCP 服务（本次调用的工具入口）。
+/// http_url 指向宿主本地 MCP 服务；bridge 是备选 stdio 桥接（程序 + 固定参数，
+/// 调 ACP session/new 时把 http_url 追加为最后一个参数）。
+#[derive(Debug, Clone)]
+pub struct InjectedMcp {
+    pub name: String,
+    pub http_url: String,
+    pub bridge: Option<(String, Vec<String>)>,
+}
+
 /// 一次调用的输入。
 #[derive(Debug, Clone)]
 pub struct RunRequest {
@@ -51,6 +61,8 @@ pub struct RunRequest {
     pub prompt: String,
     /// spec.cwd 为空时的工作目录
     pub data_dir: PathBuf,
+    /// Agent A13：本次调用注入的 MCP 服务（可空 = 不注入工具）
+    pub mcp_servers: Vec<InjectedMcp>,
 }
 
 /// 运行过程中的事件（按发生顺序）。

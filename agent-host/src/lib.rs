@@ -6,6 +6,8 @@
 
 pub mod acp;
 mod conn;
+pub mod mcp;
+pub mod mcp_bridge;
 pub mod runtime;
 
 use std::collections::HashMap;
@@ -26,6 +28,10 @@ pub struct HostConfig {
     pub label: String,
     /// windows / macos / linux
     pub platform: String,
+    /// Agent A13：stdio MCP 桥接（程序 + 固定参数；MCP URL 追加为最后一个参数）。
+    /// Agent 不支持 http MCP 时用；None = 无桥接兜底（此时不声明 http 能力的
+    /// Agent 拿不到注入工具）。
+    pub mcp_bridge: Option<(String, Vec<String>)>,
 }
 
 /// 每条宿主连接建立前取一次一次性 WS 票（内部实现用账号登录态换
@@ -59,6 +65,8 @@ pub(crate) struct Shared {
     pub superseded: std::sync::atomic::AtomicBool,
     /// cwd 为空时 Agent 进程的默认工作目录
     pub data_dir: std::path::PathBuf,
+    /// Agent A13：本地 MCP 服务；起不来的话本次运行不注入工具（仅告警）
+    pub mcp: Option<mcp::McpServer>,
 }
 
 pub struct HostHandle {
@@ -117,6 +125,7 @@ pub fn spawn(cfg: HostConfig, tickets: Arc<dyn TicketSource>) -> HostHandle {
         host_id: host_id_tx,
         running: Arc::new(Mutex::new(HashMap::new())),
         superseded: std::sync::atomic::AtomicBool::new(false),
+        mcp: mcp::McpServer::start(),
     });
     let _ = std::fs::create_dir_all(&shared.data_dir);
     let s2 = shared.clone();

@@ -89,11 +89,20 @@ pub async fn agent_host_start(
     if let Some(old) = old {
         old.shutdown().await;
     }
+    // Agent A13：stdio MCP 桥接 = 本程序 + --agent-mcp-bridge（main.rs 入口拦截）；
+    // Agent 不声明 http MCP 能力时经它拿到注入工具。
+    let mcp_bridge = std::env::current_exe().ok().map(|exe| {
+        (
+            exe.to_string_lossy().to_string(),
+            vec!["--agent-mcp-bridge".to_string()],
+        )
+    });
     let cfg = agent_host::HostConfig {
         server_url,
         install_id: install_id(&app)?,
         label,
         platform: std::env::consts::OS.to_string(),
+        mcp_bridge,
     };
     let tickets: Arc<dyn agent_host::TicketSource> = Arc::new(FrontTickets {
         app: app.clone(),

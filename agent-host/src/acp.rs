@@ -8,7 +8,9 @@
 // fs/terminal 等反向请求；万一发起（含 session/request_permission）一律拒绝。
 
 pub use crate::runtime::AgentSpec;
-use crate::runtime::{AgentRuntime, Events, RunEvent, RunFuture, RunOutput, RunRequest};
+use crate::runtime::{
+    AgentRuntime, Events, InjectedMcp, RunEvent, RunFuture, RunOutput, RunRequest,
+};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -116,21 +118,56 @@ pub async fn run_invocation(req: &RunRequest, events: Events) -> Result<RunOutpu
         err,
         events,
     };
-    let r = drive(&mut pipe, &dir, &req.prompt).await;
+    let r = drive(&mut pipe, &dir, &req.prompt, &req.mcp_servers).await;
     let _ = child.kill().await;
     r.map(|_| RunOutput {
         text: std::mem::take(&mut pipe.text),
     })
 }
 
-async fn drive(pipe: &mut Pipe, dir: &Path, prompt: &str) -> Result<(), String> {
-    pipe.call(
-        "initialize",
-        json!({"protocolVersion": 1, "clientCapabilities": {}}),
-    )
-    .await?;
+/// Agent A13：按 Agent 声明的能力把注入的 MCP 服务折成 ACP mcpServers 条目。
+/// Agent 声明 mcpCapabilities.http → http 形态直连；否则有桥接配置 → stdio
+/// 桥接条目（URL 追加为最后一个参数）；都不行 → 不注入并告警。
+fn mcp_entries(init: &Value, injected: &[InjectedMcp]) -> Vec<Value> {
+    let http_ok = init
+        .pointer("/agentCapabilities/mcpCapabilities/http")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut out = Vec::new();
+    for m in injected {
+        if http_ok {
+            out.push(json!({"type":"http","name":m.name,"url":m.http_url,"headers":[]}));
+        } else if let Some((cmd, args)) = &m.bridge {
+            let mut a = args.clone();
+            a.push(m.http_url.clone());
+            out.push(json!({"name":m.name,"command":cmd,"args":a,"env":[]}));
+        } else {
+            tracing::warn!(
+                "Agent 未声明 http MCP 能力且未配置桥接：{} 的注入工具不可用",
+                m.name
+            );
+        }
+    }
+    out
+}
+
+async fn drive(
+    pipe: &mut Pipe,
+    dir: &Path,
+    prompt: &str,
+    injected: &[InjectedMcp],
+) -> Result<(), String> {
+    let init = pipe
+        .call(
+            "initialize",
+            json!({"protocolVersion": 1, "clientCapabilities": {}}),
+        )
+        .await?;
     let new = pipe
-        .call("session/new", json!({"cwd": dir, "mcpServers": []}))
+        .call(
+            "session/new",
+            json!({"cwd": dir, "mcpServers": mcp_entries(&init, injected)}),
+        )
         .await?;
     let session_id = new["sessionId"].clone();
     pipe.call(

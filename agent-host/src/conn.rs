@@ -1,6 +1,6 @@
 // 宿主 WS 连接循环：连上→host_hello→host_ready→收 invocation_start 起任务。
 
-use crate::runtime::{self, AgentSpec, RunRequest};
+use crate::runtime::{self, AgentSpec, InjectedMcp, RunRequest};
 use crate::Shared;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -45,6 +45,13 @@ fn ws_url(server: &str, ticket: &str) -> String {
         .replace("https://", "wss://")
         .replace("http://", "ws://");
     format!("{base}/v1/ws?ticket={ticket}&role=host")
+}
+
+/// server_url 的 http(s) 基址（注入工具回拨服务端 REST 用）
+fn http_base(server: &str) -> String {
+    server
+        .replace("wss://", "https://")
+        .replace("ws://", "http://")
 }
 
 async fn connect_once(s: &Arc<Shared>) -> Result<(), String> {
@@ -164,10 +171,33 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
         }
     };
     let prompt = v["prompt"].as_str().unwrap_or_default().to_string();
+    // Agent A13：有 tools_token 且本地 MCP 服务在跑 → 登记一条调用级映射。
+    // McpHandle 随调用任务存活：成功/失败/取消/abort 都会 drop → 摘映射（404）。
+    let tools_token = v["tools_token"].as_str().map(str::to_string);
+    let (mcp_servers, mcp_handle) = match (s.mcp.as_ref(), tools_token) {
+        (Some(mcp), Some(token)) => {
+            let h = mcp.register(http_base(&s.cfg.server_url), token);
+            (
+                vec![InjectedMcp {
+                    name: "chat".into(),
+                    http_url: h.url.clone(),
+                    bridge: s.cfg.mcp_bridge.clone(),
+                }],
+                Some(h),
+            )
+        }
+        (None, Some(_)) => {
+            warn!("本地 MCP 服务未启动，调用 {inv_id} 不注入工具");
+            (Vec::new(), None)
+        }
+        _ => (Vec::new(), None),
+    };
     let out2 = out.clone();
     let running = s.running.clone();
     let dir = s.data_dir.clone();
     let task = tokio::spawn(async move {
+        // 映射的生命周期钉在这次调用上：任务结束/被 abort 时 drop
+        let _mcp_handle = mcp_handle;
         let rt = runtime::runtime_for(&spec);
         // 事件暂不外发（接收端即刻丢弃）；流式输出票把它接到服务端
         let (events, _) = tokio::sync::mpsc::unbounded_channel();
@@ -175,6 +205,7 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
             spec,
             prompt,
             data_dir: dir,
+            mcp_servers,
         };
         let r = rt.run(req, events).await.map(|o| o.text);
         send_finish(&out2, inv_id, r);

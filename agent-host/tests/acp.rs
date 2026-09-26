@@ -23,6 +23,7 @@ async fn run(prompt: &str) -> Result<RunOutput, String> {
         spec: fake(),
         prompt: prompt.into(),
         data_dir: std::env::temp_dir(),
+        mcp_servers: Vec::new(),
     };
     run_invocation(&req, events).await
 }
@@ -58,6 +59,7 @@ async fn acp_emits_text_events_in_order() {
         spec: fake(),
         prompt: "echo:hello world".into(),
         data_dir: std::env::temp_dir(),
+        mcp_servers: Vec::new(),
     };
     let out = run_invocation(&req, events).await.expect("echo 应成功");
     let mut chunks = Vec::new();
