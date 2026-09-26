@@ -407,7 +407,8 @@ fn valid_queue_timeout(secs: i32) -> bool {
 
 async fn user_settings(pool: &PgPool, uid: Uuid) -> Result<AgentUserSettings, sqlx::Error> {
     Ok(sqlx::query_as::<_, AgentUserSettings>(
-        "SELECT output_mode, queue_timeout_secs FROM agent_user_settings WHERE user_id = $1",
+        "SELECT output_mode, queue_timeout_secs, max_call_depth
+           FROM agent_user_settings WHERE user_id = $1",
     )
     .bind(uid)
     .fetch_optional(pool)
@@ -415,6 +416,7 @@ async fn user_settings(pool: &PgPool, uid: Uuid) -> Result<AgentUserSettings, sq
     .unwrap_or(AgentUserSettings {
         output_mode: "stream".into(),
         queue_timeout_secs: 86400,
+        max_call_depth: 3,
     }))
 }
 
@@ -425,7 +427,8 @@ pub async fn effective_settings(
 ) -> Result<AgentUserSettings, sqlx::Error> {
     sqlx::query_as::<_, AgentUserSettings>(
         "SELECT COALESCE(a.output_mode, s.output_mode, 'stream') AS output_mode,
-                COALESCE(a.queue_timeout_secs, s.queue_timeout_secs, 86400) AS queue_timeout_secs
+                COALESCE(a.queue_timeout_secs, s.queue_timeout_secs, 86400) AS queue_timeout_secs,
+                COALESCE(s.max_call_depth, 3) AS max_call_depth
            FROM agents a
            LEFT JOIN agent_user_settings s ON s.user_id = a.owner_id
           WHERE a.id = $1",
@@ -462,15 +465,22 @@ pub async fn put_user_settings(
         }
         cur.queue_timeout_secs = t;
     }
+    if let Some(d) = req.max_call_depth {
+        if !(1..=10).contains(&d) {
+            return Err(AppError::bad_request("bad_max_call_depth"));
+        }
+        cur.max_call_depth = d;
+    }
     sqlx::query(
-        "INSERT INTO agent_user_settings (user_id, output_mode, queue_timeout_secs)
-         VALUES ($1, $2, $3)
+        "INSERT INTO agent_user_settings (user_id, output_mode, queue_timeout_secs, max_call_depth)
+         VALUES ($1, $2, $3, $4)
          ON CONFLICT (user_id) DO UPDATE
-            SET output_mode = $2, queue_timeout_secs = $3, updated_at = now()",
+            SET output_mode = $2, queue_timeout_secs = $3, max_call_depth = $4, updated_at = now()",
     )
     .bind(uid)
     .bind(&cur.output_mode)
     .bind(cur.queue_timeout_secs)
+    .bind(cur.max_call_depth)
     .execute(&st.pool)
     .await?;
     Ok(Json(cur))
@@ -690,9 +700,13 @@ pub async fn delete_agent(
         let members = domain::member_ids(&st.pool, inv.conversation_id)
             .await
             .unwrap_or_else(|_| vec![owner]);
+        let members = with_root_members(&st, &members, inv).await;
         push_invocation(&st, &members, inv);
         crate::approvals::expire_invocation(&st, inv.id).await;
     }
+    // 删掉的 Agent 自己的调用已失败；它派出的未结束子调用一并取消
+    let roots: Vec<Uuid> = invs.iter().map(|i| i.id).collect();
+    cascade_cancel(&st, &roots, None).await;
     // 会话列表要带上 deleted；Agent 列表面板重拉
     crate::api::notify(&st, &[owner], "conversations");
     crate::api::notify(&st, &[owner], "agents");
@@ -925,10 +939,13 @@ pub async fn list_invocations(
         .await?
         .ok_or_else(|| AppError::forbidden("not a member of this conversation"))?;
     let mut rows = sqlx::query_as::<_, InvocationView>(
-        "SELECT id, agent_id, conversation_id, trigger_message_id, schedule_id, status, error,
-                attachment_ids, created_at, started_at, finished_at
-           FROM agent_invocations WHERE conversation_id = $1
-          ORDER BY created_at DESC, id DESC LIMIT $2",
+        "SELECT i.id, i.agent_id, i.conversation_id, i.trigger_message_id, i.schedule_id,
+                i.status, i.error, i.attachment_ids, i.created_at, i.started_at, i.finished_at,
+                i.parent_invocation_id, i.root_conversation_id, a.name AS agent_name
+           FROM agent_invocations i
+           JOIN agents a ON a.id = i.agent_id
+          WHERE i.conversation_id = $1
+          ORDER BY i.created_at DESC, i.id DESC LIMIT $2",
     )
     .bind(conv)
     .bind(q.limit.unwrap_or(50).clamp(1, 200))
@@ -1035,10 +1052,13 @@ pub async fn cancel_invocation(
         st.inv_runs.remove(&id);
     }
     let members = domain::member_ids(&st.pool, conv).await.unwrap_or_default();
+    let members = with_root_members(&st, &members, &inv).await;
     push_invocation(&st, &members, &inv);
     if status == "running" || status == "awaiting_approval" {
         crate::approvals::expire_invocation(&st, id).await;
     }
+    // 未结束的后代一并取消（排队的也算）
+    cascade_cancel(&st, &[id], None).await;
     Ok(Json(inv))
 }
 
@@ -1056,6 +1076,9 @@ struct RevokedInv {
     created_at: DateTime<Utc>,
     started_at: Option<DateTime<Utc>>,
     finished_at: Option<DateTime<Utc>>,
+    parent_invocation_id: Option<Uuid>,
+    root_conversation_id: Option<Uuid>,
+    agent_name: String,
     host_id: Uuid,
 }
 
@@ -1073,7 +1096,8 @@ pub async fn revoke_access(st: &SharedState, user_ids: &[Uuid]) {
             AND i.finished_at IS NULL
             AND i.status IN ('queued', 'running', 'awaiting_approval')
          RETURNING i.id, i.agent_id, i.conversation_id, i.trigger_message_id, i.schedule_id,
-                   i.status, i.error, i.created_at, i.started_at, i.finished_at, a.host_id",
+                   i.status, i.error, i.created_at, i.started_at, i.finished_at,
+                   i.parent_invocation_id, i.root_conversation_id, a.name AS agent_name, a.host_id",
     )
     .bind(user_ids)
     .fetch_all(&st.pool)
@@ -1089,29 +1113,32 @@ pub async fn revoke_access(st: &SharedState, user_ids: &[Uuid]) {
         })
         .to_string();
         st.send_to_host(inv.host_id, &payload);
+        let view = InvocationView {
+            id: inv.id,
+            agent_id: inv.agent_id,
+            conversation_id: inv.conversation_id,
+            trigger_message_id: inv.trigger_message_id,
+            schedule_id: inv.schedule_id,
+            attachment_ids: Vec::new(),
+            status: inv.status.clone(),
+            error: inv.error.clone(),
+            created_at: inv.created_at,
+            started_at: inv.started_at,
+            finished_at: inv.finished_at,
+            current_step: None,
+            parent_invocation_id: inv.parent_invocation_id,
+            root_conversation_id: inv.root_conversation_id,
+            agent_name: inv.agent_name.clone(),
+        };
         let members = domain::member_ids(&st.pool, inv.conversation_id)
             .await
             .unwrap_or_default();
-        push_invocation(
-            st,
-            &members,
-            &InvocationView {
-                id: inv.id,
-                agent_id: inv.agent_id,
-                conversation_id: inv.conversation_id,
-                trigger_message_id: inv.trigger_message_id,
-                schedule_id: inv.schedule_id,
-                attachment_ids: Vec::new(),
-                status: inv.status.clone(),
-                error: inv.error.clone(),
-                created_at: inv.created_at,
-                started_at: inv.started_at,
-                finished_at: inv.finished_at,
-                current_step: None,
-            },
-        );
+        let members = with_root_members(st, &members, &view).await;
+        push_invocation(st, &members, &view);
         crate::approvals::expire_invocation(st, inv.id).await;
     }
+    let roots: Vec<Uuid> = invs.iter().map(|i| i.id).collect();
+    cascade_cancel(st, &roots, Some("agent_access_revoked")).await;
     for uid in user_ids {
         st.disconnect_user_hosts(*uid);
     }
@@ -1431,9 +1458,28 @@ async fn dispatch(
         let _ = domain::lock_conversation(&mut tx, conv).await?;
         let atts = collect_pending_attachments(&mut tx, conv, agent.owner, trigger).await?;
         let inv = if online {
-            insert_running(&mut *tx, &agent, conv, Some(trigger), None, &atts).await?
+            insert_running(
+                &mut *tx,
+                &agent,
+                conv,
+                Some(trigger),
+                None,
+                &atts,
+                &InvLink::default(),
+            )
+            .await?
         } else {
-            insert_queued(&mut *tx, &agent, conv, Some(trigger), None, timeout, &atts).await?
+            insert_queued(
+                &mut *tx,
+                &agent,
+                conv,
+                Some(trigger),
+                None,
+                timeout,
+                &atts,
+                &InvLink::default(),
+            )
+            .await?
         };
         tx.commit().await?;
         Ok(inv)
@@ -1470,6 +1516,7 @@ pub(crate) async fn fire_schedule(st: &SharedState, job: ScheduleFire) {
         .unwrap_or_default();
     let timeout = queue_timeout_secs(&st.pool, agent.id).await;
     let online = st.host_online(agent.host_id);
+    let link = InvLink::default();
     let inv = if online {
         insert_running(
             &st.pool,
@@ -1478,6 +1525,7 @@ pub(crate) async fn fire_schedule(st: &SharedState, job: ScheduleFire) {
             None,
             Some(job.schedule_id),
             &[],
+            &link,
         )
         .await
     } else {
@@ -1489,6 +1537,7 @@ pub(crate) async fn fire_schedule(st: &SharedState, job: ScheduleFire) {
             Some(job.schedule_id),
             timeout,
             &[],
+            &link,
         )
         .await
     };
@@ -1508,17 +1557,19 @@ async fn deliver_invocation(
     context_key: &str,
     member_ids: &[Uuid],
 ) {
-    push_invocation(st, member_ids, &inv);
+    // 子调用的状态帧和流式帧都要带到根会话成员（被调方专属会话之外的人）
+    let member_ids = with_root_members(st, member_ids, &inv).await;
+    push_invocation(st, &member_ids, &inv);
     if inv.status != "running" {
         return;
     }
-    register_run(st, agent, &inv, member_ids).await;
+    register_run(st, agent, &inv, &member_ids).await;
     let payload = invocation_start_payload(st, &inv, agent, context_key, prompt).await;
     if !st.send_to_host(agent.host_id, &payload) {
         st.inv_runs.remove(&inv.id);
         let timeout = queue_timeout_secs(&st.pool, agent.id).await;
         if let Some(q) = requeue(&st.pool, inv.id, timeout).await {
-            push_invocation(st, member_ids, &q);
+            push_invocation(st, &member_ids, &q);
         }
     }
 }
@@ -1621,7 +1672,32 @@ async fn queue_timeout_secs(pool: &PgPool, agent_id: Uuid) -> i32 {
 
 pub(crate) const INV_RETURNING: &str =
     "RETURNING id, agent_id, conversation_id, trigger_message_id, schedule_id, status, error,
-                   attachment_ids, created_at, started_at, finished_at";
+                   attachment_ids, created_at, started_at, finished_at, parent_invocation_id,
+                   root_conversation_id,
+                   (SELECT name FROM agents WHERE id = agent_invocations.agent_id) AS agent_name";
+
+/// 子调用额外落库的关联。主人直接发起 / 定时调用用默认值（depth 0，无父无根）。
+struct InvLink {
+    parent: Option<Uuid>,
+    depth: i32,
+    root: Option<Uuid>,
+    /// `call:<上下文号>`。空则收尾时按会话或定时任务推导。
+    context_key: Option<String>,
+    /// 离线补发用的完整指令。触发消息只是截断后的记录，不能当指令。
+    prompt: Option<String>,
+}
+
+impl Default for InvLink {
+    fn default() -> Self {
+        Self {
+            parent: None,
+            depth: 0,
+            root: None,
+            context_key: None,
+            prompt: None,
+        }
+    }
+}
 
 async fn insert_running(
     ex: impl sqlx::PgExecutor<'_>,
@@ -1630,12 +1706,14 @@ async fn insert_running(
     trigger: Option<Uuid>,
     schedule: Option<Uuid>,
     atts: &[Uuid],
+    link: &InvLink,
 ) -> Result<InvocationView, sqlx::Error> {
     sqlx::query_as::<_, InvocationView>(&format!(
         "INSERT INTO agent_invocations
             (agent_id, conversation_id, trigger_message_id, schedule_id, status, started_at,
-             attachment_ids)
-         VALUES ($1, $2, $3, $4, 'running', now(), $5)
+             attachment_ids, parent_invocation_id, depth, root_conversation_id, context_key,
+             prompt)
+         VALUES ($1, $2, $3, $4, 'running', now(), $5, $6, $7, $8, $9, $10)
          {INV_RETURNING}"
     ))
     .bind(agent.id)
@@ -1643,6 +1721,11 @@ async fn insert_running(
     .bind(trigger)
     .bind(schedule)
     .bind(atts)
+    .bind(link.parent)
+    .bind(link.depth)
+    .bind(link.root)
+    .bind(&link.context_key)
+    .bind(&link.prompt)
     .fetch_one(ex)
     .await
 }
@@ -1655,14 +1738,16 @@ async fn insert_queued(
     schedule: Option<Uuid>,
     timeout_secs: i32,
     atts: &[Uuid],
+    link: &InvLink,
 ) -> Result<InvocationView, sqlx::Error> {
     sqlx::query_as::<_, InvocationView>(&format!(
         "INSERT INTO agent_invocations
             (agent_id, conversation_id, trigger_message_id, schedule_id, status, queue_deadline,
-             attachment_ids)
+             attachment_ids, parent_invocation_id, depth, root_conversation_id, context_key,
+             prompt)
          VALUES ($1, $2, $3, $4, 'queued',
                  CASE WHEN $5 > 0 THEN now() + make_interval(secs => $5::double precision) END,
-                 $6)
+                 $6, $7, $8, $9, $10, $11)
          {INV_RETURNING}"
     ))
     .bind(agent.id)
@@ -1671,6 +1756,11 @@ async fn insert_queued(
     .bind(schedule)
     .bind(timeout_secs)
     .bind(atts)
+    .bind(link.parent)
+    .bind(link.depth)
+    .bind(link.root)
+    .bind(&link.context_key)
+    .bind(&link.prompt)
     .fetch_one(ex)
     .await
 }
@@ -1686,11 +1776,23 @@ async fn invocation_start_payload(
     prompt: &str,
 ) -> String {
     let session_id = context_session(&st.pool, agent.id, context_key).await;
-    // 签发失败（几乎不可能）时不带凭据：调用照常跑，只是用不了工具/传不了产出文件
-    let tools_token =
-        crate::auth::mint_invocation(inv.id, agent.owner, agent.id, 0, &st.cfg.jwt_secret)
-            .map_err(|e| tracing::error!(error = ?e, "tools_token mint failed"))
-            .ok();
+    // 深度以调用行为准（主人直接发起是 0）。签发失败时不带凭据，调用照常跑。
+    let depth: i32 = sqlx::query_scalar("SELECT depth FROM agent_invocations WHERE id = $1")
+        .bind(inv.id)
+        .fetch_optional(&st.pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    let tools_token = crate::auth::mint_invocation(
+        inv.id,
+        agent.owner,
+        agent.id,
+        depth as i64,
+        &st.cfg.jwt_secret,
+    )
+    .map_err(|e| tracing::error!(error = ?e, "tools_token mint failed"))
+    .ok();
     let attachments = attachment_meta(&st.pool, &inv.attachment_ids).await;
     json!({
         "type": "invocation_start",
@@ -1729,6 +1831,8 @@ struct QueuedStart {
     prompt: String,
     trigger_message_id: Option<Uuid>,
     schedule_id: Option<Uuid>,
+    context_key: Option<String>,
+    prompt_stored: bool,
 }
 
 /// 排队时 prompt 没落库。私聊 / 群上线补发时，按这条触发消息上的全部目标 Agent 再剥一次 @。
@@ -1775,8 +1879,9 @@ pub async fn flush_queued(st: &SharedState, host_id: Uuid) {
     }
     let rows = sqlx::query_as::<_, QueuedStart>(
         "SELECT i.id, i.conversation_id, a.id AS agent_id,
-                COALESCE(m.content, s.prompt, '') AS prompt,
-                i.trigger_message_id, i.schedule_id
+                COALESCE(i.prompt, m.content, s.prompt, '') AS prompt,
+                i.trigger_message_id, i.schedule_id, i.context_key,
+                (i.prompt IS NOT NULL) AS prompt_stored
            FROM agent_invocations i
            JOIN agents a ON a.id = i.agent_id
            LEFT JOIN messages m ON m.id = i.trigger_message_id
@@ -1803,29 +1908,36 @@ pub async fn flush_queued(st: &SharedState, host_id: Uuid) {
         let agent = match load_cfg(&st.pool, row.agent_id).await {
             Ok(Some(a)) => a,
             _ => {
+                let members = with_root_members(st, &members, &inv).await;
                 push_invocation(st, &members, &inv);
                 continue;
             }
         };
-        // 定时任务被删掉之后，排队中的调用没有指令可发
-        if (row.schedule_id.is_some() && row.prompt.is_empty())
-            || (row.schedule_id.is_none() && row.trigger_message_id.is_none())
+        // 定时任务被删掉之后，排队中的调用没有指令可发。
+        // 子调用把完整指令存在 prompt 列，不走这条。
+        if !row.prompt_stored
+            && ((row.schedule_id.is_some() && row.prompt.is_empty())
+                || (row.schedule_id.is_none() && row.trigger_message_id.is_none()))
         {
             let _ =
                 finish_invocation(st, row.id, "failed", Some("schedule_deleted"), &members).await;
             continue;
         }
-        let prompt = if row.schedule_id.is_some() {
+        let prompt = if row.prompt_stored || row.schedule_id.is_some() {
             row.prompt.clone()
         } else if let Some(trigger) = row.trigger_message_id {
             prompt_for_flushed(&st.pool, row.conversation_id, trigger, &row.prompt).await
         } else {
             String::new()
         };
-        let context_key = match row.schedule_id {
-            Some(id) => format!("schedule:{id}"),
-            None => row.conversation_id.to_string(),
-        };
+        let context_key = row
+            .context_key
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| match row.schedule_id {
+                Some(id) => format!("schedule:{id}"),
+                None => row.conversation_id.to_string(),
+            });
         deliver_invocation(st, &agent, inv, &prompt, &context_key, &members).await;
     }
 }
@@ -1883,6 +1995,7 @@ async fn sweep_timed_out(st: &SharedState) -> Result<(), sqlx::Error> {
         let members = domain::member_ids(&st.pool, inv.conversation_id)
             .await
             .unwrap_or_default();
+        let members = with_root_members(st, &members, &inv).await;
         push_invocation(st, &members, &inv);
     }
     Ok(())
@@ -1908,7 +2021,8 @@ pub async fn finish_invocation(
     .fetch_optional(&st.pool)
     .await?;
     if let Some(inv) = &inv {
-        push_invocation(st, member_ids, inv);
+        let members = with_root_members(st, member_ids, inv).await;
+        push_invocation(st, &members, inv);
     }
     Ok(inv)
 }
@@ -1919,6 +2033,258 @@ fn push_invocation(st: &SharedState, member_ids: &[Uuid], inv: &InvocationView) 
     })
     .unwrap();
     st.send_to_users(member_ids, &p);
+}
+
+/// 会话成员，再加上根会话里还没包括的人。根会话就是本会话时不重复查。
+pub(crate) async fn with_root_members(
+    st: &SharedState,
+    member_ids: &[Uuid],
+    inv: &InvocationView,
+) -> Vec<Uuid> {
+    let mut members = member_ids.to_vec();
+    let Some(root) = inv.root_conversation_id else {
+        return members;
+    };
+    if root == inv.conversation_id {
+        return members;
+    }
+    if let Ok(extra) = domain::member_ids(&st.pool, root).await {
+        for id in extra {
+            if !members.contains(&id) {
+                members.push(id);
+            }
+        }
+    }
+    members
+}
+
+/// 把 roots 的全部未结束后代改成 cancelled，推帧，并通知各自宿主。
+/// roots 自己应已是终态（这里不再改它们）。
+pub(crate) async fn cascade_cancel(st: &SharedState, roots: &[Uuid], error: Option<&str>) {
+    if roots.is_empty() {
+        return;
+    }
+    let rows = sqlx::query_as::<_, Cascaded>(
+        "WITH RECURSIVE tree AS (
+            SELECT id, status FROM agent_invocations
+             WHERE parent_invocation_id = ANY($1) AND finished_at IS NULL
+            UNION
+            SELECT i.id, i.status FROM agent_invocations i
+            JOIN tree t ON i.parent_invocation_id = t.id
+             WHERE i.finished_at IS NULL
+        )
+        UPDATE agent_invocations AS i
+           SET status = 'cancelled', error = $2, finished_at = now()
+          FROM tree
+         WHERE i.id = tree.id AND i.finished_at IS NULL
+        RETURNING i.id, i.agent_id, i.conversation_id, i.trigger_message_id, i.schedule_id,
+                  i.status, i.error, i.created_at, i.started_at, i.finished_at,
+                  i.parent_invocation_id, i.root_conversation_id,
+                  (SELECT name FROM agents WHERE id = i.agent_id) AS agent_name,
+                  (SELECT host_id FROM agents WHERE id = i.agent_id) AS host_id,
+                  tree.status AS prev_status",
+    )
+    .bind(roots)
+    .bind(error)
+    .fetch_all(&st.pool)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::error!(error = %e, "级联取消子调用失败");
+        Vec::new()
+    });
+    for row in rows {
+        let id = row.id;
+        let host_id = row.host_id;
+        let conv = row.conversation_id;
+        let prev = row.prev_status.clone();
+        if prev == "running" || prev == "awaiting_approval" {
+            let payload = json!({
+                "type": "invocation_cancel",
+                "invocation_id": id,
+            })
+            .to_string();
+            st.send_to_host(host_id, &payload);
+            st.inv_runs.remove(&id);
+        }
+        let members = domain::member_ids(&st.pool, conv).await.unwrap_or_default();
+        let view = row.into_view();
+        let members = with_root_members(st, &members, &view).await;
+        push_invocation(st, &members, &view);
+        crate::approvals::expire_invocation(st, id).await;
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct Cascaded {
+    id: Uuid,
+    agent_id: Uuid,
+    conversation_id: Uuid,
+    trigger_message_id: Option<Uuid>,
+    schedule_id: Option<Uuid>,
+    status: String,
+    error: Option<String>,
+    created_at: DateTime<Utc>,
+    started_at: Option<DateTime<Utc>>,
+    finished_at: Option<DateTime<Utc>>,
+    parent_invocation_id: Option<Uuid>,
+    root_conversation_id: Option<Uuid>,
+    agent_name: String,
+    host_id: Uuid,
+    prev_status: String,
+}
+
+impl Cascaded {
+    fn into_view(self) -> InvocationView {
+        InvocationView {
+            id: self.id,
+            agent_id: self.agent_id,
+            conversation_id: self.conversation_id,
+            trigger_message_id: self.trigger_message_id,
+            schedule_id: self.schedule_id,
+            attachment_ids: Vec::new(),
+            status: self.status,
+            error: self.error,
+            created_at: self.created_at,
+            started_at: self.started_at,
+            finished_at: self.finished_at,
+            current_step: None,
+            parent_invocation_id: self.parent_invocation_id,
+            root_conversation_id: self.root_conversation_id,
+            agent_name: self.agent_name,
+        }
+    }
+}
+
+/// 工具接口发起的子调用。找不到主人名下未删除的同名 Agent → not found。
+pub(crate) struct ChildReq {
+    pub owner: Uuid,
+    pub parent_id: Uuid,
+    pub parent_depth: i32,
+    pub parent_conversation: Uuid,
+    pub parent_root: Option<Uuid>,
+    pub caller_name: String,
+    pub agent_name: String,
+    pub prompt: String,
+    pub context_id: Option<Uuid>,
+}
+
+pub(crate) struct ChildRes {
+    pub invocation_id: Uuid,
+    pub context_id: Uuid,
+    pub status: String,
+}
+
+pub(crate) async fn start_child_call(st: &SharedState, req: ChildReq) -> AppResult<ChildRes> {
+    if req.prompt.is_empty() || req.prompt.chars().count() > 4000 {
+        return Err(AppError::bad_request("bad_prompt"));
+    }
+    if !crate::agent_access::user_allows(&st.pool, req.owner).await? {
+        return Err(AppError::forbidden("agent_access_denied"));
+    }
+    let found = sqlx::query_as::<_, (Uuid, Uuid)>(
+        "SELECT a.id, c.id
+           FROM agents a
+           JOIN conversations c ON c.agent_id = a.id AND c.type = 'agent'
+          WHERE a.owner_id = $1 AND a.deleted_at IS NULL AND lower(a.name) = lower($2)",
+    )
+    .bind(req.owner)
+    .bind(&req.agent_name)
+    .fetch_optional(&st.pool)
+    .await?;
+    let Some((callee_id, callee_conv)) = found else {
+        return Err(AppError::not_found("agent not found"));
+    };
+    let max_depth: i32 =
+        sqlx::query_scalar("SELECT max_call_depth FROM agent_user_settings WHERE user_id = $1")
+            .bind(req.owner)
+            .fetch_optional(&st.pool)
+            .await?
+            .unwrap_or(3);
+    let depth = req.parent_depth.saturating_add(1);
+    if depth > max_depth {
+        return Err(AppError::bad_request("depth_exceeded"));
+    }
+    let agent = load_cfg(&st.pool, callee_id)
+        .await?
+        .filter(|a| a.deleted_at.is_none())
+        .ok_or_else(|| AppError::not_found("agent not found"))?;
+    let context_id = req.context_id.unwrap_or_else(Uuid::new_v4);
+    let context_key = format!("call:{context_id}");
+    let root = req.parent_root.unwrap_or(req.parent_conversation);
+    let excerpt: String = req.prompt.chars().take(200).collect();
+    let record = format!("📨 被 @{} 调用：{excerpt}", req.caller_name);
+    let posted = domain::post_message(
+        &st.pool,
+        domain::PostMessage {
+            conversation_id: callee_conv,
+            sender_id: req.owner,
+            content: &record,
+            client_msg_id: None,
+            attachment_id: None,
+            reply_to_id: None,
+            poll: None,
+            forwarded_from: None,
+            forward_attachment: None,
+            agent_id: Some(agent.id),
+            agent_steps: None,
+            approval: None,
+        },
+    )
+    .await
+    .map_err(|e| match e {
+        PostError::Deny { message, .. } => AppError::bad_request(message),
+        PostError::Db(err) => AppError::internal(err),
+    })?;
+    let trigger = posted.message.id;
+    crate::ws::broadcast_posted(st, callee_conv, &posted).await;
+
+    let link = InvLink {
+        parent: Some(req.parent_id),
+        depth,
+        root: Some(root),
+        context_key: Some(context_key.clone()),
+        prompt: Some(req.prompt.clone()),
+    };
+    let timeout = queue_timeout_secs(&st.pool, agent.id).await;
+    let online = st.host_online(agent.host_id);
+    let inv = if online {
+        insert_running(
+            &st.pool,
+            &agent,
+            callee_conv,
+            Some(trigger),
+            None,
+            &[],
+            &link,
+        )
+        .await?
+    } else {
+        insert_queued(
+            &st.pool,
+            &agent,
+            callee_conv,
+            Some(trigger),
+            None,
+            timeout,
+            &[],
+            &link,
+        )
+        .await?
+    };
+    let members = domain::member_ids(&st.pool, callee_conv)
+        .await
+        .unwrap_or_default();
+    let inv_id = inv.id;
+    deliver_invocation(st, &agent, inv, &req.prompt, &context_key, &members).await;
+    let status: String = sqlx::query_scalar("SELECT status FROM agent_invocations WHERE id = $1")
+        .bind(inv_id)
+        .fetch_one(&st.pool)
+        .await?;
+    Ok(ChildRes {
+        invocation_id: inv_id,
+        context_id,
+        status,
+    })
 }
 
 // ---------- Agent A03：宿主事件流（invocation_event） ----------
@@ -2109,6 +2475,7 @@ struct FinishHead {
     host_id: Uuid,
     schedule_id: Option<Uuid>,
     schedule_name: Option<String>,
+    context_key: Option<String>,
 }
 
 /// 宿主回传的 invocation_finish：校验该调用确实派给这条宿主连接。
@@ -2132,7 +2499,7 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
     };
     let row = sqlx::query_as::<_, FinishHead>(
         "SELECT i.status, a.owner_id, i.conversation_id, a.id AS agent_id, a.host_id,
-                i.schedule_id, s.name AS schedule_name
+                i.schedule_id, s.name AS schedule_name, i.context_key
            FROM agent_invocations i
            JOIN agents a ON a.id = i.agent_id
            LEFT JOIN agent_schedules s ON s.id = i.schedule_id
@@ -2153,16 +2520,19 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
         host_id: real_host,
         schedule_id,
         schedule_name,
+        context_key: stored_key,
     } = row;
     // 已取消 / 已超时 / 已结束，或不是这条宿主的调用：不发回复。
     // awaiting_approval 仍是进行中（进程崩了也会回 finish）。
     if (status != "running" && status != "awaiting_approval") || real_host != host_id {
         return;
     }
-    let context_key = match schedule_id {
-        Some(sid) => format!("schedule:{sid}"),
-        None => conv.to_string(),
-    };
+    let context_key = stored_key
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| match schedule_id {
+            Some(sid) => format!("schedule:{sid}"),
+            None => conv.to_string(),
+        });
 
     // A03：摘下运行时状态；终结前的滞留增量在定稿消息前冲刷出去
     let run = st.inv_runs.remove(&inv_id).map(|(_, r)| r);
@@ -2232,13 +2602,16 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
         post_agent_text(st, conv, owner, agent_id, &text, steps_json).await;
         // A05：正文之后按序发产出附件；files 里只认本次调用凭据上传的附件
         post_agent_files(st, conv, owner, agent_id, inv_id, &v["files"]).await;
+        // 成功时记下完整回复（截 100k 字符），供互调查询。失败不写。
+        let stored: String = text.chars().take(100_000).collect();
         let updated = sqlx::query_as::<_, InvocationView>(&format!(
             "UPDATE agent_invocations
-                SET status = 'succeeded', error = NULL, finished_at = now()
+                SET status = 'succeeded', error = NULL, finished_at = now(), result_text = $2
               WHERE id = $1 AND status IN ('running', 'awaiting_approval')
              {INV_RETURNING}"
         ))
         .bind(inv_id)
+        .bind(&stored)
         .fetch_optional(&mut *tx)
         .await;
         if tx.commit().await.is_err() {
@@ -2248,6 +2621,7 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
             let member_ids = domain::member_ids(&st.pool, conv)
                 .await
                 .unwrap_or_else(|_| vec![owner]);
+            let member_ids = with_root_members(st, &member_ids, &inv).await;
             push_invocation(st, &member_ids, &inv);
         }
         crate::approvals::expire_invocation(st, inv_id).await;
@@ -2271,6 +2645,7 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
             let member_ids = domain::member_ids(&st.pool, conv)
                 .await
                 .unwrap_or_else(|_| vec![owner]);
+            let member_ids = with_root_members(st, &member_ids, &inv).await;
             push_invocation(st, &member_ids, &inv);
         }
         crate::approvals::expire_invocation(st, inv_id).await;

@@ -18,7 +18,7 @@ export const QUEUE_TIMEOUT_OPTIONS: { v: number; label: string }[] = [
   { v: 0, label: "永不" },
 ];
 
-// Agent 个人默认设置：输出方式 + 排队超时。单个 Agent 可在它的配置里覆盖。
+// Agent 个人默认设置：输出方式 + 排队超时 + 互调深度。单个 Agent 可覆盖前两项。
 export default function AgentSettings() {
   const [s, setS] = useState<AgentUserSettings | null>(null);
   const [err, setErr] = useState("");
@@ -71,6 +71,19 @@ export default function AgentSettings() {
           {QUEUE_TIMEOUT_OPTIONS.map((o) => (
             <option key={o.v} value={o.v}>
               {o.label}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="row agent-item">
+        <span className="grow">Agent 互相调用最多几层</span>
+        <select
+          value={s.max_call_depth}
+          onChange={(e) => void save({ max_call_depth: Number(e.target.value) })}
+        >
+          {Array.from({ length: 10 }, (_, i) => i + 1).map((n) => (
+            <option key={n} value={n}>
+              {n}
             </option>
           ))}
         </select>

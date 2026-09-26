@@ -78,6 +78,7 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
         include_str!("../migrations/0026_agent_attachments.sql"),
         include_str!("../migrations/0027_agent_schedules.sql"),
         include_str!("../migrations/0028_agent_approvals.sql"),
+        include_str!("../migrations/0029_agent_calls.sql"),
     ] {
         sqlx::raw_sql(script).execute(&pool).await.unwrap();
     }
@@ -165,6 +166,27 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
     .await
     .unwrap();
     assert!(approvals, "0028 creates agent_approvals");
+    let parent_col = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+            SELECT 1 FROM information_schema.columns
+             WHERE table_name = 'agent_invocations' AND column_name = 'parent_invocation_id')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        parent_col,
+        "0029 adds agent_invocations.parent_invocation_id"
+    );
+    let depth_col = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+            SELECT 1 FROM information_schema.columns
+             WHERE table_name = 'agent_user_settings' AND column_name = 'max_call_depth')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(depth_col, "0029 adds agent_user_settings.max_call_depth");
 
     pool.close().await;
     sqlx::query(&format!("DROP DATABASE {name}"))

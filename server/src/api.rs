@@ -159,6 +159,14 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
             )),
         )
         .route(
+            "/agent-tools/invocations",
+            post(crate::agent_tools::tool_create_invocation),
+        )
+        .route(
+            "/agent-tools/invocations/{id}",
+            get(crate::agent_tools::tool_get_invocation),
+        )
+        .route(
             "/agent-tools/schedules",
             get(crate::schedules::tool_list_schedules).post(crate::schedules::tool_create_schedule),
         )

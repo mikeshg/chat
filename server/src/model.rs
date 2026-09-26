@@ -631,6 +631,8 @@ pub struct AgentUserSettings {
     pub output_mode: String,
     /// 排队超时秒数，0 = 永不
     pub queue_timeout_secs: i32,
+    /// 互调深度上限（1–10）。子调用 depth = 父 depth + 1，超过则拒绝。
+    pub max_call_depth: i32,
 }
 
 /// PUT /v1/users/me/agent-settings：缺省字段不改
@@ -638,6 +640,8 @@ pub struct AgentUserSettings {
 pub struct UpdateAgentUserSettingsReq {
     pub output_mode: Option<String>,
     pub queue_timeout_secs: Option<i32>,
+    /// 1–10。缺省 = 不改。
+    pub max_call_depth: Option<i32>,
 }
 
 /// PATCH /v1/agents/{id}：字段缺省 = 不改；覆盖项显式 null = 清除、回到个人默认。
@@ -740,6 +744,12 @@ pub struct InvocationView {
     /// 广播前由调用上下文填充，历史查询对 running 调用回填、其余为 null。
     #[sqlx(default)]
     pub current_step: Option<String>,
+    /// 父调用。主人直接发起的调用为 null。
+    pub parent_invocation_id: Option<Uuid>,
+    /// 整条调用链的根会话。子调用继承；主人直接发起的为 null。
+    pub root_conversation_id: Option<Uuid>,
+    /// 被调 Agent 的名字（给嵌套展示用，不落在调用行上）。
+    pub agent_name: String,
 }
 
 // ---------- 消息生命周期 REST ----------

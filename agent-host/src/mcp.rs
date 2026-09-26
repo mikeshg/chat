@@ -68,7 +68,12 @@ impl McpServer {
         let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
         let state = McpState {
             routes: routes.clone(),
-            http: reqwest::Client::builder().no_proxy().build().ok()?,
+            // 互调 ?wait= 单次最长约 20 秒，留出余量，避免默认 30 秒刚好卡住
+            http: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(45))
+                .build()
+                .ok()?,
         };
         let app = Router::new()
             .route("/mcp/{id}", post(mcp_post))
@@ -174,6 +179,56 @@ static TOOLS: &[ToolDef] = &[
         },
         call: |st, b, args| Box::pin(delete_schedule(st, b, args)),
     },
+    ToolDef {
+        name: "call_agent",
+        description: "调用主人的另一个 Agent（包括在别的电脑上的；不能调用别人的 Agent）。\
+                      name 是对方的名字，prompt 是交给它的指令。\
+                      context_id 可选：不传则新开一段上下文并在结果里带回上下文号，下次带上同一个号就接着聊。\
+                      wait 默认 true，会等到结束（最多 600 秒）并返回结果正文；超时则说明仍在运行，并给出调用号，请用 wait_invocation 继续等。\
+                      要并行派出多个，把 wait 设为 false 拿到调用号，再逐个 wait_invocation。",
+        schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "主人的另一个 Agent 的名字"},
+                    "prompt": {"type": "string", "description": "交给它的指令"},
+                    "wait": {"type": "boolean", "description": "是否等待结果，默认 true。并行派出时设为 false"},
+                    "context_id": {"type": "string", "description": "上次返回的上下文号；不传则新开"}
+                },
+                "required": ["name", "prompt"]
+            })
+        },
+        call: |st, b, args| Box::pin(call_agent(st, b, args)),
+    },
+    ToolDef {
+        name: "get_invocation",
+        description: "立刻查看自己派出的一次调用的状态。已经结束时带上结果正文。只能查这次调用自己派出的子调用。",
+        schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "invocation_id": {"type": "string", "description": "call_agent 返回的调用号"}
+                },
+                "required": ["invocation_id"]
+            })
+        },
+        call: |st, b, args| Box::pin(get_invocation(st, b, args)),
+    },
+    ToolDef {
+        name: "wait_invocation",
+        description: "等待自己派出的一次调用结束。timeout_secs 默认 300，最大 600。超时则说明仍在运行。只能等这次调用自己派出的子调用。",
+        schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "invocation_id": {"type": "string", "description": "call_agent 返回的调用号"},
+                    "timeout_secs": {"type": "integer", "description": "最多等多少秒，默认 300，最大 600"}
+                },
+                "required": ["invocation_id"]
+            })
+        },
+        call: |st, b, args| Box::pin(wait_invocation(st, b, args)),
+    },
 ];
 
 /// GET /v1/agent-tools/history 的结果 → `[seq 12] 张三: …` 行
@@ -250,12 +305,12 @@ async fn call_server(
         .header("authorization", format!("Invocation {}", b.token))
         .send()
         .await
-        .map_err(|e| format!("schedules 请求失败: {e}"))?;
+        .map_err(|e| format!("工具请求失败: {e}"))?;
     let status = r.status();
     let text = r
         .text()
         .await
-        .map_err(|e| format!("schedules 响应读取失败: {e}"))?;
+        .map_err(|e| format!("工具响应读取失败: {e}"))?;
     if status.as_u16() == 204 || text.trim().is_empty() {
         if status.is_success() {
             return Ok(Value::Null);
@@ -267,7 +322,7 @@ async fn call_server(
             parsed["error"]
                 .as_str()
                 .unwrap_or(if text.is_empty() { "?" } else { text.as_str() });
-        return Err(format!("schedules {}: {msg}", status.as_u16()));
+        return Err(format!("tool {}: {msg}", status.as_u16()));
     }
     Ok(parsed)
 }
@@ -294,7 +349,7 @@ async fn create_schedule(st: &McpState, b: &Binding, args: &Value) -> Result<Str
 async fn list_schedules(st: &McpState, b: &Binding, _args: &Value) -> Result<String, String> {
     let v = call_server(st, b, "GET", "/v1/agent-tools/schedules", None).await?;
     let Some(rows) = v.as_array() else {
-        return Err("schedules 响应不是列表".into());
+        return Err("工具响应不是列表".into());
     };
     if rows.is_empty() {
         return Ok("（没有定时任务）".into());
@@ -327,6 +382,147 @@ async fn delete_schedule(st: &McpState, b: &Binding, args: &Value) -> Result<Str
     )
     .await?;
     Ok("已删除".into())
+}
+
+fn terminal_status(status: &str) -> bool {
+    matches!(status, "succeeded" | "failed" | "cancelled" | "timed_out")
+}
+
+fn format_inv(v: &Value, context_id: Option<&str>) -> String {
+    let status = v["status"].as_str().unwrap_or("?");
+    let id = v["invocation_id"].as_str().unwrap_or("");
+    let mut out = format!("status={status}\ninvocation_id={id}\n");
+    if let Some(ctx) = context_id.filter(|s| !s.is_empty()) {
+        out.push_str(&format!("context_id={ctx}\n"));
+    }
+    if let Some(err) = v["error"].as_str() {
+        out.push_str(&format!("error={err}\n"));
+    }
+    if let Some(text) = v["result_text"].as_str() {
+        out.push_str("result:\n");
+        out.push_str(text);
+        if !text.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// 分段 ?wait=，单次不超过 20 秒，总时长 total 秒。
+async fn poll_invocation(
+    st: &McpState,
+    b: &Binding,
+    id: &str,
+    total_secs: u64,
+) -> Result<Value, String> {
+    if total_secs == 0 {
+        return call_server(
+            st,
+            b,
+            "GET",
+            &format!("/v1/agent-tools/invocations/{id}?wait=0"),
+            None,
+        )
+        .await;
+    }
+    let started = std::time::Instant::now();
+    let budget = std::time::Duration::from_secs(total_secs);
+    loop {
+        let left = budget.saturating_sub(started.elapsed()).as_secs();
+        if left == 0 {
+            return call_server(
+                st,
+                b,
+                "GET",
+                &format!("/v1/agent-tools/invocations/{id}?wait=0"),
+                None,
+            )
+            .await;
+        }
+        let chunk = left.min(20);
+        let v = call_server(
+            st,
+            b,
+            "GET",
+            &format!("/v1/agent-tools/invocations/{id}?wait={chunk}"),
+            None,
+        )
+        .await?;
+        let status = v["status"].as_str().unwrap_or("");
+        if terminal_status(status) || started.elapsed() >= budget {
+            return Ok(v);
+        }
+    }
+}
+
+async fn call_agent(st: &McpState, b: &Binding, args: &Value) -> Result<String, String> {
+    let name = args["name"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or("缺少 name")?;
+    let prompt = args["prompt"].as_str().ok_or("缺少 prompt")?;
+    let wait = args.get("wait").and_then(Value::as_bool).unwrap_or(true);
+    let mut body = json!({"agent_name": name, "prompt": prompt});
+    if let Some(ctx) = args
+        .get("context_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        body["context_id"] = json!(ctx);
+    }
+    let created = call_server(st, b, "POST", "/v1/agent-tools/invocations", Some(&body)).await?;
+    let inv_id = created["invocation_id"].as_str().unwrap_or("").to_string();
+    let context_id = created["context_id"].as_str().unwrap_or("").to_string();
+    if !wait {
+        return Ok(format_inv(&created, Some(&context_id)));
+    }
+    let v = poll_invocation(st, b, &inv_id, 600).await?;
+    if terminal_status(v["status"].as_str().unwrap_or("")) {
+        return Ok(format_inv(&v, Some(&context_id)));
+    }
+    Ok(format!(
+        "仍在运行\ninvocation_id={inv_id}\ncontext_id={context_id}\n用 wait_invocation 继续等待\n"
+    ))
+}
+
+async fn get_invocation(st: &McpState, b: &Binding, args: &Value) -> Result<String, String> {
+    let id = args["invocation_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or("缺少 invocation_id")?;
+    let v = call_server(
+        st,
+        b,
+        "GET",
+        &format!("/v1/agent-tools/invocations/{id}?wait=0"),
+        None,
+    )
+    .await?;
+    Ok(format_inv(&v, None))
+}
+
+async fn wait_invocation(st: &McpState, b: &Binding, args: &Value) -> Result<String, String> {
+    let id = args["invocation_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or("缺少 invocation_id")?;
+    let mut secs = args
+        .get("timeout_secs")
+        .and_then(Value::as_i64)
+        .unwrap_or(300);
+    if secs < 0 {
+        secs = 0;
+    }
+    if secs > 600 {
+        secs = 600;
+    }
+    let v = poll_invocation(st, b, id, secs as u64).await?;
+    if terminal_status(v["status"].as_str().unwrap_or("")) {
+        return Ok(format_inv(&v, None));
+    }
+    Ok(format!(
+        "仍在运行\ninvocation_id={id}\n用 wait_invocation 继续等待\n"
+    ))
 }
 
 // ---------- JSON-RPC 分发 ----------
