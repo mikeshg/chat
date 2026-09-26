@@ -86,6 +86,7 @@ pub async fn handle_request(st: &SharedState, host_id: Uuid, v: &Value) {
         return;
     };
     let members = domain::member_ids(&st.pool, conv).await.unwrap_or_default();
+    let members = crate::agents::with_root_members(st, &members, &inv).await;
     push_invocation(st, &members, &inv);
 
     let agent_conv = sqlx::query_scalar::<_, Uuid>(
@@ -218,6 +219,7 @@ pub async fn decide(
     let host_id = row.host_id;
     tx.commit().await?;
 
+    let origin_members = crate::agents::with_root_members(&st, &origin_members, &inv).await;
     push_invocation(&st, &origin_members, &inv);
     crate::ws::broadcast_message_updated(
         &st,

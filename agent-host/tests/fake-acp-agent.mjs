@@ -15,6 +15,9 @@
 //   recall       → 本会话之前收到过的全部指令，用 | 连接；没有则 (empty)
 //   whoami       → 当前 mode / model、环境变量 FAKE_ECHO、第一个文本块、额外目录
 //   tool:read_history  → 经注入的 MCP 服务 tools/call read_conversation_history，原样回出文本
+//   call:<名字>:<指令> → 同步调用主人的该 Agent，回出结果正文
+//   callasync:<名1>,<名2>:<指令> → 并行派出后逐个等待，结果用 | 连接
+//   callctx:<名字>:<上下文号|new>:<指令> → 带 / 不带上下文号调用，回出 ctx=<号> result=<正文>
 //   perm:<kind>:<路径> → session/request_permission（kind + locations，选项 allow/always/reject）。
 //                        选定 allow 类回 allowed:<optionId>，拒绝或取消回 rejected
 //   其他          → 回 "ok"
@@ -218,6 +221,21 @@ async function runMcpTool(name, args) {
   const text = Array.isArray(content) ? content.map((c) => c.text ?? "").join("\n") : JSON.stringify(r);
   if (r?.result?.isError) throw new Error(text);
   return text;
+}
+
+function invocationIdOf(text) {
+  const m = /^invocation_id=([0-9a-fA-F-]+)/m.exec(text || "");
+  return m ? m[1] : "";
+}
+function contextIdOf(text) {
+  const m = /^context_id=([0-9a-fA-F-]+)/m.exec(text || "");
+  return m ? m[1] : "";
+}
+function resultBody(text) {
+  const mark = "result:\n";
+  const i = (text || "").indexOf(mark);
+  if (i < 0) return (text || "").trim();
+  return text.slice(i + mark.length).replace(/\n$/, "");
 }
 
 async function runReadHistory() {
@@ -441,6 +459,61 @@ rl.on("line", (line) => {
         .catch((e) => {
           chunk(sessionId, `tool error: ${e?.message || e}`);
           result(id, { stopReason: "end_turn" });
+        });
+      return;
+    }
+    // A14：互调。指令里可以再带冒号（echo:hi、call:c:…），只按前两段切开。
+    if (text.startsWith("callasync:") || text.startsWith("callctx:") || text.startsWith("call:")) {
+      const promptId = id;
+      const promptText = text;
+      (async () => {
+        if (promptText.startsWith("callasync:")) {
+          const rest = promptText.slice("callasync:".length);
+          const cut = rest.indexOf(":");
+          const names = rest.slice(0, cut).split(",").map((s) => s.trim()).filter(Boolean);
+          const instruction = rest.slice(cut + 1);
+          const created = await Promise.all(
+            names.map((name) => runMcpTool("call_agent", { name, prompt: instruction, wait: false })),
+          );
+          const parts = [];
+          for (const c of created) {
+            const waited = await runMcpTool("wait_invocation", {
+              invocation_id: invocationIdOf(c),
+              timeout_secs: 600,
+            });
+            parts.push(resultBody(waited));
+          }
+          return parts.join("|");
+        }
+        if (promptText.startsWith("callctx:")) {
+          const rest = promptText.slice("callctx:".length);
+          const c1 = rest.indexOf(":");
+          const name = rest.slice(0, c1);
+          const rest2 = rest.slice(c1 + 1);
+          const c2 = rest2.indexOf(":");
+          const ctxTok = rest2.slice(0, c2);
+          const instruction = rest2.slice(c2 + 1);
+          const args = { name, prompt: instruction, wait: true };
+          if (ctxTok !== "new") args.context_id = ctxTok;
+          const out = await runMcpTool("call_agent", args);
+          return `ctx=${contextIdOf(out)} result=${resultBody(out)}`;
+        }
+        const rest = promptText.slice("call:".length);
+        const cut = rest.indexOf(":");
+        const name = rest.slice(0, cut);
+        const instruction = rest.slice(cut + 1);
+        const out = await runMcpTool("call_agent", { name, prompt: instruction, wait: true });
+        return resultBody(out);
+      })()
+        .then((out) => {
+          remember(promptText, out);
+          chunk(sessionId, out);
+          result(promptId, { stopReason: "end_turn" });
+        })
+        .catch((e) => {
+          const out = `tool error: ${e?.message || e}`;
+          chunk(sessionId, out);
+          result(promptId, { stopReason: "end_turn" });
         });
       return;
     }

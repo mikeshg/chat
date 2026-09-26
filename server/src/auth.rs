@@ -121,7 +121,7 @@ pub struct InvocationClaims {
     pub owner: Uuid,
     /// 被调用的 Agent
     pub agent: Uuid,
-    /// A2A 调用深度；当前恒 0（后续票预留）
+    /// 调用行上的深度（主人直接发起为 0，子调用逐层 +1）
     pub depth: i64,
     pub iat: usize,
     pub exp: usize,

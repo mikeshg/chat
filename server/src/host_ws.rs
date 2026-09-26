@@ -212,7 +212,8 @@ async fn fail_running(st: &SharedState, host_id: Uuid) {
             AND status IN ('running', 'awaiting_approval')
             AND agent_id IN (SELECT id FROM agents WHERE host_id = $1)
          RETURNING id, agent_id, conversation_id, trigger_message_id, schedule_id, status, error,
-                   created_at, started_at, finished_at",
+                   created_at, started_at, finished_at, parent_invocation_id, root_conversation_id,
+                   (SELECT name FROM agents WHERE id = agent_invocations.agent_id) AS agent_name",
     )
     .bind(host_id)
     .fetch_all(&st.pool)
@@ -224,6 +225,7 @@ async fn fail_running(st: &SharedState, host_id: Uuid) {
         let members = crate::domain::member_ids(&st.pool, inv.conversation_id)
             .await
             .unwrap_or_default();
+        let members = agents::with_root_members(&st, &members, &inv).await;
         let p = serde_json::to_string(&WsOut::AgentInvocation {
             invocation: inv.clone(),
         })

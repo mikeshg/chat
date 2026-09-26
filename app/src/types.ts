@@ -294,6 +294,8 @@ export interface AgentUserSettings {
   output_mode: AgentOutputMode;
   /** 排队超时秒数，0 = 永不 */
   queue_timeout_secs: number;
+  /** 互调深度上限，1–10。缺省时按 3 */
+  max_call_depth: number;
 }
 
 /** 定时任务时间表，与服务端 spec 同形 */
@@ -379,6 +381,12 @@ export interface InvocationView {
   finished_at: string | null;
   /** Agent A03：running 期间为当前步骤标题；终态/旧服务端为 null 或缺省 */
   current_step?: string | null;
+  /** 父调用。主人直接发起时为 null 或缺省 */
+  parent_invocation_id?: string | null;
+  /** 整条调用链的根会话。主人直接发起时为 null 或缺省 */
+  root_conversation_id?: string | null;
+  /** 被调 Agent 的名字（嵌套展示用） */
+  agent_name?: string | null;
 }
 
 /** 会话偏好（用户维度；旧服务端无此字段 → 视为全默认） */
