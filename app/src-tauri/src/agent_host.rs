@@ -121,6 +121,8 @@ pub async fn agent_host_start(
         label,
         platform: std::env::consts::OS.to_string(),
         mcp_bridge,
+        registry_url: agent_host::DEFAULT_REGISTRY_URL.into(),
+        data_dir: agent_host::default_data_dir(),
     };
     let tickets: Arc<dyn agent_host::TicketSource> = Arc::new(FrontTickets {
         app: app.clone(),

@@ -229,6 +229,7 @@ async fn acp_tool_e2e(mode: &str) -> String {
         model: String::new(),
         mode: String::new(),
         extra_dirs: Vec::new(),
+        registry: None,
     };
     let (events, _) = tokio::sync::mpsc::unbounded_channel();
     let mut req =

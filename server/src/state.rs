@@ -87,6 +87,8 @@ pub struct AppState {
     /// Agent A04：排队超时清扫间隔（毫秒），默认 30s。
     /// 清扫循环每小段重读这个值，测试调小后不用等完原来的 30 秒。
     pub queue_sweep_interval_ms: AtomicU64,
+    /// Agent A07：登记表请求 request_id → 等宿主回 registry_result。超时从这里摘掉。
+    pub registry_wait: DashMap<Uuid, tokio::sync::oneshot::Sender<serde_json::Value>>,
 }
 
 impl AppState {
@@ -105,6 +107,7 @@ impl AppState {
             backup_busy: AtomicBool::new(false),
             hosts: DashMap::new(),
             queue_sweep_interval_ms: AtomicU64::new(30_000),
+            registry_wait: DashMap::new(),
         });
         crate::agents::spawn_queue_sweeper(st.clone());
         st

@@ -20,7 +20,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, Command};
+use tokio::process::ChildStdin;
 use tokio::sync::{mpsc, watch};
 
 /// 收到 session/cancel 后，最多再等这么久让 session/prompt 返回，然后杀进程。
@@ -49,6 +49,8 @@ struct Pipe {
     /// stderr 尾（诊断用，封顶 ~2KB）
     err: Arc<Mutex<String>>,
     events: Events,
+    /// 本次拒绝的权限请求次数
+    permissions_rejected: u32,
     /// session/load 响应返回前的历史回放，不能算进本次回复
     suppress_chunks: bool,
 }
@@ -62,9 +64,9 @@ pub async fn run_invocation(req: RunRequest, events: Events) -> Result<RunOutput
     } else {
         PathBuf::from(&spec.cwd)
     };
-    let mut cmd = Command::new(&spec.command);
-    cmd.args(&spec.args)
-        .current_dir(&dir)
+    // PATH + PATHEXT；.cmd / .bat 经 cmd.exe 启动（含自定义命令和 npm 垫片）
+    let mut cmd = crate::command::prepare(&spec.command, &spec.args);
+    cmd.current_dir(&dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -131,6 +133,7 @@ pub async fn run_invocation(req: RunRequest, events: Events) -> Result<RunOutput
         text: String::new(),
         err,
         events,
+        permissions_rejected: 0,
         suppress_chunks: false,
     };
     // 取消信号单独克隆一份：drive 只读 req，等待取消需要可变的 Receiver
@@ -139,6 +142,7 @@ pub async fn run_invocation(req: RunRequest, events: Events) -> Result<RunOutput
     let _ = child.kill().await;
     r.map(|d| RunOutput {
         text: std::mem::take(&mut pipe.text),
+        permissions_rejected: pipe.permissions_rejected,
         session_id: d.session_id,
         modes: d.modes,
         models: d.models,
@@ -476,6 +480,7 @@ impl Pipe {
         let id = msg["id"].clone();
         let method = msg["method"].as_str().unwrap_or_default();
         let resp = if method == "session/request_permission" {
+            self.permissions_rejected += 1;
             let deny = msg
                 .pointer("/params/options")
                 .and_then(Value::as_array)

@@ -178,10 +178,34 @@ export interface AgentHostView {
   last_seen_at: string;
 }
 
-/** Agent 运行描述（A01 只有 command + args 一种形状） */
+/** 登记表里钉住的一条（id + 版本）。安装路径由宿主自己解析。 */
+export interface RegistryPin {
+  id: string;
+  version: string;
+}
+
+/** Agent 运行描述：自定义命令，或登记表条目。 */
 export interface AgentRuntime {
-  command: string;
-  args: string[];
+  command?: string;
+  args?: string[];
+  registry?: RegistryPin;
+}
+
+/** GET /agent-hosts/{id}/registry 的一条 */
+export interface RegistryEntry {
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  icon: string;
+  kinds: string[];
+  status: string;
+  reason?: string;
+}
+
+export interface RegistryList {
+  entries: RegistryEntry[];
+  error?: string | null;
 }
 
 /** 宿主上报的一个模型或模式 */
@@ -399,6 +423,14 @@ export type WsOut =
       /** Agent A01：调用状态变化（发给会话成员的普通连接） */
       type: "agent_invocation";
       invocation: InvocationView;
+    }
+  | {
+      /** Agent A07：登记表安装进度，只发给宿主主人的普通连接 */
+      type: "registry_install_progress";
+      host_id: string;
+      entry_id: string;
+      stage: string;
+      error?: string;
     }
   | { type: "force_logout"; reason: string }
   | {

@@ -135,6 +135,10 @@ pub async fn host_session(
                                 agents::handle_finish(&st, host_id, &v).await;
                             } else if v["type"] == "agent_options" {
                                 agents::handle_options(&st, host_id, &v).await;
+                            } else if v["type"] == "registry_result" {
+                                agents::handle_registry_result(&st, &v);
+                            } else if v["type"] == "registry_install_progress" {
+                                agents::handle_registry_progress(&st, host_id, &v);
                             }
                         }
                     }

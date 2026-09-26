@@ -139,6 +139,8 @@ async fn read_loop(
                     }
                     "invocation_start" => start_invocation(s, out, &v),
                     "agent_probe" => start_probe(s, out, &v),
+                    "registry_list" => start_registry_list(s, out, &v),
+                    "registry_install" => start_registry_install(s, out, &v),
                     "invocation_cancel" => {
                         // 不直接 abort：让 ACP 先发 session/cancel，最多再等 5 秒才杀进程。
                         // 这次调用不再回 invocation_finish。
@@ -209,10 +211,22 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
     let running = s.running.clone();
     let cancels = s.cancels.clone();
     let dir = s.data_dir.clone();
+    let registry_url = s.cfg.registry_url.clone();
     let cancel_flag = cancel_rx.clone();
     let task = tokio::spawn(async move {
         // 映射的生命周期钉在这次调用上：任务结束/被 abort 时 drop
         let _mcp_handle = mcp_handle;
+        let spec = match materialize(spec, &dir, &registry_url).await {
+            Ok(s) => s,
+            Err(e) => {
+                if !*cancel_flag.borrow() {
+                    send_finish(&out2, inv_id, Err(e));
+                }
+                running.lock().unwrap().remove(&inv_id);
+                cancels.lock().unwrap().remove(&inv_id);
+                return;
+            }
+        };
         let rt = runtime::runtime_for(&spec);
         // 事件暂不外发（接收端即刻丢弃）；流式输出票把它接到服务端
         let (events, _) = tokio::sync::mpsc::unbounded_channel();
@@ -244,8 +258,17 @@ fn start_probe(s: &Arc<Shared>, out: &Out, v: &Value) {
     let out2 = out.clone();
     let running = s.running.clone();
     let dir = s.data_dir.clone();
+    let registry_url = s.cfg.registry_url.clone();
     let key = Uuid::new_v4();
     let task = tokio::spawn(async move {
+        let spec = match materialize(spec, &dir, &registry_url).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("probe 无法解析登记表运行时: {e}");
+                running.lock().unwrap().remove(&key);
+                return;
+            }
+        };
         let rt = runtime::runtime_for(&spec);
         let (events, _) = tokio::sync::mpsc::unbounded_channel();
         let req = runtime::RunRequest::for_probe(spec, dir);
@@ -255,6 +278,70 @@ fn start_probe(s: &Arc<Shared>, out: &Out, v: &Value) {
         running.lock().unwrap().remove(&key);
     });
     s.running.lock().unwrap().insert(key, task);
+}
+
+/// 登记表形状在这里换成本机命令；没装就返回 registry_not_installed。
+async fn materialize(
+    mut spec: AgentSpec,
+    data_dir: &std::path::Path,
+    registry_url: &str,
+) -> Result<AgentSpec, String> {
+    let Some(pin) = spec.registry.clone() else {
+        return Ok(spec);
+    };
+    let launch =
+        crate::registry::resolve_launch(data_dir, registry_url, &pin.id, &pin.version).await?;
+    spec.command = launch.command;
+    spec.args = launch.args;
+    spec.env.extend(launch.env);
+    Ok(spec)
+}
+
+fn start_registry_list(s: &Arc<Shared>, out: &Out, v: &Value) {
+    let request_id = v["request_id"].clone();
+    let s = s.clone();
+    let out = out.clone();
+    tokio::spawn(async move {
+        let outcome = crate::registry::list_local(&s.data_dir, &s.cfg.registry_url).await;
+        let msg = json!({
+            "type": "registry_result",
+            "request_id": request_id,
+            "entries": outcome.entries,
+            "error": outcome.error,
+        });
+        let _ = out.send(Message::Text(msg.to_string().into()));
+    });
+}
+
+fn start_registry_install(s: &Arc<Shared>, out: &Out, v: &Value) {
+    let entry_id = v["entry_id"].as_str().unwrap_or_default().to_string();
+    let version = v["version"].as_str().unwrap_or_default().to_string();
+    let s = s.clone();
+    let out = out.clone();
+    tokio::spawn(async move {
+        let entry_for_cb = entry_id.clone();
+        let out_cb = out.clone();
+        crate::registry::install(
+            &s.data_dir,
+            &s.cfg.registry_url,
+            &entry_id,
+            &version,
+            move |stage, err| {
+                let mut msg = json!({
+                    "type": "registry_install_progress",
+                    "entry_id": entry_for_cb,
+                    "stage": stage,
+                });
+                if let Some(e) = err {
+                    if !e.is_empty() {
+                        msg["error"] = json!(e);
+                    }
+                }
+                let _ = out_cb.send(Message::Text(msg.to_string().into()));
+            },
+        )
+        .await;
+    });
 }
 
 fn send_options(out: &Out, agent_id: Uuid, got: &RunOutput, force: bool) {
