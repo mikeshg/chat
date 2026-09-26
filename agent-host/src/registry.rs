@@ -46,8 +46,31 @@ pub struct Launch {
 }
 
 struct PkgDist {
+    /// 包名（不含版本）
     package: String,
+    /// 登记表 package 字段自带的版本（`@scope/name@1.2.3`）；没有则用条目的 version
+    pinned: Option<String>,
     args: Vec<String>,
+}
+
+impl PkgDist {
+    /// `包名@版本`，版本只拼一次
+    fn spec(&self, version: &str) -> String {
+        format!(
+            "{}@{}",
+            self.package,
+            self.pinned.as_deref().unwrap_or(version)
+        )
+    }
+}
+
+/// 拆开登记表里可能自带版本的包名：`@scope/name@1.2.3` → (`@scope/name`, Some(`1.2.3`))。
+/// 作用域包以 `@` 开头，所以从第二个字符起找版本分隔符。
+fn split_package(spec: &str) -> (String, Option<String>) {
+    match spec.get(1..).and_then(|rest| rest.find('@')).map(|i| i + 1) {
+        Some(i) if i + 1 < spec.len() => (spec[..i].to_string(), Some(spec[i + 1..].to_string())),
+        _ => (spec.to_string(), None),
+    }
 }
 
 struct BinDist {
@@ -215,7 +238,7 @@ pub async fn resolve_launch(
     if let Some(pkg) = &agent.uvx {
         if tool_present("uvx") {
             let args = if pkg.args.is_empty() {
-                vec![format!("{}@{version}", pkg.package)]
+                vec![pkg.spec(version)]
             } else {
                 pkg.args.clone()
             };
@@ -417,6 +440,7 @@ fn choose_install(data_dir: &Path, agent: &AgentRec) -> Choice {
         {
             return Choice::Npx(PkgDist {
                 package: pkg.package.clone(),
+                pinned: pkg.pinned.clone(),
                 args: pkg.args.clone(),
             });
         }
@@ -510,7 +534,7 @@ where
         progress(STAGE_FAILED, Some(&format!("无法创建安装目录：{e}")));
         return;
     }
-    let spec = format!("{}@{}", pkg.package, agent.version);
+    let spec = pkg.spec(&agent.version);
     let mut cmd = crate::command::prepare(
         "npm",
         &[
@@ -795,12 +819,14 @@ fn parse_agent(v: &Value) -> Option<AgentRec> {
 
 fn parse_pkg(v: Option<&Value>) -> Option<PkgDist> {
     let v = v?;
-    let package = json_str(v.get("package"))?;
-    if package.is_empty() {
+    let raw = json_str(v.get("package"))?;
+    if raw.is_empty() {
         return None;
     }
+    let (package, pinned) = split_package(&raw);
     Some(PkgDist {
         package,
+        pinned,
         args: string_list(v.get("args")),
     })
 }
@@ -853,4 +879,27 @@ fn string_list(v: Option<&Value>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::split_package;
+
+    #[test]
+    fn package_with_and_without_embedded_version() {
+        assert_eq!(
+            split_package("@agentclientprotocol/claude-agent-acp@0.81.2"),
+            (
+                "@agentclientprotocol/claude-agent-acp".into(),
+                Some("0.81.2".into())
+            )
+        );
+        assert_eq!(split_package("@scope/name"), ("@scope/name".into(), None));
+        assert_eq!(
+            split_package("plain@1.0.0"),
+            ("plain".into(), Some("1.0.0".into()))
+        );
+        assert_eq!(split_package("plain"), ("plain".into(), None));
+        assert_eq!(split_package("trailing@"), ("trailing@".into(), None));
+    }
 }
