@@ -41,13 +41,14 @@ pub async fn require_invocation(st: &SharedState, headers: &HeaderMap) -> AppRes
     let claims =
         auth::verify_invocation(token, &st.cfg.jwt_secret).map_err(|_| tool_unauthorized())?;
 
-    // 查库：调用仍在进行 + claims 与库行一致 + 主人未禁用。
+    // 查库：调用仍在进行 + claims 与库行一致 + 主人（Agent 的主人，不是会话 owner）未禁用。
+    // 群 / 私聊 / 定时调用的目标会话 owner 往往不是主人，不能拿 conversations.owner_id 当主人。
     // 结束（succeeded/failed/cancelled/timed_out）即失效，无需单独的撤销表。
-    let row = sqlx::query_as::<_, (Uuid, Uuid, String, Option<Uuid>, Option<DateTime<Utc>>)>(
-        "SELECT i.conversation_id, i.agent_id, i.status, c.owner_id, u.disabled_at
+    let row = sqlx::query_as::<_, (Uuid, Uuid, String, Uuid, Option<DateTime<Utc>>)>(
+        "SELECT i.conversation_id, i.agent_id, i.status, a.owner_id, u.disabled_at
            FROM agent_invocations i
-           JOIN conversations c ON c.id = i.conversation_id
-           JOIN users u ON u.id = c.owner_id
+           JOIN agents a ON a.id = i.agent_id
+           JOIN users u ON u.id = a.owner_id
           WHERE i.id = $1",
     )
     .bind(claims.sub)
@@ -57,7 +58,7 @@ pub async fn require_invocation(st: &SharedState, headers: &HeaderMap) -> AppRes
         return Err(tool_unauthorized());
     };
     if disabled_at.is_some()
-        || owner != Some(claims.owner)
+        || owner != claims.owner
         || agent != claims.agent
         || !matches!(status.as_str(), "running" | "awaiting_approval")
     {

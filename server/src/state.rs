@@ -118,6 +118,8 @@ pub struct AppState {
     pub queue_sweep_interval_ms: AtomicU64,
     /// Agent A03：invocation_id -> 进行中调用的运行时状态
     pub inv_runs: DashMap<Uuid, InvRun>,
+    /// Agent A17：定时调用扫描间隔（毫秒），默认 30s。测试调小后不用等完原来的 30 秒。
+    pub schedule_sweep_interval_ms: AtomicU64,
 }
 
 impl AppState {
@@ -137,8 +139,10 @@ impl AppState {
             hosts: DashMap::new(),
             queue_sweep_interval_ms: AtomicU64::new(30_000),
             inv_runs: DashMap::new(),
+            schedule_sweep_interval_ms: AtomicU64::new(30_000),
         });
         crate::agents::spawn_queue_sweeper(st.clone());
+        crate::schedules::spawn_sweeper(st.clone());
         st
     }
 

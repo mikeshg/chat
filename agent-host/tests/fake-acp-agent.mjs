@@ -196,6 +196,20 @@ function mcpCall(method, params, withId = true) {
   return mcpStdio(method, params, withId);
 }
 
+async function runMcpTool(name, args) {
+  await mcpCall("initialize", {
+    protocolVersion: "2025-03-26",
+    capabilities: {},
+    clientInfo: { name: "fake-acp-agent", version: "0" },
+  });
+  await mcpCall("notifications/initialized", {}, false);
+  const r = await mcpCall("tools/call", { name, arguments: args });
+  const content = r?.result?.content;
+  const text = Array.isArray(content) ? content.map((c) => c.text ?? "").join("\n") : JSON.stringify(r);
+  if (r?.result?.isError) throw new Error(text);
+  return text;
+}
+
 async function runReadHistory() {
   await mcpCall("initialize", {
     protocolVersion: "2025-03-26",
@@ -355,6 +369,23 @@ rl.on("line", (line) => {
     }
     if (text === "tool:read_history") {
       runReadHistory()
+        .then((out) => {
+          chunk(sessionId, out || "(empty)");
+          result(id, { stopReason: "end_turn" });
+        })
+        .catch((e) => {
+          chunk(sessionId, `tool error: ${e?.message || e}`);
+          result(id, { stopReason: "end_turn" });
+        });
+      return;
+    }
+    if (text === "tool:create_schedule") {
+      runMcpTool("create_schedule", {
+        name: "from-agent",
+        prompt: "echo:from-schedule",
+        spec: { type: "interval", minutes: 30 },
+        timezone: "UTC",
+      })
         .then((out) => {
           chunk(sessionId, out || "(empty)");
           result(id, { stopReason: "end_turn" });

@@ -117,21 +117,64 @@ struct ToolDef {
     call: for<'a> fn(&'a McpState, &'a Binding, &'a Value) -> ToolFut<'a>,
 }
 
-static TOOLS: &[ToolDef] = &[ToolDef {
-    name: "read_conversation_history",
-    description: "读取发起本次调用的会话的最近消息。返回最新的若干条（seq 升序）；\
+static TOOLS: &[ToolDef] = &[
+    ToolDef {
+        name: "read_conversation_history",
+        description: "读取发起本次调用的会话的最近消息。返回最新的若干条（seq 升序）；\
                   要更早的历史传 before_seq（某条 seq 之前的消息），limit 控制条数（默认 50，最大 200）。",
-    schema: || {
-        json!({
-            "type": "object",
-            "properties": {
-                "before_seq": {"type": "integer", "description": "只返回 seq 小于该值的消息"},
-                "limit": {"type": "integer", "description": "最多返回多少条，默认 50，上限 200"}
-            }
-        })
+        schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "before_seq": {"type": "integer", "description": "只返回 seq 小于该值的消息"},
+                    "limit": {"type": "integer", "description": "最多返回多少条，默认 50，上限 200"}
+                }
+            })
+        },
+        call: |st, b, args| Box::pin(read_history(st, b, args)),
     },
-    call: |st, b, args| Box::pin(read_history(st, b, args)),
-}];
+    ToolDef {
+        name: "create_schedule",
+        description: "给当前 Agent 建一条定时任务。到点后用 prompt 调用它，结果发到目标会话。\
+                      不传 target_conversation_id 时发到发起本次调用的会话。\
+                      spec 是 {type:once,at} / {type:daily,time} / {type:weekly,days,time} / {type:interval,minutes}，\
+                      timezone 是 IANA 名（如 Asia/Shanghai）。minutes 至少 5。",
+        schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "1–40 字"},
+                    "prompt": {"type": "string", "description": "到点执行的指令，1–4000 字"},
+                    "spec": {"type": "object", "description": "时间表"},
+                    "timezone": {"type": "string", "description": "IANA 时区"},
+                    "target_conversation_id": {"type": "string", "description": "结果发到的会话，缺省为当前会话"}
+                },
+                "required": ["name", "prompt", "spec", "timezone"]
+            })
+        },
+        call: |st, b, args| Box::pin(create_schedule(st, b, args)),
+    },
+    ToolDef {
+        name: "list_schedules",
+        description: "列出当前 Agent 的定时任务（名称、是否启用、创建者、下次运行时间）。",
+        schema: || json!({"type": "object", "properties": {}}),
+        call: |st, b, args| Box::pin(list_schedules(st, b, args)),
+    },
+    ToolDef {
+        name: "delete_schedule",
+        description: "删除当前 Agent 的一条定时任务。参数 id 来自 list_schedules。",
+        schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "定时任务 id"}
+                },
+                "required": ["id"]
+            })
+        },
+        call: |st, b, args| Box::pin(delete_schedule(st, b, args)),
+    },
+];
 
 /// GET /v1/agent-tools/history 的结果 → `[seq 12] 张三: …` 行
 async fn read_history(st: &McpState, b: &Binding, args: &Value) -> Result<String, String> {
@@ -187,6 +230,103 @@ async fn read_history(st: &McpState, b: &Binding, args: &Value) -> Result<String
         out.push_str("（还有更早的消息：用 before_seq 继续往前翻）\n");
     }
     Ok(out)
+}
+
+async fn call_server(
+    st: &McpState,
+    b: &Binding,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> Result<Value, String> {
+    let url = format!("{}{path}", b.server);
+    let req = match method {
+        "GET" => st.http.get(&url),
+        "POST" => st.http.post(&url).json(body.unwrap_or(&Value::Null)),
+        "DELETE" => st.http.delete(&url),
+        _ => return Err(format!("不支持的方法 {method}")),
+    };
+    let r = req
+        .header("authorization", format!("Invocation {}", b.token))
+        .send()
+        .await
+        .map_err(|e| format!("schedules 请求失败: {e}"))?;
+    let status = r.status();
+    let text = r
+        .text()
+        .await
+        .map_err(|e| format!("schedules 响应读取失败: {e}"))?;
+    if status.as_u16() == 204 || text.trim().is_empty() {
+        if status.is_success() {
+            return Ok(Value::Null);
+        }
+    }
+    let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    if !status.is_success() {
+        let msg =
+            parsed["error"]
+                .as_str()
+                .unwrap_or(if text.is_empty() { "?" } else { text.as_str() });
+        return Err(format!("schedules {}: {msg}", status.as_u16()));
+    }
+    Ok(parsed)
+}
+
+async fn create_schedule(st: &McpState, b: &Binding, args: &Value) -> Result<String, String> {
+    let mut body = json!({
+        "name": args.get("name").cloned().unwrap_or(Value::Null),
+        "prompt": args.get("prompt").cloned().unwrap_or(Value::Null),
+        "spec": args.get("spec").cloned().unwrap_or(Value::Null),
+        "timezone": args.get("timezone").cloned().unwrap_or(Value::Null),
+    });
+    if let Some(t) = args.get("target_conversation_id").filter(|v| v.is_string()) {
+        body["target_conversation_id"] = t.clone();
+    }
+    let v = call_server(st, b, "POST", "/v1/agent-tools/schedules", Some(&body)).await?;
+    Ok(format!(
+        "已创建 id={} name={} created_by={}",
+        v["id"].as_str().unwrap_or(""),
+        v["name"].as_str().unwrap_or(""),
+        v["created_by"].as_str().unwrap_or("")
+    ))
+}
+
+async fn list_schedules(st: &McpState, b: &Binding, _args: &Value) -> Result<String, String> {
+    let v = call_server(st, b, "GET", "/v1/agent-tools/schedules", None).await?;
+    let Some(rows) = v.as_array() else {
+        return Err("schedules 响应不是列表".into());
+    };
+    if rows.is_empty() {
+        return Ok("（没有定时任务）".into());
+    }
+    let mut out = String::new();
+    for s in rows {
+        out.push_str(&format!(
+            "id={} name={} created_by={} enabled={} next={}\n",
+            s["id"].as_str().unwrap_or(""),
+            s["name"].as_str().unwrap_or(""),
+            s["created_by"].as_str().unwrap_or(""),
+            s["enabled"],
+            s["next_run_at"]
+        ));
+    }
+    Ok(out)
+}
+
+async fn delete_schedule(st: &McpState, b: &Binding, args: &Value) -> Result<String, String> {
+    let id = args["id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or("缺少 id")?;
+    call_server(
+        st,
+        b,
+        "DELETE",
+        &format!("/v1/agent-tools/schedules/{id}"),
+        None,
+    )
+    .await?;
+    Ok("已删除".into())
 }
 
 // ---------- JSON-RPC 分发 ----------

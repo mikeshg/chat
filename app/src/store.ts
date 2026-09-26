@@ -569,7 +569,11 @@ export function applyInvocations(
   if (incoming.length === 0) return {};
   const invocations = { ...s.invocations };
   let agentRuns = s.agentRuns;
+  let touched = false;
   for (const inv of incoming) {
+    // 定时调用没有触发消息，状态不挂在某一条消息下面（回复本身会出现在会话里）
+    if (!inv.trigger_message_id) continue;
+    touched = true;
     const cur = { ...(invocations[inv.conversation_id] ?? {}) };
     const prev = cur[inv.trigger_message_id] ?? [];
     const idx = prev.findIndex((x) => x.id === inv.id);
@@ -587,6 +591,7 @@ export function applyInvocations(
       }
     }
   }
+  if (!touched && agentRuns === s.agentRuns) return {};
   return agentRuns === s.agentRuns ? { invocations } : { invocations, agentRuns };
 }
 

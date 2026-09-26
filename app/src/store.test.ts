@@ -521,6 +521,10 @@ describe("Agent A01：宿主状态与调用记录", () => {
     expect(s.invocations.ac.m1.map((i) => i.id)).toEqual(["i1", "i2"]);
     // 空批量不动状态
     expect(applyInvocations(s, [])).toEqual({});
+    // 定时调用没有触发消息，不挂到某条消息上
+    expect(
+      applyInvocations(s, [{ ...running, id: "sched", trigger_message_id: null, schedule_id: "s1" }]),
+    ).toEqual({});
   });
 
   it("invocationErrorText：稳定错误码 → 中文文案", () => {

@@ -12,6 +12,8 @@ pub mod host_ws;
 pub mod media;
 pub mod model;
 pub mod push;
+pub mod schedule;
+pub mod schedules;
 pub mod sessions;
 pub mod settings;
 pub mod state;

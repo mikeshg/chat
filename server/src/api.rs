@@ -123,6 +123,14 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
         )
         .route("/agents/{id}/probe", post(crate::agents::probe_agent))
         .route(
+            "/agents/{id}/schedules",
+            get(crate::schedules::list_schedules).post(crate::schedules::create_schedule),
+        )
+        .route(
+            "/agent-schedules/{id}",
+            patch(crate::schedules::patch_schedule).delete(crate::schedules::delete_schedule),
+        )
+        .route(
             "/users/me/agent-settings",
             get(crate::agents::get_user_settings).put(crate::agents::put_user_settings),
         )
@@ -134,6 +142,14 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
         .route(
             "/agent-tools/history",
             get(crate::agent_tools::tool_history),
+        )
+        .route(
+            "/agent-tools/schedules",
+            get(crate::schedules::tool_list_schedules).post(crate::schedules::tool_create_schedule),
+        )
+        .route(
+            "/agent-tools/schedules/{id}",
+            delete(crate::schedules::tool_delete_schedule),
         )
         .route(
             "/conversations/{id}/agent-context/reset",
