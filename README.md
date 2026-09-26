@@ -41,6 +41,12 @@ docker compose up -d          # WSL/任意有 Docker 的环境
 # 浏览器打开 http://localhost:28080
 ```
 
+更新代码后必须带 `--build`，否则 compose 会继续用旧镜像：
+
+```bash
+git pull && docker compose up -d --build
+```
+
 环境变量：`DATABASE_URL`、`JWT_SECRET`（生产必须改）、`PORT`、`BIND`、`APP_DIST`、`FILES_DIR`（附件存储目录，compose 挂 `chat-files` 卷）、`UPLOAD_MAX_MB`（单文件上限，默认 25）。
 
 ## 开发
