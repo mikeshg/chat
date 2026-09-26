@@ -31,6 +31,7 @@ import PinnedBar from "./PinnedBar";
 import NewPollModal from "./NewPollModal";
 import PollCard from "./PollCard";
 import { imageBubbleSize } from "./mediaFormat";
+import AgentAvatar from "./AgentAvatar";
 import Avatar from "./Avatar";
 import VoiceRecorder from "./VoiceRecorder";
 
@@ -351,6 +352,7 @@ export default function ChatView() {
   const typing = s.typing[conv.id];
   const typingFresh = typing && Date.now() - typing.ts < 5000;
   const readonly = conv.kind === "dm" && conv.peer && !s.friends.some((f) => f.user.id === conv.peer!.id);
+  const agentDeleted = conv.kind === "agent" && !!conv.agent?.deleted;
 
   // 生命周期入口可见性（服务端在锁内二次校验；这里只做 UI 层收敛）
   // A01：Agent 消息 sender_id 是主人但归属 Agent —— 不可编辑；删除仍允许（主人的会话）
@@ -581,6 +583,7 @@ export default function ChatView() {
   const send = async () => {
     const t = text.trim();
     if (readonly || sending || mutBusy) return;
+    if (conv?.kind === "agent" && conv.agent?.deleted) return;
     if (s.editingMessage) {
       await submitEdit();
       return;
@@ -799,13 +802,20 @@ export default function ChatView() {
   return (
     <main className="chat-view">
       <header className="chat-head">
+        {conv.kind === "agent" && conv.agent && (
+          <AgentAvatar
+            agentId={conv.agent.id}
+            name={conv.agent.name}
+            version={conv.agent.avatar_version}
+          />
+        )}
         <div>
           <div className="chat-title">{title}</div>
           <div className="chat-status">
             {conv.kind === "self"
               ? "在你的设备间同步消息与文件"
               : conv.kind === "agent"
-                ? `${agentHost ? (agentHost.label || "宿主") + (agentHost.platform ? ` (${agentHost.platform})` : "") : "宿主"} · ${conv.agent?.host_online ? "在线" : "离线"}`
+                ? `${agentHost ? (agentHost.label || "宿主") + (agentHost.platform ? ` (${agentHost.platform})` : "") : "宿主"} · ${agentDeleted ? "已删除" : conv.agent?.host_online ? "在线" : "离线"}`
                 : conv.kind === "dm"
                   ? peerOnline
                     ? "在线"
@@ -915,9 +925,12 @@ export default function ChatView() {
               >
                 {!mine &&
                   (m.agent ? (
-                    <div className="avatar sm agent-avatar" title={m.agent.name}>
-                      🤖
-                    </div>
+                    <AgentAvatar
+                      agentId={m.agent.id}
+                      name={m.agent.name}
+                      version={m.agent.avatar_version}
+                      size="sm"
+                    />
                   ) : (
                     <Avatar
                       userId={m.sender_id}
@@ -1157,6 +1170,7 @@ export default function ChatView() {
           <div className="readonly-hint">对方已不是你的好友，会话只读</div>
         ) : (
           <>
+            {agentDeleted && <div className="readonly-hint">该 Agent 已删除</div>}
             <input ref={fileInput} type="file" hidden multiple onChange={onFile} />
             {s.replyingTo && (
               <div className="composer-banner">
@@ -1233,13 +1247,14 @@ export default function ChatView() {
               <button
                 className="icon-btn attach-btn"
                 title="发送图片/文件（也可直接粘贴）"
+                disabled={agentDeleted}
                 onClick={() => fileInput.current?.click()}
               >
                 📎
               </button>
               <VoiceRecorder
                 convId={conv.id}
-                disabled={sending || mutBusy}
+                disabled={sending || mutBusy || agentDeleted}
                 onError={setMutErr}
               />
               {conv.kind === "group" && (
@@ -1255,7 +1270,8 @@ export default function ChatView() {
               <textarea
                 ref={taRef}
                 value={text}
-                placeholder="输入消息，Enter 发送，Shift+Enter 换行"
+                disabled={agentDeleted}
+                placeholder={agentDeleted ? "该 Agent 已删除" : "输入消息，Enter 发送，Shift+Enter 换行"}
                 onChange={(e) => onInput(e.target.value)}
                 onPaste={onPaste}
                 onKeyDown={(e) => {
@@ -1280,7 +1296,7 @@ export default function ChatView() {
                 className="primary send-btn"
                 onClick={send}
                 disabled={
-                  sending || mutBusy || (!text.trim() && pendingFiles.length === 0)
+                  agentDeleted || sending || mutBusy || (!text.trim() && pendingFiles.length === 0)
                 }
               >
                 {s.editingMessage ? (mutBusy ? "保存中…" : "保存") : sending ? "发送中…" : "发送"}

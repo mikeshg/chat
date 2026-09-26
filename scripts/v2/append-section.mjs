@@ -8,8 +8,9 @@ const [branch, task, file] = process.argv.slice(2);
 const show = (ref) => execSync(`git show ${ref}:${file}`, { encoding: 'utf8', maxBuffer: 1 << 27 });
 const ours = show('HEAD');
 const theirs = show(branch);
-const hit = theirs.search(new RegExp(`===== V2 ${task}[ =]`)); // 允许标记后带说明文字
-if (hit < 0) throw new Error(`section V2 ${task} not found in ${branch}:${file}`);
+const prefix = process.env.SECTION_PREFIX ?? "V2"; // Agent 票用 SECTION_PREFIX=Agent
+const hit = theirs.search(new RegExp(`===== ${prefix} ${task}[ =]`)); // 允许标记后带说明文字
+if (hit < 0) throw new Error(`section ${prefix} ${task} not found in ${branch}:${file}`);
 const i = theirs.lastIndexOf('\n', hit) + 1; // 分节注释所在行的行首
 const nl = ours.includes('\r\n') ? '\r\n' : '\n';
 const add = theirs.slice(i).replace(/\r?\n/g, nl);

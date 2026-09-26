@@ -130,6 +130,8 @@ pub async fn host_session(
                         if let Ok(v) = serde_json::from_str::<Value>(&t) {
                             if v["type"] == "invocation_finish" {
                                 agents::handle_finish(&st, host_id, &v).await;
+                            } else if v["type"] == "agent_options" {
+                                agents::handle_options(&st, host_id, &v).await;
                             }
                         }
                     }

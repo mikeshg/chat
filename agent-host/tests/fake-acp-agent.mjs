@@ -6,11 +6,14 @@
 //   fail         → JSON-RPC error
 //   crash        → 直接退出（进程码 2）
 //   recall       → 本会话之前收到过的全部指令，用 | 连接；没有则 (empty)
+//   whoami       → 当前 mode / model、环境变量 FAKE_ECHO、第一个文本块、额外目录
 //   其他          → 回 "ok"
 //
 // 会话跨进程保留：状态写在临时目录 chat-fake-acp/<sessionId>.json。
 // 启动参数 --caps=resume|load|none（默认 resume）决定 initialize 声明的能力。
 // load 模式恢复时先用 session/update 回放已存的回复正文，再返回 session/load 结果。
+// 指令取 prompt 的最后一个文本块（附加指令放在前面的块里）。
+// session/new 报告两个 mode、两个 model；支持 session/set_mode / session/set_model。
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -66,6 +69,18 @@ const chunk = (sessionId, text) =>
 
 let sessionId = null;
 let state = { prompts: [], replies: [] };
+let currentMode = "ask";
+let currentModel = "fast";
+let additionalDirs = [];
+
+const MODES = [
+  { id: "ask", name: "Ask" },
+  { id: "code", name: "Code" },
+];
+const MODELS = [
+  { modelId: "fast", name: "Fast" },
+  { modelId: "smart", name: "Smart" },
+];
 
 function remember(text, reply) {
   state.prompts.push(text);
@@ -92,8 +107,8 @@ rl.on("line", (line) => {
   if (id === undefined) return; // 通知一律不回
 
   if (method === "initialize") {
-    const agentCapabilities = {};
-    if (caps === "resume") agentCapabilities.sessionCapabilities = { resume: {} };
+    const agentCapabilities = { sessionCapabilities: { additionalDirectories: {} } };
+    if (caps === "resume") agentCapabilities.sessionCapabilities.resume = {};
     else if (caps === "load") agentCapabilities.loadSession = true;
     return result(id, { protocolVersion: 1, agentCapabilities, authMethods: [] });
   }
@@ -101,7 +116,22 @@ rl.on("line", (line) => {
     sessionId = crypto.randomUUID();
     state = { prompts: [], replies: [] };
     saveState(sessionId, state);
-    return result(id, { sessionId });
+    currentMode = "ask";
+    currentModel = "fast";
+    additionalDirs = Array.isArray(params?.additionalDirectories) ? params.additionalDirectories : [];
+    return result(id, {
+      sessionId,
+      modes: { currentModeId: currentMode, availableModes: MODES },
+      models: { currentModelId: currentModel, availableModels: MODELS },
+    });
+  }
+  if (method === "session/set_mode") {
+    currentMode = params?.modeId ?? currentMode;
+    return result(id, {});
+  }
+  if (method === "session/set_model") {
+    currentModel = params?.modelId ?? currentModel;
+    return result(id, {});
   }
   if (method === "session/resume") {
     if (caps !== "resume") return rpcErr(id, "resume unsupported");
@@ -118,7 +148,20 @@ rl.on("line", (line) => {
     return result(id, { sessionId });
   }
   if (method === "session/prompt") {
-    const text = (params?.prompt ?? []).map((p) => p?.text ?? "").join("");
+    const blocks = (params?.prompt ?? []).map((p) => (typeof p?.text === "string" ? p.text : ""));
+    const text = blocks[blocks.length - 1] ?? "";
+    if (text.trim() === "whoami") {
+      const out = [
+        `mode=${currentMode}`,
+        `model=${currentModel}`,
+        `FAKE_ECHO=${process.env.FAKE_ECHO ?? ""}`,
+        `first=${blocks[0] ?? ""}`,
+        `dirs=${additionalDirs.join(",")}`,
+      ].join("\n");
+      remember(text, out);
+      chunk(sessionId, out);
+      return result(id, { stopReason: "end_turn" });
+    }
     if (text.startsWith("echo:")) {
       const out = text.slice(5);
       remember(text, out);

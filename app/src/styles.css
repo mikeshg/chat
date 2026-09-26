@@ -937,3 +937,15 @@ button.icon-btn.chat-head-btn { flex: 0 0 auto; width: auto; height: 32px; white
 /* ===== Agent A02 ===== */
 button.icon-btn.chat-head-btn.topic-btn { font-size: 13px; }
 button.icon-btn.chat-head-btn.topic-btn:disabled { opacity: 0.5; }
+/* ===== Agent A06 ===== */
+.agent-editor { margin-top: 8px; }
+.agent-field { display: flex; flex-direction: column; gap: 4px; }
+.agent-field select, .agent-field input { width: 100%; }
+.agent-env-list { display: flex; flex-direction: column; gap: 6px; }
+.agent-env input { flex: 1; min-width: 0; }
+.agent-del-confirm {
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 8px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg);
+}
+.chat-head .agent-avatar { flex: 0 0 auto; }

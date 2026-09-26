@@ -1,6 +1,6 @@
 // 宿主 WS 连接循环：连上→host_hello→host_ready→收 invocation_start 起任务。
 
-use crate::runtime::{self, AgentSpec, RunOutput, RunRequest};
+use crate::runtime::{self, AgentOption, AgentSpec, RunOutput};
 use crate::Shared;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -131,6 +131,7 @@ async fn read_loop(
                         return Ok(());
                     }
                     "invocation_start" => start_invocation(s, out, &v),
+                    "agent_probe" => start_probe(s, out, &v),
                     "invocation_cancel" => {
                         if let Some(id) = v["invocation_id"]
                             .as_str()
@@ -170,6 +171,7 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    let agent_id = spec.id;
     let out2 = out.clone();
     let running = s.running.clone();
     let dir = s.data_dir.clone();
@@ -177,17 +179,61 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
         let rt = runtime::runtime_for(&spec);
         // 事件暂不外发（接收端即刻丢弃）；流式输出票把它接到服务端
         let (events, _) = tokio::sync::mpsc::unbounded_channel();
-        let req = RunRequest {
-            spec,
-            prompt,
-            data_dir: dir,
-            resume_session,
-        };
+        let mut req = runtime::RunRequest::for_invocation(spec, prompt, dir);
+        req.resume_session = resume_session;
         let r = rt.run(req, events).await;
+        if let Ok(out) = &r {
+            // 正常调用结束后也上报一次可选项（session/new 里有才发）
+            send_options(&out2, agent_id, out, false);
+        }
         send_finish(&out2, inv_id, r);
         running.lock().unwrap().remove(&inv_id);
     });
     s.running.lock().unwrap().insert(inv_id, task);
+}
+
+/// agent_probe：只握手并新建会话，把可选项报回去，不起调用。
+fn start_probe(s: &Arc<Shared>, out: &Out, v: &Value) {
+    let Some(spec) = AgentSpec::from_json(&v["agent"]) else {
+        return;
+    };
+    let agent_id = spec.id;
+    let out2 = out.clone();
+    let running = s.running.clone();
+    let dir = s.data_dir.clone();
+    let key = Uuid::new_v4();
+    let task = tokio::spawn(async move {
+        let rt = runtime::runtime_for(&spec);
+        let (events, _) = tokio::sync::mpsc::unbounded_channel();
+        let req = runtime::RunRequest::for_probe(spec, dir);
+        if let Ok(out) = rt.run(req, events).await {
+            send_options(&out2, agent_id, &out, true);
+        }
+        running.lock().unwrap().remove(&key);
+    });
+    s.running.lock().unwrap().insert(key, task);
+}
+
+fn send_options(out: &Out, agent_id: Uuid, got: &RunOutput, force: bool) {
+    if !force && got.modes.is_none() && got.models.is_none() {
+        return;
+    }
+    let modes = options_json(got.modes.as_deref());
+    let models = options_json(got.models.as_deref());
+    let v = json!({
+        "type": "agent_options",
+        "agent_id": agent_id,
+        "modes": modes,
+        "models": models,
+    });
+    let _ = out.send(Message::Text(v.to_string().into()));
+}
+
+fn options_json(list: Option<&[AgentOption]>) -> Vec<Value> {
+    list.unwrap_or(&[])
+        .iter()
+        .map(|o| json!({"id": o.id, "name": o.name}))
+        .collect()
 }
 
 fn send_finish(out: &Out, id: Uuid, r: Result<RunOutput, String>) {

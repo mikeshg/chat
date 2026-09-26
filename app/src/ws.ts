@@ -91,6 +91,7 @@ const PERMANENT_SEND_ERRORS = new Set([
   "bad_attachment",
   "not_found",
   "bad_frame",
+  "agent_deleted",
 ]);
 
 export function stopWs() {
@@ -519,6 +520,9 @@ async function refreshByWhat(what: string) {
   try {
     if (what === "conversations" || what === "friends" || what === "requests") {
       await refreshCatalogs();
+    } else if (what === "agents") {
+      // Agent 面板自己重拉列表（可选项 / 删除）
+      window.dispatchEvent(new Event("chat:agents"));
     }
   } catch (e) {
     console.warn("refresh failed", e);

@@ -15,6 +15,7 @@ import { openConversation } from "../ws";
 import { convPreview } from "./convPreview";
 import NewGroupModal from "./NewGroupModal";
 import SearchPanel from "./SearchPanel";
+import AgentAvatar from "./AgentAvatar";
 import Avatar from "./Avatar";
 
 function fmtTime(iso?: string | null): string {
@@ -188,6 +189,10 @@ export default function ConvList() {
                 >
                   {peerOnline && <i className="online-dot" />}
                 </Avatar>
+              ) : c.kind === "agent" && c.agent ? (
+                <AgentAvatar agentId={c.agent.id} name={c.agent.name} version={c.agent.avatar_version}>
+                  {hostOnline && <i className="online-dot" />}
+                </AgentAvatar>
               ) : (
                 <div
                   className={`avatar ${c.kind === "self" ? "self-avatar" : ""} ${c.kind === "agent" ? "agent-avatar" : ""}`}

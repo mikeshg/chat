@@ -11,7 +11,9 @@
 // fs/terminal 等反向请求；万一发起（含 session/request_permission）一律拒绝。
 
 pub use crate::runtime::AgentSpec;
-use crate::runtime::{AgentRuntime, Events, RunEvent, RunFuture, RunOutput, RunRequest};
+use crate::runtime::{
+    AgentOption, AgentRuntime, Events, RunEvent, RunFuture, RunOutput, RunRequest,
+};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -56,14 +58,19 @@ pub async fn run_invocation(req: &RunRequest, events: Events) -> Result<RunOutpu
     } else {
         PathBuf::from(&spec.cwd)
     };
-    let mut child = Command::new(&spec.command)
-        .args(&spec.args)
+    let mut cmd = Command::new(&spec.command);
+    cmd.args(&spec.args)
         .current_dir(&dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // 宿主关闭/任务被 abort 时自动杀子进程
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    // 在继承的环境上追加 / 覆盖，不清掉 PATH 等
+    for (k, v) in &req.env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("spawn `{}` 失败: {e}", spec.command))?;
 
@@ -122,16 +129,33 @@ pub async fn run_invocation(req: &RunRequest, events: Events) -> Result<RunOutpu
         events,
         suppress_chunks: false,
     };
-    let session_id = drive(&mut pipe, &dir, &req.prompt, req.resume_session.as_deref()).await;
+    let r = drive(&mut pipe, &dir, req).await;
     let _ = child.kill().await;
-    session_id.map(|session_id| RunOutput {
+    r.map(|d| RunOutput {
         text: std::mem::take(&mut pipe.text),
-        session_id: Some(session_id),
+        session_id: d.session_id,
+        modes: d.modes,
+        models: d.models,
     })
+}
+
+/// drive 的结果：本次使用的会话 id，以及 session/new 报告的可选项（恢复会话时没有）
+struct Driven {
+    session_id: Option<String>,
+    modes: Option<Vec<AgentOption>>,
+    models: Option<Vec<AgentOption>>,
 }
 
 fn cap_resume(caps: &Value) -> bool {
     match caps.pointer("/sessionCapabilities/resume") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => false,
+        Some(_) => true,
+    }
+}
+
+/// initialize 响应里声明了 sessionCapabilities.additionalDirectories（true 或 {}）才传额外目录。
+fn supports_additional_dirs(init: &Value) -> bool {
+    match init.pointer("/agentCapabilities/sessionCapabilities/additionalDirectories") {
         None | Some(Value::Null) | Some(Value::Bool(false)) => false,
         Some(_) => true,
     }
@@ -155,12 +179,28 @@ fn session_id_of(result: &Value, fallback: Option<&str>) -> Result<String, Strin
     Err("缺少 sessionId".into())
 }
 
-async fn drive(
-    pipe: &mut Pipe,
-    dir: &Path,
-    prompt: &str,
-    resume: Option<&str>,
-) -> Result<String, String> {
+fn option_list(v: Option<&Value>, id_keys: &[&str]) -> Option<Vec<AgentOption>> {
+    let arr = v?.as_array()?;
+    Some(
+        arr.iter()
+            .filter_map(|item| {
+                let id = id_keys.iter().find_map(|k| item[*k].as_str())?;
+                let name = item["name"].as_str().unwrap_or(id);
+                Some(AgentOption {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn in_options(id: &str, list: &Option<Vec<AgentOption>>) -> bool {
+    list.as_ref()
+        .is_some_and(|xs| xs.iter().any(|o| o.id == id))
+}
+
+async fn drive(pipe: &mut Pipe, dir: &Path, req: &RunRequest) -> Result<Driven, String> {
     let init = pipe
         .call(
             "initialize",
@@ -171,42 +211,94 @@ async fn drive(
         .get("agentCapabilities")
         .cloned()
         .unwrap_or(Value::Null);
-    let session_id = open_session(pipe, dir, resume, &caps).await?;
+    // 能续上已有会话就续上（probe 不续）：模式、模型、额外目录、附加指令都沿用那个会话，不再设置
+    if !req.probe {
+        if let Some(sid) = resume_session(pipe, dir, req.resume_session.as_deref(), &caps).await {
+            pipe.call(
+                "session/prompt",
+                json!({"sessionId": sid,
+                       "prompt": [{"type": "text", "text": req.prompt}]}),
+            )
+            .await?;
+            return Ok(Driven {
+                session_id: Some(sid),
+                modes: None,
+                models: None,
+            });
+        }
+    }
+    // 新建会话：额外目录、模式、模型、附加指令都只挂在这条分支上
+    let mut params = json!({"cwd": dir, "mcpServers": []});
+    if supports_additional_dirs(&init) && !req.extra_dirs.is_empty() {
+        params["additionalDirectories"] = json!(req.extra_dirs);
+    }
+    let new = pipe.call("session/new", params).await?;
+    let modes = option_list(new.pointer("/modes/availableModes"), &["id"]);
+    // ACP 模型 id 字段是 modelId；也认 id，方便假 agent 两种写法
+    let models = option_list(new.pointer("/models/availableModels"), &["modelId", "id"]);
+    if req.probe {
+        return Ok(Driven {
+            session_id: None,
+            modes,
+            models,
+        });
+    }
+    let sid = session_id_of(&new, None)?;
+    let session_id = json!(sid);
+    if !req.mode.is_empty() && in_options(&req.mode, &modes) {
+        pipe.call(
+            "session/set_mode",
+            json!({"sessionId": session_id, "modeId": req.mode}),
+        )
+        .await?;
+    }
+    if !req.model.is_empty() && in_options(&req.model, &models) {
+        pipe.call(
+            "session/set_model",
+            json!({"sessionId": session_id, "modelId": req.model}),
+        )
+        .await?;
+    }
+    let mut blocks = Vec::new();
+    if !req.instructions.is_empty() {
+        blocks.push(json!({"type": "text", "text": req.instructions}));
+    }
+    blocks.push(json!({"type": "text", "text": req.prompt}));
     pipe.call(
         "session/prompt",
-        json!({"sessionId": session_id,
-               "prompt": [{"type": "text", "text": prompt}]}),
+        json!({"sessionId": session_id, "prompt": blocks}),
     )
     .await?;
-    Ok(session_id)
+    Ok(Driven {
+        session_id: Some(sid),
+        modes,
+        models,
+    })
 }
 
-/// 按能力恢复会话；失败或没有能力时新开，不把恢复失败往外抛。
-async fn open_session(
+/// 按能力恢复会话；成功返回会话 id。没有能力或恢复失败返回 None（调用方新开，不算失败）。
+async fn resume_session(
     pipe: &mut Pipe,
     dir: &Path,
     resume: Option<&str>,
     caps: &Value,
-) -> Result<String, String> {
-    if let Some(sid) = resume.filter(|s| !s.is_empty()) {
-        let params = json!({"sessionId": sid, "cwd": dir, "mcpServers": []});
-        if cap_resume(caps) {
-            if let Ok(r) = pipe.call("session/resume", params).await {
-                return session_id_of(&r, Some(sid));
-            }
-        } else if cap_load(caps) {
-            pipe.suppress_chunks = true;
-            let loaded = pipe.call("session/load", params).await;
-            pipe.suppress_chunks = false;
-            if let Ok(r) = loaded {
-                return session_id_of(&r, Some(sid));
-            }
+) -> Option<String> {
+    let sid = resume.filter(|s| !s.is_empty())?;
+    let params = json!({"sessionId": sid, "cwd": dir, "mcpServers": []});
+    if cap_resume(caps) {
+        if let Ok(r) = pipe.call("session/resume", params).await {
+            return session_id_of(&r, Some(sid)).ok();
+        }
+    } else if cap_load(caps) {
+        // load 会先回放历史：响应返回前的 agent_message_chunk 不算本次回复
+        pipe.suppress_chunks = true;
+        let loaded = pipe.call("session/load", params).await;
+        pipe.suppress_chunks = false;
+        if let Ok(r) = loaded {
+            return session_id_of(&r, Some(sid)).ok();
         }
     }
-    let new = pipe
-        .call("session/new", json!({"cwd": dir, "mcpServers": []}))
-        .await?;
-    session_id_of(&new, None)
+    None
 }
 
 impl Pipe {

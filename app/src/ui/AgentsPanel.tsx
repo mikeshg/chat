@@ -3,6 +3,8 @@ import { agents, ApiError, convs } from "../api";
 import { setState, useApp } from "../store";
 import type { AgentView } from "../types";
 import { openConversation } from "../ws";
+import AgentAvatar from "./AgentAvatar";
+import AgentEditor from "./AgentEditor";
 import AgentSettings from "./AgentSettings";
 
 /** Agent A01：「我」页的 Agent 管理面板（宿主列表 / Agent 列表 / 添加 Agent） */
@@ -18,6 +20,7 @@ export default function AgentsPanel({ onClose }: { onClose: () => void }) {
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
   const [showForm, setShowForm] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
 
   const hosts = s.agentHosts; // online 由 agent_host_status 帧实时更新
 
@@ -35,6 +38,18 @@ export default function AgentsPanel({ onClose }: { onClose: () => void }) {
     return () => {
       alive = false;
     };
+  }, []);
+
+  // 可选项上报 / 删除后服务端推 invalidate agents
+  useEffect(() => {
+    const reload = () => {
+      agents
+        .list()
+        .then(setList)
+        .catch(() => {});
+    };
+    window.addEventListener("chat:agents", reload);
+    return () => window.removeEventListener("chat:agents", reload);
   }, []);
 
   // 新宿主出现/表单打开时默认选中第一个
@@ -140,14 +155,40 @@ export default function AgentsPanel({ onClose }: { onClose: () => void }) {
               onClick={() => void openAgentConv(a)}
               title="进入专属会话"
             >
-              <span className="agent-face">🤖</span>
+              <AgentAvatar agentId={a.id} name={a.name} version={a.avatar_version} size="sm" />
               <span className="grow">
                 <b>{a.name}</b>
                 <span className="muted"> · {hostLabel(a.host_id)}</span>
               </span>
               <i className={`online-dot ${hostOnline(a.host_id) ? "" : "off"}`} />
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setShowForm(false);
+                  setEditingId(a.id);
+                }}
+              >
+                编辑
+              </button>
             </div>
           ))}
+          {editingId && list.some((a) => a.id === editingId) && (
+            <AgentEditor
+              agent={list.find((a) => a.id === editingId)!}
+              hostLabel={hostLabel(list.find((a) => a.id === editingId)!.host_id)}
+              onUpdated={(a) => setList((cur) => cur.map((x) => (x.id === a.id ? a : x)))}
+              onSaved={(a) => {
+                setList((cur) => cur.map((x) => (x.id === a.id ? a : x)));
+                setEditingId(null);
+              }}
+              onDeleted={(id) => {
+                setList((cur) => cur.filter((x) => x.id !== id));
+                setEditingId(null);
+              }}
+              onClose={() => setEditingId(null)}
+            />
+          )}
         </section>
 
         <AgentSettings />

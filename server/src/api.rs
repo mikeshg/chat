@@ -23,7 +23,7 @@ use uuid::Uuid;
 const UPLOAD_BODY_MARGIN: usize = 1024 * 1024;
 
 /// 头像上限。路由单独设 body 上限，不复用附件的 25MB。
-const AVATAR_MAX_BYTES: usize = 1024 * 1024;
+pub(crate) const AVATAR_MAX_BYTES: usize = 1024 * 1024;
 
 /// 账号管理操作（角色/禁用）的事务级顾问锁：串行化，防止并发降权越过末位保护
 const ADMIN_LOCK_KEY: i64 = 0x63_68_61_74_61_64_6D_69; // "chatadmi"
@@ -110,7 +110,17 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
             "/agents",
             get(crate::agents::list_agents).post(crate::agents::create_agent),
         )
-        .route("/agents/{id}", patch(crate::agents::patch_agent))
+        .route(
+            "/agents/{id}",
+            patch(crate::agents::patch_agent).delete(crate::agents::delete_agent),
+        )
+        .route(
+            "/agents/{id}/avatar",
+            get(crate::agents::get_agent_avatar)
+                .put(crate::agents::put_agent_avatar)
+                .layer(DefaultBodyLimit::max(AVATAR_MAX_BYTES + UPLOAD_BODY_MARGIN)),
+        )
+        .route("/agents/{id}/probe", post(crate::agents::probe_agent))
         .route(
             "/users/me/agent-settings",
             get(crate::agents::get_user_settings).put(crate::agents::put_user_settings),
@@ -946,10 +956,13 @@ struct ConvRow {
     // Agent A01：末条消息的 Agent 归属（非空 = Agent 所写）
     m_agent_id: Option<Uuid>,
     m_agent_name: Option<String>,
+    m_agent_avatar_version: Option<i32>,
     // Agent A01：专属会话的 Agent 摘要（kind='agent' 时有值）
     c_agent_id: Option<Uuid>,
     c_agent_name: Option<String>,
     c_agent_host_id: Option<Uuid>,
+    c_agent_avatar_version: Option<i32>,
+    c_agent_deleted: Option<bool>,
     // 本人偏好（conversation_preferences 左连接，无行则全 NULL/false）
     p_pinned_at: Option<DateTime<Utc>>,
     p_archived_at: Option<DateTime<Utc>>,
@@ -990,7 +1003,10 @@ async fn list_conversations(
                 lm.sender_avatar_version AS m_sender_avatar_version,
                 lm.sender_has_avatar AS m_sender_has_avatar, lm.forwarded_from AS m_forwarded_from,
                 lm.agent_id AS m_agent_id, lm.agent_name AS m_agent_name,
+                lm.agent_avatar_version AS m_agent_avatar_version,
                 ag.id AS c_agent_id, ag.name AS c_agent_name, ag.host_id AS c_agent_host_id,
+                ag.avatar_version AS c_agent_avatar_version,
+                (ag.deleted_at IS NOT NULL) AS c_agent_deleted,
                 cp.pinned_at AS p_pinned_at, cp.archived_at AS p_archived_at,
                 cp.muted_until AS p_muted_until, cp.mute_forever AS p_mute_forever,
                 cp.updated_at AS p_updated_at,
@@ -1025,7 +1041,7 @@ async fn list_conversations(
                       reply_to_id, reply_to, edited_at, edit_version, deleted_at, reactions, poll,
                       att_width, att_height, att_has_thumb, att_duration_ms,
                       sender_avatar_version, sender_has_avatar, forwarded_from,
-                      agent_id, agent_name
+                      agent_id, agent_name, agent_avatar_version
                  FROM message_views
                 WHERE conversation_id = c.id
                 ORDER BY seq DESC
@@ -1098,6 +1114,7 @@ async fn list_conversations(
                 agent: r.m_agent_id.map(|id| crate::model::AgentRef {
                     id,
                     name: r.m_agent_name.clone().unwrap_or_default(),
+                    avatar_version: r.m_agent_avatar_version.unwrap_or(0),
                 }),
             });
             ConversationView {
@@ -1131,6 +1148,8 @@ async fn list_conversations(
                         .c_agent_host_id
                         .map(|h| st.host_online(h))
                         .unwrap_or(false),
+                    avatar_version: r.c_agent_avatar_version.unwrap_or(0),
+                    deleted: r.c_agent_deleted.unwrap_or(false),
                 }),
                 created_at: r.created_at,
             }
@@ -2064,13 +2083,13 @@ async fn dissolve_conversation(
 
 // ---------- 头像 ----------
 
-struct AvatarImage {
-    ext: &'static str,
-    mime: &'static str,
+pub(crate) struct AvatarImage {
+    pub ext: &'static str,
+    pub mime: &'static str,
 }
 
 /// 只认文件头魔数，不信任客户端 MIME，也不解码图片。
-fn sniff_avatar(buf: &[u8]) -> Option<AvatarImage> {
+pub(crate) fn sniff_avatar(buf: &[u8]) -> Option<AvatarImage> {
     if buf.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
         Some(AvatarImage {
             ext: "png",
@@ -2091,12 +2110,12 @@ fn sniff_avatar(buf: &[u8]) -> Option<AvatarImage> {
     }
 }
 
-fn avatar_file_path(files_dir: &str, stored: &str) -> std::path::PathBuf {
+pub(crate) fn avatar_file_path(files_dir: &str, stored: &str) -> std::path::PathBuf {
     std::path::Path::new(files_dir).join("avatars").join(stored)
 }
 
 /// 提交后异步删旧头像。只接受本目录文件名，避免误删 FILES_DIR 外的路径。
-fn spawn_avatar_cleanup(st: &SharedState, stored: Option<String>) {
+pub(crate) fn spawn_avatar_cleanup(st: &SharedState, stored: Option<String>) {
     let Some(stored) = stored.filter(|s| {
         !s.is_empty()
             && !s.contains('/')

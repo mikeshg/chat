@@ -153,6 +153,8 @@ export interface MessageView {
 export interface AgentRef {
   id: string;
   name: string;
+  /** 头像版本；0 或旧服务端缺省 = 没有头像 */
+  avatar_version?: number;
 }
 
 /** 会话上的 Agent 归属（kind='agent' 时出现，A01） */
@@ -162,6 +164,9 @@ export interface ConvAgentRef {
   host_id: string;
   /** 宿主实时在线态（随 agent_host_status 帧更新） */
   host_online: boolean;
+  avatar_version?: number;
+  /** 软删除后专属会话只读 */
+  deleted?: boolean;
 }
 
 /** GET /agent-hosts 单条宿主视图（A01） */
@@ -179,7 +184,19 @@ export interface AgentRuntime {
   args: string[];
 }
 
-/** GET /agents 单条 Agent 视图（A01） */
+/** 宿主上报的一个模型或模式 */
+export interface AgentOptionItem {
+  id: string;
+  name: string;
+}
+
+/** reported_options：还没探测过时是 {} */
+export interface ReportedOptions {
+  modes?: AgentOptionItem[];
+  models?: AgentOptionItem[];
+}
+
+/** GET /agents 单条 Agent 视图（A01；A06 补配置与头像） */
 export interface AgentView {
   id: string;
   name: string;
@@ -192,6 +209,16 @@ export interface AgentView {
   /** 覆盖项：null = 跟随个人默认（旧服务端无此字段） */
   output_mode?: AgentOutputMode | null;
   queue_timeout_secs?: number | null;
+  extra_dirs?: string[];
+  /** 空串 = 用 agent 默认 */
+  model?: string;
+  mode?: string;
+  instructions?: string;
+  /** 只在主人自己的列表 / PATCH 响应里 */
+  env?: Record<string, string>;
+  reported_options?: ReportedOptions;
+  avatar_version?: number;
+  deleted?: boolean;
 }
 
 /** 输出方式：实时流式 / 状态 + 最终结果 / 每步一条消息 */
@@ -204,10 +231,18 @@ export interface AgentUserSettings {
   queue_timeout_secs: number;
 }
 
-/** PATCH /agents/{id}：缺省字段不改，null = 清除覆盖 */
+/** PATCH /agents/{id}：缺省字段不改；覆盖项 null = 清除、回到个人默认 */
 export interface PatchAgentReq {
   output_mode?: AgentOutputMode | null;
   queue_timeout_secs?: number | null;
+  name?: string;
+  runtime?: AgentRuntime;
+  cwd?: string;
+  extra_dirs?: string[];
+  model?: string;
+  mode?: string;
+  instructions?: string;
+  env?: Record<string, string>;
 }
 
 /** POST /agents 请求体（A01） */

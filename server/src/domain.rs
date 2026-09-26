@@ -212,6 +212,8 @@ pub struct MsgViewRow {
     // Agent A01（0019）：非空 = 该消息由 Agent 发出
     pub agent_id: Option<Uuid>,
     pub agent_name: Option<String>,
+    // Agent A06：消息上的 Agent 头像版本（无 Agent 时为 NULL）
+    pub agent_avatar_version: Option<i32>,
 }
 
 impl MsgViewRow {
@@ -260,6 +262,7 @@ impl MsgViewRow {
             agent: self.agent_id.map(|id| crate::model::AgentRef {
                 id,
                 name: self.agent_name.unwrap_or_default(),
+                avatar_version: self.agent_avatar_version.unwrap_or(0),
             }),
         }
     }
@@ -692,6 +695,21 @@ async fn write_message(
 
     if kind_name == "dm" && !dm_writable(tx, msg.conversation_id, msg.sender_id).await? {
         return Err(PostError::deny("not_friends", "好友关系已解除，会话只读").into());
+    }
+
+    // 已删除的 Agent：专属会话只读。用户消息与宿主回写都不落库，也就不会再触发调用。
+    if kind_name == "agent" {
+        let aid = conv_agent.ok_or_else(|| PostError::deny("agent_deleted", "agent_deleted"))?;
+        let gone = sqlx::query_scalar::<_, bool>(
+            "SELECT deleted_at IS NOT NULL FROM agents WHERE id = $1",
+        )
+        .bind(aid)
+        .fetch_optional(&mut **tx)
+        .await?
+        .unwrap_or(true);
+        if gone {
+            return Err(PostError::deny("agent_deleted", "agent_deleted").into());
+        }
     }
 
     // Agent 消息只能写进该 Agent 的专属会话（A01：宿主回写路径在锁外已验主，
