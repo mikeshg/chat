@@ -809,7 +809,11 @@ fn restore_order(
 
 /// 数据库回灌：单事务内 卸环约束 → TRUNCATE 全表 CASCADE → 拓扑序 COPY → 回装约束。
 /// 任一步失败事务整体回滚。
-async fn restore_db(st: &SharedState, db_dir: &Path) -> Result<Vec<String>, AppError> {
+/// 回灌数据库并作废全部凭据，返回**未提交**的事务：文件替换成功后才提交，失败直接丢弃回滚。
+async fn restore_db(
+    st: &SharedState,
+    db_dir: &Path,
+) -> Result<(sqlx::Transaction<'static, sqlx::Postgres>, Vec<String>), AppError> {
     let tables = current_tables(st).await?;
     let edges_raw: Vec<(String, String, String, String)> = sqlx::query_as(
         "SELECT pgc.conrelid::regclass::text AS dep,
@@ -875,10 +879,17 @@ async fn restore_db(st: &SharedState, db_dir: &Path) -> Result<Vec<String>, AppE
         .execute(&mut *tx)
         .await?;
     }
-    tracing::info!("restore_db: committing");
-    tx.commit().await?;
-    tracing::info!("restore_db: committed");
-    Ok(order)
+    // 备份里的旧令牌与恢复前签发的令牌一律作废（与回灌同一事务）
+    sqlx::query("UPDATE users SET session_version = session_version + 1")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE sessions SET revoked_at = now() WHERE revoked_at IS NULL")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE refresh_tokens SET revoked_at = now() WHERE revoked_at IS NULL")
+        .execute(&mut *tx)
+        .await?;
+    Ok((tx, order))
 }
 
 /// regclass 文本 → 纯表名（剥掉 schema 与引号；我们的对象名都是简单小写标识符）
@@ -890,40 +901,63 @@ fn unqualify(reg: &str) -> String {
         .to_string()
 }
 
-/// 文件替换：.restore-new 完全解好后，当前文件 → .restore-old，新文件上位，再删旧档。
-/// .backups/.restore-*/.spool-* 顶层前缀两边都不动。
-fn swap_files(files_dir: &Path, new_dir: &Path, old_dir: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(old_dir).map_err(|e| e.to_string())?;
-    let rd = std::fs::read_dir(files_dir).map_err(|e| e.to_string())?;
-    for e in rd.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if EXCLUDE_PREFIXES.iter().any(|x| name.starts_with(x)) {
-            continue;
+/// files_dir 顶层里参与替换的条目（.backups/.restore-*/.spool-* 两边都不动）
+fn swap_entries(dir: &Path) -> Result<Vec<std::ffi::OsString>, String> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
+        let name = e.map_err(|e| e.to_string())?.file_name();
+        if !EXCLUDE_PREFIXES
+            .iter()
+            .any(|x| name.to_string_lossy().starts_with(x))
+        {
+            out.push(name);
         }
-        std::fs::rename(e.path(), old_dir.join(&name)).map_err(|e| e.to_string())?;
     }
-    let rd = std::fs::read_dir(new_dir).map_err(|e| e.to_string())?;
-    for e in rd.flatten() {
-        std::fs::rename(e.path(), files_dir.join(e.file_name())).map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
+/// 逐个 rename from → to；中途失败把已挪的挪回去再报错（尽力而为，挪回失败只记日志）
+fn move_all(names: &[std::ffi::OsString], from: &Path, to: &Path) -> Result<(), String> {
+    for (i, n) in names.iter().enumerate() {
+        if let Err(e) = std::fs::rename(from.join(n), to.join(n)) {
+            for n in &names[..i] {
+                if let Err(e2) = std::fs::rename(to.join(n), from.join(n)) {
+                    tracing::error!(name = ?n, error = %e2, "restore: move back failed");
+                }
+            }
+            return Err(format!("{}: {e}", n.to_string_lossy()));
+        }
     }
-    std::fs::remove_dir_all(old_dir).map_err(|e| e.to_string())?;
-    std::fs::remove_dir_all(new_dir).map_err(|e| e.to_string())?;
     Ok(())
 }
 
-/// 恢复完成后：全部用户 session_version +1、吊销全部 sessions 与 refresh_tokens。
-/// 备份签发时与恢复签发前的所有凭据一律作废（任务要求）。
-async fn invalidate_all_credentials(st: &SharedState) -> AppResult<()> {
-    sqlx::query("UPDATE users SET session_version = session_version + 1")
-        .execute(&st.pool)
-        .await?;
-    sqlx::query("UPDATE sessions SET revoked_at = now() WHERE revoked_at IS NULL")
-        .execute(&st.pool)
-        .await?;
-    sqlx::query("UPDATE refresh_tokens SET revoked_at = now() WHERE revoked_at IS NULL")
-        .execute(&st.pool)
-        .await?;
-    Ok(())
+/// 文件替换：当前文件 → .restore-old，.restore-new → 原位。失败时撤回到原状再报错。
+/// 返回 (旧条目, 新条目)，数据库提交失败时交给 unswap_files 撤回。
+type Swapped = (Vec<std::ffi::OsString>, Vec<std::ffi::OsString>);
+fn swap_files(files_dir: &Path, new_dir: &Path, old_dir: &Path) -> Result<Swapped, String> {
+    std::fs::create_dir_all(old_dir).map_err(|e| e.to_string())?;
+    let old = swap_entries(files_dir)?;
+    let new: Vec<_> = std::fs::read_dir(new_dir)
+        .map_err(|e| e.to_string())?
+        .map(|e| e.map(|e| e.file_name()).map_err(|e| e.to_string()))
+        .collect::<Result<_, _>>()?;
+    move_all(&old, files_dir, old_dir)?;
+    if let Err(e) = move_all(&new, new_dir, files_dir) {
+        move_all(&old, old_dir, files_dir)
+            .map_err(|e2| format!("{e}; 旧文件挪回失败（保留在 .restore-old）: {e2}"))?;
+        return Err(e);
+    }
+    Ok((old, new))
+}
+
+fn unswap_files(
+    files_dir: &Path,
+    new_dir: &Path,
+    old_dir: &Path,
+    sw: &Swapped,
+) -> Result<(), String> {
+    move_all(&sw.1, files_dir, new_dir)?;
+    move_all(&sw.0, old_dir, files_dir)
 }
 
 async fn do_restore(st: &SharedState, upload_path: &Path) -> AppResult<Value> {
@@ -932,6 +966,15 @@ async fn do_restore(st: &SharedState, upload_path: &Path) -> AppResult<Value> {
     let staging = files_dir.join(format!(".restore-tmp-{}", Uuid::new_v4().simple()));
     let new_dir = files_dir.join(".restore-new");
     let old_dir = files_dir.join(".restore-old");
+    // 上次恢复撤回失败时原文件留在 .restore-old：不能再往里挪、更不能在成功后连它一起删
+    if std::fs::read_dir(&old_dir).is_ok_and(|mut d| d.next().is_some()) {
+        return Err(AppError::internal(format!(
+            "{} 非空（上次恢复遗留的原文件），请人工处理后再恢复",
+            old_dir.display()
+        )));
+    }
+    // .restore-new 只会是解包出的备份副本，残留直接清掉
+    let _ = tokio::fs::remove_dir_all(&new_dir).await;
     let upload2 = upload_path.to_path_buf();
     let db_dir = staging.join("db");
     let new2 = new_dir.clone();
@@ -948,20 +991,28 @@ async fn do_restore(st: &SharedState, upload_path: &Path) -> AppResult<Value> {
         }
     };
 
-    // 解包成功后任何失败都要清 staging；库失败时 .restore-new 一并撤掉（文件尚未动）
+    // 顺序：库回灌（不提交）→ 换文件 → 提交。换文件失败丢弃事务；提交失败把文件换回去。
     let r = async {
         tracing::info!("restore: extracted files={files}, restore_db start");
-        let tables = restore_db(st, &staging.join("db")).await?;
-        tracing::info!("restore: db done, swap_files start");
-        let files_dir2 = files_dir.clone();
-        let new3 = new_dir.clone();
-        let old2 = old_dir.clone();
-        tokio::task::spawn_blocking(move || swap_files(&files_dir2, &new3, &old2))
+        let (tx, tables) = restore_db(st, &staging.join("db")).await?;
+        let (f2, n2, o2) = (files_dir.clone(), new_dir.clone(), old_dir.clone());
+        let swapped = tokio::task::spawn_blocking(move || swap_files(&f2, &n2, &o2))
             .await
             .map_err(AppError::internal)?
-            .map_err(AppError::internal)?;
-        tracing::info!("restore: swap done, invalidate start");
-        invalidate_all_credentials(st).await?;
+            .map_err(|e| AppError::internal(format!("文件替换失败（数据库未改动）: {e}")))?;
+        if let Err(e) = tx.commit().await {
+            let (f2, n2, o2) = (files_dir.clone(), new_dir.clone(), old_dir.clone());
+            let back = tokio::task::spawn_blocking(move || unswap_files(&f2, &n2, &o2, &swapped))
+                .await
+                .map_err(AppError::internal)?;
+            return Err(AppError::internal(match back {
+                Ok(()) => format!("数据库提交失败，文件已换回: {e}"),
+                Err(b) => {
+                    format!("数据库提交失败，文件换回失败（原文件在 .restore-old）: {e}; {b}")
+                }
+            }));
+        }
+        tracing::info!("restore: committed");
         Ok::<_, AppError>(json!({
             "tables": tables,
             "files": files,
@@ -969,16 +1020,13 @@ async fn do_restore(st: &SharedState, upload_path: &Path) -> AppResult<Value> {
     }
     .await;
 
-    tracing::info!(
-        ok = r.is_ok(),
-        "restore: inner block finished, cleanup staging"
-    );
     let _ = tokio::fs::remove_dir_all(&staging).await;
-    tracing::info!("restore: staging cleaned");
-    if r.is_err() {
-        // 库回灌失败 → 文件未动；把已解出的新档与旧档暂存清掉
-        let _ = tokio::fs::remove_dir_all(&new_dir).await;
+    let _ = tokio::fs::remove_dir_all(&new_dir).await;
+    if r.is_ok() {
         let _ = tokio::fs::remove_dir_all(&old_dir).await;
+    } else if tokio::fs::remove_dir(&old_dir).await.is_err() && old_dir.exists() {
+        // 只删空目录：非空说明原文件没能挪回，留给人工
+        tracing::error!(dir = %old_dir.display(), "restore failed; original files kept here");
     }
     r
 }

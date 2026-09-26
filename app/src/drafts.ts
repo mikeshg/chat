@@ -38,3 +38,8 @@ export function writeDrafts(
     storage.setItem(draftsKey(userId), JSON.stringify(drafts));
   } catch {}
 }
+
+/** 发送完成后输入框/草稿该留下什么：去掉已发出的前缀，只留发送期间新输入的部分；被改过的原样保留 */
+export function unsentText(cur: string, sent: string): string {
+  return sent && cur.startsWith(sent) ? cur.slice(sent.length).trimStart() : cur;
+}

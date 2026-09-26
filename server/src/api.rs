@@ -267,6 +267,11 @@ async fn register(
 
     let hash = auth::hash_password(&req.password)?;
     let mut tx = st.pool.begin().await?;
+    // 注册全局串行：READ COMMITTED 下两个并发注册都会看到空库/同一闸门状态（双管理员）。
+    // ponytail: 全局事务锁，注册低频够用。
+    sqlx::query("SELECT pg_advisory_xact_lock(7100001)")
+        .execute(&mut *tx)
+        .await?;
 
     // 注册闸门：判断与插入在同一事务内（不留竞态窗口）。
     // 空库放行（首个用户仍是管理员引导路径）；非空库按 registration_mode 校验。
@@ -489,6 +494,12 @@ async fn logout(
         }
     }
     tx.commit().await?;
+    // 会话已撤销：它名下的 WS 也要断（WS 只在入站帧时校验会话，静默连接否则会一直收推送）
+    if let Some((uid, Some(sid))) = found {
+        if let Some(epoch) = st.kick_session(uid, sid, "logout") {
+            ws::publish_offline(&st, uid, epoch).await;
+        }
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2117,7 +2128,12 @@ async fn put_avatar(
 
     let me = load_user_row(&st, uid).await?;
     let version = me.avatar_version + 1;
-    let stored = format!("{uid}-{version}.{}", img.ext);
+    // 文件名带随机段：并发上传各写各的文件，乐观锁输掉的一方只删自己的，不会删掉赢家的
+    let stored = format!(
+        "{uid}-{version}-{}.{}",
+        &Uuid::new_v4().simple().to_string()[..8],
+        img.ext
+    );
     let dir = std::path::Path::new(&st.cfg.files_dir).join("avatars");
     tokio::fs::create_dir_all(&dir)
         .await

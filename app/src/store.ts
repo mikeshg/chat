@@ -232,6 +232,26 @@ export function upsertMessage(list: MessageView[], m: MessageView): MessageView[
   return next;
 }
 
+/**
+ * 从 after 起向后逐页拉，直到拉到 stop 前一条或没有更多。
+ * 跳转到缓存之外的旧消息时用它补齐到缓存最早一条：缓存必须连续（hasMore/loadMore 只看最小 seq）。
+ * ponytail: 远距离跳转会逐页（200 条/页）补齐整段；历史到万级再改成独立窗口 + 向下加载。
+ */
+export async function fetchForward(
+  page: (after: number) => Promise<{ messages: MessageView[]; has_more: boolean }>,
+  after: number,
+  stop: number,
+): Promise<MessageView[]> {
+  const out: MessageView[] = [];
+  for (;;) {
+    const p = await page(after);
+    out.push(...p.messages);
+    const last = p.messages[p.messages.length - 1];
+    if (!p.has_more || !last || last.seq >= stop - 1) return out;
+    after = last.seq;
+  }
+}
+
 export function prependMessages(list: MessageView[], older: MessageView[]): MessageView[] {
   const seen = new Set(list.map((m) => m.id));
   return [...older.filter((m) => !seen.has(m.id)), ...list];

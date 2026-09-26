@@ -5412,18 +5412,24 @@ async fn p22_replace_deletes_old_file() {
     assert_eq!(cur.bytes().await.unwrap().as_ref(), jpeg.as_slice());
 
     // 提交后异步删旧文件。旧版本请求仍回当前图，但磁盘上不应再有 v1 文件。
+    // 文件名 {uid}-{版本}-{随机段}.{扩展名}
     let dir = files_dir.join("avatars");
-    let old = dir.join(format!("{}-1.png", u.id));
+    let has = |prefix: String, ext: &str| {
+        std::fs::read_dir(&dir).unwrap().flatten().any(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with(&prefix) && n.ends_with(ext)
+        })
+    };
     let mut gone = false;
     for _ in 0..50 {
-        if !old.exists() {
+        if !has(format!("{}-1-", u.id), ".png") {
             gone = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert!(gone, "旧头像文件应在更换后被删除");
-    assert!(dir.join(format!("{}-2.jpg", u.id)).exists());
+    assert!(has(format!("{}-2-", u.id), ".jpg"));
 }
 
 /// 声称 image/png 但内容是 HTML，以及超过 1MB，都是 400。
@@ -8630,4 +8636,199 @@ async fn p41_maintenance_blocks_api() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
+}
+
+// ===== V2 审查修复（gpt-6-astar） =====
+
+/// 1. 文件替换失败（新档里有 .backups 条目，挪不到位）：数据库不提交、原文件全部挪回，
+///    .restore-old / .restore-new 不留；.restore-old 有遗留原文件时拒绝恢复且不碰它。
+#[tokio::test]
+async fn review_restore_swap_failure_keeps_files_and_db() {
+    let (base, _st, files_dir) = spawn_backup_env("sf").await;
+    let c = http();
+    let admin = register(&base, &format!("rvsf_{}", uniq())).await;
+    std::fs::write(files_dir.join("keep.bin"), b"before").unwrap();
+    let name = create_and_wait_backup(&base, &admin.access).await;
+    let bytes = download_backup(&base, &admin.access, &name).await;
+
+    // 备份后的改动：恢复失败时必须原样保留
+    let r = c
+        .patch(format!("{base}/v1/users/me"))
+        .header("authorization", authz(&admin.access))
+        .json(&json!({"display_name": "changed"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    std::fs::write(files_dir.join("after.bin"), b"after").unwrap();
+
+    let mut entries = read_backup(&bytes);
+    entries.insert("files/.backups/evil".into(), b"x".to_vec());
+    let r = restore_upload(
+        &base,
+        &admin.access,
+        write_backup(&entries),
+        Some("RESTORE"),
+    )
+    .await;
+    assert_eq!(r.status(), 500, "{}", r.text().await.unwrap());
+
+    assert_eq!(
+        std::fs::read(files_dir.join("keep.bin")).unwrap(),
+        b"before"
+    );
+    assert_eq!(
+        std::fs::read(files_dir.join("after.bin")).unwrap(),
+        b"after"
+    );
+    assert!(!files_dir.join(".restore-old").exists());
+    assert!(!files_dir.join(".restore-new").exists());
+    assert!(files_dir.join(".backups").join(&name).exists());
+    // 库没回滚到备份时刻、凭据没作废
+    let me: Value = c
+        .get(format!("{base}/v1/users/me"))
+        .header("authorization", authz(&admin.access))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(me["display_name"], "changed");
+
+    // 遗留的 .restore-old（上次撤回失败的原文件）：拒绝恢复，文件不动
+    let old = files_dir.join(".restore-old");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join("orphan.bin"), b"orig").unwrap();
+    let r = restore_upload(&base, &admin.access, bytes, Some("RESTORE")).await;
+    assert_eq!(r.status(), 500);
+    assert_eq!(std::fs::read(old.join("orphan.bin")).unwrap(), b"orig");
+    assert_eq!(
+        std::fs::read(files_dir.join("after.bin")).unwrap(),
+        b"after"
+    );
+}
+
+/// 4. 空库并发注册只能产生一个管理员
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_register_race_single_admin() {
+    let (base, st) = spawn_named_state(&format!("chat_it_rvreg_{}", uniq())).await;
+    let tasks: Vec<_> = (0..8)
+        .map(|i| {
+            let base = base.clone();
+            tokio::spawn(async move {
+                http()
+                    .post(format!("{base}/v1/auth/register"))
+                    .json(
+                        &json!({"username": format!("rv{i}_{}", uniq()), "password": "secret123"}),
+                    )
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+            })
+        })
+        .collect();
+    for t in tasks {
+        assert_eq!(t.await.unwrap(), 200);
+    }
+    let admins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role = 'admin'")
+        .fetch_one(&st.pool)
+        .await
+        .unwrap();
+    assert_eq!(admins, 1);
+}
+
+/// 5. 登出撤销会话后，该会话名下的 WS 立即收到 force_logout
+#[tokio::test]
+async fn review_logout_kicks_session_ws() {
+    let base = spawn().await;
+    let u = register(&base, &format!("rvlo_{}", uniq())).await;
+    let dev = login_device(&base, &u.username, "secret123", "A").await;
+    let (mut s, _) = tokio_tungstenite::connect_async(ws_url(&base, &dev).await)
+        .await
+        .unwrap();
+    next_of(&mut s, "presence_init").await;
+    let r = http()
+        .post(format!("{base}/v1/auth/logout"))
+        .json(&json!({"refresh_token": dev.refresh}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    let v = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        next_of(&mut s, "force_logout"),
+    )
+    .await
+    .expect("登出后该会话的 WS 应被踢");
+    assert_eq!(v["reason"], "logout");
+}
+
+/// 6. 永不读取的连接：发送缓冲塞满后写超时/出站队列满即断开（心跳检查远在窗口外，不能靠它）
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_ws_stuck_reader_is_dropped() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (base, st) = spawn_named_state(&format!("chat_it_rvws_{}", uniq())).await;
+    st.ws_ping_interval_ms.store(60_000, Relaxed);
+    st.ws_idle_timeout_ms.store(1000, Relaxed);
+    let z = register(&base, &format!("rvws_{}", uniq())).await;
+    let zid = uuid::Uuid::parse_str(&z.id).unwrap();
+    let _zombie = tokio_tungstenite::connect_async(ws_url(&base, &z).await)
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if st.is_online(zid) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(st.is_online(zid));
+
+    let big = "x".repeat(64 * 1024);
+    let t0 = std::time::Instant::now();
+    let mut dropped = false;
+    while t0.elapsed() < std::time::Duration::from_secs(8) {
+        st.send_to_user(zid, &big);
+        if !st.is_online(zid) {
+            dropped = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    assert!(dropped, "读不动的连接应被断开");
+}
+
+/// 8. 并发换头像：输家只删自己的文件，赢家的头像始终可取
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_avatar_concurrent_upload_keeps_winner_file() {
+    let (base, _files_dir) = spawn_avatar().await;
+    let u = register(&base, &format!("rvav_{}", uniq())).await;
+    for round in 0..8 {
+        let (r1, r2) = tokio::join!(
+            put_avatar(&base, &u.access, png_bytes(), "image/png"),
+            put_avatar(&base, &u.access, png_bytes(), "image/png"),
+        );
+        for r in [r1.status(), r2.status()] {
+            assert!(r == 200 || r == 409, "round {round}: {r}");
+        }
+        let me: Value = http()
+            .get(format!("{base}/v1/users/me"))
+            .header("authorization", authz(&u.access))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let r = http()
+            .get(format!(
+                "{base}/v1/users/{}/avatar?v={}",
+                u.id, me["avatar_version"]
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "round {round}: 赢家的头像文件被删了");
+    }
 }

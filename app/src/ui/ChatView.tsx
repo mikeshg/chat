@@ -6,6 +6,7 @@ import {
   applyUpdatedMessage,
   convTitle,
   getState,
+  fetchForward,
   prependMessages,
   pushToast,
   setDraft,
@@ -13,6 +14,7 @@ import {
   upsertMessage,
   useApp,
 } from "../store";
+import { unsentText } from "../drafts";
 import type { AttachmentView, MemberView, MessageView, ReplyPreview } from "../types";
 import { sendChat, sendTyping } from "../ws";
 import RichText from "../richText";
@@ -202,6 +204,9 @@ export default function ChatView() {
     setEmojiPick(null);
     setMsgMenu(null);
     setMutErr(null);
+    // 待发附件属于旧会话，不能带到新会话里发出去
+    setPendingFiles([]);
+    setSendErr(null);
     // 切换会话：在途 mutation 回调失权（owner token 已换），忙碌态与编辑代次一并复位
     mutation.current = null;
     draftRevision.current++;
@@ -548,26 +553,34 @@ export default function ChatView() {
     if (!t && pendingFiles.length === 0) return;
     setSending(true);
     setSendErr(null);
+    // 上传期间用户可能继续输入、加附件、切会话：完成后只清本次发出的那部分
+    const sentText = text;
+    const sentFiles = pendingFiles;
+    const rt0 = s.replyingTo;
+    const still = () => getState().activeConv === conv.id;
     try {
       // 先上传待发附件，文字随最后一个附件消息一起发
       const atts: AttachmentView[] = [];
-      for (const f of pendingFiles) {
+      for (const f of sentFiles) {
         atts.push(await files.upload(conv.id, f));
       }
-      const rt = s.replyingTo ?? undefined;
+      const rt = rt0 ?? undefined;
       atts.forEach((att, i) =>
         sendChat(conv.id, i === atts.length - 1 ? t : "", att, i === atts.length - 1 ? rt : undefined),
       );
       if (atts.length === 0 && t) sendChat(conv.id, t, undefined, rt);
-      setText("");
-      setDraft(conv.id, ""); // 发送即清该会话草稿
-      setPendingFiles([]);
-      setAc(null);
-      setState({ replyingTo: null });
-      stickBottom.current = true;
+      const draft = getState().drafts[conv.id] ?? "";
+      if (unsentText(draft, sentText) !== draft) setDraft(conv.id, unsentText(draft, sentText)); // 发送即清该会话草稿
+      if (getState().replyingTo === rt0) setState({ replyingTo: null });
+      if (still()) {
+        setText((cur) => unsentText(cur, sentText));
+        setPendingFiles((p) => p.filter((f) => !sentFiles.includes(f)));
+        setAc(null);
+        stickBottom.current = true;
+      }
     } catch (err) {
       // 保留服务端文案（如 413 配额提示）；待发附件不清，便于重试
-      setSendErr(err instanceof Error ? err.message : "发送失败");
+      if (still()) setSendErr(err instanceof Error ? err.message : "发送失败");
     } finally {
       setSending(false);
     }
@@ -622,13 +635,18 @@ export default function ChatView() {
     setFlashId(id);
     if (!(getState().messages[conv.id] ?? []).some((x) => x.id === id)) {
       try {
-        const p = await convs.messages(conv.id, {
-          after_seq: Math.max(0, seq - 25),
-          limit: 50,
-        });
+        // 补到缓存最早一条为止，不留断档；缓存为空时补到最新（随后的首屏历史与之重叠）
+        const cached = (getState().messages[conv.id] ?? []).filter((x) => !x.id.startsWith("client:"));
+        const stop = cached[0]?.seq ?? conv.last_seq + 1;
+        const got = await fetchForward(
+          (after) => convs.messages(conv.id, { after_seq: after, limit: 200 }),
+          Math.max(0, seq - 25),
+          stop,
+        );
+        if (token !== jumpRequest.current) return;
         // P1-11：按 id/seq 合并进现有窗口，不能整体替换（会丢弃实时/乐观消息）
         setState((st) => {
-          const merged = p.messages.reduce(
+          const merged = got.reduce(
             (l, x) => upsertMessage(l, x),
             st.messages[conv.id] ?? [],
           );

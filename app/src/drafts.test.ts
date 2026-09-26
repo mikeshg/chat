@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { draftsKey, readDrafts, writeDrafts } from "./drafts";
+import { draftsKey, readDrafts, unsentText, writeDrafts } from "./drafts";
 
 /** 内存版 localStorage（可按需注入坏数据/抛错） */
 function memStorage(initial: Record<string, string> = {}) {
@@ -52,4 +52,11 @@ describe("草稿持久化（localStorage chat_drafts:<userId>）", () => {
     expect(readDrafts(throwing, "u1")).toEqual({});
     expect(() => writeDrafts(throwing, "u1", { c1: "x" })).not.toThrow();
   });
+});
+
+describe("unsentText：发送完成只清已发出的部分", () => {
+  it("未改动 → 清空", () => expect(unsentText("hello", "hello")).toBe(""));
+  it("发送期间追加输入 → 只留新输入", () => expect(unsentText("hello next", "hello")).toBe("next"));
+  it("改过已发内容 → 原样保留", () => expect(unsentText("hell0", "hello")).toBe("hell0"));
+  it("只发附件（无文字）→ 不动输入框", () => expect(unsentText("typing", "")).toBe("typing"));
 });

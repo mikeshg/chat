@@ -5,6 +5,7 @@ import {
   applyRefreshed,
   applySyncMessages,
   applyUpdatedMessage,
+  fetchForward,
   mergeConversationLists,
   resolveAck,
   shouldNotify,
@@ -398,5 +399,31 @@ describe("V2 P1-1 后台时打开着的会话照常计未读", () => {
   it("后台：打开着的会话计未读，标题与通知才准确", () => {
     const s = state({ activeConv: CONV, me: { id: "me" } as AppState["me"] });
     expect(unread(applyLiveMessage(s, msg({ seq: 2 }), false))).toBe(1);
+  });
+});
+
+describe("跳转补齐：fetchForward 拉到缓存最早一条为止", () => {
+  // 服务端 after_seq 分页：seq 1..1000，每页 200
+  const page = async (after: number) => {
+    const messages = Array.from({ length: Math.min(200, 1000 - after) }, (_, i) => msg({ id: "m" + (after + i + 1), seq: after + i + 1 }));
+    return { messages, has_more: messages.length === 200 };
+  };
+
+  it("远处跳转：结果连续且接上缓存（无断档）", async () => {
+    const got = await fetchForward(page, 75, 951);
+    expect(got[0].seq).toBe(76);
+    got.forEach((m, i) => expect(m.seq).toBe(76 + i));
+    expect(got[got.length - 1].seq).toBeGreaterThanOrEqual(950);
+  });
+
+  it("离缓存近：一页就停", async () => {
+    let calls = 0;
+    await fetchForward(async (a) => (calls++, page(a)), 900, 951);
+    expect(calls).toBe(1);
+  });
+
+  it("没有更多时停止（补到最新）", async () => {
+    const got = await fetchForward(page, 0, Infinity);
+    expect(got.length).toBe(1000);
   });
 });

@@ -16,13 +16,28 @@ pub enum ConnMsg {
     Shutdown(String),
 }
 
+/// 单连接出站队列上限。对端读不动（弱网/死连接）时队列满 → 断开，客户端重连后按 seq 补齐。
+/// ponytail: 按帧数限，不按字节；大帧多的场景再改字节预算。
+pub const CONN_QUEUE: usize = 1024;
+
 /// 单条在线连接：出站事件发送端 + 所属登录会话（老连接可为 None）
 pub struct Conn {
-    pub tx: mpsc::UnboundedSender<ConnMsg>,
+    pub tx: mpsc::Sender<ConnMsg>,
     pub sid: Option<Uuid>,
     /// 客户端经 client_state 帧上报的前台活跃态（V2 P3-3）；
     /// 不上报的旧客户端默认 true（保守视为活跃，不误推）
     pub active: AtomicBool,
+    /// 出站队列满（或已关）时置位，会话循环看到后断开
+    pub stalled: Arc<AtomicBool>,
+}
+
+impl Conn {
+    /// 非阻塞投递：广播方绝不等慢连接
+    fn push(&self, m: ConnMsg) {
+        if self.tx.try_send(m).is_err() {
+            self.stalled.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 /// user_id -> (conn_id -> 连接)
@@ -91,8 +106,9 @@ impl AppState {
         &self,
         uid: Uuid,
         conn_id: Uuid,
-        tx: mpsc::UnboundedSender<ConnMsg>,
+        tx: mpsc::Sender<ConnMsg>,
         sid: Option<Uuid>,
+        stalled: Arc<AtomicBool>,
     ) -> Option<u64> {
         let first = {
             let bucket = self.conns.entry(uid).or_default();
@@ -103,6 +119,7 @@ impl AppState {
                     tx,
                     sid,
                     active: AtomicBool::new(true),
+                    stalled,
                 },
             );
             first
@@ -134,7 +151,7 @@ impl AppState {
     pub fn send_to_user(&self, uid: Uuid, payload: &str) {
         if let Some(m) = self.conns.get(&uid) {
             for s in m.iter() {
-                let _ = s.tx.send(ConnMsg::Frame(payload.to_string()));
+                s.push(ConnMsg::Frame(payload.to_string()));
             }
         }
     }
@@ -164,7 +181,7 @@ impl AppState {
         let mut had = false;
         for conn in bucket.iter() {
             had = true;
-            let _ = conn.tx.send(ConnMsg::Shutdown(frame.clone()));
+            conn.push(ConnMsg::Shutdown(frame.clone()));
         }
         had.then(|| self.bump_epoch(uid))
     }
@@ -194,7 +211,7 @@ impl AppState {
             for id in ids {
                 if let Some((_, conn)) = bucket.remove(&id) {
                     kicked = true;
-                    let _ = conn.tx.send(ConnMsg::Shutdown(frame.clone()));
+                    conn.push(ConnMsg::Shutdown(frame.clone()));
                 }
             }
             kicked && bucket.is_empty()

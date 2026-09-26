@@ -11,7 +11,8 @@ use axum::{
 };
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -68,9 +69,10 @@ pub async fn handle_session(
 ) {
     let uid = grant.uid;
     let conn_id = Uuid::new_v4();
-    let (tx, mut rx) = mpsc::unbounded_channel::<ConnMsg>();
+    let (tx, mut rx) = mpsc::channel::<ConnMsg>(crate::state::CONN_QUEUE);
+    let stalled = Arc::new(AtomicBool::new(false));
 
-    let online_epoch = st.register_conn(uid, conn_id, tx.clone(), grant.sid);
+    let online_epoch = st.register_conn(uid, conn_id, tx.clone(), grant.sid, stalled.clone());
 
     let watchers = st.watchers(uid).await.unwrap_or_default();
     if !connection_valid(&st, uid, conn_id, grant.session_version, grant.sid).await {
@@ -94,7 +96,7 @@ pub async fn handle_session(
         .copied()
         .filter(|w| st.is_online(*w))
         .collect();
-    let _ = tx.send(ConnMsg::Frame(frame(&WsOut::PresenceInit { online })));
+    let _ = tx.try_send(ConnMsg::Frame(frame(&WsOut::PresenceInit { online })));
 
     let (mut sink, mut stream) = socket.split();
     // V2 P3-3：心跳超时——任何入站帧（含 Pong）都刷新 last_inbound；
@@ -106,19 +108,27 @@ pub async fn handle_session(
     ping.tick().await; // 跳过立即触发
     let mut last_inbound = Instant::now();
 
+    // 每次写都限时 idle_timeout：对端收不下（死连接把发送缓冲塞满）就断开，
+    // 否则一次写卡住会饿死同一 select 里的心跳超时与踢下线
+    let t = idle_timeout;
     loop {
+        // 出站队列满：广播方已丢帧，断开让客户端重连补齐
+        if stalled.load(Ordering::Relaxed) {
+            break;
+        }
         tokio::select! {
             out = rx.recv() => {
                 match out {
                     Some(ConnMsg::Frame(payload)) => {
-                        if sink.send(Message::Text(payload.into())).await.is_err() {
+                        if !send_timed(&mut sink, Message::Text(payload.into()), t).await {
                             break;
                         }
                     }
                     // 被踢下线：先把 force_logout 帧送到客户端，再主动关闭 socket
                     Some(ConnMsg::Shutdown(payload)) => {
-                        let _ = sink.send(Message::Text(payload.into())).await;
-                        let _ = sink.send(Message::Close(None)).await;
+                        if send_timed(&mut sink, Message::Text(payload.into()), t).await {
+                            send_timed(&mut sink, Message::Close(None), t).await;
+                        }
                         break;
                     }
                     None => break,
@@ -126,10 +136,10 @@ pub async fn handle_session(
             }
             _ = ping.tick() => {
                 if last_inbound.elapsed() > idle_timeout {
-                    let _ = sink.send(Message::Close(None)).await;
+                    send_timed(&mut sink, Message::Close(None), t).await;
                     break;
                 }
-                if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
+                if !send_timed(&mut sink, Message::Ping(Vec::new().into()), t).await {
                     break;
                 }
             }
@@ -140,7 +150,7 @@ pub async fn handle_session(
                         match msg {
                             Message::Text(text) => {
                                 if !on_text(&st, uid, conn_id, grant.session_version, grant.sid, &tx, &text).await {
-                                    let _ = sink.send(Message::Close(None)).await;
+                                    send_timed(&mut sink, Message::Close(None), t).await;
                                     break;
                                 }
                             }
@@ -158,6 +168,13 @@ pub async fn handle_session(
     if let Some(epoch) = st.unregister_conn(uid, conn_id) {
         publish_offline(&st, uid, epoch).await;
     }
+}
+
+async fn send_timed<S>(sink: &mut S, m: Message, limit: Duration) -> bool
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    matches!(tokio::time::timeout(limit, sink.send(m)).await, Ok(Ok(())))
 }
 
 /// 最后一个连接断开或被踢下线后广播离线。epoch 已经变了就放弃，避免盖住刚连上的设备。
@@ -265,9 +282,9 @@ pub async fn broadcast_posted(st: &SharedState, conv: Uuid, posted: &domain::Pos
 }
 
 /// mutation 回执：只回发起连接，与 client_msg_id 严格区分。
-fn op_ack(tx: &mpsc::UnboundedSender<ConnMsg>, client_op_id: Option<Uuid>) {
+fn op_ack(tx: &mpsc::Sender<ConnMsg>, client_op_id: Option<Uuid>) {
     if let Some(id) = client_op_id {
-        let _ = tx.send(ConnMsg::Frame(frame(&WsOut::OpAck { client_op_id: id })));
+        let _ = tx.try_send(ConnMsg::Frame(frame(&WsOut::OpAck { client_op_id: id })));
     }
 }
 
@@ -301,7 +318,7 @@ async fn on_text(
     conn_id: Uuid,
     session_version: i64,
     sid: Option<Uuid>,
-    tx: &mpsc::UnboundedSender<ConnMsg>,
+    tx: &mpsc::Sender<ConnMsg>,
     text: &str,
 ) -> bool {
     if !connection_valid(st, uid, conn_id, session_version, sid).await {
@@ -393,7 +410,7 @@ async fn on_text(
         Err(_) => (Err(ws_err("bad_frame", "unrecognized frame")), None, None),
     };
     if let Err((code, message)) = res {
-        let _ = tx.send(ConnMsg::Frame(frame(&WsOut::Error {
+        let _ = tx.try_send(ConnMsg::Frame(frame(&WsOut::Error {
             code,
             message,
             client_msg_id,
@@ -408,7 +425,7 @@ type WsResult = Result<(), (&'static str, String)>;
 async fn send_message(
     st: &SharedState,
     uid: Uuid,
-    tx: &mpsc::UnboundedSender<ConnMsg>,
+    tx: &mpsc::Sender<ConnMsg>,
     conv: Uuid,
     client_msg_id: Option<String>,
     content: &str,
@@ -436,7 +453,7 @@ async fn send_message(
 
     broadcast_posted(st, conv, &posted).await;
     // ack 只回发起连接：携带 client_msg_id 完成乐观替换
-    let _ = tx.send(ConnMsg::Frame(frame(&WsOut::MessageAck {
+    let _ = tx.try_send(ConnMsg::Frame(frame(&WsOut::MessageAck {
         client_msg_id,
         message: posted.message,
     })));
@@ -446,7 +463,7 @@ async fn send_message(
 async fn edit_message(
     st: &SharedState,
     uid: Uuid,
-    tx: &mpsc::UnboundedSender<ConnMsg>,
+    tx: &mpsc::Sender<ConnMsg>,
     message_id: Uuid,
     content: &str,
     expected_version: i32,
@@ -470,7 +487,7 @@ async fn edit_message(
 async fn delete_message(
     st: &SharedState,
     uid: Uuid,
-    tx: &mpsc::UnboundedSender<ConnMsg>,
+    tx: &mpsc::Sender<ConnMsg>,
     message_id: Uuid,
     client_op_id: Option<Uuid>,
 ) -> WsResult {
@@ -486,7 +503,7 @@ async fn delete_message(
 async fn reaction(
     st: &SharedState,
     uid: Uuid,
-    tx: &mpsc::UnboundedSender<ConnMsg>,
+    tx: &mpsc::Sender<ConnMsg>,
     message_id: Uuid,
     emoji: &str,
     add: bool,
@@ -564,7 +581,7 @@ const SYNC_PAGE: i64 = 500;
 async fn sync(
     st: &SharedState,
     uid: Uuid,
-    tx: &mpsc::UnboundedSender<ConnMsg>,
+    tx: &mpsc::Sender<ConnMsg>,
     conv: Uuid,
     last_seq: i64,
 ) -> WsResult {
@@ -581,7 +598,7 @@ async fn sync(
         })?;
     let has_more = messages.len() as i64 > SYNC_PAGE;
     messages.truncate(SYNC_PAGE as usize);
-    let _ = tx.send(ConnMsg::Frame(frame(&WsOut::SyncMessages {
+    let _ = tx.try_send(ConnMsg::Frame(frame(&WsOut::SyncMessages {
         conversation_id: conv,
         messages,
         has_more,
