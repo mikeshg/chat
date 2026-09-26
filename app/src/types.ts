@@ -389,6 +389,8 @@ export interface InvocationView {
   root_conversation_id?: string | null;
   /** 被调 Agent 的名字（嵌套展示用） */
   agent_name?: string | null;
+  /** 子调用成功时的回复前 2000 字。其余调用和非终态为空 */
+  result_preview?: string | null;
 }
 
 /** 会话偏好（用户维度；旧服务端无此字段 → 视为全默认） */

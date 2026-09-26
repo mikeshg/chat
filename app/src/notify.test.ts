@@ -87,6 +87,7 @@ function state(patch: Partial<AppState> = {}): AppState {
     agentHosts: [],
     invocations: {},
     agentRuns: {},
+    childInvocations: {},
     ...patch,
   };
 }

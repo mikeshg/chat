@@ -79,6 +79,7 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
         include_str!("../migrations/0027_agent_schedules.sql"),
         include_str!("../migrations/0028_agent_approvals.sql"),
         include_str!("../migrations/0029_agent_calls.sql"),
+        include_str!("../migrations/0030_invocation_root_index.sql"),
     ] {
         sqlx::raw_sql(script).execute(&pool).await.unwrap();
     }

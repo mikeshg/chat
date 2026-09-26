@@ -1085,3 +1085,41 @@ button.agent-host-name:hover { background: transparent; color: var(--link); }
   color: var(--link); font-size: 12px;
 }
 .inv-approval-jump:hover { text-decoration: underline; }
+
+/* ===== Agent A15 ===== */
+.nest-list { margin: 2px 0 6px 44px; min-width: 0; }
+.nest-card {
+  margin: 4px 0 4px 12px;
+  padding: 4px 8px;
+  border-left: 2px solid var(--line);
+  background: var(--panel);
+  border-radius: 8px;
+  min-width: 0;
+  max-width: 100%;
+}
+.nest-toggle {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0;
+  width: 100%;
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.nest-affix { color: var(--text); font-size: 13px; }
+.inv-status.nest-status { display: inline; padding: 0; gap: 0; font-size: 13px; }
+.nest-body { margin-top: 4px; min-width: 0; }
+.nest-body .agent-live { margin-left: 0; max-width: 100%; }
+.nest-result, .nest-reason {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 13px;
+  color: var(--text);
+}
+.nest-reason { color: var(--muted); }
+.nest-deeper { color: var(--muted); font-size: 12px; margin-top: 2px; }

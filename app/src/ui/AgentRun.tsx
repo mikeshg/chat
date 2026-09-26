@@ -8,8 +8,15 @@ import type { AgentStep, InvocationView } from "../types";
 /** 步骤项：持久化记录 ok:boolean，进行中步骤 ok:null */
 type AnyStep = Omit<AgentStep, "ok"> & { ok: boolean | null };
 
-/** 状态标签行：按 status 查表渲染图标与文字；带 current_step 时每秒刷新已用时长。 */
-export function InvocationStatusLine({ inv }: { inv: InvocationView }) {
+/** 状态标签行：按 status 查表渲染图标与文字；带 current_step 时每秒刷新已用时长。
+ *  textOnly：嵌套卡片标题只要文案（不要图标，也不要消息行的左缩进）。 */
+export function InvocationStatusLine({
+  inv,
+  textOnly = false,
+}: {
+  inv: InvocationView;
+  textOnly?: boolean;
+}) {
   const [, tick] = useReducer((n: number) => n + 1, 0);
   const ticking = inv.status === "running" && inv.current_step != null;
   useEffect(() => {
@@ -22,6 +29,9 @@ export function InvocationStatusLine({ inv }: { inv: InvocationView }) {
     : 0;
   const v = invocationStatusView(inv, elapsed);
   if (!v) return null;
+  if (textOnly) {
+    return <span className={`inv-status ${inv.status} nest-status`}>{v.text}</span>;
+  }
   return (
     <div className={`inv-status ${inv.status}`}>
       {v.icon} {v.text}
