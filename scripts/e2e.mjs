@@ -1,7 +1,7 @@
 // E2E 真实用户旅程测试 —— 直接打运行中的部署（默认 docker :8080）
 // 用法:
 //   E2E_ADMIN_USER=... E2E_ADMIN_PASS=... node scripts/e2e.mjs
-//   node scripts/e2e.mjs phase2     # phase2: 重启后持久化验证（读 .e2e-state.json）
+//   node scripts/e2e.mjs phase2     # phase2: 重启后持久化验证（读 .e2e-state.json，含 Agent）
 // 环境: BASE_URL=http://localhost:8080
 // 前提: 库里已有管理员。未提供 E2E_ADMIN_USER、且脚本注册的第一个用户成了管理员时退出 2。
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -37,9 +37,10 @@ async function api(token, method, path, body) {
 
 class Ws {
   constructor() { this.queue = []; this.waiters = []; }
-  async connect(token) {
+  async connect(token, opts = {}) {
     const { json } = await api(token, 'GET', '/ws/ticket');
-    this.ws = new WebSocket(`${WS_BASE}/ws?ticket=${json.ticket}`);
+    const role = opts.role ? `&role=${encodeURIComponent(opts.role)}` : '';
+    this.ws = new WebSocket(`${WS_BASE}/ws?ticket=${json.ticket}${role}`);
     this.ws.onmessage = (e) => {
       const m = JSON.parse(e.data);
       const i = this.waiters.findIndex((w) => w.pred(m));
@@ -49,7 +50,7 @@ class Ws {
     await new Promise((res, rej) => { this.ws.onopen = res; this.ws.onerror = rej; });
   }
   send(o) { this.ws.send(JSON.stringify(o)); }
-  close() { this.ws.close(); }
+  close() { try { this.ws?.close(); } catch { /* 已经关上 */ } }
   waitFor(pred, ms = 8000) {
     const i = this.queue.findIndex(pred);
     if (i >= 0) return Promise.resolve(this.queue.splice(i, 1)[0]);
@@ -441,7 +442,8 @@ E2E 停止（退出码 2）：未设置 E2E_ADMIN_USER，且当前库还没有�
   }
 
   const v2 = await runV2(A, C);
-  writeFileSync(STATE, JSON.stringify({ base: BASE, A, B, C, dmId: A.dmId, attachments, v2 }, null, 2));
+  const agent = await runAgent(A, B);
+  writeFileSync(STATE, JSON.stringify({ base: BASE, A, B, C, dmId: A.dmId, attachments, v2, agent }, null, 2));
   console.log(`state saved -> ${STATE}`);
 }
 
@@ -487,6 +489,36 @@ async function phase2() {
     const pins = await api(t, 'GET', `/conversations/${v.pinConvId}/pins`);
     const pinned = Array.isArray(pins.json) && pins.json.some((p) => p.message?.id === v.pinMessageId);
     ok('pin persisted', pins.status === 200 && pinned, `got ${pins.status} ${JSON.stringify(pins.json)?.slice(0, 160)}`);
+  }
+
+  console.log('== Agent 重启后持久化 ==');
+  const ag = s.agent || {};
+  {
+    const settings = await api(t, 'GET', '/users/me/agent-settings');
+    ok('agent settings persisted',
+      settings.status === 200
+        && settings.json?.output_mode === ag.outputMode
+        && settings.json?.max_call_depth === ag.maxCallDepth
+        && settings.json?.queue_timeout_secs === ag.queueTimeout,
+      `got ${settings.status} ${JSON.stringify(settings.json)}`);
+    const hosts = await api(t, 'GET', '/agent-hosts');
+    const host = (hosts.json || []).find((h) => h.id === ag.hostId);
+    ok('host record persisted',
+      hosts.status === 200 && !!host && host.label === ag.hostLabel && host.platform === ag.hostPlatform,
+      `got ${hosts.status} label=${host?.label} platform=${host?.platform}`);
+    const agents = await api(t, 'GET', '/agents');
+    const keep = (agents.json || []).find((a) => a.id === ag.keepId);
+    ok('agent persisted',
+      agents.status === 200 && keep?.name === ag.keepName && keep?.host_id === ag.hostId,
+      `got ${agents.status} name=${keep?.name} host=${keep?.host_id}`);
+    const deletedListed = (agents.json || []).some((a) => a.id === ag.deletedId);
+    ok('deleted agent stays out of the list', !!ag.deletedId && !deletedListed, `listed=${deletedListed}`);
+    const convs = await api(t, 'GET', '/conversations');
+    const conv = (convs.json || []).find((c) => c.id === ag.convId);
+    ok('deleted agent conversation persisted',
+      conv?.kind === 'agent' && conv?.agent?.deleted === true
+        && conv?.agent?.id === ag.deletedId && conv?.agent?.name === ag.deletedName,
+      `kind=${conv?.kind} deleted=${conv?.agent?.deleted} name=${conv?.agent?.name}`);
   }
 }
 
@@ -761,6 +793,288 @@ async function runV2(A, C) {
   }
 
   return v2;
+}
+
+// ---------- Agent（A18）----------
+// 只覆盖不需要真宿主进程的部分：伪造 WS role=host 完成登记。
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function runAgent(A, B) {
+  console.log('== Agent ==');
+  const saved = {
+    hostId: null,
+    hostLabel: 'e2e-host',
+    hostPlatform: 'e2e',
+    keepId: null,
+    keepName: 'e2ekeep',
+    deletedId: null,
+    deletedName: 'e2ebot',
+    convId: null,
+    outputMode: null,
+    maxCallDepth: null,
+    queueTimeout: null,
+  };
+  let adminToken = null;
+  let defaultAllowed = true;
+  if (!process.env.E2E_ADMIN_USER || !process.env.E2E_ADMIN_PASS) {
+    console.log('  (skip agent admin asserts: set E2E_ADMIN_USER/E2E_ADMIN_PASS)');
+  } else {
+    const la = await api(null, 'POST', '/auth/login', {
+      username: process.env.E2E_ADMIN_USER,
+      password: process.env.E2E_ADMIN_PASS,
+    });
+    ok('admin login for agent', la.status === 200 && la.json?.user?.role === 'admin', `got ${la.status}`);
+    if (la.status === 200) {
+      adminToken = la.json.access_token;
+      const cur = await api(adminToken, 'GET', '/admin/settings');
+      const enabled = cur.json?.agent_enabled;
+      ok('read agent_enabled', cur.status === 200 && typeof enabled === 'boolean', `got ${cur.status}`);
+      defaultAllowed = cur.json?.agent_default_allowed !== false;
+      if (cur.status === 200 && enabled === false) {
+        const on = await api(adminToken, 'PUT', '/admin/settings', { agent_enabled: true });
+        ok('turn agent_enabled on', on.status === 200 && on.json?.agent_enabled === true, `got ${on.status}`);
+      } else {
+        ok('agent_enabled is on', enabled === true, `got ${enabled}`);
+      }
+    }
+  }
+
+  // 管理员流程可能把 B 的旧 token 作废，这里重新登录。A 的 token 仍有效。
+  const relogB = await api(null, 'POST', '/auth/login', { username: B.username, password: B.password });
+  ok('B re-login for agent', relogB.status === 200 && !!relogB.json?.access_token, `got ${relogB.status}`);
+  const ta = A.access_token;
+  const tb = relogB.json?.access_token;
+  if (!ta || !tb) return saved;
+
+  const hosts0 = await api(ta, 'GET', '/agent-hosts');
+  ok('A has no agent hosts', hosts0.status === 200 && Array.isArray(hosts0.json) && hosts0.json.length === 0,
+    `got ${hosts0.status} n=${hosts0.json?.length}`);
+  const fake = await api(ta, 'POST', '/agents', {
+    name: 'e2ebot',
+    host_id: '00000000-0000-4000-8000-000000000099',
+    runtime: { command: 'e2e-agent', args: ['--never'] },
+  });
+  ok('unknown host id is 404', fake.status === 404, `got ${fake.status} ${fake.json?.error || ''}`);
+
+  const host = new Ws();
+  let hostId = null;
+  try {
+    await host.connect(ta, { role: 'host' });
+    host.send({
+      type: 'host_hello',
+      install_id: randomUUID(),
+      label: saved.hostLabel,
+      platform: saved.hostPlatform,
+    });
+    const ready = await host.waitType('host_ready');
+    hostId = ready.host_id;
+    ok('host handshake ready', typeof hostId === 'string' && hostId.length > 0);
+  } catch (e) {
+    ok('host handshake ready', false, String(e?.message || e));
+  }
+  saved.hostId = hostId;
+  if (hostId) {
+    const listed = await api(ta, 'GET', '/agent-hosts');
+    const row = (listed.json || []).find((h) => h.id === hostId);
+    ok('host listed online', listed.status === 200 && row?.online === true && row?.label === saved.hostLabel,
+      `got ${listed.status} online=${row?.online} label=${row?.label}`);
+  }
+
+  let agent = null;
+  if (hostId) {
+    const created = await api(ta, 'POST', '/agents', {
+      name: 'e2ebot',
+      host_id: hostId,
+      runtime: { command: 'e2e-agent', args: ['--never'] },
+      cwd: '',
+    });
+    ok('create e2ebot', created.status === 200 && created.json?.name === 'e2ebot' && !!created.json?.conversation_id,
+      `got ${created.status} ${created.json?.error || ''}`);
+    agent = created.status === 200 ? created.json : null;
+    const dup = await api(ta, 'POST', '/agents', {
+      name: 'e2ebot',
+      host_id: hostId,
+      runtime: { command: 'e2e-agent', args: ['--never'] },
+    });
+    ok('duplicate agent name 409', dup.status === 409 && dup.json?.error === 'name_taken',
+      `got ${dup.status} ${dup.json?.error || ''}`);
+    if (agent) {
+      const convs = await api(ta, 'GET', '/conversations');
+      const ac = (convs.json || []).find((c) => c.id === agent.conversation_id);
+      ok('agent conversation listed',
+        ac?.kind === 'agent' && ac?.agent?.id === agent.id && ac?.agent?.name === 'e2ebot',
+        `kind=${ac?.kind} name=${ac?.agent?.name}`);
+      const patched = await api(ta, 'PATCH', `/agents/${agent.id}`, {
+        name: 'e2ebot2',
+        output_mode: 'status',
+        queue_timeout_secs: 120,
+      });
+      ok('patch name and overrides',
+        patched.status === 200 && patched.json?.name === 'e2ebot2'
+          && patched.json?.output_mode === 'status' && patched.json?.queue_timeout_secs === 120,
+        `got ${patched.status} ${JSON.stringify(patched.json)?.slice(0, 180)}`);
+      const again = await api(ta, 'GET', '/agents');
+      const seen = (again.json || []).find((a) => a.id === agent.id);
+      ok('patch visible in agent list',
+        seen?.name === 'e2ebot2' && seen?.output_mode === 'status' && seen?.queue_timeout_secs === 120,
+        `name=${seen?.name} mode=${seen?.output_mode} timeout=${seen?.queue_timeout_secs}`);
+      const back = await api(ta, 'PATCH', `/agents/${agent.id}`, { name: 'e2ebot' });
+      ok('rename back to e2ebot', back.status === 200 && back.json?.name === 'e2ebot',
+        `got ${back.status} ${back.json?.error || back.json?.name || ''}`);
+      if (back.status === 200) agent = back.json;
+      saved.deletedId = agent.id;
+      saved.convId = agent.conversation_id;
+    }
+  }
+
+  const req = await api(ta, 'POST', '/friends/requests', { username: B.username, message: 'agent' });
+  let friends = req.status === 409 && req.json?.error === 'already friends';
+  if (friends) {
+    ok('A and B are friends again', true);
+  } else {
+    ok('re-friend A->B', req.status === 200 || req.status === 201, `got ${req.status} ${req.json?.error || ''}`);
+    const incoming = await api(tb, 'GET', '/friends/requests');
+    const hit = (incoming.json?.incoming || []).find((x) => x.user?.username === A.username);
+    const acc = await api(tb, 'POST', `/friends/requests/${hit?.id}/accept`);
+    ok('B accepts A again', (acc.status === 200 || acc.status === 204) && !!hit, `got ${acc.status}`);
+    friends = acc.status === 200 || acc.status === 204;
+  }
+  let gid = null;
+  if (friends) {
+    const g = await api(ta, 'POST', '/conversations/group', {
+      name: `agent群${rid}`, member_ids: [B.user.id],
+    });
+    ok('A and B share a group', (g.status === 200 || g.status === 201) && !!g.json?.id,
+      `got ${g.status} ${g.json?.error || ''}`);
+    gid = g.json?.id || null;
+  } else {
+    ok('A and B share a group', false, 'not friends');
+  }
+
+  if (gid && agent?.id && hostId) {
+    const wa = new Ws();
+    const wb = new Ws();
+    try {
+      await wa.connect(ta);
+      await wb.connect(tb);
+      await wa.waitType('presence_init');
+      await wb.waitType('presence_init');
+      const before = await api(ta, 'GET', `/conversations/${gid}/agent-invocations`);
+      const n0 = Array.isArray(before.json) ? before.json.length : -1;
+      wb.send({ type: 'send_message', conversation_id: gid, client_msg_id: 'b-at', content: '@e2ebot hi' });
+      await wb.waitType('message_ack', (m) => m.client_msg_id === 'b-at');
+      const afterB = await api(ta, 'GET', `/conversations/${gid}/agent-invocations`);
+      const n1 = Array.isArray(afterB.json) ? afterB.json.length : -1;
+      ok('non-owner mention does not invoke', afterB.status === 200 && n1 === n0 && n0 >= 0,
+        `before=${n0} after=${n1} status=${afterB.status}`);
+      wa.send({ type: 'send_message', conversation_id: gid, client_msg_id: 'a-at', content: '@e2ebot hi' });
+      await wa.waitType('message_ack', (m) => m.client_msg_id === 'a-at');
+      const afterA = await api(ta, 'GET', `/conversations/${gid}/agent-invocations`);
+      const mine = (afterA.json || []).filter((i) => i.agent_id === agent.id);
+      ok('owner mention creates an invocation', afterA.status === 200 && mine.length === n0 + 1,
+        `got ${afterA.status} n=${mine.length} want=${n0 + 1}`);
+      const inv = mine[0];
+      ok('invocation running while host online', inv?.status === 'running', `status=${inv?.status} error=${inv?.error}`);
+      host.close();
+      let failed = null;
+      const deadline = Date.now() + 10000;
+      while (Date.now() < deadline) {
+        const r = await api(ta, 'GET', `/conversations/${gid}/agent-invocations`);
+        failed = (r.json || []).find((i) => i.id === inv?.id) || null;
+        if (failed?.status === 'failed') break;
+        await sleep(200);
+      }
+      ok('host disconnect fails the invocation',
+        failed?.status === 'failed' && failed?.error === 'host_disconnected',
+        `status=${failed?.status} error=${failed?.error}`);
+    } catch (e) {
+      ok('agent mention flow', false, String(e?.message || e));
+    } finally {
+      wa.close();
+      wb.close();
+      host.close();
+    }
+  } else {
+    host.close();
+  }
+
+  const put = await api(ta, 'PUT', '/users/me/agent-settings', { output_mode: 'steps', max_call_depth: 4 });
+  ok('put agent settings', put.status === 200 && put.json?.output_mode === 'steps' && put.json?.max_call_depth === 4,
+    `got ${put.status} ${put.json?.error || ''}`);
+  const got = await api(ta, 'GET', '/users/me/agent-settings');
+  ok('read back agent settings',
+    got.status === 200 && got.json?.output_mode === put.json?.output_mode
+      && got.json?.max_call_depth === put.json?.max_call_depth
+      && got.json?.queue_timeout_secs === put.json?.queue_timeout_secs,
+    `got ${got.status} ${JSON.stringify(got.json)}`);
+  if (got.status === 200) {
+    saved.outputMode = got.json.output_mode;
+    saved.maxCallDepth = got.json.max_call_depth;
+    saved.queueTimeout = got.json.queue_timeout_secs;
+  }
+
+  if (adminToken && B.user?.id) {
+    const deny = await api(adminToken, 'PUT', `/admin/users/${B.user.id}/agent-access`, { allowed: false });
+    ok('admin forbids B', deny.status === 204, `got ${deny.status} ${deny.json?.error || ''}`);
+    const bagents = await api(tb, 'GET', '/agents');
+    ok('B list agents 403', bagents.status === 403 && bagents.json?.error === 'agent_access_denied',
+      `got ${bagents.status} ${bagents.json?.error || ''}`);
+    const me = await api(tb, 'GET', '/users/me');
+    ok('B agent_access false', me.status === 200 && me.json?.agent_access === false,
+      `got ${me.status} access=${me.json?.agent_access}`);
+    const restore = await api(adminToken, 'PUT', `/admin/users/${B.user.id}/agent-access`, { allowed: null });
+    ok('restore B to default', restore.status === 204, `got ${restore.status} ${restore.json?.error || ''}`);
+    const ul = await api(adminToken, 'GET', `/admin/users?q=${encodeURIComponent(B.username)}`);
+    const row = (ul.json || []).find((u) => u.id === B.user.id);
+    ok('B override cleared', ul.status === 200 && row?.agent_access === null, `access=${row?.agent_access}`);
+    const me2 = await api(tb, 'GET', '/users/me');
+    ok('B agent_access follows default', me2.status === 200 && me2.json?.agent_access === defaultAllowed,
+      `got ${me2.json?.agent_access} want=${defaultAllowed}`);
+  }
+
+  if (hostId) {
+    const keep = await api(ta, 'POST', '/agents', {
+      name: saved.keepName,
+      host_id: hostId,
+      runtime: { command: 'e2e-agent', args: ['--keep'] },
+    });
+    ok('keep agent created', keep.status === 200 && keep.json?.name === saved.keepName,
+      `got ${keep.status} ${keep.json?.error || ''}`);
+    saved.keepId = keep.json?.id || null;
+  }
+  if (agent?.id) {
+    const del = await api(ta, 'DELETE', `/agents/${agent.id}`);
+    ok('delete e2ebot', del.status === 204, `got ${del.status} ${del.json?.error || ''}`);
+    const left = await api(ta, 'GET', '/agents');
+    const still = (left.json || []).some((a) => a.id === agent.id);
+    const kept = (left.json || []).some((a) => a.id === saved.keepId);
+    ok('deleted agent not listed', left.status === 200 && !still && (!saved.keepId || kept),
+      `status=${left.status} still=${still} kept=${kept}`);
+    const convs = await api(ta, 'GET', '/conversations');
+    const ac = (convs.json || []).find((c) => c.id === agent.conversation_id);
+    ok('deleted agent conversation remains',
+      ac?.kind === 'agent' && ac?.agent?.deleted === true && ac?.agent?.name === 'e2ebot',
+      `kind=${ac?.kind} deleted=${ac?.agent?.deleted} name=${ac?.agent?.name}`);
+    const w = new Ws();
+    try {
+      await w.connect(ta);
+      await w.waitType('presence_init');
+      w.send({
+        type: 'send_message', conversation_id: agent.conversation_id, client_msg_id: 'ro', content: 'still?',
+      });
+      const e = await w.waitType('error', (m) => m.client_msg_id === 'ro' || m.code === 'agent_deleted', 5000);
+      ok('send in deleted agent conversation rejected', e.code === 'agent_deleted', JSON.stringify(e));
+    } catch (err) {
+      ok('send in deleted agent conversation rejected', false, String(err?.message || err));
+    } finally {
+      w.close();
+    }
+  }
+  host.close();
+  return saved;
 }
 
 (PHASE === 'phase2' ? phase2() : phase1())
