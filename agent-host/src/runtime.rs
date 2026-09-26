@@ -29,6 +29,15 @@ pub struct AgentSpec {
     pub model: String,
     pub mode: String,
     pub extra_dirs: Vec<String>,
+    /// 登记表形状。调用前由宿主解析成 command / args；自定义命令时为 None。
+    pub registry: Option<RegistryPin>,
+}
+
+/// agents.runtime 里的 `{ "registry": { "id", "version" } }`。
+#[derive(Debug, Clone)]
+pub struct RegistryPin {
+    pub id: String,
+    pub version: String,
 }
 
 fn json_string_list(v: &Value, key: &str) -> Vec<String> {
@@ -53,19 +62,41 @@ fn json_env(v: &Value) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+fn registry_pin(v: &Value) -> Option<RegistryPin> {
+    let r = v.pointer("/runtime/registry")?;
+    let id = r.get("id")?.as_str()?.trim();
+    let version = r.get("version")?.as_str()?.trim();
+    if id.is_empty() || version.is_empty() {
+        return None;
+    }
+    Some(RegistryPin {
+        id: id.to_string(),
+        version: version.to_string(),
+    })
+}
+
 impl AgentSpec {
     /// 缺省字段视为空：旧服务端的快照不含配置项时照常跑。
+    /// 登记表形状没有 command，由宿主在调用时再解析。
     pub fn from_json(v: &Value) -> Option<Self> {
+        let registry = registry_pin(v);
+        let (command, args) = if registry.is_some() {
+            (String::new(), Vec::new())
+        } else {
+            (
+                v.pointer("/runtime/command")?.as_str()?.to_string(),
+                v.pointer("/runtime/args")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|a| a.as_str().map(str::to_string))
+                    .collect(),
+            )
+        };
         Some(Self {
             id: Uuid::parse_str(v.get("id")?.as_str()?).ok()?,
             name: v.get("name")?.as_str()?.to_string(),
-            command: v.pointer("/runtime/command")?.as_str()?.to_string(),
-            args: v
-                .pointer("/runtime/args")?
-                .as_array()?
-                .iter()
-                .filter_map(|a| a.as_str().map(str::to_string))
-                .collect(),
+            command,
+            args,
             cwd: v
                 .get("cwd")
                 .and_then(Value::as_str)
@@ -88,6 +119,7 @@ impl AgentSpec {
                 .unwrap_or_default()
                 .to_string(),
             extra_dirs: json_string_list(v, "extra_dirs"),
+            registry,
         })
     }
 }
@@ -180,6 +212,8 @@ pub enum RunEvent {
 pub struct RunOutput {
     /// 完整回复正文（= 全部 Text 事件拼接）
     pub text: String,
+    /// 本次拒绝了几次 session/request_permission（本票一律拒绝，A12 才审批）
+    pub permissions_rejected: u32,
     /// 本次实际使用的运行时会话 id（新开或恢复成功）
     pub session_id: Option<String>,
     /// session/new 带了 modes.availableModes 时为 Some（可以是空列表）

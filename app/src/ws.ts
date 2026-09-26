@@ -453,6 +453,9 @@ function dispatch(f: WsOut) {
       // Agent A03：stream 模式增量帧 → 临时渲染状态（不落库）
       setState((cur) => applyAgentStream(cur, f));
       break;
+    case "registry_install_progress":
+      window.dispatchEvent(new CustomEvent("chat:registry-progress", { detail: f }));
+      break;
     case "force_logout": {
       // 被踢下线（禁用/重置密码/改密/移出设备）：记录原因 → 停连接 → 回登录页
       sessionStorage.setItem("chat_kick_reason", kickReasonText(f.reason));

@@ -157,6 +157,11 @@ async fn main() {
             label,
             platform: platform.into(),
             mcp_bridge,
+            registry_url: get("--registry-url")
+                .unwrap_or_else(|| agent_host::DEFAULT_REGISTRY_URL.into()),
+            data_dir: get("--data-dir")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(agent_host::default_data_dir),
         },
         ticket_source(creds),
     );

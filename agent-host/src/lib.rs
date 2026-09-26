@@ -5,9 +5,11 @@
 // 不支持 GUI：纯库 + CLI 示例；Tauri 壳在 app/src-tauri 侧桥接。
 
 pub mod acp;
+pub mod command;
 mod conn;
 pub mod mcp;
 pub mod mcp_bridge;
+pub mod registry;
 pub mod runtime;
 
 use std::collections::HashMap;
@@ -32,6 +34,19 @@ pub struct HostConfig {
     /// Agent 不支持 http MCP 时用；None = 无桥接兜底（此时不声明 http 能力的
     /// Agent 拿不到注入工具）。
     pub mcp_bridge: Option<(String, Vec<String>)>,
+    /// ACP 登记表索引。测试指向本地假登记表。
+    pub registry_url: String,
+    /// 登记表缓存和安装目录。空 cwd 的 Agent 也用这里当工作目录。
+    pub data_dir: std::path::PathBuf,
+}
+
+/// 官方登记表索引。
+pub const DEFAULT_REGISTRY_URL: &str =
+    "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json";
+
+/// 还没指定数据目录时的默认位置（A09 再换成持久目录）。
+pub fn default_data_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("chat-agent-host")
 }
 
 /// 每条宿主连接建立前取一次一次性 WS 票（内部实现用账号登录态换
@@ -123,8 +138,9 @@ impl HostHandle {
 /// 循环收 invocation_start；断线指数退避重连（封顶 30s）。
 pub fn spawn(cfg: HostConfig, tickets: Arc<dyn TicketSource>) -> HostHandle {
     let (host_id_tx, host_id_rx) = watch::channel::<Option<Uuid>>(None);
+    let data_dir = cfg.data_dir.clone();
     let shared = Arc::new(Shared {
-        data_dir: std::env::temp_dir().join("chat-agent-host"),
+        data_dir,
         cfg,
         tickets,
         host_id: host_id_tx,

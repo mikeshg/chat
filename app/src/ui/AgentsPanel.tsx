@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
 import { agents, ApiError, convs } from "../api";
 import { setState, useApp } from "../store";
-import type { AgentHostView, AgentView } from "../types";
+import type { AgentHostView, AgentView, RegistryEntry } from "../types";
 import { openConversation } from "../ws";
 import { groupAgentsByHost, hostDisplayName } from "./agentHosts";
 import AgentAvatar from "./AgentAvatar";
 import AgentEditor from "./AgentEditor";
 import AgentSettings from "./AgentSettings";
+import RegistryPicker from "./RegistryPicker";
 
 /** Agent A01：「我」页的 Agent 管理面板（宿主列表 / Agent 列表 / 添加 Agent） */
 export default function AgentsPanel({ onClose }: { onClose: () => void }) {
@@ -18,6 +19,8 @@ export default function AgentsPanel({ onClose }: { onClose: () => void }) {
   const [command, setCommand] = useState("");
   const [args, setArgs] = useState("");
   const [cwd, setCwd] = useState("");
+  const [runtimeTab, setRuntimeTab] = useState<"registry" | "custom">("registry");
+  const [picked, setPicked] = useState<RegistryEntry | null>(null);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
   const [showForm, setShowForm] = useState(false);
@@ -114,16 +117,20 @@ export default function AgentsPanel({ onClose }: { onClose: () => void }) {
     setErr("");
     setBusy(true);
     try {
+      const runtime =
+        runtimeTab === "registry" && picked
+          ? { registry: { id: picked.id, version: picked.version } }
+          : {
+              command: command.trim(),
+              args: args
+                .split("\n")
+                .map((x) => x.trim())
+                .filter(Boolean),
+            };
       const a = await agents.create({
         name: name.trim(),
         host_id: hostId,
-        runtime: {
-          command: command.trim(),
-          args: args
-            .split("\n")
-            .map((x) => x.trim())
-            .filter(Boolean),
-        },
+        runtime,
         cwd: cwd.trim(),
       });
       setList((l) => [...l, a]);
@@ -131,6 +138,7 @@ export default function AgentsPanel({ onClose }: { onClose: () => void }) {
       setCommand("");
       setArgs("");
       setCwd("");
+      setPicked(null);
       setShowForm(false);
     } catch (e) {
       // 400 bad_name / 409 name_taken / 404 宿主不存在 —— 保留服务端文案
@@ -253,7 +261,14 @@ export default function AgentsPanel({ onClose }: { onClose: () => void }) {
               value={name}
               onChange={(e) => setName(e.target.value)}
             />
-            <select value={hostId} onChange={(e) => setHostId(e.target.value)}>
+            <select
+              aria-label="宿主"
+              value={hostId}
+              onChange={(e) => {
+                setHostId(e.target.value);
+                setPicked(null);
+              }}
+            >
               {hosts.map((h) => (
                 <option key={h.id} value={h.id}>
                   {hostLabel(h.id)}
@@ -261,18 +276,45 @@ export default function AgentsPanel({ onClose }: { onClose: () => void }) {
                 </option>
               ))}
             </select>
+            <div className="agent-tabs" role="tablist" aria-label="运行时">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={runtimeTab === "registry"}
+                onClick={() => setRuntimeTab("registry")}
+              >
+                从登记表选择
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={runtimeTab === "custom"}
+                onClick={() => setRuntimeTab("custom")}
+              >
+                自定义命令
+              </button>
+            </div>
+            {runtimeTab === "registry" ? (
+              <RegistryPicker hostId={hostId} selectedId={picked?.id ?? ""} onSelect={setPicked} />
+            ) : (
+              <>
+                <input
+                  aria-label="启动命令"
+                  placeholder="启动命令（如 node / claude-code / codex）"
+                  value={command}
+                  onChange={(e) => setCommand(e.target.value)}
+                />
+                <textarea
+                  aria-label="命令参数"
+                  placeholder="参数（每行一个，可留空）"
+                  value={args}
+                  onChange={(e) => setArgs(e.target.value)}
+                  rows={3}
+                />
+              </>
+            )}
             <input
-              placeholder="启动命令（如 node / claude-code / codex）"
-              value={command}
-              onChange={(e) => setCommand(e.target.value)}
-            />
-            <textarea
-              placeholder="参数（每行一个，可留空）"
-              value={args}
-              onChange={(e) => setArgs(e.target.value)}
-              rows={3}
-            />
-            <input
+              aria-label="工作目录"
               placeholder="工作目录（宿主机上的绝对路径，可留空）"
               value={cwd}
               onChange={(e) => setCwd(e.target.value)}
@@ -282,7 +324,12 @@ export default function AgentsPanel({ onClose }: { onClose: () => void }) {
               <button onClick={() => setShowForm(false)}>取消</button>
               <button
                 className="primary"
-                disabled={busy || !name.trim() || !hostId || !command.trim()}
+                disabled={
+                  busy ||
+                  !name.trim() ||
+                  !hostId ||
+                  (runtimeTab === "custom" ? !command.trim() : picked?.status !== "ready")
+                }
                 onClick={create}
               >
                 {busy ? "创建中…" : "创建"}

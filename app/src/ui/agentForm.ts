@@ -20,6 +20,8 @@ export interface AgentFormInput {
   envRows: EnvRow[];
   outputMode: string;
   queueTimeout: string;
+  /** 有它就按登记表形状提交，不再带自定义命令 */
+  registry?: { id: string; version: string };
 }
 
 function lines(text: string): string[] {
@@ -39,7 +41,9 @@ export function shapeAgentPatch(input: AgentFormInput): PatchAgentReq {
   }
   return {
     name: input.name.trim(),
-    runtime: { command: input.command.trim(), args: lines(input.argsText) },
+    runtime: input.registry
+      ? { registry: { id: input.registry.id, version: input.registry.version } }
+      : { command: input.command.trim(), args: lines(input.argsText) },
     cwd: input.cwd.trim(),
     extra_dirs: lines(input.extraDirsText),
     model: input.model,

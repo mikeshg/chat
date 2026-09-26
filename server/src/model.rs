@@ -582,7 +582,7 @@ pub struct AgentView {
     pub name: String,
     pub host_id: Uuid,
     pub host_online: bool,
-    /// 运行时描述快照；A01 形状 {"command": "...", "args": ["..."]}
+    /// 运行时：{"command","args"} 或 {"registry":{"id","version"}}
     pub runtime: serde_json::Value,
     /// 宿主机工作目录；空串 = 宿主决定
     pub cwd: String,
@@ -673,11 +673,26 @@ pub struct CreateAgentReq {
     pub cwd: String,
 }
 
+/// 两种运行时：自定义命令，或登记表条目（只校验字段，不联网）。
 #[derive(Debug, Deserialize)]
-pub struct AgentRuntimeReq {
-    pub command: String,
+#[serde(untagged)]
+pub enum AgentRuntimeReq {
+    Registry {
+        registry: RegistryPin,
+    },
+    Command {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RegistryPin {
     #[serde(default)]
-    pub args: Vec<String>,
+    pub id: String,
+    #[serde(default)]
+    pub version: String,
 }
 
 /// agent_invocations 行的视图（WS agent_invocation 帧与历史 GET 共用形状）

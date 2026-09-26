@@ -26,6 +26,7 @@ fn fake() -> AgentSpec {
         model: String::new(),
         mode: String::new(),
         extra_dirs: Vec::new(),
+        registry: None,
     }
 }
 

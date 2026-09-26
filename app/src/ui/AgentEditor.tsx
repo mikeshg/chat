@@ -3,6 +3,7 @@ import { agents, ApiError } from "../api";
 import { cropAvatarFile } from "../avatar";
 import type { AgentView, ReportedOptions } from "../types";
 import { shapeAgentPatch } from "./agentForm";
+import { runtimeLabel } from "./registryEntry";
 import AgentAvatar from "./AgentAvatar";
 import AgentSchedules from "./AgentSchedules";
 import { OUTPUT_MODE_OPTIONS, QUEUE_TIMEOUT_OPTIONS } from "./AgentSettings";
@@ -67,6 +68,23 @@ export default function AgentEditor({
   const [probing, setProbing] = useState(false);
   const [confirmDel, setConfirmDel] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
+  const pin = agent.runtime?.registry;
+  const [registryName, setRegistryName] = useState(pin?.id ?? "");
+
+  useEffect(() => {
+    if (!pin) return;
+    let alive = true;
+    agents
+      .registry(agent.host_id)
+      .then((res) => {
+        const hit = (res.entries ?? []).find((e) => e.id === pin.id);
+        if (alive && hit?.name) setRegistryName(hit.name);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [agent.host_id, pin?.id, pin?.version]);
 
   const reportedKey = JSON.stringify(agent.reported_options ?? {});
   useEffect(() => {
@@ -99,6 +117,7 @@ export default function AgentEditor({
           envRows,
           outputMode,
           queueTimeout,
+          registry: pin,
         }),
       );
       onSaved(updated);
@@ -183,19 +202,28 @@ export default function AgentEditor({
         <span className="muted">宿主（不可改）</span>
         <input value={hostLabel} readOnly />
       </label>
-      <input
-        aria-label="启动命令"
-        placeholder="启动命令"
-        value={command}
-        onChange={(e) => setCommand(e.target.value)}
-      />
-      <textarea
-        aria-label="命令参数"
-        placeholder="参数（每行一个）"
-        value={argsText}
-        onChange={(e) => setArgsText(e.target.value)}
-        rows={3}
-      />
+      {pin ? (
+        <label className="agent-field">
+          <span className="muted">运行时</span>
+          <input aria-label="运行时" readOnly value={runtimeLabel(agent.runtime, registryName)} />
+        </label>
+      ) : (
+        <>
+          <input
+            aria-label="启动命令"
+            placeholder="启动命令"
+            value={command}
+            onChange={(e) => setCommand(e.target.value)}
+          />
+          <textarea
+            aria-label="命令参数"
+            placeholder="参数（每行一个）"
+            value={argsText}
+            onChange={(e) => setArgsText(e.target.value)}
+            rows={3}
+          />
+        </>
+      )}
       <input
         aria-label="工作目录"
         placeholder="工作目录（可留空）"
@@ -317,7 +345,12 @@ export default function AgentEditor({
         <button type="button" onClick={onClose} disabled={busy}>
           取消
         </button>
-        <button type="button" className="primary" disabled={busy || !name.trim() || !command.trim()} onClick={() => void save()}>
+        <button
+          type="button"
+          className="primary"
+          disabled={busy || !name.trim() || (!pin && !command.trim())}
+          onClick={() => void save()}
+        >
           {busy ? "保存中…" : "保存"}
         </button>
       </div>
