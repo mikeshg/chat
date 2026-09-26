@@ -640,6 +640,8 @@ pub struct InvocationView {
     pub trigger_message_id: Uuid,
     pub status: String,
     pub error: Option<String>,
+    /// Agent A05：这次调用带走的主人附件 id（派发时定下的清单；空数组 = 没带附件）
+    pub attachment_ids: Vec<Uuid>,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,

@@ -180,7 +180,7 @@ async fn fail_running(st: &SharedState, host_id: Uuid) {
             AND status IN ('running', 'awaiting_approval')
             AND agent_id IN (SELECT id FROM agents WHERE host_id = $1)
          RETURNING id, agent_id, conversation_id, trigger_message_id, status, error,
-                   created_at, started_at, finished_at",
+                   attachment_ids, created_at, started_at, finished_at",
     )
     .bind(host_id)
     .fetch_all(&st.pool)

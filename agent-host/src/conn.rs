@@ -169,7 +169,7 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
     let spec = match AgentSpec::from_json(&v["agent"]) {
         Some(x) => x,
         None => {
-            send_finish(out, inv_id, Err("agent 描述非法".into()));
+            send_finish(out, inv_id, Err("agent 描述非法".into()), Vec::new(), 0);
             return;
         }
     };
@@ -187,7 +187,7 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
     // Agent A13：有 tools_token 且本地 MCP 服务在跑 → 登记一条调用级映射。
     // McpHandle 随调用任务存活：成功/失败/取消/abort 都会 drop → 摘映射（404）。
     let tools_token = v["tools_token"].as_str().map(str::to_string);
-    let (mcp_servers, mcp_handle) = match (s.mcp.as_ref(), tools_token) {
+    let (mcp_servers, mcp_handle) = match (s.mcp.as_ref(), tools_token.clone()) {
         (Some(mcp), Some(token)) => {
             let h = mcp.register(http_base(&s.cfg.server_url), token);
             (
@@ -205,6 +205,10 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
         }
         _ => (Vec::new(), None),
     };
+    // Agent A05：附件清单与工作目录（<data_dir>/inv-<id>/{in,out}）
+    let att_metas = crate::files::parse_attachments(&v["attachments"]);
+    let http_base = http_base(&s.cfg.server_url);
+    let http = s.http.clone();
     let out2 = out.clone();
     let running = s.running.clone();
     let cancels = s.cancels.clone();
@@ -213,6 +217,8 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
     let task = tokio::spawn(async move {
         // 映射的生命周期钉在这次调用上：任务结束/被 abort 时 drop
         let _mcp_handle = mcp_handle;
+        // A05：工作目录随任务存活，结束时整树删除（inv-<id>/）
+        let (_wd, in_dir, out_dir) = crate::files::WorkDir::create(&dir, inv_id);
         let rt = runtime::runtime_for(&spec);
         // 事件暂不外发（接收端即刻丢弃）；流式输出票把它接到服务端
         let (events, _) = tokio::sync::mpsc::unbounded_channel();
@@ -220,14 +226,26 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
         req.resume_session = resume_session;
         req.cancel = cancel_rx;
         req.mcp_servers = mcp_servers;
+        // A05：先下载输入附件再起 agent；下载失败的条目跳过
+        req.attachments =
+            crate::files::download_inputs(&http, &http_base, &in_dir, &att_metas).await;
+        req.outbox = Some(out_dir.clone());
         let r = rt.run(req, events).await;
         // 取消过的调用不回 invocation_finish（服务端已标 cancelled，再回也会被忽略）
         if !*cancel_flag.borrow() {
+            // A05：凭据只在调用进行中有效——先传产出文件再回 finish
+            let (files, files_skipped) = match &r {
+                Ok(_) => {
+                    crate::files::upload_outbox(&http, &http_base, &out_dir, tools_token.as_deref())
+                        .await
+                }
+                Err(_) => (Vec::new(), 0),
+            };
             if let Ok(out) = &r {
                 // 正常调用结束后也上报一次可选项（session/new 里有才发）
                 send_options(&out2, agent_id, out, false);
             }
-            send_finish(&out2, inv_id, r);
+            send_finish(&out2, inv_id, r, files, files_skipped);
         }
         running.lock().unwrap().remove(&inv_id);
         cancels.lock().unwrap().remove(&inv_id);
@@ -279,10 +297,19 @@ fn options_json(list: Option<&[AgentOption]>) -> Vec<Value> {
         .collect()
 }
 
-fn send_finish(out: &Out, id: Uuid, r: Result<RunOutput, String>) {
+/// A05：files 是本次调用上传到服务端的产出附件 id（按上传顺序），
+/// files_skipped 是因配额被拒的数量（服务端追加提示到正文）。
+fn send_finish(
+    out: &Out,
+    id: Uuid,
+    r: Result<RunOutput, String>,
+    files: Vec<String>,
+    files_skipped: usize,
+) {
     let v = match r {
         Ok(o) => json!({"type":"invocation_finish","invocation_id":id,"ok":true,
-            "text": o.text, "session_id": o.session_id}),
+            "text": o.text, "session_id": o.session_id,
+            "files": files, "files_skipped": files_skipped}),
         // error 截断 500 字符，避免超长 stderr 刷屏。失败不带 session_id，服务端不更新上下文。
         Err(e) => json!({"type":"invocation_finish","invocation_id":id,"ok":false,
             "error":e.chars().take(500).collect::<String>()}),

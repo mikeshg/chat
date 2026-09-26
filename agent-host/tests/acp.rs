@@ -1,7 +1,7 @@
 // ACP 客户端测试：跑 tests/fake-acp-agent.mjs（node）。
 
 use agent_host::acp::run_invocation;
-use agent_host::runtime::{AgentSpec, RunEvent, RunOutput, RunRequest};
+use agent_host::runtime::{AgentSpec, LocalFile, RunEvent, RunOutput, RunRequest};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -265,4 +265,117 @@ async fn acp_ignore_cancel_kills_after_grace() {
         Ok(o) => assert_ne!(o.text, "done"),
         Err(_) => {}
     }
+}
+
+// ===== Agent A05 =====
+// 附件进提示块：image/* 且 agent 声明 promptCapabilities.image → image 块（base64）；
+// 其余一律 resource_link（file:// uri + name + mime + size）。
+// outbox → CHAT_AGENT_OUTBOX 环境变量，假 agent 用 makefile/makebig 写产出文件。
+
+fn tmp_file(name: &str, bytes: &[u8]) -> (PathBuf, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("a05-acp-{}", Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fp = dir.join(name);
+    std::fs::write(&fp, bytes).unwrap();
+    (dir, fp)
+}
+
+fn attach(path: PathBuf, name: &str, mime: &str) -> LocalFile {
+    LocalFile {
+        path,
+        name: name.into(),
+        mime: mime.into(),
+    }
+}
+
+/// 图片 + 有 image 能力 → image 块；假 agent 回报解码后的字节数
+#[tokio::test]
+async fn a05_image_attachment_becomes_image_block() {
+    let (dir, fp) = tmp_file("pic.png", &[0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
+    let mut r = req("inspect");
+    r.attachments = vec![attach(fp, "pic.png", "image/png")];
+    let (events, _) = mpsc::unbounded_channel();
+    let out = run_invocation(r, events).await.expect("inspect 应成功");
+    assert!(out.text.contains("image:image/png:7"), "{}", out.text);
+    assert!(!out.text.contains("link:"), "{}", out.text);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 非图片恒为 resource_link；--no-image 时图片也走 link
+#[tokio::test]
+async fn a05_resource_link_blocks() {
+    // 非图片（能力开着也走 link）
+    let (dir, fp) = tmp_file("note.txt", b"hi");
+    let mut r = req("inspect");
+    r.attachments = vec![attach(fp, "note.txt", "text/plain")];
+    let (events, _) = mpsc::unbounded_channel();
+    let out = run_invocation(r, events).await.expect("inspect 应成功");
+    assert!(out.text.contains("link:note.txt:true"), "{}", out.text);
+    assert!(!out.text.contains("image:"), "{}", out.text);
+
+    // --no-image + 图片 → link
+    let (d2, fp2) = tmp_file("p.png", &[1, 2, 3]);
+    let mut spec = fake();
+    spec.args.push("--no-image".into());
+    let mut r = runtime_req(spec, "inspect");
+    r.attachments = vec![attach(fp2, "p.png", "image/png")];
+    let (events, _) = mpsc::unbounded_channel();
+    let out = run_invocation(r, events).await.expect("inspect 应成功");
+    assert!(out.text.contains("link:p.png:true"), "{}", out.text);
+    assert!(!out.text.contains("image:"), "{}", out.text);
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&d2).ok();
+}
+
+/// 附件块在指令文本块之前：inspect 遍历 prompt 块顺序即附件顺序
+#[tokio::test]
+async fn a05_attachments_before_text_in_order() {
+    let (dir, f1) = tmp_file("z.txt", b"z");
+    let (_d2, f2) = tmp_file("a.png", &[9]);
+    let mut r = req("inspect");
+    r.attachments = vec![
+        attach(f1, "z.txt", "text/plain"),
+        attach(f2, "a.png", "image/png"),
+    ];
+    let (events, _) = mpsc::unbounded_channel();
+    let out = run_invocation(r, events).await.expect("inspect 应成功");
+    let zi = out.text.find("link:z.txt:true").unwrap();
+    let ai = out.text.find("image:image/png:1").unwrap();
+    assert!(zi < ai, "附件块应保持 attachments 顺序: {}", out.text);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// outbox 目录经 CHAT_AGENT_OUTBOX 传到子进程；makefile 写文件成功
+#[tokio::test]
+async fn a05_outbox_env_reaches_agent() {
+    let out_dir = std::env::temp_dir().join(format!("a05-ob-{}", Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let mut r = req("makefile:done.txt:yes");
+    r.outbox = Some(out_dir.clone());
+    let (events, _) = mpsc::unbounded_channel();
+    let out = run_invocation(r, events).await.expect("makefile 应成功");
+    assert_eq!(out.text, "ok");
+    let content = std::fs::read_to_string(out_dir.join("done.txt")).unwrap();
+    assert_eq!(content, "yes");
+    std::fs::remove_dir_all(&out_dir).ok();
+}
+
+/// 恢复会话路径同样带附件：resume 时 attachments 仍进提示块
+#[tokio::test]
+async fn a05_resume_carries_attachments() {
+    let spec = fake_caps("resume");
+    let (first, _) = invoke(spec.clone(), "echo:one", None)
+        .await
+        .expect("第一次应成功");
+    let sid = first.session_id.clone().expect("session_id");
+
+    let (dir, fp) = tmp_file("r.txt", b"r");
+    let mut r = runtime_req(spec, "inspect");
+    r.resume_session = Some(sid);
+    r.attachments = vec![attach(fp, "r.txt", "text/plain")];
+    let (events, _) = mpsc::unbounded_channel();
+    let out = run_invocation(r, events).await.expect("resume 应成功");
+    assert!(out.text.contains("link:r.txt:true"), "{}", out.text);
+    std::fs::remove_dir_all(&dir).ok();
 }

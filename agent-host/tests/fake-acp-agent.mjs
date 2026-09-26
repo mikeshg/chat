@@ -11,7 +11,11 @@
 //   recall       → 本会话之前收到过的全部指令，用 | 连接；没有则 (empty)
 //   whoami       → 当前 mode / model、环境变量 FAKE_ECHO、第一个文本块、额外目录
 //   tool:read_history  → 经注入的 MCP 服务 tools/call read_conversation_history，原样回出文本
+//   inspect       → 回出收到的每个非文本块（image:<mime>:<字节数> / link:<name>:<存在与否>），
+//                   无非文本块则 (no attachments)
+//   makefile:<名>:<内容> → 写进 CHAT_AGENT_OUTBOX 后回 "ok"；makebig:<名>:<字节数> 写零字节文件
 //   其他          → 回 "ok"
+//   --no-image    → initialize 不声明 promptCapabilities.image（图片退化为 resource_link）
 //
 // 会话跨进程保留：状态写在临时目录 chat-fake-acp/<sessionId>.json。
 // 启动参数 --caps=resume|load|none（默认 resume）决定 initialize 声明的能力。
@@ -31,6 +35,17 @@ const capArg = process.argv.find((a) => a.startsWith("--caps="));
 const caps = capArg ? capArg.slice("--caps=".length) : "resume";
 const dir = path.join(os.tmpdir(), "chat-fake-acp");
 const ignoreCancel = process.argv.includes("--ignore-cancel");
+const noImage = process.argv.includes("--no-image");
+// 宿主在 prompt 末尾追加的 outbox 提示块（固定前缀），不是用户指令
+const HINT = "如需把文件发给用户";
+
+/// file:///… → 本地路径（Windows 的 /C:/x 去掉前导斜杠）
+function uriToPath(u) {
+  if (typeof u !== "string" || !u.startsWith("file://")) return null;
+  let p = decodeURIComponent(u.slice(7));
+  if (/^\/[A-Za-z]:\//.test(p)) p = p.slice(1);
+  return p;
+}
 
 function fileOf(id) {
   if (typeof id !== "string" || !/^[A-Za-z0-9_-]+$/.test(id)) return null;
@@ -208,6 +223,7 @@ rl.on("line", (line) => {
 
   if (method === "initialize") {
     const agentCapabilities = { sessionCapabilities: { additionalDirectories: {} } };
+    if (!noImage) agentCapabilities.promptCapabilities = { image: true };
     if (caps === "resume") agentCapabilities.sessionCapabilities.resume = {};
     else if (caps === "load") agentCapabilities.loadSession = true;
     // --mcp=http 声明支持 http 注入；否则只支持 stdio
@@ -253,8 +269,11 @@ rl.on("line", (line) => {
     return result(id, { sessionId });
   }
   if (method === "session/prompt") {
-    const blocks = (params?.prompt ?? []).map((p) => (typeof p?.text === "string" ? p.text : ""));
-    const text = blocks[blocks.length - 1] ?? "";
+    const raw = params?.prompt ?? [];
+    const blocks = raw.map((p) => (typeof p?.text === "string" ? p.text : ""));
+    // 最后一个文本块可能是宿主的 outbox 提示，不是指令——去掉再取
+    const cmds = blocks.filter((t) => !t.startsWith(HINT));
+    const text = cmds[cmds.length - 1] ?? "";
     if (text.trim() === "whoami") {
       const out = [
         `mode=${currentMode}`,
@@ -307,6 +326,48 @@ rl.on("line", (line) => {
           result(id, { stopReason: "end_turn" });
         });
       return;
+    }
+    if (text === "inspect") {
+      // 回报每个非文本块：image:<mime>:<解码字节数> / link:<name>:<目标存在与否>
+      const parts = [];
+      for (const p of raw) {
+        if (p?.type === "image") {
+          const n = Buffer.from(p.data ?? "", "base64").length;
+          parts.push(`image:${p.mimeType ?? ""}:${n}`);
+        } else if (p?.type === "resource_link") {
+          const fp = uriToPath(p.uri);
+          parts.push(`link:${p.name ?? ""}:${fp ? fs.existsSync(fp) : false}`);
+        }
+      }
+      const out = parts.length ? parts.join("|") : "(no attachments)";
+      remember(text, out);
+      chunk(sessionId, out);
+      return result(id, { stopReason: "end_turn" });
+    }
+    if (text.startsWith("makefile:") || text.startsWith("makebig:")) {
+      // makefile:<名>:<内容> / makebig:<名>:<字节数> → 写进 CHAT_AGENT_OUTBOX
+      const isBig = text.startsWith("makebig:");
+      const rest = text.slice(isBig ? 8 : 9);
+      const sep = rest.indexOf(":");
+      const name = path.basename(rest.slice(0, sep >= 0 ? sep : rest.length));
+      const body = sep >= 0 ? rest.slice(sep + 1) : "";
+      const outDir = process.env.CHAT_AGENT_OUTBOX;
+      if (!outDir) {
+        remember(text, "no outbox");
+        chunk(sessionId, "no outbox");
+        return result(id, { stopReason: "end_turn" });
+      }
+      try {
+        fs.mkdirSync(outDir, { recursive: true });
+        const data = isBig ? Buffer.alloc(parseInt(body, 10) || 0) : Buffer.from(body);
+        fs.writeFileSync(path.join(outDir, name), data);
+        remember(text, "ok");
+        chunk(sessionId, "ok");
+      } catch (e) {
+        remember(text, `write failed: ${e?.message || e}`);
+        chunk(sessionId, `write failed: ${e?.message || e}`);
+      }
+      return result(id, { stopReason: "end_turn" });
     }
     if (text === "fail") {
       remember(text, null);

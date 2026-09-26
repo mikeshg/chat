@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { ApiError } from "../api";
-import { editRejected, ownsEditResult, prepareEditSubmission } from "./ChatView";
+import type { ConversationView, MessageView } from "../types";
+import {
+  editRejected,
+  ownsEditResult,
+  pendingAgentAttachment,
+  prepareEditSubmission,
+} from "./ChatView";
 
 describe("edit submission callback ownership", () => {
   const token = {};
@@ -53,5 +59,51 @@ describe("edit submission payload", () => {
   it("validates the Rust codepoint limit rather than UTF-16 units", () => {
     expect(prepareEditSubmission(null, "m", "𠀀".repeat(4000), 0).content).toHaveLength(8000);
     expect(() => prepareEditSubmission(null, "m", "𠀀".repeat(4001), 0)).toThrow();
+  });
+});
+
+// ===== Agent A05 =====
+// 专属会话里主人的附件消息显示「待交付」提示，被调用带走（attachment_ids）后消失。
+describe("pending agent attachment hint", () => {
+  const me = "u-me";
+  const agentConv = { kind: "agent" } as ConversationView;
+  const msg = (over: Partial<MessageView> = {}): MessageView => ({
+    id: "m1",
+    conversation_id: "c1",
+    seq: 1,
+    sender_id: me,
+    sender_username: "u",
+    sender_name: "u",
+    content: "",
+    kind: "file",
+    attachment: { id: "a1", file_name: "f.txt", mime: "text/plain", size: 1 },
+    mentions: [],
+    created_at: "t",
+    ...over,
+  });
+
+  it("own file/image messages in an agent conv are pending until an invocation takes them", () => {
+    expect(pendingAgentAttachment(msg(), agentConv, me, new Set())).toBe(true);
+    expect(pendingAgentAttachment(msg({ kind: "image" }), agentConv, me, new Set())).toBe(true);
+    // 已被某次调用带走 → 提示消失
+    expect(pendingAgentAttachment(msg(), agentConv, me, new Set(["a1"]))).toBe(false);
+  });
+
+  it("agent messages, text, audio, deleted and non-agent convs never show it", () => {
+    expect(
+      pendingAgentAttachment(msg({ agent: { id: "g", name: "g" } }), agentConv, me, new Set()),
+    ).toBe(false);
+    expect(
+      pendingAgentAttachment(msg({ kind: "text", attachment: null }), agentConv, me, new Set()),
+    ).toBe(false);
+    expect(pendingAgentAttachment(msg({ kind: "audio" }), agentConv, me, new Set())).toBe(false);
+    expect(pendingAgentAttachment(msg({ deleted_at: "x" }), agentConv, me, new Set())).toBe(false);
+    expect(
+      pendingAgentAttachment(msg(), { kind: "dm" } as ConversationView, me, new Set()),
+    ).toBe(false);
+    // 别人的消息（非主人所发）不显示
+    expect(pendingAgentAttachment(msg({ sender_id: "other" }), agentConv, me, new Set())).toBe(
+      false,
+    );
   });
 });

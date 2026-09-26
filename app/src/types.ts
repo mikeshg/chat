@@ -262,6 +262,8 @@ export interface InvocationView {
   trigger_message_id: string;
   status: string;
   error: string | null;
+  /** Agent A05：本次调用带走的附件 id（旧服务端缺省 → 视为空） */
+  attachment_ids?: string[];
   created_at: string;
   started_at: string | null;
   finished_at: string | null;

@@ -13,7 +13,9 @@ name = "agent-host"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "futures-util",
+ "mime_guess",
  "reqwest",
  "serde",
  "serde_json",
