@@ -91,6 +91,7 @@ async fn collect_outbox_empty_or_missing() {
 
 struct Up {
     auth: Option<String>,
+    #[allow(dead_code)]
     name: String,
 }
 

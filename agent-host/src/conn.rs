@@ -202,9 +202,20 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
     // Agent A13：有 tools_token 且本地 MCP 服务在跑 → 登记一条调用级映射。
     // McpHandle 随调用任务存活：成功/失败/取消/abort 都会 drop → 摘映射（404）。
     let tools_token = v["tools_token"].as_str().map(str::to_string);
+    // 档位和审批通道随这次调用的 MCP 映射一起登记：send_message 在 read_only 时要能发起审批。
+    let (ask_tx, ask_rx) = tokio::sync::mpsc::unbounded_channel::<ApprovalNotice>();
+    let approvals = ApprovalLink {
+        tx: ask_tx,
+        registry: s.approvals.clone(),
+    };
     let (mcp_servers, mcp_handle) = match (s.mcp.as_ref(), tools_token.clone()) {
         (Some(mcp), Some(token)) => {
-            let h = mcp.register(http_base(&s.cfg.server_url), token);
+            let h = mcp.register_with(
+                http_base(&s.cfg.server_url),
+                token,
+                spec.permission_tier.clone(),
+                Some(approvals.clone()),
+            );
             (
                 vec![InjectedMcp {
                     name: "chat".into(),
@@ -230,11 +241,6 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
     let dir = s.data_dir.clone();
     let registry_url = s.cfg.registry_url.clone();
     let cancel_flag = cancel_rx.clone();
-    let (ask_tx, ask_rx) = tokio::sync::mpsc::unbounded_channel::<ApprovalNotice>();
-    let approvals = ApprovalLink {
-        tx: ask_tx,
-        registry: s.approvals.clone(),
-    };
     let ask_out = out.clone();
     let task = tokio::spawn(async move {
         // 映射的生命周期钉在这次调用上：任务结束/被 abort 时 drop
