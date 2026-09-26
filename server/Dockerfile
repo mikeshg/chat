@@ -12,14 +12,18 @@ RUN pnpm -F app build
 FROM rust:1-bookworm AS server
 WORKDIR /src
 COPY server/Cargo.toml server/Cargo.lock server/
+# 服务端以 path 依赖引用 agent-host（共享协议类型），两边都要拷
+COPY agent-host/Cargo.toml agent-host/
 # 先用空壳编一遍依赖，利用层缓存
-RUN mkdir server/src \
+RUN mkdir server/src agent-host/src \
     && echo 'fn main(){}' > server/src/main.rs \
     && echo '' > server/src/lib.rs \
+    && echo '' > agent-host/src/lib.rs \
     && cargo build --release --manifest-path server/Cargo.toml
+COPY agent-host/src agent-host/src
 COPY server/src server/src
 COPY server/migrations server/migrations
-RUN touch server/src/lib.rs server/src/main.rs \
+RUN touch agent-host/src/lib.rs server/src/lib.rs server/src/main.rs \
     && cargo build --release --manifest-path server/Cargo.toml
 
 # ---------- 运行时 ----------
