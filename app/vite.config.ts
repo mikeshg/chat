@@ -9,7 +9,7 @@ export default defineConfig({
     port: Number(process.env.CHAT_WEB_PORT ?? 5173),
     proxy: {
       "/v1": {
-        target: process.env.CHAT_API ?? "http://localhost:8080",
+        target: process.env.CHAT_API ?? "http://localhost:28080",
         changeOrigin: true,
         ws: true,
       },

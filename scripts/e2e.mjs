@@ -1,8 +1,8 @@
-// E2E 真实用户旅程测试 —— 直接打运行中的部署（默认 docker :8080）
+// E2E 真实用户旅程测试 —— 直接打运行中的部署（默认 docker :28080）
 // 用法:
 //   E2E_ADMIN_USER=... E2E_ADMIN_PASS=... node scripts/e2e.mjs
 //   node scripts/e2e.mjs phase2     # phase2: 重启后持久化验证（读 .e2e-state.json，含 Agent）
-// 环境: BASE_URL=http://localhost:8080
+// 环境: BASE_URL=http://localhost:28080
 // 前提: 库里已有管理员。未提供 E2E_ADMIN_USER、且脚本注册的第一个用户成了管理员时退出 2。
 import { readFileSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
@@ -10,7 +10,7 @@ import { deflateSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-const BASE = (process.env.BASE_URL || 'http://localhost:8080') + '/v1';
+const BASE = (process.env.BASE_URL || 'http://localhost:28080') + '/v1';
 const WS_BASE = BASE.replace(/^http/, 'ws');
 const STATE = join(dirname(fileURLToPath(import.meta.url)), '.e2e-state.json');
 const PHASE = process.argv[2] || 'phase1';

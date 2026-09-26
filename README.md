@@ -32,13 +32,13 @@
 - 备份与恢复：管理后台一键生成备份（数据库全部表 + 附件 / 头像文件，tar.gz）、下载到本地；上传备份文件恢复（需键入 RESTORE 确认，恢复后所有用户需重新登录）
 - Agent：本地 agent（ACP，如 Claude Code、Codex，登记表里可以一键安装）。在专属会话里直接发消息，或在任意会话里 `@名字` 调用。输出可以是实时流式、只显示状态和最终结果，或每步一条消息。权限分只读、可改工作目录、完全放开，超出档位要主人审批。宿主离线时调用会排队。Agent 之间可以互调，也可以定时调用。管理员可以关掉整个功能，或按用户允许、禁止
 - 实时：WebSocket（一次性 ticket 鉴权）、多设备同时在线、在线状态、正在输入、未读数、已读同步
-- 部署：`docker compose up -d` 一条命令（Postgres + 服务端托管前端，单端口 8080）
+- 部署：`docker compose up -d` 一条命令（Postgres + 服务端托管前端，主机端口 28080）
 
 ## 快速开始（服务端）
 
 ```bash
 docker compose up -d          # WSL/任意有 Docker 的环境
-# 浏览器打开 http://localhost:8080
+# 浏览器打开 http://localhost:28080
 ```
 
 环境变量：`DATABASE_URL`、`JWT_SECRET`（生产必须改）、`PORT`、`BIND`、`APP_DIST`、`FILES_DIR`（附件存储目录，compose 挂 `chat-files` 卷）、`UPLOAD_MAX_MB`（单文件上限，默认 25）。
@@ -48,9 +48,9 @@ docker compose up -d          # WSL/任意有 Docker 的环境
 ```bash
 # 数据库（主机端口 15432）
 docker compose up db -d
-# 后端（:8080）
+# 后端（:28080）
 cd server && cargo run
-# 前端（:5173，已配置 /v1 代理到 :8080）
+# 前端（:5173，已配置 /v1 代理到 :28080）
 pnpm install && pnpm dev
 ```
 
@@ -59,7 +59,7 @@ pnpm install && pnpm dev
 ```bash
 pnpm test    # cargo test：auth/好友流/会话权限/seq/WS/群规则 集成测试（需 db 容器）
 
-# E2E 冒烟：直接打运行中的部署（默认 http://localhost:8080）
+# E2E 冒烟：直接打运行中的部署（默认 http://localhost:28080）
 # 前提：库里已经有管理员。全新部署里第一个注册用户会自动成为管理员；
 # 若未设置 E2E_ADMIN_USER，且脚本注册的第一个用户成了管理员，脚本提示后退出 2，
 # 避免「非管理员 403」整批误报。管理员流程和注册开关需要 E2E_ADMIN_USER / E2E_ADMIN_PASS。
@@ -91,7 +91,7 @@ pnpm tauri build --bundles app   # → src-tauri/target/release/bundle/macos/Cha
 
 把 `Chat.app` 拖进「应用程序」即可。加上 `dmg`（`--bundles app,dmg`）会多打一个 DMG，但这一步要用 AppleScript 控制 Finder，失败时 `Chat.app` 已经生成，直接拖即可。
 
-Tauri 端登录页填写服务器地址（如 `http://192.168.1.5:8080`）。
+Tauri 端登录页填写服务器地址（如 `http://192.168.1.5:28080`）。
 
 ### Android 在 Windows 上的已知坑
 
@@ -143,9 +143,9 @@ CHAT_REAL_AGENT_SMOKE=1 cargo test -p agent-host --test smoke -- --nocapture --t
 ## 局域网访问
 
 - **同一台机器只跑一个服务端实例**：多实例共享数据库但 WS 连接表各自独立，跨实例的消息只能落库、推不到对端（表现为"必须刷新才看到新消息"）。开发调试也统一用 docker。
-- 原生跑 `cargo run`（仅临时调试用）：直接监听 `0.0.0.0:8080`，同网段设备访问 `http://<本机IP>:8080`。用时先停掉 docker server。
+- 原生跑 `cargo run`（仅临时调试用）：直接监听 `0.0.0.0:28080`，同网段设备访问 `http://<本机IP>:28080`。用时先停掉 docker server。
 - WSL2 里的 `docker compose up`：发布端口只到 Windows localhost。要暴露到局域网需管理员跑一次：
-  `netsh interface portproxy add v4tov4 listenport=8080 listenaddress=0.0.0.0 connectport=8080 connectaddress=127.0.0.1`
+  `netsh interface portproxy add v4tov4 listenport=28080 listenaddress=0.0.0.0 connectport=28080 connectaddress=127.0.0.1`
   （真实部署到 Linux 服务器无此问题，`0.0.0.0` 直接生效）
 
 ## 架构

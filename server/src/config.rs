@@ -20,7 +20,7 @@ impl Config {
             port: std::env::var("PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
-                .unwrap_or(8080),
+                .unwrap_or(28080),
             app_dist: std::env::var("APP_DIST").ok().filter(|s| !s.is_empty()),
             files_dir: std::env::var("FILES_DIR").unwrap_or_else(|_| "./data/files".into()),
             upload_max_bytes: std::env::var("UPLOAD_MAX_MB")

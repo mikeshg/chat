@@ -46,7 +46,7 @@ const LS_REFRESH = "chat_refresh";
 const LS_USER = "chat_user";
 
 // ---------- 服务器地址 ----------
-// 空 = 同源（vite dev proxy / 服务端托管静态文件时）；Tauri/LAN 场景填 http://host:8080
+// 空 = 同源（vite dev proxy / 服务端托管静态文件时）；Tauri/LAN 场景填 http://host:28080
 export function getServer(): string {
   return (localStorage.getItem(LS_SERVER) ?? "").replace(/\/+$/, "");
 }

@@ -118,7 +118,7 @@ export default function AuthScreen() {
           required
         />
         <input
-          placeholder="服务器地址（同源部署可留空，如 http://192.168.1.5:8080）"
+          placeholder="服务器地址（同源部署可留空，如 http://192.168.1.5:28080）"
           value={server}
           onChange={(e) => setServerUrl(e.target.value)}
         />

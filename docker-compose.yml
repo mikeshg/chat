@@ -29,7 +29,7 @@ services:
     volumes:
       - chat-files:/data/files
     ports:
-      - "8080:8080"
+      - "28080:8080"
     depends_on:
       db:
         condition: service_healthy
