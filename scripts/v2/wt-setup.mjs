@@ -44,7 +44,7 @@ const specs = readdirSync(join(REPO, DOCS, 'tasks'));
 
 mkdirSync(join(RUNTIME, 'devin'), { recursive: true });
 tasks.forEach((task, i) => {
-  const slot = i + 1;
+  const slot = Number(process.env.SLOT_BASE ?? 0) + i + 1; // SLOT_BASE：避开仍在运行的槽位
   const t = task.toLowerCase();
   const wt = join(WT_ROOT, t);
   const spec = specs.find((f) => f.startsWith(`${task}-`));
