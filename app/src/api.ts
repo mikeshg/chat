@@ -3,6 +3,7 @@ import type {
   AdminSettings,
   AdminUserView,
   AgentHostView,
+  AgentUserSettings,
   AgentView,
   AttachmentView,
   AuthResponse,
@@ -10,6 +11,7 @@ import type {
   BackupList,
   BackupTicket,
   CreateAgentReq,
+  PatchAgentReq,
   InvocationView,
   RestoreResult,
   ConversationDetail,
@@ -326,6 +328,12 @@ export const agents = {
   list: () => get<AgentView[]>("/agents"),
   /** 创建 Agent（同时建专属会话）；400 bad_name / 409 name_taken / 404 宿主非本人 */
   create: (body: CreateAgentReq) => post<AgentView>("/agents", body),
+  /** 改 Agent（本批只有覆盖项）；404 = 不是自己的 Agent */
+  patch: (id: string, body: PatchAgentReq) => patch<AgentView>(`/agents/${id}`, body),
+  /** 个人默认设置 */
+  settings: () => get<AgentUserSettings>("/users/me/agent-settings"),
+  updateSettings: (body: Partial<AgentUserSettings>) =>
+    put<AgentUserSettings>("/users/me/agent-settings", body),
   /** 会话最近的调用记录（刷新后恢复状态行；仅成员可读） */
   invocations: (convId: string, limit = 50) =>
     get<InvocationView[]>(`/conversations/${convId}/agent-invocations?limit=${limit}`),

@@ -7,6 +7,8 @@
 // 宿主作为 ACP client 声明空 clientCapabilities：理论上 agent 不应发起
 // fs/terminal 等反向请求；万一发起（含 session/request_permission）一律拒绝。
 
+pub use crate::runtime::AgentSpec;
+use crate::runtime::{AgentRuntime, Events, RunEvent, RunFuture, RunOutput, RunRequest};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -14,37 +16,13 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::mpsc;
-use uuid::Uuid;
 
-/// invocation_start 帧里 agent 字段的运行时描述。
-#[derive(Debug, Clone)]
-pub struct AgentSpec {
-    pub id: Uuid,
-    pub name: String,
-    pub command: String,
-    pub args: Vec<String>,
-    /// 空串 = 用宿主数据目录作为 cwd
-    pub cwd: String,
-}
+/// ACP 运行时：每次调用起一个 agent 子进程。
+pub struct AcpRuntime;
 
-impl AgentSpec {
-    pub fn from_json(v: &Value) -> Option<Self> {
-        Some(Self {
-            id: Uuid::parse_str(v.get("id")?.as_str()?).ok()?,
-            name: v.get("name")?.as_str()?.to_string(),
-            command: v.pointer("/runtime/command")?.as_str()?.to_string(),
-            args: v
-                .pointer("/runtime/args")?
-                .as_array()?
-                .iter()
-                .filter_map(|a| a.as_str().map(str::to_string))
-                .collect(),
-            cwd: v
-                .get("cwd")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-        })
+impl AgentRuntime for AcpRuntime {
+    fn run(&self, req: RunRequest, events: Events) -> RunFuture {
+        Box::pin(async move { run_invocation(&req, events).await })
     }
 }
 
@@ -61,17 +39,15 @@ struct Pipe {
     text: String,
     /// stderr 尾（诊断用，封顶 ~2KB）
     err: Arc<Mutex<String>>,
+    events: Events,
 }
 
-/// 跑一次调用：起进程、握手、发 prompt、收全部分块文本。
-/// Ok(累计文本)；Err(人类可读原因，调用方截断)。
-pub async fn run_invocation(
-    spec: &AgentSpec,
-    prompt: &str,
-    data_dir: &Path,
-) -> Result<String, String> {
+/// 跑一次调用：起进程、握手、发 prompt、收全部分块文本（同时逐段发 RunEvent::Text）。
+/// Err 为人类可读原因，调用方截断。
+pub async fn run_invocation(req: &RunRequest, events: Events) -> Result<RunOutput, String> {
+    let spec = &req.spec;
     let dir: PathBuf = if spec.cwd.is_empty() {
-        data_dir.to_path_buf()
+        req.data_dir.clone()
     } else {
         PathBuf::from(&spec.cwd)
     };
@@ -138,10 +114,13 @@ pub async fn run_invocation(
         next_id: 1,
         text: String::new(),
         err,
+        events,
     };
-    let r = drive(&mut pipe, &dir, prompt).await;
+    let r = drive(&mut pipe, &dir, &req.prompt).await;
     let _ = child.kill().await;
-    r.map(|_| std::mem::take(&mut pipe.text))
+    r.map(|_| RunOutput {
+        text: std::mem::take(&mut pipe.text),
+    })
 }
 
 async fn drive(pipe: &mut Pipe, dir: &Path, prompt: &str) -> Result<(), String> {
@@ -231,6 +210,7 @@ impl Pipe {
                 .and_then(Value::as_str)
             {
                 self.text.push_str(t);
+                let _ = self.events.send(RunEvent::Text(t.to_string()));
             }
         }
     }

@@ -9669,3 +9669,122 @@ async fn agent_invocation_history() {
     assert_eq!(r.status(), 403);
     ha.shutdown().await;
 }
+
+// ===== Agent 设置层（第 2 批前预重构） =====
+
+#[tokio::test]
+async fn agent_settings_defaults_and_overrides() {
+    let base = spawn_named_db(&format!("chat_t_agset_{}", uniq())).await;
+    let a = register(&base, &format!("agseta_{}", uniq())).await;
+    let b = register(&base, &format!("agsetb_{}", uniq())).await;
+    let c = http();
+    let settings = |u: &TestUser| {
+        c.get(format!("{base}/v1/users/me/agent-settings"))
+            .header("authorization", authz(&u.access))
+    };
+
+    // 没设置过 → 默认值
+    let s: Value = settings(&a).send().await.unwrap().json().await.unwrap();
+    assert_eq!(s["output_mode"], "stream");
+    assert_eq!(s["queue_timeout_secs"], 86400);
+
+    // 部分更新：只改输出方式；非法值 400
+    let put = |u: &TestUser, body: Value| {
+        c.put(format!("{base}/v1/users/me/agent-settings"))
+            .header("authorization", authz(&u.access))
+            .json(&body)
+            .send()
+    };
+    let r = put(&a, json!({"output_mode": "status"})).await.unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let s: Value = settings(&a).send().await.unwrap().json().await.unwrap();
+    assert_eq!(s["output_mode"], "status");
+    assert_eq!(s["queue_timeout_secs"], 86400);
+    assert_eq!(
+        put(&a, json!({"output_mode": "loud"}))
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        400
+    );
+    assert_eq!(
+        put(&a, json!({"queue_timeout_secs": -1}))
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        400
+    );
+    assert_eq!(
+        put(&a, json!({"queue_timeout_secs": 0}))
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+    // 别人的设置不受影响
+    let sb: Value = settings(&b).send().await.unwrap().json().await.unwrap();
+    assert_eq!(sb["output_mode"], "stream");
+
+    // Agent 覆盖：新建时为 null；PATCH 设值、显式 null 清除、缺省字段不动
+    let (h, host_id) = spawn_host(&base, &a, uuid::Uuid::new_v4()).await;
+    let (_, agent) = create_agent(&base, &a, &host_id, "setter").await;
+    assert!(agent["output_mode"].is_null() && agent["queue_timeout_secs"].is_null());
+    let id = agent["id"].as_str().unwrap();
+    let patch = |u: &TestUser, body: Value| {
+        c.patch(format!("{base}/v1/agents/{id}"))
+            .header("authorization", authz(&u.access))
+            .json(&body)
+            .send()
+    };
+    let v: Value = patch(
+        &a,
+        json!({"output_mode": "steps", "queue_timeout_secs": 600}),
+    )
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(v["output_mode"], "steps");
+    assert_eq!(v["queue_timeout_secs"], 600);
+    let v: Value = patch(&a, json!({"output_mode": null}))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(v["output_mode"].is_null());
+    assert_eq!(v["queue_timeout_secs"], 600);
+    assert_eq!(
+        patch(&a, json!({"output_mode": "x"}))
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        400
+    );
+    // 别人的 Agent → 404
+    assert_eq!(
+        patch(&b, json!({"output_mode": "steps"}))
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        404
+    );
+    // 列表里带覆盖值
+    let list: Value = c
+        .get(format!("{base}/v1/agents"))
+        .header("authorization", authz(&a.access))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list[0]["queue_timeout_secs"], 600);
+    h.shutdown().await;
+}

@@ -3,6 +3,7 @@ import { agents, ApiError, convs } from "../api";
 import { setState, useApp } from "../store";
 import type { AgentView } from "../types";
 import { openConversation } from "../ws";
+import AgentSettings from "./AgentSettings";
 
 /** Agent A01：「我」页的 Agent 管理面板（宿主列表 / Agent 列表 / 添加 Agent） */
 export default function AgentsPanel({ onClose }: { onClose: () => void }) {
@@ -148,6 +149,8 @@ export default function AgentsPanel({ onClose }: { onClose: () => void }) {
             </div>
           ))}
         </section>
+
+        <AgentSettings />
 
         {showForm ? (
           <section className="agent-form">

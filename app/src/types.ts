@@ -189,6 +189,25 @@ export interface AgentView {
   cwd: string;
   conversation_id: string;
   created_at: string;
+  /** 覆盖项：null = 跟随个人默认（旧服务端无此字段） */
+  output_mode?: AgentOutputMode | null;
+  queue_timeout_secs?: number | null;
+}
+
+/** 输出方式：实时流式 / 状态 + 最终结果 / 每步一条消息 */
+export type AgentOutputMode = "stream" | "status" | "steps";
+
+/** 个人 Agent 默认设置（GET/PUT /users/me/agent-settings） */
+export interface AgentUserSettings {
+  output_mode: AgentOutputMode;
+  /** 排队超时秒数，0 = 永不 */
+  queue_timeout_secs: number;
+}
+
+/** PATCH /agents/{id}：缺省字段不改，null = 清除覆盖 */
+export interface PatchAgentReq {
+  output_mode?: AgentOutputMode | null;
+  queue_timeout_secs?: number | null;
 }
 
 /** POST /agents 请求体（A01） */

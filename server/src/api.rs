@@ -9,7 +9,7 @@ use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
@@ -109,6 +109,11 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
         .route(
             "/agents",
             get(crate::agents::list_agents).post(crate::agents::create_agent),
+        )
+        .route("/agents/{id}", patch(crate::agents::patch_agent))
+        .route(
+            "/users/me/agent-settings",
+            get(crate::agents::get_user_settings).put(crate::agents::put_user_settings),
         )
         .route(
             "/conversations/{id}/agent-invocations",

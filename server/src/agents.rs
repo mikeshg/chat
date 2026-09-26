@@ -9,7 +9,10 @@
 use crate::auth;
 use crate::domain::{self, PostError};
 use crate::error::{AppError, AppResult};
-use crate::model::{AgentHostView, AgentView, CreateAgentReq, InvocationView, WsOut};
+use crate::model::{
+    AgentHostView, AgentUserSettings, AgentView, CreateAgentReq, InvocationView, PatchAgentReq,
+    UpdateAgentUserSettingsReq, WsOut,
+};
 use crate::state::SharedState;
 use axum::{
     extract::{Path, Query, State},
@@ -52,47 +55,53 @@ pub async fn list_hosts(
     ))
 }
 
+/// AgentView 的查询列（list / patch 共用）
+const AGENT_SELECT: &str = "SELECT a.id, a.name, a.host_id, a.runtime, a.cwd, a.created_at,
+        (SELECT c.id FROM conversations c
+          WHERE c.agent_id = a.id AND c.type = 'agent') AS conversation_id,
+        a.output_mode, a.queue_timeout_secs
+   FROM agents a";
+
+#[derive(sqlx::FromRow)]
+struct AgentDbRow {
+    id: Uuid,
+    name: String,
+    host_id: Uuid,
+    runtime: serde_json::Value,
+    cwd: String,
+    created_at: DateTime<Utc>,
+    conversation_id: Option<Uuid>,
+    output_mode: Option<String>,
+    queue_timeout_secs: Option<i32>,
+}
+
+fn agent_view(st: &SharedState, r: AgentDbRow) -> AgentView {
+    AgentView {
+        id: r.id,
+        name: r.name,
+        host_id: r.host_id,
+        host_online: st.host_online(r.host_id),
+        runtime: r.runtime,
+        cwd: r.cwd,
+        conversation_id: r.conversation_id.unwrap_or_default(),
+        created_at: r.created_at,
+        output_mode: r.output_mode,
+        queue_timeout_secs: r.queue_timeout_secs,
+    }
+}
+
 pub async fn list_agents(
     State(st): State<SharedState>,
     headers: HeaderMap,
 ) -> AppResult<Json<Vec<AgentView>>> {
     let uid = uid(&headers, &st).await?;
-    let rows = sqlx::query_as::<
-        _,
-        (
-            Uuid,
-            String,
-            Uuid,
-            serde_json::Value,
-            String,
-            DateTime<Utc>,
-            Option<Uuid>,
-        ),
-    >(
-        "SELECT a.id, a.name, a.host_id, a.runtime, a.cwd, a.created_at,
-                (SELECT c.id FROM conversations c
-                  WHERE c.agent_id = a.id AND c.type = 'agent') AS conversation_id
-           FROM agents a WHERE a.owner_id = $1 ORDER BY a.created_at, a.id",
-    )
+    let rows = sqlx::query_as::<_, AgentDbRow>(&format!(
+        "{AGENT_SELECT} WHERE a.owner_id = $1 ORDER BY a.created_at, a.id"
+    ))
     .bind(uid)
     .fetch_all(&st.pool)
     .await?;
-    Ok(Json(
-        rows.into_iter()
-            .map(
-                |(id, name, host_id, runtime, cwd, created_at, conv)| AgentView {
-                    id,
-                    name,
-                    host_id,
-                    host_online: st.host_online(host_id),
-                    runtime,
-                    cwd,
-                    conversation_id: conv.unwrap_or_default(),
-                    created_at,
-                },
-            )
-            .collect(),
-    ))
+    Ok(Json(rows.into_iter().map(|r| agent_view(&st, r)).collect()))
 }
 
 /// Agent 名规则：1–32 字符，只允许字母/数字/`_`/`-`，首字符不能是 `-`。
@@ -187,7 +196,143 @@ pub async fn create_agent(
         cwd,
         conversation_id: conv_id,
         created_at: Utc::now(),
+        output_mode: None,
+        queue_timeout_secs: None,
     }))
+}
+
+// ---------- 设置：个人默认 + 单个 Agent 覆盖 ----------
+
+const OUTPUT_MODES: [&str; 3] = ["stream", "status", "steps"];
+/// 排队超时上限 30 天；0 = 永不
+const MAX_QUEUE_TIMEOUT_SECS: i32 = 30 * 24 * 3600;
+
+fn valid_output_mode(m: &str) -> bool {
+    OUTPUT_MODES.contains(&m)
+}
+
+fn valid_queue_timeout(secs: i32) -> bool {
+    (0..=MAX_QUEUE_TIMEOUT_SECS).contains(&secs)
+}
+
+async fn user_settings(pool: &PgPool, uid: Uuid) -> Result<AgentUserSettings, sqlx::Error> {
+    Ok(sqlx::query_as::<_, AgentUserSettings>(
+        "SELECT output_mode, queue_timeout_secs FROM agent_user_settings WHERE user_id = $1",
+    )
+    .bind(uid)
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or(AgentUserSettings {
+        output_mode: "stream".into(),
+        queue_timeout_secs: 86400,
+    }))
+}
+
+/// 某个 Agent 的生效设置：Agent 覆盖 → 主人的个人默认 → 系统默认
+pub async fn effective_settings(
+    pool: &PgPool,
+    agent_id: Uuid,
+) -> Result<AgentUserSettings, sqlx::Error> {
+    sqlx::query_as::<_, AgentUserSettings>(
+        "SELECT COALESCE(a.output_mode, s.output_mode, 'stream') AS output_mode,
+                COALESCE(a.queue_timeout_secs, s.queue_timeout_secs, 86400) AS queue_timeout_secs
+           FROM agents a
+           LEFT JOIN agent_user_settings s ON s.user_id = a.owner_id
+          WHERE a.id = $1",
+    )
+    .bind(agent_id)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn get_user_settings(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+) -> AppResult<Json<AgentUserSettings>> {
+    let uid = uid(&headers, &st).await?;
+    Ok(Json(user_settings(&st.pool, uid).await?))
+}
+
+pub async fn put_user_settings(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<UpdateAgentUserSettingsReq>,
+) -> AppResult<Json<AgentUserSettings>> {
+    let uid = uid(&headers, &st).await?;
+    let mut cur = user_settings(&st.pool, uid).await?;
+    if let Some(m) = req.output_mode {
+        if !valid_output_mode(&m) {
+            return Err(AppError::bad_request("bad_output_mode"));
+        }
+        cur.output_mode = m;
+    }
+    if let Some(t) = req.queue_timeout_secs {
+        if !valid_queue_timeout(t) {
+            return Err(AppError::bad_request("bad_queue_timeout"));
+        }
+        cur.queue_timeout_secs = t;
+    }
+    sqlx::query(
+        "INSERT INTO agent_user_settings (user_id, output_mode, queue_timeout_secs)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (user_id) DO UPDATE
+            SET output_mode = $2, queue_timeout_secs = $3, updated_at = now()",
+    )
+    .bind(uid)
+    .bind(&cur.output_mode)
+    .bind(cur.queue_timeout_secs)
+    .execute(&st.pool)
+    .await?;
+    Ok(Json(cur))
+}
+
+/// PATCH /v1/agents/{id}：本票只有两个覆盖项；其余配置项由后续票往 PatchAgentReq 里加。
+pub async fn patch_agent(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(req): Json<PatchAgentReq>,
+) -> AppResult<Json<AgentView>> {
+    let uid = uid(&headers, &st).await?;
+    if let Some(Some(m)) = &req.output_mode {
+        if !valid_output_mode(m) {
+            return Err(AppError::bad_request("bad_output_mode"));
+        }
+    }
+    if let Some(Some(t)) = req.queue_timeout_secs {
+        if !valid_queue_timeout(t) {
+            return Err(AppError::bad_request("bad_queue_timeout"));
+        }
+    }
+    let mut tx = st.pool.begin().await?;
+    let owner =
+        sqlx::query_scalar::<_, Uuid>("SELECT owner_id FROM agents WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if owner != Some(uid) {
+        return Err(AppError::not_found("agent not found"));
+    }
+    if let Some(m) = req.output_mode {
+        sqlx::query("UPDATE agents SET output_mode = $2, updated_at = now() WHERE id = $1")
+            .bind(id)
+            .bind(m)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(t) = req.queue_timeout_secs {
+        sqlx::query("UPDATE agents SET queue_timeout_secs = $2, updated_at = now() WHERE id = $1")
+            .bind(id)
+            .bind(t)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    let row = sqlx::query_as::<_, AgentDbRow>(&format!("{AGENT_SELECT} WHERE a.id = $1"))
+        .bind(id)
+        .fetch_one(&st.pool)
+        .await?;
+    Ok(Json(agent_view(&st, row)))
 }
 
 #[derive(Deserialize)]

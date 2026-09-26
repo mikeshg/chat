@@ -1,6 +1,6 @@
 // 宿主 WS 连接循环：连上→host_hello→host_ready→收 invocation_start 起任务。
 
-use crate::acp;
+use crate::runtime::{self, AgentSpec, RunRequest};
 use crate::Shared;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -156,7 +156,7 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
     else {
         return;
     };
-    let spec = match acp::AgentSpec::from_json(&v["agent"]) {
+    let spec = match AgentSpec::from_json(&v["agent"]) {
         Some(x) => x,
         None => {
             send_finish(out, inv_id, Err("agent 描述非法".into()));
@@ -168,7 +168,15 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
     let running = s.running.clone();
     let dir = s.data_dir.clone();
     let task = tokio::spawn(async move {
-        let r = acp::run_invocation(&spec, &prompt, &dir).await;
+        let rt = runtime::runtime_for(&spec);
+        // 事件暂不外发（接收端即刻丢弃）；流式输出票把它接到服务端
+        let (events, _) = tokio::sync::mpsc::unbounded_channel();
+        let req = RunRequest {
+            spec,
+            prompt,
+            data_dir: dir,
+        };
+        let r = rt.run(req, events).await.map(|o| o.text);
         send_finish(&out2, inv_id, r);
         running.lock().unwrap().remove(&inv_id);
     });

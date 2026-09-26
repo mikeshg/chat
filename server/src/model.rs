@@ -533,6 +533,43 @@ pub struct AgentView {
     /// 专属 AgentConversation
     pub conversation_id: Uuid,
     pub created_at: DateTime<Utc>,
+    /// 覆盖项：null = 跟随主人的个人默认（见 AgentUserSettings）
+    pub output_mode: Option<String>,
+    pub queue_timeout_secs: Option<i32>,
+}
+
+/// 个人 Agent 默认设置（GET/PUT /v1/users/me/agent-settings）；也用作「生效值」
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct AgentUserSettings {
+    /// stream（实时流式）/ status（状态 + 最终结果）/ steps（每步一条消息）
+    pub output_mode: String,
+    /// 排队超时秒数，0 = 永不
+    pub queue_timeout_secs: i32,
+}
+
+/// PUT /v1/users/me/agent-settings：缺省字段不改
+#[derive(Debug, Deserialize)]
+pub struct UpdateAgentUserSettingsReq {
+    pub output_mode: Option<String>,
+    pub queue_timeout_secs: Option<i32>,
+}
+
+/// PATCH /v1/agents/{id}：字段缺省 = 不改；显式 null = 清除覆盖、回到个人默认
+#[derive(Debug, Deserialize)]
+pub struct PatchAgentReq {
+    #[serde(default, deserialize_with = "double_option")]
+    pub output_mode: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub queue_timeout_secs: Option<Option<i32>>,
+}
+
+/// 区分「字段缺省」(None) 与「显式 null」(Some(None))
+fn double_option<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
 }
 
 /// POST /v1/agents 请求体
