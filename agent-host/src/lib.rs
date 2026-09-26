@@ -7,6 +7,7 @@
 pub mod acp;
 pub mod command;
 mod conn;
+pub mod files;
 pub mod mcp;
 pub mod mcp_bridge;
 pub mod permission;
@@ -90,6 +91,8 @@ pub(crate) struct Shared {
     pub mcp: Option<mcp::McpServer>,
     /// Agent A12：进行中的审批等待（跨本次进程的各次连接共用，断线时清空）
     pub approvals: Arc<runtime::ApprovalRegistry>,
+    /// Agent A05：附件下载（能力 URL）与产出上传（Invocation 凭据）共用的 HTTP 客户端
+    pub http: reqwest::Client,
 }
 
 pub struct HostHandle {
@@ -152,6 +155,7 @@ pub fn spawn(cfg: HostConfig, tickets: Arc<dyn TicketSource>) -> HostHandle {
         superseded: std::sync::atomic::AtomicBool::new(false),
         mcp: mcp::McpServer::start(),
         approvals: runtime::ApprovalRegistry::new(),
+        http: reqwest::Client::new(),
     });
     let _ = std::fs::create_dir_all(&shared.data_dir);
     let s2 = shared.clone();

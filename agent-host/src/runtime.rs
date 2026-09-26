@@ -201,6 +201,16 @@ pub struct InjectedMcp {
     pub bridge: Option<(String, Vec<String>)>,
 }
 
+/// Agent A05：已下载到本地的输入附件（宿主提前落盘到 <data_dir>/inv-<id>/in/）。
+#[derive(Debug, Clone)]
+pub struct LocalFile {
+    /// 本地绝对路径
+    pub path: PathBuf,
+    /// 展示名（已剥路径穿越，只剩 basename）
+    pub name: String,
+    pub mime: String,
+}
+
 /// 一次调用的输入。
 #[derive(Debug, Clone)]
 pub struct RunRequest {
@@ -225,6 +235,10 @@ pub struct RunRequest {
     pub permission_tier: String,
     /// 超档时向服务端要审批。None = 单测 / 无连接，超档直接取消。
     pub approvals: Option<ApprovalLink>,
+    /// Agent A05：随调用交付的附件（已下载到 in/），排在指令文本块之前
+    pub attachments: Vec<LocalFile>,
+    /// Agent A05：产出文件目录；Some 时导出 CHAT_AGENT_OUTBOX 并追加提示文本块
+    pub outbox: Option<PathBuf>,
 }
 
 impl RunRequest {
@@ -254,6 +268,8 @@ impl RunRequest {
             cancel: watch::channel(false).1,
             mcp_servers: Vec::new(),
             approvals: None,
+            attachments: Vec::new(),
+            outbox: None,
         }
     }
 }

@@ -254,6 +254,9 @@ button.ctx-item:hover { background: var(--bg); }
 .msg-file .file-meta { display: flex; flex-direction: column; }
 .msg-file .file-meta b { font-size: 14px; word-break: break-all; }
 .msg-file .file-meta i { color: var(--muted); font-size: 12px; font-style: normal; }
+/* Agent A05：附件消息下的待交付提示 */
+.att-pending-hint { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.msg-row.mine .att-pending-hint { text-align: right; }
 .attach-btn { height: 36px; align-self: flex-end; }
 .composer {
   border-top: 1px solid var(--line); background: var(--panel);

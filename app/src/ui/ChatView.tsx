@@ -18,7 +18,14 @@ import {
   useApp,
 } from "../store";
 import { unsentText } from "../drafts";
-import type { AgentView, AttachmentView, MemberView, MessageView, ReplyPreview } from "../types";
+import type {
+  AgentView,
+  AttachmentView,
+  ConversationView,
+  MemberView,
+  MessageView,
+  ReplyPreview,
+} from "../types";
 import { resolveMentions, retainExplicit, type ExplicitTarget } from "../mentionResolve";
 import { sendChat, sendTyping } from "../ws";
 import RichText from "../richText";
@@ -94,6 +101,25 @@ export function ownsEditResult(
 /** 服务端明确拒绝的编辑结果：下一次提交必须是新 op；其余错误按“结果未确认”保留原 clientOpId 供幂等重试 */
 export function editRejected(e: unknown): boolean {
   return e instanceof ApiError && [400, 403, 404, 409, 422].includes(e.status);
+}
+
+/** Agent A05：专属会话里主人的附件消息在被某次调用带走（attachment_ids）前显示待交付提示 */
+export function pendingAgentAttachment(
+  m: MessageView,
+  conv: ConversationView,
+  meId: string | undefined,
+  taken: Set<string>,
+): boolean {
+  return (
+    conv.kind === "agent" &&
+    !!meId &&
+    m.sender_id === meId &&
+    !m.agent &&
+    !m.deleted_at &&
+    (m.kind === "image" || m.kind === "file") &&
+    !!m.attachment &&
+    !taken.has(m.attachment.id)
+  );
 }
 
 /** 快捷 emoji 表态集合 */
@@ -383,6 +409,12 @@ export default function ChatView() {
     ? s.agentHosts.find((h) => h.id === conv.agent!.host_id)
     : undefined;
   const invs = s.invocations[conv.id] ?? {};
+  // A05：已被调用带走的附件 id 集合（决定附件消息的待交付提示显隐）
+  const takenAttIds = new Set(
+    Object.values(invs)
+      .flat()
+      .flatMap((iv) => iv.attachment_ids ?? []),
+  );
   // A04：409 = 调用已经结束，静默拉一次历史把标签对齐
   const cancelInvocation = (id: string) => {
     void (async () => {
@@ -1237,6 +1269,9 @@ export default function ChatView() {
                         )}
                         {m.edited_at && <span className="edited-mark">（已编辑）</span>}
                       </div>
+                    )}
+                    {pendingAgentAttachment(m, conv, s.me?.id, takenAttIds) && (
+                      <div className="att-pending-hint">将随下一条指令一起发给 Agent</div>
                     )}
                     {(m.reactions?.length ?? 0) > 0 && (
                       <div className="reactions">

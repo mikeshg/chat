@@ -673,13 +673,12 @@ pub async fn delete_agent(
         .bind(id)
         .execute(&mut *tx)
         .await?;
-    let invs = sqlx::query_as::<_, InvocationView>(
+    let invs = sqlx::query_as::<_, InvocationView>(&format!(
         "UPDATE agent_invocations SET status = 'failed', error = 'agent_deleted',
                 finished_at = now()
           WHERE agent_id = $1 AND finished_at IS NULL
-         RETURNING id, agent_id, conversation_id, trigger_message_id, schedule_id, status, error,
-                   created_at, started_at, finished_at",
-    )
+         {INV_RETURNING}"
+    ))
     .bind(id)
     .fetch_all(&mut *tx)
     .await?;
@@ -927,7 +926,7 @@ pub async fn list_invocations(
         .ok_or_else(|| AppError::forbidden("not a member of this conversation"))?;
     let mut rows = sqlx::query_as::<_, InvocationView>(
         "SELECT id, agent_id, conversation_id, trigger_message_id, schedule_id, status, error,
-                created_at, started_at, finished_at
+                attachment_ids, created_at, started_at, finished_at
            FROM agent_invocations WHERE conversation_id = $1
           ORDER BY created_at DESC, id DESC LIMIT $2",
     )
@@ -1013,14 +1012,13 @@ pub async fn cancel_invocation(
     if terminal_status(&status) {
         return Err(AppError::conflict("already_finished"));
     }
-    let inv = sqlx::query_as::<_, InvocationView>(
+    let inv = sqlx::query_as::<_, InvocationView>(&format!(
         "UPDATE agent_invocations
             SET status = 'cancelled', error = NULL, finished_at = now()
           WHERE id = $1 AND finished_at IS NULL
             AND status IN ('queued', 'running', 'awaiting_approval')
-         RETURNING id, agent_id, conversation_id, trigger_message_id, schedule_id, status, error,
-                   created_at, started_at, finished_at",
-    )
+         {INV_RETURNING}"
+    ))
     .bind(id)
     .fetch_optional(&st.pool)
     .await?;
@@ -1103,6 +1101,7 @@ pub async fn revoke_access(st: &SharedState, user_ids: &[Uuid]) {
                 conversation_id: inv.conversation_id,
                 trigger_message_id: inv.trigger_message_id,
                 schedule_id: inv.schedule_id,
+                attachment_ids: Vec::new(),
                 status: inv.status.clone(),
                 error: inv.error.clone(),
                 created_at: inv.created_at,
@@ -1425,13 +1424,23 @@ async fn dispatch(
     }
     let timeout = queue_timeout_secs(&st.pool, agent.id).await;
     let online = st.host_online(agent.host_id);
+    // A05：待交付附件的收集与调用入库放进同一事务、同一把会话行锁——
+    // 并发触发的两条文字消息各自派发时，附件按 seq 唯一地分给其中一次。
+    let inv: Result<InvocationView, sqlx::Error> = async {
+        let mut tx = st.pool.begin().await?;
+        let _ = domain::lock_conversation(&mut tx, conv).await?;
+        let atts = collect_pending_attachments(&mut tx, conv, agent.owner, trigger).await?;
+        let inv = if online {
+            insert_running(&mut *tx, &agent, conv, Some(trigger), None, &atts).await?
+        } else {
+            insert_queued(&mut *tx, &agent, conv, Some(trigger), None, timeout, &atts).await?
+        };
+        tx.commit().await?;
+        Ok(inv)
+    }
+    .await;
     // 在线先标 running 再下发，客户端看到的第一帧就是 running（不是先闪一下排队）。
     // 发不出去则改回 queued，与离线同语义。
-    let inv = if online {
-        insert_running(&st.pool, &agent, conv, Some(trigger), None).await
-    } else {
-        insert_queued(&st.pool, &agent, conv, Some(trigger), None, timeout).await
-    };
     let Ok(inv) = inv else {
         tracing::error!("agent_invocation insert failed");
         return;
@@ -1468,6 +1477,7 @@ pub(crate) async fn fire_schedule(st: &SharedState, job: ScheduleFire) {
             job.conversation_id,
             None,
             Some(job.schedule_id),
+            &[],
         )
         .await
     } else {
@@ -1478,6 +1488,7 @@ pub(crate) async fn fire_schedule(st: &SharedState, job: ScheduleFire) {
             None,
             Some(job.schedule_id),
             timeout,
+            &[],
         )
         .await
     };
@@ -1502,7 +1513,7 @@ async fn deliver_invocation(
         return;
     }
     register_run(st, agent, &inv, member_ids).await;
-    let payload = invocation_start_payload(st, inv.id, agent, context_key, prompt).await;
+    let payload = invocation_start_payload(st, &inv, agent, context_key, prompt).await;
     if !st.send_to_host(agent.host_id, &payload) {
         st.inv_runs.remove(&inv.id);
         let timeout = queue_timeout_secs(&st.pool, agent.id).await;
@@ -1546,6 +1557,61 @@ async fn register_run(
     );
 }
 
+/// A05：收集主人的待交付 image/file 附件，上限 10。
+/// 「待交付」= 触发消息之前落库、且未被本会话任何调用带走（attachment_ids 不含它）——
+/// 超上限留下的附件自然留给下一次调用。在会话行锁内跑，并发触发各自拿到不重叠清单。
+async fn collect_pending_attachments(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    conv: Uuid,
+    owner: Uuid,
+    trigger: Uuid,
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT a.id
+           FROM messages m
+           JOIN attachments a ON a.id = m.attachment_id
+          WHERE m.conversation_id = $1
+            AND m.sender_id = $2
+            AND m.agent_id IS NULL
+            AND m.kind IN ('image', 'file')
+            AND m.deleted_at IS NULL
+            AND m.seq < (SELECT seq FROM messages WHERE id = $3)
+            AND NOT EXISTS (
+                  SELECT 1 FROM agent_invocations i
+                   WHERE i.conversation_id = $1
+                     AND a.id = ANY (i.attachment_ids)
+                )
+          ORDER BY m.seq
+          LIMIT 10",
+    )
+    .bind(conv)
+    .bind(owner)
+    .bind(trigger)
+    .fetch_all(&mut **tx)
+    .await
+}
+
+/// invocation_start.attachments：按 attachment_ids 的顺序还原元数据
+/// （附件行中途被删的条目直接缺席，宿主按拿到的清单下载）。
+async fn attachment_meta(pool: &PgPool, ids: &[Uuid]) -> Vec<Value> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    sqlx::query_as::<_, (Uuid, String, String, i64)>(
+        "SELECT a.id, a.file_name, a.mime, a.size
+           FROM unnest($1::uuid[]) WITH ORDINALITY u(id, ord)
+           JOIN attachments a ON a.id = u.id
+          ORDER BY u.ord",
+    )
+    .bind(ids)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(id, name, mime, size)| json!({"id": id, "name": name, "mime": mime, "size": size}))
+    .collect()
+}
+
 async fn queue_timeout_secs(pool: &PgPool, agent_id: Uuid) -> i32 {
     effective_settings(pool, agent_id)
         .await
@@ -1555,42 +1621,48 @@ async fn queue_timeout_secs(pool: &PgPool, agent_id: Uuid) -> i32 {
 
 pub(crate) const INV_RETURNING: &str =
     "RETURNING id, agent_id, conversation_id, trigger_message_id, schedule_id, status, error,
-                   created_at, started_at, finished_at";
+                   attachment_ids, created_at, started_at, finished_at";
 
 async fn insert_running(
-    pool: &PgPool,
+    ex: impl sqlx::PgExecutor<'_>,
     agent: &AgentRow,
     conv: Uuid,
     trigger: Option<Uuid>,
     schedule: Option<Uuid>,
+    atts: &[Uuid],
 ) -> Result<InvocationView, sqlx::Error> {
     sqlx::query_as::<_, InvocationView>(&format!(
         "INSERT INTO agent_invocations
-            (agent_id, conversation_id, trigger_message_id, schedule_id, status, started_at)
-         VALUES ($1, $2, $3, $4, 'running', now())
+            (agent_id, conversation_id, trigger_message_id, schedule_id, status, started_at,
+             attachment_ids)
+         VALUES ($1, $2, $3, $4, 'running', now(), $5)
          {INV_RETURNING}"
     ))
     .bind(agent.id)
     .bind(conv)
     .bind(trigger)
     .bind(schedule)
-    .fetch_one(pool)
+    .bind(atts)
+    .fetch_one(ex)
     .await
 }
 
 async fn insert_queued(
-    pool: &PgPool,
+    ex: impl sqlx::PgExecutor<'_>,
     agent: &AgentRow,
     conv: Uuid,
     trigger: Option<Uuid>,
     schedule: Option<Uuid>,
     timeout_secs: i32,
+    atts: &[Uuid],
 ) -> Result<InvocationView, sqlx::Error> {
     sqlx::query_as::<_, InvocationView>(&format!(
         "INSERT INTO agent_invocations
-            (agent_id, conversation_id, trigger_message_id, schedule_id, status, queue_deadline)
+            (agent_id, conversation_id, trigger_message_id, schedule_id, status, queue_deadline,
+             attachment_ids)
          VALUES ($1, $2, $3, $4, 'queued',
-                 CASE WHEN $5 > 0 THEN now() + make_interval(secs => $5::double precision) END)
+                 CASE WHEN $5 > 0 THEN now() + make_interval(secs => $5::double precision) END,
+                 $6)
          {INV_RETURNING}"
     ))
     .bind(agent.id)
@@ -1598,32 +1670,36 @@ async fn insert_queued(
     .bind(trigger)
     .bind(schedule)
     .bind(timeout_secs)
-    .fetch_one(pool)
+    .bind(atts)
+    .fetch_one(ex)
     .await
 }
 
 /// invocation_start 帧：Agent 配置快照（A06）+ 该会话记住的运行时会话（A02）
-/// + 本次调用的工具凭据（A13，只在调用进行中有效）。即时派发与宿主上线后清排队共用。
+/// + 本次调用的工具凭据（A13，只在调用进行中有效）+ 待交付附件元数据（A05）。
+/// 即时派发与宿主上线后清排队共用。
 async fn invocation_start_payload(
     st: &SharedState,
-    inv_id: Uuid,
+    inv: &InvocationView,
     agent: &AgentRow,
     context_key: &str,
     prompt: &str,
 ) -> String {
     let session_id = context_session(&st.pool, agent.id, context_key).await;
-    // 签发失败（几乎不可能）时不带凭据：调用照常跑，只是用不了工具
+    // 签发失败（几乎不可能）时不带凭据：调用照常跑，只是用不了工具/传不了产出文件
     let tools_token =
-        crate::auth::mint_invocation(inv_id, agent.owner, agent.id, 0, &st.cfg.jwt_secret)
+        crate::auth::mint_invocation(inv.id, agent.owner, agent.id, 0, &st.cfg.jwt_secret)
             .map_err(|e| tracing::error!(error = ?e, "tools_token mint failed"))
             .ok();
+    let attachments = attachment_meta(&st.pool, &inv.attachment_ids).await;
     json!({
         "type": "invocation_start",
-        "invocation_id": inv_id,
+        "invocation_id": inv.id,
         "agent": agent_snapshot(agent),
         "prompt": prompt,
         "context": {"key": context_key, "session_id": session_id},
         "tools_token": tools_token,
+        "attachments": attachments,
     })
     .to_string()
 }
@@ -1821,12 +1897,11 @@ pub async fn finish_invocation(
     error: Option<&str>,
     member_ids: &[Uuid],
 ) -> Result<Option<InvocationView>, sqlx::Error> {
-    let inv = sqlx::query_as::<_, InvocationView>(
+    let inv = sqlx::query_as::<_, InvocationView>(&format!(
         "UPDATE agent_invocations SET status = $2, error = $3, finished_at = now()
           WHERE id = $1 AND finished_at IS NULL
-         RETURNING id, agent_id, conversation_id, trigger_message_id, schedule_id, status, error,
-                   created_at, started_at, finished_at",
-    )
+         {INV_RETURNING}"
+    ))
     .bind(id)
     .bind(status)
     .bind(error)
@@ -2117,6 +2192,14 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
                 text = format!("⏰ 定时任务「{name}」\n{text}");
             }
         }
+        // A05：配额不够没发出去的产出文件，在正文末尾说明
+        let skipped = v["files_skipped"].as_i64().unwrap_or(0).max(0);
+        if skipped > 0 {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&format!("（{skipped} 个文件因存储空间不足未发送）"));
+        }
         // 步骤记录：finish 帧带的 steps 优先（宿主权威记录），缺省退回事件累积
         let steps: Vec<AgentStepView> = match v["steps"].as_array() {
             Some(arr) => arr
@@ -2147,6 +2230,8 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
         };
         // 持锁写回复，取消的 UPDATE 会等这把锁，提交后看到的已是终态
         post_agent_text(st, conv, owner, agent_id, &text, steps_json).await;
+        // A05：正文之后按序发产出附件；files 里只认本次调用凭据上传的附件
+        post_agent_files(st, conv, owner, agent_id, inv_id, &v["files"]).await;
         let updated = sqlx::query_as::<_, InvocationView>(&format!(
             "UPDATE agent_invocations
                 SET status = 'succeeded', error = NULL, finished_at = now()
@@ -2189,6 +2274,71 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
             push_invocation(st, &member_ids, &inv);
         }
         crate::approvals::expire_invocation(st, inv_id).await;
+    }
+}
+
+/// Agent A05：finish.files 给出的附件逐个发成 Agent 的附件消息（排在正文之后）。
+/// 只认 attachments.agent_invocation_id = 本次调用的行——别调用/普通上传/不存在的
+/// id 一律静默忽略；文件顺序与 files 数组一致（unnest ORDINALITY 还原）。
+async fn post_agent_files(
+    st: &SharedState,
+    conv: Uuid,
+    owner: Uuid,
+    agent_id: Uuid,
+    inv_id: Uuid,
+    files: &Value,
+) {
+    let ids: Vec<Uuid> = files
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if ids.is_empty() {
+        return;
+    }
+    let rows = sqlx::query_scalar::<_, Uuid>(
+        "SELECT a.id
+           FROM unnest($2::uuid[]) WITH ORDINALITY u(id, ord)
+           JOIN attachments a ON a.id = u.id
+          WHERE a.agent_invocation_id = $1
+          ORDER BY u.ord",
+    )
+    .bind(inv_id)
+    .bind(&ids)
+    .fetch_all(&st.pool)
+    .await
+    .unwrap_or_default();
+    for att_id in rows {
+        let posted = domain::post_message(
+            &st.pool,
+            domain::PostMessage {
+                conversation_id: conv,
+                sender_id: owner,
+                content: "",
+                client_msg_id: None,
+                attachment_id: Some(att_id),
+                reply_to_id: None,
+                poll: None,
+                forwarded_from: None,
+                forward_attachment: None,
+                agent_id: Some(agent_id),
+                agent_steps: None,
+                approval: None,
+            },
+        )
+        .await;
+        match posted {
+            Ok(p) => crate::ws::broadcast_posted(st, conv, &p).await,
+            Err(PostError::Deny { code, message }) => {
+                tracing::warn!(code, message, "agent file message rejected");
+            }
+            Err(PostError::Db(e)) => {
+                tracing::error!(error = %e, "agent file message insert failed");
+            }
+        }
     }
 }
 

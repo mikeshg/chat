@@ -7,11 +7,12 @@ use crate::auth;
 use crate::domain;
 use crate::error::{AppError, AppResult};
 use crate::state::SharedState;
-use axum::extract::{Query, State};
+use axum::extract::{Multipart, Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 /// 校验通过的调用凭据上下文：工具操作被钉死在这一次调用上
@@ -141,4 +142,49 @@ pub async fn tool_history(
         messages: messages.into_iter().map(ToolMessage::from).collect(),
         has_more,
     }))
+}
+
+/// POST /v1/agent-tools/files（Agent A05）：调用产出文件上传，multipart 字段 `file`。
+/// 附件记为：上传者=调用主人、会话=发起调用的会话，并打 agent_invocation_id 归属标记——
+/// invocation_finish.files 只能引用本次调用上传的附件。
+/// 配额/大小上限/图片缩略图与普通上传同一管线；超配额回 413 + quota_exceeded。
+pub async fn tool_upload_file(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    mut mp: Multipart,
+) -> AppResult<Json<Value>> {
+    let ctx = require_invocation(&st, &headers).await?;
+    let (quota_mb, quota_bytes, used_bytes) = crate::api::upload_quota(&st, ctx.owner).await?;
+    let rd = crate::api::read_upload(
+        &mut mp,
+        st.cfg.upload_max_bytes,
+        quota_bytes,
+        used_bytes,
+        &[],
+    )
+    .await?;
+    if rd.too_large {
+        return Err(AppError::bad_request("file too large"));
+    }
+    if rd.over_quota {
+        return Err(AppError::payload_too_large(format!(
+            "quota_exceeded: {}",
+            crate::api::quota_message(used_bytes, quota_mb)
+        )));
+    }
+    if !rd.got_file || rd.buf.is_empty() {
+        return Err(AppError::bad_request("missing file"));
+    }
+    let att = crate::api::store_upload(
+        &st,
+        ctx.owner,
+        ctx.conversation,
+        rd.file_name,
+        rd.mime,
+        rd.buf,
+        None,
+        Some(ctx.invocation),
+    )
+    .await?;
+    Ok(Json(json!({"attachment_id": att.id})))
 }

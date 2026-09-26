@@ -151,6 +151,13 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
             "/agent-tools/history",
             get(crate::agent_tools::tool_history),
         )
+        // Agent A05：产出文件上传（Invocation 凭据）；body 上限与普通上传一致
+        .route(
+            "/agent-tools/files",
+            post(crate::agent_tools::tool_upload_file).layer(DefaultBodyLimit::max(
+                cfg.upload_max_bytes + UPLOAD_BODY_MARGIN,
+            )),
+        )
         .route(
             "/agent-tools/schedules",
             get(crate::schedules::tool_list_schedules).post(crate::schedules::tool_create_schedule),
@@ -2373,7 +2380,7 @@ fn pct_encode(s: &str) -> String {
 }
 
 /// 413 配额提示：已用按 0.1 MB 精度展示
-fn quota_message(used_bytes: i64, quota_mb: i64) -> String {
+pub(crate) fn quota_message(used_bytes: i64, quota_mb: i64) -> String {
     format!(
         "存储空间已满（已用 {:.1} MB / 上限 {} MB）",
         used_bytes as f64 / 1024.0 / 1024.0,
@@ -2381,112 +2388,107 @@ fn quota_message(used_bytes: i64, quota_mb: i64) -> String {
     )
 }
 
-/// multipart: conversation_id 字段 + file 字段。上传者必须是会话成员。
-async fn upload_file(
-    State(st): State<SharedState>,
-    headers: HeaderMap,
-    mut mp: Multipart,
-) -> AppResult<Json<AttachmentView>> {
-    let uid = uid_of(&headers, &st).await?;
-    // 存储配额（V2 P2-1）：读取中按累计字节早拒，最终以实际写入字节为准。
-    // ponytail: 并发上传可略超配额（无锁读-改）；如需严格上限，按 uploader_id 加锁串行化上传。
+/// 存储配额三件套（V2 P2-1）：quota_mb、折算字节（0=不限）、当前已用。
+/// POST /v1/files 与 /v1/agent-tools/files（A05）共用。
+pub(crate) async fn upload_quota(
+    st: &SharedState,
+    uploader: Uuid,
+) -> AppResult<(i64, Option<i64>, i64)> {
     let quota_mb = settings::load(&st.pool).await?.storage_quota_mb;
     let quota_bytes = (quota_mb > 0).then(|| quota_mb * 1024 * 1024);
+    // ponytail: 并发上传可略超配额（无锁读-改）；如需严格上限，按 uploader_id 加锁串行化上传。
     let used_bytes = match quota_bytes {
-        Some(_) => domain::storage_used(&st.pool, uid).await?,
+        Some(_) => domain::storage_used(&st.pool, uploader).await?,
         None => 0,
     };
-    let mut conv: Option<Uuid> = None;
-    let mut file_name = "file".to_string();
-    let mut mime = "application/octet-stream".to_string();
-    let mut buf: Vec<u8> = Vec::new();
-    let mut got_file = false;
-    let mut too_large = false;
-    let mut over_quota = false;
-    let mut duration_raw: Option<String> = None;
+    Ok((quota_mb, quota_bytes, used_bytes))
+}
 
+/// multipart 读取结果：file 字段进 buf（超限/超配额排空打标），
+/// text_fields 白名单里的普通文本字段收进 fields。
+pub(crate) struct UploadRead {
+    pub fields: std::collections::HashMap<String, String>,
+    pub file_name: String,
+    pub mime: String,
+    pub buf: Vec<u8>,
+    pub got_file: bool,
+    pub too_large: bool,
+    pub over_quota: bool,
+}
+
+/// 流式读 multipart：文件本体卡 upload_max_bytes 与配额，错误响应仍能送达。
+pub(crate) async fn read_upload(
+    mp: &mut Multipart,
+    max_bytes: usize,
+    quota_bytes: Option<i64>,
+    used_bytes: i64,
+    text_fields: &[&'static str],
+) -> AppResult<UploadRead> {
+    let mut rd = UploadRead {
+        fields: std::collections::HashMap::new(),
+        file_name: "file".to_string(),
+        mime: "application/octet-stream".to_string(),
+        buf: Vec::new(),
+        got_file: false,
+        too_large: false,
+        over_quota: false,
+    };
     while let Some(mut field) = mp
         .next_field()
         .await
         .map_err(|e| AppError::bad_request(format!("bad multipart: {e}")))?
     {
-        match field.name() {
-            Some("conversation_id") => {
-                let v = field
-                    .text()
-                    .await
-                    .map_err(|_| AppError::bad_request("bad conversation_id"))?;
-                conv = Some(
-                    Uuid::parse_str(v.trim())
-                        .map_err(|_| AppError::bad_request("bad conversation_id"))?,
-                );
+        let name = field.name().unwrap_or_default().to_string();
+        if name == "file" {
+            if let Some(n) = field.file_name() {
+                rd.file_name = n.to_string();
             }
-            Some("duration_ms") => {
-                // 先记下原文，等 MIME 齐了再校验，避免非法时长把文件写进磁盘。
-                duration_raw = Some(
-                    field
-                        .text()
-                        .await
-                        .map_err(|_| AppError::bad_request("bad duration_ms"))?,
-                );
+            if let Some(ct) = field.content_type() {
+                rd.mime = ct.to_string();
             }
-            Some("file") => {
-                if let Some(n) = field.file_name() {
-                    file_name = n.to_string();
+            rd.got_file = true;
+            while let Some(chunk) = field
+                .chunk()
+                .await
+                .map_err(|e| AppError::bad_request(format!("read error: {e}")))?
+            {
+                if rd.too_large || rd.over_quota {
+                    continue; // 排空剩余 body，保证错误响应能送达
                 }
-                if let Some(ct) = field.content_type() {
-                    mime = ct.to_string();
-                }
-                got_file = true;
-                while let Some(chunk) = field
-                    .chunk()
-                    .await
-                    .map_err(|e| AppError::bad_request(format!("read error: {e}")))?
-                {
-                    if too_large || over_quota {
-                        continue; // 排空剩余 body，保证错误响应能送达
-                    }
-                    buf.extend_from_slice(&chunk);
-                    if buf.len() > st.cfg.upload_max_bytes {
-                        too_large = true;
-                        buf.clear();
-                    } else if let Some(qb) = quota_bytes {
-                        if used_bytes + buf.len() as i64 > qb {
-                            over_quota = true;
-                            buf.clear();
-                        }
+                rd.buf.extend_from_slice(&chunk);
+                if rd.buf.len() > max_bytes {
+                    rd.too_large = true;
+                    rd.buf.clear();
+                } else if let Some(qb) = quota_bytes {
+                    if used_bytes + rd.buf.len() as i64 > qb {
+                        rd.over_quota = true;
+                        rd.buf.clear();
                     }
                 }
             }
-            _ => {}
+        } else if text_fields.contains(&name.as_str()) {
+            let v = field
+                .text()
+                .await
+                .map_err(|_| AppError::bad_request(format!("bad {name}")))?;
+            rd.fields.insert(name, v);
         }
     }
-    if too_large {
-        return Err(AppError::bad_request("file too large"));
-    }
-    if over_quota {
-        return Err(AppError::payload_too_large(quota_message(
-            used_bytes, quota_mb,
-        )));
-    }
-    let conv = conv.ok_or_else(|| AppError::bad_request("missing conversation_id"))?;
-    if !got_file || buf.is_empty() {
-        return Err(AppError::bad_request("missing file"));
-    }
-    require_member(&st, conv, uid).await?;
-    let duration_ms = match duration_raw {
-        Some(raw) => {
-            // 语音时长只接受音频附件；普通文件即使漏传字段也不写成语音。
-            if !mime_base(&mime).starts_with("audio/") {
-                return Err(AppError::bad_request(
-                    "duration_ms is only allowed for audio",
-                ));
-            }
-            Some(parse_duration_ms(raw.trim())?)
-        }
-        None => None,
-    };
+    Ok(rd)
+}
 
+/// 写盘 + 图片尺寸/缩略图 + attachments 行。
+/// agent_invocation_id 是 A05 产出文件的归属标记（普通上传为 None）。
+pub(crate) async fn store_upload(
+    st: &SharedState,
+    uploader: Uuid,
+    conv: Uuid,
+    file_name: String,
+    mime: String,
+    buf: Vec<u8>,
+    duration_ms: Option<i32>,
+    agent_invocation_id: Option<Uuid>,
+) -> AppResult<AttachmentView> {
     let id = Uuid::new_v4();
     // 只存文件名。FILES_DIR 换位置时仍能拼回来；旧的绝对路径在下载时照旧使用。
     let stored = id.to_string();
@@ -2528,11 +2530,11 @@ async fn upload_file(
     sqlx::query(
         "INSERT INTO attachments
              (id, uploader_id, conv_id, file_name, mime, size, storage_path, width, height, thumb_path,
-              duration_ms)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+              duration_ms, agent_invocation_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(id)
-    .bind(uid)
+    .bind(uploader)
     .bind(conv)
     .bind(&file_name)
     .bind(&mime)
@@ -2542,9 +2544,10 @@ async fn upload_file(
     .bind(height)
     .bind(&thumb_path)
     .bind(duration_ms)
+    .bind(agent_invocation_id)
     .execute(&st.pool)
     .await?;
-    Ok(Json(AttachmentView {
+    Ok(AttachmentView {
         id,
         file_name,
         mime,
@@ -2553,7 +2556,68 @@ async fn upload_file(
         height,
         has_thumb: thumb_path.is_some(),
         duration_ms,
-    }))
+    })
+}
+
+/// multipart: conversation_id 字段 + file 字段。上传者必须是会话成员。
+async fn upload_file(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    mut mp: Multipart,
+) -> AppResult<Json<AttachmentView>> {
+    let uid = uid_of(&headers, &st).await?;
+    let (quota_mb, quota_bytes, used_bytes) = upload_quota(&st, uid).await?;
+    let rd = read_upload(
+        &mut mp,
+        st.cfg.upload_max_bytes,
+        quota_bytes,
+        used_bytes,
+        &["conversation_id", "duration_ms"],
+    )
+    .await?;
+    if rd.too_large {
+        return Err(AppError::bad_request("file too large"));
+    }
+    if rd.over_quota {
+        return Err(AppError::payload_too_large(quota_message(
+            used_bytes, quota_mb,
+        )));
+    }
+    let conv = match rd.fields.get("conversation_id") {
+        None => return Err(AppError::bad_request("missing conversation_id")),
+        Some(v) => {
+            Uuid::parse_str(v.trim()).map_err(|_| AppError::bad_request("bad conversation_id"))?
+        }
+    };
+    if !rd.got_file || rd.buf.is_empty() {
+        return Err(AppError::bad_request("missing file"));
+    }
+    require_member(&st, conv, uid).await?;
+    let duration_ms = match rd.fields.get("duration_ms") {
+        Some(raw) => {
+            // 语音时长只接受音频附件；普通文件即使漏传字段也不写成语音。
+            if !mime_base(&rd.mime).starts_with("audio/") {
+                return Err(AppError::bad_request(
+                    "duration_ms is only allowed for audio",
+                ));
+            }
+            Some(parse_duration_ms(raw.trim())?)
+        }
+        None => None,
+    };
+    Ok(Json(
+        store_upload(
+            &st,
+            uid,
+            conv,
+            rd.file_name,
+            rd.mime,
+            rd.buf,
+            duration_ms,
+            None,
+        )
+        .await?,
+    ))
 }
 
 /// 语音时长：仅整数，1–300000 毫秒（5 分钟）。空串、小数、越界都拒绝。

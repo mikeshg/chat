@@ -725,9 +725,14 @@ pub struct InvocationView {
     pub trigger_message_id: Option<Uuid>,
     /// 定时调用的来源。普通消息触发时不出现在 JSON 里。
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[sqlx(default)]
     pub schedule_id: Option<Uuid>,
     pub status: String,
     pub error: Option<String>,
+    /// Agent A05：这次调用带走的主人附件 id（派发时定下的清单；空数组 = 没带附件）
+    /// 查询漏了这一列时按空处理，而不是整行解码失败（A12 合并时吃过这个亏）
+    #[sqlx(default)]
+    pub attachment_ids: Vec<Uuid>,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,

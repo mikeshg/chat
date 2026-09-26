@@ -14,9 +14,10 @@
 use crate::permission;
 pub use crate::runtime::AgentSpec;
 use crate::runtime::{
-    AgentOption, AgentRuntime, ApprovalLink, ApprovalNotice, Events, InjectedMcp, RunEvent,
-    RunFuture, RunOutput, RunRequest, StepRecord,
+    AgentOption, AgentRuntime, ApprovalLink, ApprovalNotice, Events, InjectedMcp, LocalFile,
+    RunEvent, RunFuture, RunOutput, RunRequest, StepRecord,
 };
+use base64::Engine;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -90,6 +91,10 @@ pub async fn run_invocation(req: RunRequest, events: Events) -> Result<RunOutput
     // 在继承的环境上追加 / 覆盖，不清掉 PATH 等
     for (k, v) in &req.env {
         cmd.env(k, v);
+    }
+    // A05：产出文件目录；agent 往这里写文件，宿主在调用成功后逐个上传回会话
+    if let Some(o) = &req.outbox {
+        cmd.env("CHAT_AGENT_OUTBOX", o);
     }
     let mut child = cmd
         .spawn()
@@ -202,6 +207,62 @@ fn cap_load(caps: &Value) -> bool {
     caps.get("loadSession").and_then(Value::as_bool) == Some(true)
 }
 
+/// A05：initialize 响应里声明了 promptCapabilities.image（true 或 {}）→ 图片走 image 块。
+fn cap_image(init: &Value) -> bool {
+    match init.pointer("/agentCapabilities/promptCapabilities/image") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => false,
+        Some(_) => true,
+    }
+}
+
+/// 附件 → ACP 内容块。声明了 image 能力的图片走 base64 image 块；
+/// 其余（含没声明能力的图片、读不出内容的）走 resource_link。
+fn attachment_block(f: &LocalFile, image_ok: bool) -> Value {
+    if image_ok && f.mime.starts_with("image/") {
+        if let Ok(bytes) = std::fs::read(&f.path) {
+            return json!({
+                "type": "image",
+                "mimeType": f.mime,
+                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            });
+        }
+    }
+    let size = std::fs::metadata(&f.path).map(|m| m.len()).unwrap_or(0);
+    json!({
+        "type": "resource_link",
+        "uri": file_uri(&f.path),
+        "name": f.name,
+        "mimeType": f.mime,
+        "size": size,
+    })
+}
+
+/// file:///… 形式：Windows 反斜杠转正斜杠，盘符前补 /。
+fn file_uri(p: &Path) -> String {
+    let mut s = p.to_string_lossy().replace('\\', "/");
+    if !s.starts_with('/') {
+        s = format!("/{s}");
+    }
+    format!("file://{s}")
+}
+
+/// 附件块 + 用户文本 +（有 outbox 时的）产出提示，组成 session/prompt 的块列表。
+/// 新建会话的附加指令块仍由调用方放在最前。
+fn prompt_blocks(req: &RunRequest, image_ok: bool) -> Vec<Value> {
+    let mut blocks: Vec<Value> = req
+        .attachments
+        .iter()
+        .map(|f| attachment_block(f, image_ok))
+        .collect();
+    blocks.push(json!({"type": "text", "text": req.prompt}));
+    if let Some(o) = &req.outbox {
+        blocks.push(json!({"type": "text", "text": format!(
+            "如需把文件发给用户，把文件保存到 {}", o.display()
+        )}));
+    }
+    blocks
+}
+
 fn session_id_of(result: &Value, fallback: Option<&str>) -> Result<String, String> {
     if let Some(s) = result.get("sessionId").and_then(Value::as_str) {
         if !s.is_empty() {
@@ -283,6 +344,8 @@ async fn drive(
     if *cancel.borrow() {
         return Ok(Driven::default());
     }
+    // A05：图片能不能走 image 块看 initialize 声明的能力
+    let image_ok = cap_image(&init);
     // 注入的工具（A13）：新建和恢复会话都要带上
     let mcp = json!(mcp_entries(&init, &req.mcp_servers));
     // 能续上已有会话就续上（probe 不续）：模式、模型、额外目录、附加指令都沿用那个会话，不再设置
@@ -290,7 +353,8 @@ async fn drive(
         if let Some(sid) =
             resume_session(pipe, dir, req.resume_session.as_deref(), &caps, &mcp).await
         {
-            let prompt = json!([{"type": "text", "text": req.prompt}]);
+            // A05：恢复路径同样带附件块与 outbox 提示
+            let prompt = json!(prompt_blocks(req, image_ok));
             prompt_or_cancel(pipe, &json!(sid), prompt, cancel).await?;
             return Ok(Driven {
                 session_id: Some(sid),
@@ -341,7 +405,8 @@ async fn drive(
     if !req.instructions.is_empty() {
         blocks.push(json!({"type": "text", "text": req.instructions}));
     }
-    blocks.push(json!({"type": "text", "text": req.prompt}));
+    // A05：附件块插在指令之后、用户文本之前
+    blocks.extend(prompt_blocks(req, image_ok));
     prompt_or_cancel(pipe, &session_id, json!(blocks), cancel).await?;
     Ok(Driven {
         session_id: Some(sid),
