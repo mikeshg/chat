@@ -9943,7 +9943,7 @@ async fn agent_context_continues_in_same_conversation() {
     b.host.shutdown().await;
 }
 
-/// 2. 重置后再 recall 是空会话；非成员被拒；非 agent 会话 400。
+/// 2. 重置后再 recall 是空会话；非成员被拒；私聊可重置、文件传输助手 400。
 #[tokio::test]
 async fn agent_context_reset_clears_and_rejects() {
     let b = a02_boot("rs").await;
@@ -9961,7 +9961,13 @@ async fn agent_context_reset_clears_and_rejects() {
     assert_eq!(reset_context(&b.base, &other, &conv).await, 403);
     befriend(&b.base, &b.user, &other).await;
     let dm = dm_conv(&b.base, &b.user).await;
-    assert_eq!(reset_context(&b.base, &b.user, &dm).await, 400);
+    // 私聊 / 群也能开新话题（清请求者自己的 Agent 在这里的上下文）；文件传输助手仍不支持
+    assert_eq!(reset_context(&b.base, &b.user, &dm).await, 204);
+    let selfc = self_conv(&b.base, &b.user).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(reset_context(&b.base, &b.user, &selfc).await, 400);
     b.host.shutdown().await;
 }
 
