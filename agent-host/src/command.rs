@@ -130,6 +130,7 @@ fn batch_command(script: &Path, args: &[String]) -> Command {
     cmd
 }
 
+#[cfg(windows)]
 fn quote_cmd_arg(a: &str) -> String {
     if a.is_empty() || a.chars().any(|c| c.is_whitespace() || c == '"') {
         format!("\"{}\"", a.replace('"', "\\\""))
