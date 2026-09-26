@@ -26,6 +26,18 @@ const chunk = (sessionId, text) =>
   });
 
 let sessionId = "fake-session";
+let currentMode = "ask";
+let currentModel = "fast";
+let additionalDirs = [];
+
+const MODES = [
+  { id: "ask", name: "Ask" },
+  { id: "code", name: "Code" },
+];
+const MODELS = [
+  { modelId: "fast", name: "Fast" },
+  { modelId: "smart", name: "Smart" },
+];
 
 rl.on("line", (line) => {
   let m;
@@ -38,14 +50,49 @@ rl.on("line", (line) => {
   if (id === undefined) return; // 通知一律不回
 
   if (method === "initialize") {
-    return result(id, { protocolVersion: 1, agentCapabilities: {}, authMethods: [] });
+    return result(id, {
+      protocolVersion: 1,
+      agentCapabilities: { sessionCapabilities: { additionalDirectories: {} } },
+      authMethods: [],
+    });
   }
   if (method === "session/new") {
     sessionId = "fake-session";
-    return result(id, { sessionId });
+    currentMode = "ask";
+    currentModel = "fast";
+    additionalDirs = Array.isArray(params?.additionalDirectories) ? params.additionalDirectories : [];
+    return result(id, {
+      sessionId,
+      modes: { currentModeId: currentMode, availableModes: MODES },
+      models: { currentModelId: currentModel, availableModels: MODELS },
+    });
+  }
+  if (method === "session/set_mode") {
+    currentMode = params?.modeId ?? currentMode;
+    return result(id, {});
+  }
+  if (method === "session/set_model") {
+    currentModel = params?.modelId ?? currentModel;
+    return result(id, {});
   }
   if (method === "session/prompt") {
-    const text = (params?.prompt ?? []).map((p) => p?.text ?? "").join("");
+    const blocks = (params?.prompt ?? []).map((p) => (typeof p?.text === "string" ? p.text : ""));
+    const last = (blocks[blocks.length - 1] ?? "").trim();
+    if (last === "whoami") {
+      const first = blocks[0] ?? "";
+      chunk(
+        sessionId,
+        [
+          `mode=${currentMode}`,
+          `model=${currentModel}`,
+          `FAKE_ECHO=${process.env.FAKE_ECHO ?? ""}`,
+          `first=${first}`,
+          `dirs=${additionalDirs.join(",")}`,
+        ].join("\n"),
+      );
+      return result(id, { stopReason: "end_turn" });
+    }
+    const text = blocks.join("");
     if (text.startsWith("echo:")) {
       const out = text.slice(5);
       const mid = Math.max(1, Math.floor(out.length / 2));

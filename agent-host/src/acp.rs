@@ -8,7 +8,9 @@
 // fs/terminal 等反向请求；万一发起（含 session/request_permission）一律拒绝。
 
 pub use crate::runtime::AgentSpec;
-use crate::runtime::{AgentRuntime, Events, RunEvent, RunFuture, RunOutput, RunRequest};
+use crate::runtime::{
+    AgentOption, AgentRuntime, Events, RunEvent, RunFuture, RunOutput, RunRequest,
+};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -51,14 +53,19 @@ pub async fn run_invocation(req: &RunRequest, events: Events) -> Result<RunOutpu
     } else {
         PathBuf::from(&spec.cwd)
     };
-    let mut child = Command::new(&spec.command)
-        .args(&spec.args)
+    let mut cmd = Command::new(&spec.command);
+    cmd.args(&spec.args)
         .current_dir(&dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // 宿主关闭/任务被 abort 时自动杀子进程
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    // 在继承的环境上追加 / 覆盖，不清掉 PATH 等
+    for (k, v) in &req.env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("spawn `{}` 失败: {e}", spec.command))?;
 
@@ -116,30 +123,94 @@ pub async fn run_invocation(req: &RunRequest, events: Events) -> Result<RunOutpu
         err,
         events,
     };
-    let r = drive(&mut pipe, &dir, &req.prompt).await;
+    let r = drive(&mut pipe, &dir, req).await;
     let _ = child.kill().await;
-    r.map(|_| RunOutput {
+    r.map(|(modes, models)| RunOutput {
         text: std::mem::take(&mut pipe.text),
+        modes,
+        models,
     })
 }
 
-async fn drive(pipe: &mut Pipe, dir: &Path, prompt: &str) -> Result<(), String> {
-    pipe.call(
-        "initialize",
-        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+/// initialize 响应里声明了 sessionCapabilities.additionalDirectories（true 或 {}）才传额外目录。
+fn supports_additional_dirs(init: &Value) -> bool {
+    match init.pointer("/agentCapabilities/sessionCapabilities/additionalDirectories") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => false,
+        Some(_) => true,
+    }
+}
+
+fn option_list(v: Option<&Value>, id_keys: &[&str]) -> Option<Vec<AgentOption>> {
+    let arr = v?.as_array()?;
+    Some(
+        arr.iter()
+            .filter_map(|item| {
+                let id = id_keys.iter().find_map(|k| item[*k].as_str())?;
+                let name = item["name"].as_str().unwrap_or(id);
+                Some(AgentOption {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                })
+            })
+            .collect(),
     )
-    .await?;
-    let new = pipe
-        .call("session/new", json!({"cwd": dir, "mcpServers": []}))
+}
+
+fn in_options(id: &str, list: &Option<Vec<AgentOption>>) -> bool {
+    list.as_ref()
+        .is_some_and(|xs| xs.iter().any(|o| o.id == id))
+}
+
+async fn drive(
+    pipe: &mut Pipe,
+    dir: &Path,
+    req: &RunRequest,
+) -> Result<(Option<Vec<AgentOption>>, Option<Vec<AgentOption>>), String> {
+    let init = pipe
+        .call(
+            "initialize",
+            json!({"protocolVersion": 1, "clientCapabilities": {}}),
+        )
         .await?;
+    // 新建会话：额外目录、模式、模型、附加指令都只挂在这条分支上
+    // （恢复会话的路径由后续票另写，避免把附加指令重复塞进去）。
+    let mut params = json!({"cwd": dir, "mcpServers": []});
+    if supports_additional_dirs(&init) && !req.extra_dirs.is_empty() {
+        params["additionalDirectories"] = json!(req.extra_dirs);
+    }
+    let new = pipe.call("session/new", params).await?;
+    let modes = option_list(new.pointer("/modes/availableModes"), &["id"]);
+    // ACP 模型 id 字段是 modelId；也认 id，方便假 agent 两种写法
+    let models = option_list(new.pointer("/models/availableModels"), &["modelId", "id"]);
+    if req.probe {
+        return Ok((modes, models));
+    }
     let session_id = new["sessionId"].clone();
+    if !req.mode.is_empty() && in_options(&req.mode, &modes) {
+        pipe.call(
+            "session/set_mode",
+            json!({"sessionId": session_id, "modeId": req.mode}),
+        )
+        .await?;
+    }
+    if !req.model.is_empty() && in_options(&req.model, &models) {
+        pipe.call(
+            "session/set_model",
+            json!({"sessionId": session_id, "modelId": req.model}),
+        )
+        .await?;
+    }
+    let mut blocks = Vec::new();
+    if !req.instructions.is_empty() {
+        blocks.push(json!({"type": "text", "text": req.instructions}));
+    }
+    blocks.push(json!({"type": "text", "text": req.prompt}));
     pipe.call(
         "session/prompt",
-        json!({"sessionId": session_id,
-               "prompt": [{"type": "text", "text": prompt}]}),
+        json!({"sessionId": session_id, "prompt": blocks}),
     )
     .await?;
-    Ok(())
+    Ok((modes, models))
 }
 
 impl Pipe {

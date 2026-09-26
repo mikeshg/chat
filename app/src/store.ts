@@ -574,6 +574,8 @@ export function invocationErrorText(error: string | null | undefined): string {
       return "Agent 所在电脑不在线";
     case "host_disconnected":
       return "Agent 所在电脑断开了";
+    case "agent_deleted":
+      return "该 Agent 已删除";
     default:
       return error ?? "未知原因";
   }

@@ -328,8 +328,19 @@ export const agents = {
   list: () => get<AgentView[]>("/agents"),
   /** 创建 Agent（同时建专属会话）；400 bad_name / 409 name_taken / 404 宿主非本人 */
   create: (body: CreateAgentReq) => post<AgentView>("/agents", body),
-  /** 改 Agent（本批只有覆盖项）；404 = 不是自己的 Agent */
+  /** 改 Agent；400 校验失败 / 409 name_taken / 404 不是自己的或已删除 */
   patch: (id: string, body: PatchAgentReq) => patch<AgentView>(`/agents/${id}`, body),
+  /** 软删除。进行中的调用会被取消 */
+  remove: (id: string) => del<void>(`/agents/${id}`),
+  /** 让在线宿主上报可选模型 / 模式；离线 409 host_offline */
+  probe: (id: string) => post<{ ok?: boolean }>(`/agents/${id}/probe`),
+  /** 上传头像（PNG / JPEG / WebP），返回更新后的 Agent */
+  uploadAvatar: (id: string, file: Blob) => {
+    const fd = new FormData();
+    const ext = file.type === "image/png" ? "png" : file.type === "image/webp" ? "webp" : "jpg";
+    fd.append("file", file, `avatar.${ext}`);
+    return call<AgentView>(`/agents/${id}/avatar`, { method: "PUT", body: fd });
+  },
   /** 个人默认设置 */
   settings: () => get<AgentUserSettings>("/users/me/agent-settings"),
   updateSettings: (body: Partial<AgentUserSettings>) =>

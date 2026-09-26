@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -239,6 +240,8 @@ pub struct MessageView {
 pub struct AgentRef {
     pub id: Uuid,
     pub name: String,
+    /// 当前头像版本；0 = 没有头像。客户端用 GET /agents/{id}/avatar?v=
+    pub avatar_version: i32,
 }
 
 /// 群公告（会话列表随 ConversationView 下发；清空时整字段为 null）。
@@ -295,6 +298,10 @@ pub struct ConvAgentRef {
     pub name: String,
     pub host_id: Uuid,
     pub host_online: bool,
+    /// 当前头像版本；0 = 没有头像
+    pub avatar_version: i32,
+    /// 软删除后专属会话仍在，输入只读
+    pub deleted: bool,
 }
 
 /// GET /conversations/preferences 的条目：{conversation_id, preference}
@@ -536,6 +543,21 @@ pub struct AgentView {
     /// 覆盖项：null = 跟随主人的个人默认（见 AgentUserSettings）
     pub output_mode: Option<String>,
     pub queue_timeout_secs: Option<i32>,
+    /// 宿主机上的额外可访问目录
+    pub extra_dirs: Vec<String>,
+    /// 空串 = 用 agent 自己的默认模型 / 模式
+    pub model: String,
+    pub mode: String,
+    /// 附加指令；只在新建运行时会话时放在用户指令前
+    pub instructions: String,
+    /// 环境变量（明文）。只出现在主人自己的 GET /agents 与 PATCH 响应里
+    pub env: serde_json::Value,
+    /// 宿主上报的可选模型 / 模式：{"modes":[{"id","name"}],"models":[...]}
+    pub reported_options: serde_json::Value,
+    /// 头像版本；0 = 没有头像
+    pub avatar_version: i32,
+    /// 软删除后列表不再返回；字段留给已经拿到的视图
+    pub deleted: bool,
 }
 
 /// 个人 Agent 默认设置（GET/PUT /v1/users/me/agent-settings）；也用作「生效值」
@@ -554,13 +576,25 @@ pub struct UpdateAgentUserSettingsReq {
     pub queue_timeout_secs: Option<i32>,
 }
 
-/// PATCH /v1/agents/{id}：字段缺省 = 不改；显式 null = 清除覆盖、回到个人默认
+/// PATCH /v1/agents/{id}：字段缺省 = 不改；覆盖项显式 null = 清除、回到个人默认。
+/// 请求里出现 host_id（任何值）→ 400 host_immutable。
 #[derive(Debug, Deserialize)]
 pub struct PatchAgentReq {
     #[serde(default, deserialize_with = "double_option")]
     pub output_mode: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
     pub queue_timeout_secs: Option<Option<i32>>,
+    pub name: Option<String>,
+    pub runtime: Option<AgentRuntimeReq>,
+    pub cwd: Option<String>,
+    pub extra_dirs: Option<Vec<String>>,
+    pub model: Option<String>,
+    pub mode: Option<String>,
+    pub instructions: Option<String>,
+    pub env: Option<serde_json::Value>,
+    /// 只要 JSON 里带了这个键就为 true（值本身忽略）
+    #[serde(default, deserialize_with = "flag_present")]
+    pub host_id: bool,
 }
 
 /// 区分「字段缺省」(None) 与「显式 null」(Some(None))
@@ -570,6 +604,14 @@ where
     T: Deserialize<'de>,
 {
     Option::<T>::deserialize(d).map(Some)
+}
+
+/// 字段出现即为 true；缺省走 serde default（false）
+fn flag_present<'de, D>(d: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    IgnoredAny::deserialize(d).map(|_| true)
 }
 
 /// POST /v1/agents 请求体

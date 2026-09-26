@@ -506,6 +506,7 @@ describe("Agent A01：宿主状态与调用记录", () => {
   it("invocationErrorText：稳定错误码 → 中文文案", () => {
     expect(invocationErrorText("host_offline")).toBe("Agent 所在电脑不在线");
     expect(invocationErrorText("host_disconnected")).toBe("Agent 所在电脑断开了");
+    expect(invocationErrorText("agent_deleted")).toBe("该 Agent 已删除");
     expect(invocationErrorText("boom")).toBe("boom");
     expect(invocationErrorText(null)).toBe("未知原因");
   });

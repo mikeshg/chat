@@ -15,12 +15,14 @@ use crate::model::{
 };
 use crate::state::SharedState;
 use axum::{
-    extract::{Path, Query, State},
-    http::HeaderMap,
+    extract::{Multipart, Path, Query, State},
+    http::{header, HeaderMap, StatusCode},
+    response::IntoResponse,
     Json,
 };
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -59,7 +61,10 @@ pub async fn list_hosts(
 const AGENT_SELECT: &str = "SELECT a.id, a.name, a.host_id, a.runtime, a.cwd, a.created_at,
         (SELECT c.id FROM conversations c
           WHERE c.agent_id = a.id AND c.type = 'agent') AS conversation_id,
-        a.output_mode, a.queue_timeout_secs
+        a.output_mode, a.queue_timeout_secs,
+        a.extra_dirs, a.model, a.mode, a.instructions, a.env,
+        a.avatar_version, a.reported_options,
+        (a.deleted_at IS NOT NULL) AS deleted
    FROM agents a";
 
 #[derive(sqlx::FromRow)]
@@ -67,12 +72,20 @@ struct AgentDbRow {
     id: Uuid,
     name: String,
     host_id: Uuid,
-    runtime: serde_json::Value,
+    runtime: Value,
     cwd: String,
     created_at: DateTime<Utc>,
     conversation_id: Option<Uuid>,
     output_mode: Option<String>,
     queue_timeout_secs: Option<i32>,
+    extra_dirs: Vec<String>,
+    model: String,
+    mode: String,
+    instructions: String,
+    env: Value,
+    avatar_version: i32,
+    reported_options: Value,
+    deleted: bool,
 }
 
 fn agent_view(st: &SharedState, r: AgentDbRow) -> AgentView {
@@ -87,6 +100,14 @@ fn agent_view(st: &SharedState, r: AgentDbRow) -> AgentView {
         created_at: r.created_at,
         output_mode: r.output_mode,
         queue_timeout_secs: r.queue_timeout_secs,
+        extra_dirs: r.extra_dirs,
+        model: r.model,
+        mode: r.mode,
+        instructions: r.instructions,
+        env: r.env,
+        reported_options: r.reported_options,
+        avatar_version: r.avatar_version,
+        deleted: r.deleted,
     }
 }
 
@@ -96,7 +117,7 @@ pub async fn list_agents(
 ) -> AppResult<Json<Vec<AgentView>>> {
     let uid = uid(&headers, &st).await?;
     let rows = sqlx::query_as::<_, AgentDbRow>(&format!(
-        "{AGENT_SELECT} WHERE a.owner_id = $1 ORDER BY a.created_at, a.id"
+        "{AGENT_SELECT} WHERE a.owner_id = $1 AND a.deleted_at IS NULL ORDER BY a.created_at, a.id"
     ))
     .bind(uid)
     .fetch_all(&st.pool)
@@ -124,18 +145,7 @@ pub async fn create_agent(
     if !valid_name(&req.name) {
         return Err(AppError::bad_request("bad_name"));
     }
-    let command = req.runtime.command.trim();
-    if command.is_empty() || command.chars().count() > 500 {
-        return Err(AppError::bad_request("bad_runtime"));
-    }
-    if req.runtime.args.len() > 50 || req.runtime.args.iter().any(|a| a.chars().count() > 500) {
-        return Err(AppError::bad_request("bad_runtime"));
-    }
-    let cwd = req.cwd.trim().to_string();
-    if cwd.chars().count() > 500 {
-        return Err(AppError::bad_request("bad_runtime"));
-    }
-    let runtime = serde_json::json!({"command": command, "args": req.runtime.args});
+    let (runtime, cwd) = check_runtime(&req.runtime.command, &req.runtime.args, &req.cwd)?;
 
     let mut tx = st.pool.begin().await?;
     // 宿主必须属于当前用户；否则 404（不暴露他人资源存在性）
@@ -198,7 +208,84 @@ pub async fn create_agent(
         created_at: Utc::now(),
         output_mode: None,
         queue_timeout_secs: None,
+        extra_dirs: Vec::new(),
+        model: String::new(),
+        mode: String::new(),
+        instructions: String::new(),
+        env: json!({}),
+        reported_options: json!({}),
+        avatar_version: 0,
+        deleted: false,
     }))
+}
+
+/// command / args / cwd 与创建共用同一套限制。
+fn check_runtime(command: &str, args: &[String], cwd: &str) -> AppResult<(Value, String)> {
+    let command = command.trim();
+    if command.is_empty() || command.chars().count() > 500 {
+        return Err(AppError::bad_request("bad_runtime"));
+    }
+    if args.len() > 50 || args.iter().any(|a| a.chars().count() > 500) {
+        return Err(AppError::bad_request("bad_runtime"));
+    }
+    let cwd = cwd.trim().to_string();
+    if cwd.chars().count() > 500 {
+        return Err(AppError::bad_request("bad_runtime"));
+    }
+    Ok((json!({"command": command, "args": args}), cwd))
+}
+
+fn check_instructions(s: &str) -> AppResult<()> {
+    if s.chars().count() > 8000 {
+        return Err(AppError::bad_request("bad_instructions"));
+    }
+    Ok(())
+}
+
+/// 空串 = 用 agent 默认。过长拒绝。
+fn check_token(s: &str, code: &'static str) -> AppResult<String> {
+    let t = s.trim();
+    if t.chars().count() > 200 {
+        return Err(AppError::bad_request(code));
+    }
+    Ok(t.to_string())
+}
+
+/// 去掉空行后 ≤ 10 个，每个 ≤ 500 字符。
+fn check_extra_dirs(dirs: &[String]) -> AppResult<Vec<String>> {
+    let dirs: Vec<String> = dirs
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if dirs.len() > 10 || dirs.iter().any(|s| s.chars().count() > 500) {
+        return Err(AppError::bad_request("bad_extra_dirs"));
+    }
+    Ok(dirs)
+}
+
+/// 字符串到字符串，≤ 50 项，键 ≤ 100、值 ≤ 4000。空键拒绝。
+fn check_env(v: &Value) -> AppResult<Value> {
+    let obj = v
+        .as_object()
+        .ok_or_else(|| AppError::bad_request("bad_env"))?;
+    if obj.len() > 50 {
+        return Err(AppError::bad_request("bad_env"));
+    }
+    let mut out = serde_json::Map::new();
+    for (k, val) in obj {
+        if k.is_empty() || k.chars().count() > 100 {
+            return Err(AppError::bad_request("bad_env"));
+        }
+        let s = val
+            .as_str()
+            .ok_or_else(|| AppError::bad_request("bad_env"))?;
+        if s.chars().count() > 4000 {
+            return Err(AppError::bad_request("bad_env"));
+        }
+        out.insert(k.clone(), Value::String(s.to_string()));
+    }
+    Ok(Value::Object(out))
 }
 
 // ---------- 设置：个人默认 + 单个 Agent 覆盖 ----------
@@ -286,7 +373,8 @@ pub async fn put_user_settings(
     Ok(Json(cur))
 }
 
-/// PATCH /v1/agents/{id}：本票只有两个覆盖项；其余配置项由后续票往 PatchAgentReq 里加。
+/// PATCH /v1/agents/{id}：缺省字段不改。已删除 / 别人的 Agent → 404。
+/// 带 host_id → 400 host_immutable（宿主在添加时选定，不能换）。
 pub async fn patch_agent(
     State(st): State<SharedState>,
     headers: HeaderMap,
@@ -304,14 +392,62 @@ pub async fn patch_agent(
             return Err(AppError::bad_request("bad_queue_timeout"));
         }
     }
+    let name = match &req.name {
+        Some(n) if !valid_name(n) => return Err(AppError::bad_request("bad_name")),
+        Some(n) => Some(n.clone()),
+        None => None,
+    };
+    // runtime 与 cwd 各自缺省 = 不改，避免只改命令时把工作目录清掉
+    let new_runtime = match &req.runtime {
+        Some(rt) => {
+            let (runtime, _) = check_runtime(&rt.command, &rt.args, "")?;
+            Some(runtime)
+        }
+        None => None,
+    };
+    let new_cwd = match &req.cwd {
+        Some(cwd) => {
+            let cwd = cwd.trim().to_string();
+            if cwd.chars().count() > 500 {
+                return Err(AppError::bad_request("bad_runtime"));
+            }
+            Some(cwd)
+        }
+        None => None,
+    };
+    let extra_dirs = match &req.extra_dirs {
+        Some(d) => Some(check_extra_dirs(d)?),
+        None => None,
+    };
+    let model = match &req.model {
+        Some(m) => Some(check_token(m, "bad_model")?),
+        None => None,
+    };
+    let mode = match &req.mode {
+        Some(m) => Some(check_token(m, "bad_mode")?),
+        None => None,
+    };
+    if let Some(s) = &req.instructions {
+        check_instructions(s)?;
+    }
+    let env = match &req.env {
+        Some(v) => Some(check_env(v)?),
+        None => None,
+    };
+
     let mut tx = st.pool.begin().await?;
-    let owner =
-        sqlx::query_scalar::<_, Uuid>("SELECT owner_id FROM agents WHERE id = $1 FOR UPDATE")
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?;
-    if owner != Some(uid) {
+    let row = sqlx::query_as::<_, (Uuid, Option<DateTime<Utc>>)>(
+        "SELECT owner_id, deleted_at FROM agents WHERE id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    // 已删除与不存在、别人的 Agent 一样 404，不暴露存在性
+    if !matches!(&row, Some((owner, None)) if *owner == uid) {
         return Err(AppError::not_found("agent not found"));
+    }
+    if req.host_id {
+        return Err(AppError::bad_request("host_immutable"));
     }
     if let Some(m) = req.output_mode {
         sqlx::query("UPDATE agents SET output_mode = $2, updated_at = now() WHERE id = $1")
@@ -327,12 +463,334 @@ pub async fn patch_agent(
             .execute(&mut *tx)
             .await?;
     }
+    if let Some(n) = name {
+        match sqlx::query("UPDATE agents SET name = $2, updated_at = now() WHERE id = $1")
+            .bind(id)
+            .bind(n)
+            .execute(&mut *tx)
+            .await
+        {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(db)) if db.constraint() == Some("uq_agents_owner_name") => {
+                return Err(AppError::conflict("name_taken"));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if let Some(runtime) = new_runtime {
+        sqlx::query("UPDATE agents SET runtime = $2, updated_at = now() WHERE id = $1")
+            .bind(id)
+            .bind(runtime)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(cwd) = new_cwd {
+        sqlx::query("UPDATE agents SET cwd = $2, updated_at = now() WHERE id = $1")
+            .bind(id)
+            .bind(cwd)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(dirs) = extra_dirs {
+        sqlx::query("UPDATE agents SET extra_dirs = $2, updated_at = now() WHERE id = $1")
+            .bind(id)
+            .bind(dirs)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(m) = model {
+        sqlx::query("UPDATE agents SET model = $2, updated_at = now() WHERE id = $1")
+            .bind(id)
+            .bind(m)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(m) = mode {
+        sqlx::query("UPDATE agents SET mode = $2, updated_at = now() WHERE id = $1")
+            .bind(id)
+            .bind(m)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(s) = req.instructions {
+        sqlx::query("UPDATE agents SET instructions = $2, updated_at = now() WHERE id = $1")
+            .bind(id)
+            .bind(s)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(env) = env {
+        sqlx::query("UPDATE agents SET env = $2, updated_at = now() WHERE id = $1")
+            .bind(id)
+            .bind(env)
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
+    Ok(Json(load_agent_view(&st, id).await?))
+}
+
+async fn load_agent_view(st: &SharedState, id: Uuid) -> AppResult<AgentView> {
     let row = sqlx::query_as::<_, AgentDbRow>(&format!("{AGENT_SELECT} WHERE a.id = $1"))
         .bind(id)
         .fetch_one(&st.pool)
         .await?;
-    Ok(Json(agent_view(&st, row)))
+    Ok(agent_view(st, row))
+}
+
+/// DELETE /v1/agents/{id}：软删除。进行中的调用改 failed/agent_deleted，并通知宿主取消。
+pub async fn delete_agent(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> AppResult<StatusCode> {
+    let uid = uid(&headers, &st).await?;
+    let mut tx = st.pool.begin().await?;
+    let row = sqlx::query_as::<_, (Uuid, Uuid, Option<DateTime<Utc>>)>(
+        "SELECT owner_id, host_id, deleted_at FROM agents WHERE id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((owner, host_id, None)) = row else {
+        return Err(AppError::not_found("agent not found"));
+    };
+    if owner != uid {
+        return Err(AppError::not_found("agent not found"));
+    }
+    sqlx::query("UPDATE agents SET deleted_at = now(), updated_at = now() WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    let invs = sqlx::query_as::<_, InvocationView>(
+        "UPDATE agent_invocations SET status = 'failed', error = 'agent_deleted',
+                finished_at = now()
+          WHERE agent_id = $1 AND finished_at IS NULL
+         RETURNING id, agent_id, conversation_id, trigger_message_id, status, error,
+                   created_at, started_at, finished_at",
+    )
+    .bind(id)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    for inv in &invs {
+        let cancel = json!({"type": "invocation_cancel", "invocation_id": inv.id}).to_string();
+        st.send_to_host(host_id, &cancel);
+        push_invocation(&st, &[owner], inv);
+    }
+    // 会话列表要带上 deleted；Agent 列表面板重拉
+    crate::api::notify(&st, &[owner], "conversations");
+    crate::api::notify(&st, &[owner], "agents");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /v1/agents/{id}/probe：宿主在线则下发 agent_probe，202；离线 409。
+pub async fn probe_agent(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> AppResult<(StatusCode, Json<Value>)> {
+    let uid = uid(&headers, &st).await?;
+    let cfg = load_cfg(&st.pool, id)
+        .await?
+        .filter(|a| a.owner == uid && a.deleted_at.is_none())
+        .ok_or_else(|| AppError::not_found("agent not found"))?;
+    let payload = json!({
+        "type": "agent_probe",
+        "agent": agent_snapshot(&cfg),
+    })
+    .to_string();
+    if !st.host_online(cfg.host_id) || !st.send_to_host(cfg.host_id, &payload) {
+        return Err(AppError::conflict("host_offline"));
+    }
+    Ok((StatusCode::ACCEPTED, Json(json!({"ok": true}))))
+}
+
+/// 宿主上报 agent_options：写入 reported_options，并让主人重拉 Agent 列表。
+pub async fn handle_options(st: &SharedState, host_id: Uuid, v: &Value) {
+    let Some(agent_id) = v["agent_id"].as_str().and_then(|s| Uuid::parse_str(s).ok()) else {
+        return;
+    };
+    let stored = clean_reported(v);
+    let owner = sqlx::query_scalar::<_, Uuid>(
+        "UPDATE agents SET reported_options = $2, updated_at = now()
+          WHERE id = $1 AND host_id = $3 AND deleted_at IS NULL
+         RETURNING owner_id",
+    )
+    .bind(agent_id)
+    .bind(&stored)
+    .bind(host_id)
+    .fetch_optional(&st.pool)
+    .await;
+    if let Ok(Some(owner)) = owner {
+        crate::api::notify(st, &[owner], "agents");
+    }
+}
+
+fn clean_reported(v: &Value) -> Value {
+    json!({
+        "modes": clean_option_list(&v["modes"]),
+        "models": clean_option_list(&v["models"]),
+    })
+}
+
+fn clean_option_list(v: &Value) -> Vec<Value> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .take(100)
+                .filter_map(|item| {
+                    let id: String = item["id"].as_str()?.chars().take(200).collect();
+                    if id.is_empty() {
+                        return None;
+                    }
+                    let name: String = item["name"]
+                        .as_str()
+                        .unwrap_or(&id)
+                        .chars()
+                        .take(200)
+                        .collect();
+                    let name = if name.is_empty() { id.clone() } else { name };
+                    Some(json!({"id": id, "name": name}))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AvatarQuery {
+    v: Option<i32>,
+}
+
+/// PUT /v1/agents/{id}/avatar：PNG / JPEG / WebP，规则与用户头像相同。成功版本 +1。
+pub async fn put_agent_avatar(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    mut mp: Multipart,
+) -> AppResult<Json<AgentView>> {
+    let uid = uid(&headers, &st).await?;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut got_file = false;
+    let mut too_large = false;
+    while let Some(mut field) = mp
+        .next_field()
+        .await
+        .map_err(|e| AppError::bad_request(format!("bad multipart: {e}")))?
+    {
+        if field.name() != Some("file") {
+            continue;
+        }
+        got_file = true;
+        while let Some(chunk) = field
+            .chunk()
+            .await
+            .map_err(|e| AppError::bad_request(format!("read error: {e}")))?
+        {
+            if too_large {
+                continue;
+            }
+            buf.extend_from_slice(&chunk);
+            if buf.len() > crate::api::AVATAR_MAX_BYTES {
+                too_large = true;
+                buf.clear();
+            }
+        }
+    }
+    if too_large {
+        return Err(AppError::bad_request("avatar too large"));
+    }
+    if !got_file || buf.is_empty() {
+        return Err(AppError::bad_request("missing file"));
+    }
+    let img =
+        crate::api::sniff_avatar(&buf).ok_or_else(|| AppError::bad_request("unsupported image"))?;
+
+    let cur = sqlx::query_as::<_, (Uuid, i32, Option<String>, Option<DateTime<Utc>>)>(
+        "SELECT owner_id, avatar_version, avatar_path, deleted_at FROM agents WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&st.pool)
+    .await?;
+    let Some((owner, version, old_path, None)) = cur else {
+        return Err(AppError::not_found("agent not found"));
+    };
+    if owner != uid {
+        return Err(AppError::not_found("agent not found"));
+    }
+    let next = version + 1;
+    let stored = format!(
+        "{id}-{next}-{}.{}",
+        &Uuid::new_v4().simple().to_string()[..8],
+        img.ext
+    );
+    let dir = std::path::Path::new(&st.cfg.files_dir).join("avatars");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| AppError::internal(format!("create avatar dir: {e}")))?;
+    let path = dir.join(&stored);
+    if let Err(e) = tokio::fs::write(&path, &buf).await {
+        return Err(AppError::internal(format!("store avatar: {e}")));
+    }
+    let updated = sqlx::query(
+        "UPDATE agents SET avatar_path = $2, avatar_version = avatar_version + 1, updated_at = now()
+          WHERE id = $1 AND avatar_version = $3 AND deleted_at IS NULL AND owner_id = $4",
+    )
+    .bind(id)
+    .bind(&stored)
+    .bind(version)
+    .bind(uid)
+    .execute(&st.pool)
+    .await?;
+    if updated.rows_affected() == 0 {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(AppError::conflict("avatar changed, retry"));
+    }
+    crate::api::spawn_avatar_cleanup(&st, old_path);
+    crate::api::notify(&st, &[uid], "agents");
+    crate::api::notify(&st, &[uid], "conversations");
+    Ok(Json(load_agent_view(&st, id).await?))
+}
+
+/// GET /v1/agents/{id}/avatar：无需鉴权。v 等于当前版本才长期缓存。已删除的 Agent 头像仍可取。
+pub(crate) async fn get_agent_avatar(
+    State(st): State<SharedState>,
+    Path(id): Path<Uuid>,
+    Query(q): Query<AvatarQuery>,
+) -> AppResult<impl IntoResponse> {
+    let row = sqlx::query_as::<_, (Option<String>, i32)>(
+        "SELECT avatar_path, avatar_version FROM agents WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&st.pool)
+    .await?
+    .ok_or_else(|| AppError::not_found("agent not found"))?;
+    let (path, version) = row;
+    let stored = path.ok_or_else(|| AppError::not_found("no avatar"))?;
+    if stored.contains('/') || stored.contains('\\') || stored.contains("..") {
+        return Err(AppError::not_found("no avatar"));
+    }
+    let data = tokio::fs::read(crate::api::avatar_file_path(&st.cfg.files_dir, &stored))
+        .await
+        .map_err(|_| AppError::not_found("no avatar"))?;
+    let mime = crate::api::sniff_avatar(&data)
+        .map(|img| img.mime)
+        .unwrap_or("application/octet-stream");
+    let cache = if q.v == Some(version) {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    Ok((
+        [
+            (header::CONTENT_TYPE, mime.to_string()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            (header::CACHE_CONTROL, cache.to_string()),
+        ],
+        data,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -372,28 +830,84 @@ struct AgentRow {
     owner: Uuid,
     host_id: Uuid,
     name: String,
-    runtime: serde_json::Value,
+    runtime: Value,
     cwd: String,
+    extra_dirs: Vec<String>,
+    model: String,
+    mode: String,
+    instructions: String,
+    env: Value,
+    deleted_at: Option<DateTime<Utc>>,
+}
+
+#[derive(sqlx::FromRow)]
+struct AgentCfgRow {
+    id: Uuid,
+    owner_id: Option<Uuid>,
+    host_id: Uuid,
+    name: String,
+    runtime: Value,
+    cwd: String,
+    extra_dirs: Vec<String>,
+    model: String,
+    mode: String,
+    instructions: String,
+    env: Value,
+    deleted_at: Option<DateTime<Utc>>,
+}
+
+fn row_to_agent(r: AgentCfgRow) -> AgentRow {
+    AgentRow {
+        id: r.id,
+        owner: r.owner_id.unwrap_or_default(),
+        host_id: r.host_id,
+        name: r.name,
+        runtime: r.runtime,
+        cwd: r.cwd,
+        extra_dirs: r.extra_dirs,
+        model: r.model,
+        mode: r.mode,
+        instructions: r.instructions,
+        env: r.env,
+        deleted_at: r.deleted_at,
+    }
+}
+
+const AGENT_CFG_SQL: &str = "SELECT a.id, a.owner_id, a.host_id, a.name, a.runtime, a.cwd,
+        a.extra_dirs, a.model, a.mode, a.instructions, a.env, a.deleted_at";
+
+async fn load_cfg(pool: &PgPool, id: Uuid) -> Result<Option<AgentRow>, sqlx::Error> {
+    sqlx::query_as::<_, AgentCfgRow>(&format!("{AGENT_CFG_SQL} FROM agents a WHERE a.id = $1"))
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map(|r| r.map(row_to_agent))
 }
 
 async fn agent_of_conv(pool: &PgPool, conv: Uuid) -> Result<Option<AgentRow>, sqlx::Error> {
-    sqlx::query_as::<_, (Uuid, Option<Uuid>, Uuid, String, serde_json::Value, String)>(
-        "SELECT a.id, c.owner_id, a.host_id, a.name, a.runtime, a.cwd
+    sqlx::query_as::<_, AgentCfgRow>(&format!(
+        "{AGENT_CFG_SQL}
            FROM conversations c JOIN agents a ON a.id = c.agent_id
-          WHERE c.id = $1 AND c.type = 'agent'",
-    )
+          WHERE c.id = $1 AND c.type = 'agent'"
+    ))
     .bind(conv)
     .fetch_optional(pool)
     .await
-    .map(|r| {
-        r.map(|(id, owner, host_id, name, runtime, cwd)| AgentRow {
-            id,
-            owner: owner.unwrap_or_default(),
-            host_id,
-            name,
-            runtime,
-            cwd,
-        })
+    .map(|r| r.map(row_to_agent))
+}
+
+/// invocation_start / agent_probe 共用的配置快照。改配置在下一次调用生效。
+fn agent_snapshot(a: &AgentRow) -> Value {
+    json!({
+        "id": a.id,
+        "name": a.name,
+        "runtime": a.runtime,
+        "cwd": a.cwd,
+        "extra_dirs": a.extra_dirs,
+        "model": a.model,
+        "mode": a.mode,
+        "instructions": a.instructions,
+        "env": a.env,
     })
 }
 
@@ -408,7 +922,7 @@ pub async fn maybe_invoke(st: &SharedState, conv: Uuid, posted: &domain::Posted)
         _ => return,
     };
     // 只有主人本人的消息触发；专属会话唯一成员即主人，显式校验防结构漂移
-    if posted.message.sender_id != agent.owner {
+    if agent.deleted_at.is_some() || posted.message.sender_id != agent.owner {
         return;
     }
     dispatch(
@@ -454,10 +968,10 @@ async fn dispatch(
     if inv.status != "running" {
         return;
     }
-    let payload = serde_json::json!({
+    let payload = json!({
         "type": "invocation_start",
         "invocation_id": inv.id,
-        "agent": {"id": agent.id, "name": agent.name, "runtime": agent.runtime, "cwd": agent.cwd},
+        "agent": agent_snapshot(&agent),
         "prompt": prompt,
     })
     .to_string();
