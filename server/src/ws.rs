@@ -467,6 +467,7 @@ async fn send_message(
             forward_attachment: None,
             // agent_id 仅服务端宿主回写路径可达：用户 WS 不能伪造 Agent 身份
             agent_id: None,
+            agent_steps: None,
         },
     )
     .await

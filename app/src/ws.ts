@@ -11,6 +11,7 @@ import {
 import { notifyIncoming } from "./notify";
 import {
   absorbAvatarUsers,
+  applyAgentStream,
   applyHostStatus,
   applyInvocations,
   applyLiveMessage,
@@ -441,6 +442,10 @@ function dispatch(f: WsOut) {
       break;
     case "agent_invocation":
       setState((cur) => applyInvocations(cur, [f.invocation]));
+      break;
+    case "agent_stream":
+      // Agent A03：stream 模式增量帧 → 临时渲染状态（不落库）
+      setState((cur) => applyAgentStream(cur, f));
       break;
     case "force_logout": {
       // 被踢下线（禁用/重置密码/改密/移出设备）：记录原因 → 停连接 → 回登录页

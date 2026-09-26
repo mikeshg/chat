@@ -8,8 +8,11 @@
 // fs/terminal 等反向请求；万一发起（含 session/request_permission）一律拒绝。
 
 pub use crate::runtime::AgentSpec;
-use crate::runtime::{AgentRuntime, Events, RunEvent, RunFuture, RunOutput, RunRequest};
+use crate::runtime::{
+    AgentRuntime, Events, RunEvent, RunFuture, RunOutput, RunRequest, StepRecord,
+};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -40,6 +43,10 @@ struct Pipe {
     /// stderr 尾（诊断用，封顶 ~2KB）
     err: Arc<Mutex<String>>,
     events: Events,
+    /// 进行中的 tool_call：id → (title, kind)
+    open_steps: HashMap<String, (String, String)>,
+    /// 已完成步骤（按收尾顺序）
+    steps: Vec<StepRecord>,
 }
 
 /// 跑一次调用：起进程、握手、发 prompt、收全部分块文本（同时逐段发 RunEvent::Text）。
@@ -115,11 +122,14 @@ pub async fn run_invocation(req: &RunRequest, events: Events) -> Result<RunOutpu
         text: String::new(),
         err,
         events,
+        open_steps: HashMap::new(),
+        steps: Vec::new(),
     };
     let r = drive(&mut pipe, &dir, &req.prompt).await;
     let _ = child.kill().await;
     r.map(|_| RunOutput {
         text: std::mem::take(&mut pipe.text),
+        steps: std::mem::take(&mut pipe.steps),
     })
 }
 
@@ -199,19 +209,57 @@ impl Pipe {
     }
 
     fn on_notify(&mut self, method: &str, params: &Value) {
-        if method == "session/update"
-            && params
-                .pointer("/update/sessionUpdate")
-                .and_then(Value::as_str)
-                == Some("agent_message_chunk")
-        {
-            if let Some(t) = params
-                .pointer("/update/content/text")
-                .and_then(Value::as_str)
-            {
-                self.text.push_str(t);
-                let _ = self.events.send(RunEvent::Text(t.to_string()));
+        if method != "session/update" {
+            return;
+        }
+        let upd = &params["update"];
+        match upd["sessionUpdate"].as_str() {
+            Some("agent_message_chunk") => {
+                if let Some(t) = upd.pointer("/content/text").and_then(Value::as_str) {
+                    self.text.push_str(t);
+                    let _ = self.events.send(RunEvent::Text(t.to_string()));
+                }
             }
+            // A03：tool_call → StepStart；tool_call_update 终态 → StepEnd + 步骤记录
+            Some("tool_call") => {
+                if let Some(id) = upd["toolCallId"].as_str() {
+                    let title = upd["title"].as_str().unwrap_or_default().to_string();
+                    let kind = upd["kind"].as_str().unwrap_or("other").to_string();
+                    self.open_steps
+                        .insert(id.to_string(), (title.clone(), kind.clone()));
+                    let _ = self.events.send(RunEvent::StepStart {
+                        id: id.to_string(),
+                        title,
+                        kind,
+                    });
+                }
+            }
+            Some("tool_call_update") => {
+                let Some(id) = upd["toolCallId"].as_str() else {
+                    return;
+                };
+                // 只有终态算“收尾”：completed 成功，failed/stopped 等非成功 → ok=false
+                let ok = match upd["status"].as_str() {
+                    Some("completed") => true,
+                    Some("failed") | Some("stopped") => false,
+                    _ => return,
+                };
+                let (title, kind) = self
+                    .open_steps
+                    .remove(id)
+                    .unwrap_or_else(|| (String::new(), "other".into()));
+                self.steps.push(StepRecord {
+                    id: id.to_string(),
+                    title,
+                    kind,
+                    ok,
+                });
+                let _ = self.events.send(RunEvent::StepEnd {
+                    id: id.to_string(),
+                    ok,
+                });
+            }
+            _ => {}
         }
     }
 

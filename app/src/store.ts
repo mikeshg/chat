@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from "react";
+import { applyStreamFrame, dropRun, fmtElapsed, type AgentRuns, type AgentStreamFrame } from "./agentRun";
 import { writeDrafts } from "./drafts";
 import type {
   AgentHostView,
@@ -54,6 +55,8 @@ export interface AppState {
   agentHosts: AgentHostView[];
   /** Agent A01：conv_id -> trigger_message_id -> 调用记录（状态行展示用） */
   invocations: Record<string, Record<string, InvocationView>>;
+  /** Agent A03：conv_id -> invocation_id -> 进行中调用的临时输出（不落库、不跨设备） */
+  agentRuns: AgentRuns;
 }
 
 /** 头像缓存条目：版本较大的那组才有效。 */
@@ -84,6 +87,7 @@ let state: AppState = {
   pendingJump: null,
   agentHosts: [],
   invocations: {},
+  agentRuns: {},
 };
 
 const listeners = new Set<() => void>();
@@ -553,18 +557,65 @@ export function applyHostStatus(
   };
 }
 
-/** agent_invocation 帧 / 历史 GET 共用合并入口：按 trigger_message_id 归档最新状态 */
+/** agent_invocation 帧 / 历史 GET 共用合并入口：按 trigger_message_id 归档最新状态。
+ *  A03：调用进终态时顺手摘除它的临时流式输出（定稿消息已含全部内容）。 */
 export function applyInvocations(
   s: AppState,
   incoming: InvocationView[],
 ): Partial<AppState> {
   if (incoming.length === 0) return {};
   const invocations = { ...s.invocations };
+  let agentRuns = s.agentRuns;
   for (const inv of incoming) {
     const cur = invocations[inv.conversation_id] ?? {};
     invocations[inv.conversation_id] = { ...cur, [inv.trigger_message_id]: inv };
+    const convRuns = agentRuns[inv.conversation_id];
+    if (inv.finished_at != null && convRuns?.[inv.id]) {
+      if (agentRuns === s.agentRuns) agentRuns = { ...agentRuns };
+      const next = dropRun(convRuns, inv.id) ?? {};
+      if (Object.keys(next).length) {
+        agentRuns[inv.conversation_id] = next;
+      } else {
+        delete agentRuns[inv.conversation_id];
+      }
+    }
   }
-  return { invocations };
+  return agentRuns === s.agentRuns ? { invocations } : { invocations, agentRuns };
+}
+
+/** agent_stream 帧：临时输出追加；调用已知终态后迟到的帧丢弃（防状态残留）。 */
+export function applyAgentStream(
+  s: AppState,
+  f: AgentStreamFrame,
+): Partial<AppState> {
+  const invs = s.invocations[f.conversation_id];
+  const inv = invs && Object.values(invs).find((i) => i.id === f.invocation_id);
+  if (inv?.finished_at != null) return {};
+  const convRuns = s.agentRuns[f.conversation_id];
+  const next = applyStreamFrame(convRuns, f);
+  if (next === convRuns) return {};
+  return { agentRuns: { ...s.agentRuns, [f.conversation_id]: next } };
+}
+
+/** 调用状态标签的查表：running → 进行中标签；failed → 失败原因；其余 → null 不渲染。
+ *  A04 往本表加 queued / cancelled / timed_out 行。 */
+export function invocationStatusView(
+  inv: Pick<InvocationView, "status" | "error" | "current_step">,
+  elapsedSecs: number,
+): { icon: string; text: string } | null {
+  switch (inv.status) {
+    case "running":
+      return inv.current_step
+        ? {
+            icon: "⏳",
+            text: `正在工作 · 已用 ${fmtElapsed(elapsedSecs)} · 当前：${inv.current_step}`,
+          }
+        : { icon: "⏳", text: "正在处理" };
+    case "failed":
+      return { icon: "⚠", text: `失败：${invocationErrorText(inv.error)}` };
+    default:
+      return null;
+  }
 }
 
 /** 调用失败原因的展示文案（host 侧稳定错误码 → 中文） */

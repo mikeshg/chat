@@ -232,6 +232,26 @@ pub struct MessageView {
     /// Agent A01：非空 = 本消息由该 Agent 发出（sender_id 仍是主人）。
     /// 客户端归属判断一律看本字段，不能只看 sender_id。
     pub agent: Option<AgentRef>,
+    /// Agent A03：该消息附带的已完成步骤记录（仅 Agent 消息可能有值）
+    pub agent_steps: Option<Vec<AgentStepView>>,
+}
+
+/// 一条已完成步骤的持久化形状（messages.agent_steps jsonb 元素）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentStepView {
+    pub id: String,
+    pub title: String,
+    pub kind: String,
+    pub ok: bool,
+}
+
+/// Agent A03：agent_stream 帧的步骤对象；ok=null 表示进行中。
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamStepView {
+    pub id: String,
+    pub title: String,
+    pub kind: String,
+    pub ok: Option<bool>,
 }
 
 /// 消息上的 Agent 归属标记（messages.agent_id → agents.id/name 快照读）。
@@ -505,6 +525,16 @@ pub enum WsOut {
     AgentInvocation {
         invocation: InvocationView,
     },
+    /// Agent A03：stream 模式的增量帧。delta 为追加文本（可空），step 为步骤
+    /// 开始/结束（ok=null 进行中）。同调用帧序 = 事件发生序。
+    AgentStream {
+        invocation_id: Uuid,
+        conversation_id: Uuid,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        delta: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        step: Option<StreamStepView>,
+    },
 }
 
 // ---------- Agent A01：宿主 / Agent / 调用 ----------
@@ -601,6 +631,10 @@ pub struct InvocationView {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+    /// Agent A03：当前进行中步骤标题；仅存内存（AppState.inv_runs），
+    /// 广播前由调用上下文填充，历史查询对 running 调用回填、其余为 null。
+    #[sqlx(default)]
+    pub current_step: Option<String>,
 }
 
 // ---------- 消息生命周期 REST ----------

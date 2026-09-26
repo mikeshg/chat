@@ -147,6 +147,16 @@ export interface MessageView {
   forwarded_from?: string | null;
   /** Agent A01：Agent 发出的消息携带归属（sender_id 仍是主人）；旧服务端缺省 */
   agent?: AgentRef | null;
+  /** Agent A03：该消息附带的已完成步骤记录（仅 Agent 消息；旧服务端缺省） */
+  agent_steps?: AgentStep[] | null;
+}
+
+/** 一条已完成步骤的持久化形状（messages.agent_steps 元素，A03） */
+export interface AgentStep {
+  id: string;
+  title: string;
+  kind: string;
+  ok: boolean;
 }
 
 /** 消息上的 Agent 归属（A01） */
@@ -230,6 +240,8 @@ export interface InvocationView {
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
+  /** Agent A03：running 期间为当前步骤标题；终态/旧服务端为 null 或缺省 */
+  current_step?: string | null;
 }
 
 /** 会话偏好（用户维度；旧服务端无此字段 → 视为全默认） */
@@ -363,6 +375,14 @@ export type WsOut =
       /** Agent A01：调用状态变化（发给会话成员的普通连接） */
       type: "agent_invocation";
       invocation: InvocationView;
+    }
+  | {
+      /** Agent A03：stream 模式增量帧（delta 追加文本；step.ok=null 进行中） */
+      type: "agent_stream";
+      invocation_id: string;
+      conversation_id: string;
+      delta?: string;
+      step?: { id: string; title: string; kind: string; ok: boolean | null };
     }
   | { type: "force_logout"; reason: string }
   | {

@@ -8,7 +8,6 @@ import {
   convTitle,
   getState,
   fetchForward,
-  invocationErrorText,
   isOwnMessage,
   prependMessages,
   pushToast,
@@ -33,6 +32,7 @@ import PollCard from "./PollCard";
 import { imageBubbleSize } from "./mediaFormat";
 import Avatar from "./Avatar";
 import VoiceRecorder from "./VoiceRecorder";
+import { InvocationStatusLine, LiveRunBubble, StepRecord } from "./AgentRun";
 
 function fmtSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -850,6 +850,8 @@ export default function ChatView() {
           const mine = isOwnMessage(m, s.me?.id);
           const pending = m.id.startsWith("client:");
           const inv = invs[m.id];
+          // A03：该触发消息的调用若有进行中临时输出，在消息下方渲染「生成中」气泡
+          const liveRun = inv ? s.agentRuns[conv.id]?.[inv.id] : undefined;
           const prev = msgs[i - 1];
           const showTime =
             !prev || new Date(m.created_at).getTime() - new Date(prev.created_at).getTime() > 300000;
@@ -894,6 +896,10 @@ export default function ChatView() {
                     conv.kind === "group" && (
                       <div className="msg-sender">{m.sender_name}</div>
                     )
+                  )}
+                  {/* A03：定稿消息带步骤记录时，气泡上方挂可折叠步骤列表 */}
+                  {!m.deleted_at && m.agent_steps && m.agent_steps.length > 0 && (
+                    <StepRecord steps={m.agent_steps} />
                   )}
                   <div className="bubble-wrap">
                     {(canActMsg(m) || canForwardMsg(m) || canPinMsg(m)) && (
@@ -1083,14 +1089,16 @@ export default function ChatView() {
                   </div>
                 </div>
               </div>
-              {/* A01：主人这条消息触发的 Agent 调用状态行 */}
-              {inv && (inv.status === "running" || inv.status === "failed") && (
-                <div className={`inv-status ${inv.status}`}>
-                  {inv.status === "running"
-                    ? "⏳ 正在处理"
-                    : `⚠ 失败：${invocationErrorText(inv.error)}`}
-                </div>
+              {/* A03：stream 模式的「生成中」气泡（临时输出，不落库） */}
+              {liveRun && (
+                <LiveRunBubble
+                  agentName={conv.agent?.name ?? "Agent"}
+                  run={liveRun}
+                  emptyHint="正在思考…"
+                />
               )}
+              {/* A01/A03：主人这条消息触发的 Agent 调用状态标签（查表渲染） */}
+              {inv && <InvocationStatusLine inv={inv} />}
             </div>
           );
         })}

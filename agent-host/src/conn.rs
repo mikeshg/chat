@@ -1,6 +1,6 @@
 // 宿主 WS 连接循环：连上→host_hello→host_ready→收 invocation_start 起任务。
 
-use crate::runtime::{self, AgentSpec, RunRequest};
+use crate::runtime::{self, AgentSpec, RunEvent, RunRequest, StepRecord};
 use crate::Shared;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -169,26 +169,171 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
     let dir = s.data_dir.clone();
     let task = tokio::spawn(async move {
         let rt = runtime::runtime_for(&spec);
-        // 事件暂不外发（接收端即刻丢弃）；流式输出票把它接到服务端
-        let (events, _) = tokio::sync::mpsc::unbounded_channel();
+        // A03：事件经 invocation_event 帧外发；文本段 ~100ms 窗口合并
+        let (events, ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let fwd = tokio::spawn(forward_events(ev_rx, out2.clone(), inv_id));
         let req = RunRequest {
             spec,
             prompt,
             data_dir: dir,
         };
-        let r = rt.run(req, events).await.map(|o| o.text);
-        send_finish(&out2, inv_id, r);
+        let r = rt.run(req, events).await;
+        // run 结束 = events sender 释放，转发循环冲刷剩余文本后自行退出
+        let _ = fwd.await;
+        send_finish(&out2, inv_id, r.map(|o| (o.text, o.steps)));
         running.lock().unwrap().remove(&inv_id);
     });
     s.running.lock().unwrap().insert(inv_id, task);
 }
 
-fn send_finish(out: &Out, id: Uuid, r: Result<String, String>) {
+/// RunEvent 流 → invocation_event 帧。Text 事件在 100ms 窗口内合并成一帧；
+/// 步骤事件先发走积压的文本再原样透传。通道关闭 = 运行结束，冲刷后退出。
+async fn forward_events(mut rx: mpsc::UnboundedReceiver<RunEvent>, out: Out, inv_id: Uuid) {
+    let mut buf = String::new();
+    let flush_after = Duration::from_millis(100);
+    let mut deadline: Option<tokio::time::Instant> = None;
+    loop {
+        tokio::select! {
+            ev = rx.recv() => match ev {
+                Some(RunEvent::Text(t)) => {
+                    buf.push_str(&t);
+                    if deadline.is_none() {
+                        deadline = Some(tokio::time::Instant::now() + flush_after);
+                    }
+                }
+                Some(RunEvent::StepStart { id, title, kind }) => {
+                    send_event(&out, inv_id, &mut buf,
+                        json!({"type":"step_start","id":id,"title":title,"kind":kind}));
+                    deadline = None;
+                }
+                Some(RunEvent::StepEnd { id, ok }) => {
+                    send_event(&out, inv_id, &mut buf,
+                        json!({"type":"step_end","id":id,"ok":ok}));
+                    deadline = None;
+                }
+                None => {
+                    send_event(&out, inv_id, &mut buf, Value::Null);
+                    return;
+                }
+            },
+            _ = wait_deadline(deadline) => {
+                send_event(&out, inv_id, &mut buf, Value::Null);
+                deadline = None;
+            }
+        }
+    }
+}
+
+/// 有截止时间则睡到点，没有则永不就绪（select! 里安全代替 Option<Sleep>）。
+async fn wait_deadline(d: Option<tokio::time::Instant>) {
+    match d {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// 冲刷积压文本（若有）后再发 ev（Null = 只冲刷不发步骤帧）。
+fn send_event(out: &Out, inv_id: Uuid, buf: &mut String, ev: Value) {
+    if !buf.is_empty() {
+        let t = std::mem::take(buf);
+        send_event_frame(out, inv_id, json!({"type":"text","text":t}));
+    }
+    if !ev.is_null() {
+        send_event_frame(out, inv_id, ev);
+    }
+}
+
+fn send_event_frame(out: &Out, inv_id: Uuid, ev: Value) {
+    let _ = out.send(Message::Text(
+        json!({"type":"invocation_event","invocation_id":inv_id,"event":ev})
+            .to_string()
+            .into(),
+    ));
+}
+
+fn send_finish(out: &Out, id: Uuid, r: Result<(String, Vec<StepRecord>), String>) {
     let v = match r {
-        Ok(text) => json!({"type":"invocation_finish","invocation_id":id,"ok":true,"text":text}),
+        Ok((text, steps)) => json!({"type":"invocation_finish","invocation_id":id,
+            "ok":true,"text":text,"steps":steps}),
         // error 截断 500 字符，避免超长 stderr 刷屏
         Err(e) => json!({"type":"invocation_finish","invocation_id":id,"ok":false,
             "error":e.chars().take(500).collect::<String>()}),
     };
     let _ = out.send(Message::Text(v.to_string().into()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn events_of(msgs: &[Message]) -> Vec<Value> {
+        msgs.iter()
+            .map(|m| serde_json::from_str::<Value>(m.to_text().unwrap()).unwrap())
+            .map(|v| v["event"].clone())
+            .collect()
+    }
+
+    /// 密集的 Text 事件在 100ms 窗口内合并成一帧；收尾冲刷发出余下文本。
+    #[tokio::test]
+    async fn merges_text_within_100ms_window() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (out, mut got) = mpsc::unbounded_channel();
+        let inv = Uuid::new_v4();
+        let fwd = tokio::spawn(forward_events(rx, out, inv));
+        for t in ["a", "b", "c"] {
+            tx.send(RunEvent::Text(t.into())).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tx.send(RunEvent::Text("d".into())).unwrap();
+        drop(tx);
+        fwd.await.unwrap();
+        let mut evs = Vec::new();
+        while let Ok(m) = got.try_recv() {
+            evs.push(m);
+        }
+        let evs = events_of(&evs);
+        assert_eq!(
+            evs,
+            vec![
+                json!({"type":"text","text":"abc"}),
+                json!({"type":"text","text":"d"}),
+            ]
+        );
+    }
+
+    /// 步骤帧先发积压文本再透传，保证事件顺序不乱。
+    #[tokio::test]
+    async fn step_events_flush_pending_text_first() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (out, mut got) = mpsc::unbounded_channel();
+        let inv = Uuid::new_v4();
+        let fwd = tokio::spawn(forward_events(rx, out, inv));
+        tx.send(RunEvent::Text("partial".into())).unwrap();
+        tx.send(RunEvent::StepStart {
+            id: "s1".into(),
+            title: "读文件".into(),
+            kind: "read".into(),
+        })
+        .unwrap();
+        tx.send(RunEvent::StepEnd {
+            id: "s1".into(),
+            ok: false,
+        })
+        .unwrap();
+        drop(tx);
+        fwd.await.unwrap();
+        let mut evs = Vec::new();
+        while let Ok(m) = got.try_recv() {
+            evs.push(m);
+        }
+        let evs = events_of(&evs);
+        assert_eq!(
+            evs,
+            vec![
+                json!({"type":"text","text":"partial"}),
+                json!({"type":"step_start","id":"s1","title":"读文件","kind":"read"}),
+                json!({"type":"step_end","id":"s1","ok":false}),
+            ]
+        );
+    }
 }

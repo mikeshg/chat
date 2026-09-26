@@ -128,8 +128,15 @@ pub async fn host_session(
                     Some(Ok(Message::Text(t))) => {
                         last_inbound = Instant::now();
                         if let Ok(v) = serde_json::from_str::<Value>(&t) {
-                            if v["type"] == "invocation_finish" {
-                                agents::handle_finish(&st, host_id, &v).await;
+                            match v["type"].as_str().unwrap_or_default() {
+                                "invocation_finish" => {
+                                    agents::handle_finish(&st, host_id, &v).await;
+                                }
+                                // A03：步骤/增量事件（在 handler 内核验调用归属本宿主）
+                                "invocation_event" => {
+                                    agents::handle_event(&st, host_id, &v).await;
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -181,6 +188,8 @@ async fn fail_running(st: &SharedState, host_id: Uuid) {
     .await
     .unwrap_or_default();
     for inv in invs {
+        // A03：摘下运行时状态（缓冲丢弃，终态由下面的 failed 帧广播）
+        st.inv_runs.remove(&inv.id);
         let members = crate::domain::member_ids(&st.pool, inv.conversation_id)
             .await
             .unwrap_or_default();
