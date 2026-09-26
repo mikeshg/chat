@@ -111,5 +111,6 @@ Devin 查询管理员账号时被 smart 模式拒绝（命令要读取数据库�
   - Tauri / Android 实机；
   - 视觉像素审查；
   - 主机或数据库崩溃恢复（持久化只验证了进程重启）。
-- **未提交**：全部改动仍在工作区。交接前的快照在 `refs/snapshots/pre-devin-e-20260925`，确认后可用 `git update-ref -d` 删除。
+- **提交状态（2026-09-25 22:30 校正）**：本轮改动已随 V1 整体提交为 `38fba28`（2026-09-25 14:46，含 E1–E6 涉及的代码、测试与本 `docs/design/`）。交接前快照 `refs/snapshots/pre-devin-e-20260925` 仍在，确认后可用 `git update-ref -d` 删除。此前本节写“全部改动仍在工作区”已失效。
+- **HEAD 已前进，且仍在前进**：`38fba28` 之后全部是 V2 程序的提交。本文记录时点（22:37）HEAD 为 `4d2998f`，即 `38fba28` 之后第 25 个提交；V2 会话仍在并发提交，读到这句时 HEAD 很可能更靠后。V2 重写了本轮验证过的同一批文件（`38fba28..HEAD` 于 22:37 的行数）：`app/src/store.ts` +119、`app/src/ws.ts` +87、`app/src/ui/ChatView.tsx` +317、`server/src/api.rs` +807、`server/src/domain.rs` +279、`server/tests/it.rs` +2895，并新增迁移 0010/0011/0012/0015。**本文件 E1–E6 的所有数字只描述 `38fba28` 这棵树，未在其后的任何树上重跑**；把结论带到新 HEAD 前需按 handover §7 重做一遍。
 - **Devin 执行说明**：以 `-p --permission-mode smart` 非交互运行，两次在需确认的调用处退出（curl 探测注册限流、读取数据库口令）。这两处拒绝都合理；对应工作由主会话完成，没有绕过权限。

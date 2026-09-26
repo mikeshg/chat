@@ -4,11 +4,11 @@
 
 **原始会话：`codex://threads/01a0d148-af62-7e53-bab9-b959b7d3bbf2`**
 
-**工作区：`C:\Users\xie_f\projects\other\chat`；分支：`main`；所有实现仍处于未提交状态。**
+**工作区：`C:\Users\xie_f\projects\other\chat`；分支：`main`；V1 全部实现已提交为 `38fba28`（2026-09-25 14:46）。其后是 V2 程序的提交，本文时点（22:40）HEAD 为 `4d2998f`，V2 仍在同一 checkout 并发提交。V1/V2 均未推送、未部署。**
 
 ## 1. 当前结论与文档入口
 
-消息生命周期、会话偏好、群投票均已有实现和 A/B/C 阶段报告；**2026-09-25 集成验收结论为 NEEDS_CHANGES，随后按用户要求执行修复，目前修复主体已落地并自动化复验通过，但尚未提交，也不等于 V1 发布通过**。验收时的 Rust 35/35、前端 12/12、E2E 58/58 与重启后 4/4 已被修复轮的新数据取代：Rust 42+1、Vitest 33/33、E2E 48 + 真实重启后 phase2 9，详见 [handover-20260925.md](handover-20260925.md) §2。
+消息生命周期、会话偏好、群投票均已有实现和 A/B/C 阶段报告；**2026-09-25 集成验收结论为 NEEDS_CHANGES，随后按用户要求执行修复，修复主体已落地、通过自动化与浏览器级复验，并已提交为 `38fba28`（14:46）；这不等于 V1 发布通过——结论尚未在 HEAD `cb34787`（含 24 个 V2 提交）上重跑**。验收时的 Rust 35/35、前端 12/12、E2E 58/58 与重启后 4/4 已被修复轮最终一轮取代：it 43 + migrations 1、Vitest 36/36、E2E 58 + 真实重启后 phase2 9、浏览器级 M1–M5 + 编辑两场景 25/25，详见 [delivery-E.md](delivery-E.md) §E6 与 [handover-20260925.md](handover-20260925.md) §2。
 
 首次恢复只整理文档；随后按用户“继续验收”要求，由当前 Qoder 会话在全新隔离资源中执行测试与真实浏览器交互，未恢复原 Devin D。验收后用户要求“你修复一下”，本轮已修改业务源码并补回归，另修复了修复过程引入的前端编译中断。交付快照与复现步骤见 [delivery-D.md](delivery-D.md)，修复落地位置、证据强度与在跑资源见 [handover-20260925.md](handover-20260925.md)。
 
@@ -207,44 +207,44 @@ D-04 的 ACK 回退从未被证明（`resolveAck` 走 `upsertMessage`/`selectMes
 |---|---|---|
 | D-01 | 已关闭：`pnpm-lock.yaml` 收录 Vitest；A 阶段遗留的 `app/package-lock.json` 可逆移入忽略目录，只保留 pnpm 一套交付锁文件 | 若换机器，重跑 handover §7 的干净目录冻结安装 |
 | D-02 | 已关闭：0005 改为复制附件元数据并共享 `storage_path`；`server/tests/migrations.rs` 旧夹具先红后绿 | 真实部署前核实目标库已应用的迁移版本，不改已在生产执行的迁移 |
-| D-03 | 已关闭：幂等命中传 `inserted=false`，REST/WS 创建重放只回 ACK 给发起者，广播视图逐接收者 `view_by_id(viewer)` | 复跑 `replay-privacy-fixed.mjs`（17 项断言）确认未回退 |
-| D-04 | 已改：`store.ts` 的 `selectMessage`/`selectLast` 按 `edit_version` 取舍，`resolveAck` 亦经 `upsertMessage` 走同一版本判断；当时就未证明 ACK 会回退 | 浏览器重跑 delivery-D §4 的目录/实时交错序列 |
+| D-03 | 已关闭：幂等命中传 `inserted=false`，REST/WS 创建重放只回 ACK 给发起者，广播视图逐接收者 `view_by_id(viewer)` | 探针**已复跑通过**（delivery-E §E6：`replay-privacy-fixed.mjs` 18 项布尔全真）；剩余的是在 HEAD 上重跑 |
+| D-04 | 已改：`store.ts` 的 `selectMessage`/`selectLast` 按 `edit_version` 取舍，`resolveAck` 亦经 `upsertMessage` 走同一版本判断；当时就未证明 ACK 会回退 | 浏览器交错序列**已重跑并通过**（delivery-E §E2 M1，编辑与删除两条陈旧目录响应）；剩余的是在 HEAD 上重跑 |
 | D-05 | 已改：`app/src/ws.ts` read_sync 先按 `readSeq` 单调过滤，再把未读夹到 `max(0, last_seq - read_seq)`，并在校验剩余条数不足时回查目录 | 补“本地 seq=12、收到 read_sync(seq=10)”的定向用例；断网/多设备实测仍未做 |
-| D-06 | 已关闭：`selectPreference` 按 `updated_at` 新旧判定，另有服务端 `preferences_advance_after_waited_conversation_lock` | 补双设备乱序的浏览器/端到端交错验证 |
-| D-07 | `PollCard.tsx` 已有 `schedulePollDeadline` 本地计时 + 到期重算 + 冲突回读，并有新单测 | 实测保持页面不动跨过截止时间，确认自动禁用而非等重连 |
-| D-08 | 已改：`NewPollModal`/`ChatView`/`PollCard` 以 `owner` token + `session()` 归属校验包裹回调，创建在内容未变时复用同一 `client_msg_id` 重试 | 重跑 delivery-D §4 的故障注入（服务器已落库、响应丢弃），确认第二次点击不新增 seq 的重复投票 |
-| D-09 | 已改：`ChatView`/`PollCard`/`NewPollModal` 的回调以组件实例 token + `session()` 代次双重归属校验，`api.ts` 在响应处也校验代次 | 补 A→B 账号切换下在途历史与个性化投票响应的实测 |
-| D-10 | 部分推进：E2E/单测覆盖变宽，但浏览器级 M1–M3、Tauri、窄屏/键盘、多时区、混合版本仍未覆盖；截图仍受浏览器表面限制 | 按 handover §5 逐项补齐，未实测前不得改判为通过 |
+| D-06 | 已关闭：`selectPreference` 按 `updated_at` 新旧判定；服务端 `domain.rs:1679` 用 `GREATEST(clock_timestamp(), 旧值 + 1µs)` 单调推进 `updated_at`，只提供可靠排序、不做新旧拒绝 | 浏览器交错**已重跑并通过**（delivery-E §E2 M2，含服务端 pref 回读）；双设备端到端乱序仍未做 |
+| D-07 | `PollCard.tsx` 已有 `schedulePollDeadline` 本地计时 + 到期重算 + 冲突回读，并有新单测 | 跨截止时刻实测**已补**（delivery-E §E2 M4：15 秒截止、无刷新下 `disabled=2` + “已截止”） |
+| D-08 | 已改：`NewPollModal`/`ChatView`/`PollCard` 以 `owner` token + `session()` 归属校验包裹回调，创建在内容未变时复用同一 `client_msg_id` 重试 | 故障注入实测**已补**（delivery-E §E2 M5：abort 首个创建响应后重试得 `ui=1 server=1 seqs=1`） |
+| D-09 | 已改：`ChatView`/`PollCard`/`NewPollModal` 的回调以组件实例 token + `session()` 代次双重归属校验，`api.ts` 在响应处也校验代次 | `api.test.ts` 已覆盖旧代次响应拒绝（delivery-E §E3 判定回退会变红）；A→B 切换下的浏览器级在途实测仍未做 |
+| D-10 | 浏览器级 M1–M5 与编辑两场景**已完成**（delivery-E §E2，25/25）；Tauri、窄屏/键盘、多时区、混合客户端版本仍未覆盖 | 剩余项按 handover §5 第 4、8、9 项逐项补齐，未实测前不得改判为通过 |
 | D-11 | 已对齐 `CONTEXT.md` 中过时的“不可编辑、不可撤回”口径；阶段报告保留为历史快照 | 后续按文档维护流程继续校正 |
 | D-12 | 已关闭：`styles.css` EOF 多余空行去除，`git diff --check` 通过 | 收尾前重跑一次即可 |
 
-匿名普通投票/关闭路径本就采用按接收者视图；D-03 特别指创建重放路径，不应泛化为“所有匿名投票都会泄露”。修复轮确实修改了业务源码（含未发布的 0005 迁移与前端 store/UI），改动仍全部留在工作区未提交。
+匿名普通投票/关闭路径本就采用按接收者视图；D-03 特别指创建重放路径，不应泛化为“所有匿名投票都会泄露”。修复轮确实修改了业务源码（含未发布的 0005 迁移与前端 store/UI），这些改动已随 `38fba28` 进入版本库；仍**未推送、未部署**。
 
-## 8. 工作区交付清单
+## 8. 交付清单与提交状态
 
-2026-09-25 `git status --short` 显示大量未提交内容：既有前几轮的 P1/P2 与 A/B/C 实现，也有本轮修复对服务端、store、投票 UI 和 `ChatView.tsx` 的改动，以及未发布的 0005 迁移修正。本会话另更新设计/进度/验收文档，并在忽略目录内留下探针与日志。`app/package-lock.json` 已可逆移入 `server/target/fixes-20260925/package-lock.from-stage-a.json`，不再作为第二套交付锁文件；`server/target/fixes-20260925/runtime.json`（0600）内含本次测试凭据，属忽略产物，不得提交。
+2026-09-25 22:40 复核：本节原先记的“`git status --short` 显示大量未提交内容”与“`docs/design/`、迁移仍未跟踪”两条都已失效——V1 的全部实现（前几轮 P1/P2 之外的 A/B/C 实现、本轮修复对服务端/store/投票 UI/`ChatView.tsx` 的改动、0005–0009 迁移、`server/tests/migrations.rs`、Vitest 用例、测试与整个 `docs/design/`）已提交为 `38fba28`（14:46），逐项 `git cat-file -e 38fba28:<path>` 均可取到。本文时点工作区只剩 3 个已跟踪文档的修改加 2 项未跟踪：`docs/design/{delivery-E,handover-20260925,progress}.md`（本会话这三处校订，按“不自动 commit/push”留在工作区）、`.idea/`、`docs/design/v2/tasks/P3-1-search-files.md`（后者属 V2 程序在飞内容，本会话未动、未暂存、未提交）。原先列出的 `scripts/v2/union.mjs`、`scripts/v2/append-section.mjs`、`app/src-tauri/Cargo.toml` 已被 V2 程序自己的提交吸收，不再出现在工作区——这也说明任何“此刻工作区只有 N 项”的描述都会随并发写入者失效，引用前必须重取 `git status`。`app/package-lock.json` 已可逆移入 `server/target/fixes-20260925/package-lock.from-stage-a.json`，不再作为第二套交付锁文件；`server/target/fixes-20260925/runtime.json`（0600）内含本次测试凭据，位于忽略目录，未进版本库。
 
 | 分类 | 主要路径 |
 |---|---|
 | 服务端基线及功能 | `server/src/{api,auth,domain,lib,model,state,ws}.rs`，`server/Cargo.toml`、`server/Cargo.lock` |
-| 迁移（未跟踪） | `server/migrations/0005_sync_invariants.sql` 至 `0009_polls.sql` |
+| 迁移 | `server/migrations/0005_sync_invariants.sql` 至 `0009_polls.sql`（0005 为本轮就地修正的未发布迁移；`38fba28` 之后 V2 又新增了 0010/0011/0012/0015，不属 V1 交付） |
 | 前端实现 | `app/src/{App,api,store,types,ws,styles}` 对应源文件，`app/src/ui/{ChatScreen,ChatView,ContactsPanel,ConvList}.tsx` |
-| 新 UI/测试（未跟踪） | `app/src/ui/NewPollModal.tsx`、`app/src/ui/PollCard.tsx`；Vitest 用例 `app/src/{store,api,ws}.test.ts`、`app/src/ui/{ChatView,NewPollModal}.test.ts`、`app/src/ui/PollCard.test.tsx` |
+| 新 UI/测试 | `app/src/ui/NewPollModal.tsx`、`app/src/ui/PollCard.tsx`；Vitest 用例 `app/src/{store,api,ws}.test.ts`、`app/src/ui/{ChatView,NewPollModal}.test.ts`、`app/src/ui/PollCard.test.tsx` |
 | 配置和验收 | `app/package.json`、`app/src-tauri/tauri.conf.json`、`server/tests/it.rs`、`scripts/e2e.mjs` |
 | 待处理依赖文件 | 无：根 `pnpm-lock.yaml` 已收录 Vitest，A 阶段遗留的 `app/package-lock.json` 移入 `server/target/fixes-20260925/package-lock.from-stage-a.json` |
-| 新增测试（未跟踪） | `server/tests/migrations.rs`（升级数据保留夹具） |
-| 文档 | `docs/design/` 整体仍未跟踪，包含设计、进度、A/B/C 报告、集成验收 delivery-D、修复交接 handover-20260925 和 C2 执行单 |
+| 新增测试 | `server/tests/migrations.rs`（升级数据保留夹具） |
+| 文档 | `docs/design/` 已全部跟踪，包含设计、进度、A/B/C 报告、集成验收 delivery-D/E、修复交接 handover-20260925 和 C2 执行单；V2 程序另用 `docs/design/v2/**`，与 V1 分属不同树 |
 | 保留用户内容 | `.idea/` 等已有未跟踪文件，本次不清理 |
 
-不从 Git diff 单独推断每段代码的作者；多个阶段共享工作区。未提交并不等于丢失，但后续交付时必须逐项检查新文件，不能只看 tracked diff。
+上表按路径而非按“是否 tracked”列出交付范围：本轮之前 `docs/design/` 与迁移一度处于未跟踪状态，只记 tracked diff 会漏掉它们。不从 Git diff 单独推断每段代码的作者；多个阶段共享工作区。
 
 ## 9. 下一步恢复执行顺序
 
-1. **确认执行者**：本轮修复由当前 Qoder 会话与两个已中断的子 agent 在同一 checkout 串行完成，无其他写入者；若改回 Paseo 实现，先 inspect 原 D 确认没有第二个写入者。
-2. **保护现状**：重新检查 git status 和 diff。保持当前 checkout，不能 reset、覆盖未知内容、删除用户产物、自动 commit/push。
-3. **补浏览器级复验**：按 handover §5 重跑 delivery-D §4 的 M1–M5 原始操作序列（交错目录帧、迟到偏好、编辑→删除→看引用、跨截止时间、丢响应重试），这是当前唯一还挡在“发布通过”前的实测缺口。
-4. **审查 agent 自写测试**：本轮以“套件全绿”间接确认了大部分服务端改动，尚未逐文件 diff 审查其断言强度；重点看撤销/刷新并发用例是否只覆盖 happy path，以及 `server/tests/it.rs` 竞态测试是否仍接受 5xx。
-5. **决策提交**：全部改动（25 个已跟踪文件 + 迁移、测试、`docs/design/`）仍未提交，是否 commit 由用户决定；提交前排除 `.idea/`、`server/target/` 内的凭据与探针产物。
-6. **更新真实证据**：任何新数字写进 delivery-D/handover 时附命令与执行条件；未经实测的项目继续明确标注，不能因旧套件全绿便改成“全部完成”。
+1. **确认写入者**：本 checkout 现在有**两个并发写入者**——本会话（V1 修复与文档）与 V2 程序。V2 在本轮编辑文档期间就提交了 `4d2998f`（22:37），并已把自身在飞文件收进提交。任何一步开始前先重取 `git status`/`git log`，不要把 HEAD 上的新提交误认为 V1 的回退。
+2. **保护现状**：不能 reset、覆盖未知内容、删除用户产物、自动 commit/push。本会话的三处文档校订有意留在工作区，由用户决定是否提交。
+3. **浏览器级复验已完成，无需重跑**：delivery-E §E2 已用无头 Playwright 跑完 handover §5 的 M1–M5 与编辑两场景（25/25，含交错目录帧、迟到偏好、编辑→删除→看引用、跨截止时间、丢响应重试），§E3 给出逐项判定。**剩下的缺口不是“没测”，而是“测的不是最新的树”**：见 handover §5 第 9 项。
+4. **agent 自写测试审查已完成**：delivery-E §E3 已按断言强度逐文件审过撤销/刷新并发与 `server/tests/it.rs` 竞态用例，并把结论落到 §E2 的红/绿证据；若之后 V2 改写了这些用例，需按同一方式重审。
+5. **提交决策已定**：V1 全部实现与文档已于 14:46 提交为 `38fba28`（该提交内含 0005 迁移修正与 `docs/design/`，不含 `.idea/`、`server/target/` 内的凭据与探针产物）。之后是推送与部署，本会话两者都不做。
+6. **更新真实证据**：任何新数字写进 delivery-D/E 或 handover 时附命令、执行时点与它所属的 commit；未经实测的项目继续明确标注，不能因旧套件全绿便改成“全部通过”。
 
-修复轮结束：H1–H3、M1–M5 已落地并通过自动化复验，另修回一个由修复引入的前端编译中断；**尚未提交、未推送、未部署，且在浏览器级复验与 agent 测试审查完成前不视为 V1 发布通过**。
+修复轮结束：H1–H3、M1–M5 已落地并通过自动化与浏览器级复验，另修回一个由修复引入的前端编译中断；结论**已随 `38fba28` 进入版本库，仍未推送、未部署**。当前挡在“V1 发布通过”前的唯一缺口，是这些证据没有在 `38fba28` 之后的任何一棵树上重跑过——V2 已重写 `store.ts`、`ws.ts`、`ChatView.tsx`、`api.rs`、`domain.rs`、`it.rs` 并新增 4 个迁移，grep 只能说明 V1 的修复仍然存在，不能替代复验。
