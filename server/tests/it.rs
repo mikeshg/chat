@@ -8956,6 +8956,7 @@ async fn spawn_host(
             install_id,
             label: "it-host".into(),
             platform: "windows".into(),
+            mcp_bridge: None,
         },
         std::sync::Arc::new(AgentTickets {
             base: base.into(),
@@ -10878,4 +10879,330 @@ async fn agent_a04_disconnect_keeps_queue() {
         .unwrap();
     assert_eq!(arow["status"], "failed");
     h2.shutdown().await;
+}
+
+// ===== Agent A13 =====
+// 工具注入通道 + 读当前会话历史：
+// - invocation_start 下发调用专用凭据 tools_token（kind="invocation" 的 JWT）；
+// - 宿主本地 MCP 服务凭它访问 GET /v1/agent-tools/history（Authorization: Invocation <token>）；
+// - 凭据只在调用进行中（running/awaiting_approval）且主人未禁用时有效，且不能访问普通接口。
+// 凭据相关测试用裸宿主 WS（不经过 agent-host 库）抓取并扣住 tools_token；
+// 端到端测试走真 agent-host + node 假 agent（--mcp=http）。
+
+type RawHostWs =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// 裸宿主连接：role=host + host_hello → host_ready。返回 (socket, host_id)。
+async fn spawn_raw_host(base: &str, u: &TestUser) -> (RawHostWs, String) {
+    let (mut s, _) =
+        tokio_tungstenite::connect_async(format!("{}&role=host", ws_url(base, u).await))
+            .await
+            .unwrap();
+    s.send(WsMsg::Text(
+        json!({"type":"host_hello","install_id":uuid::Uuid::new_v4(),
+               "label":"raw-host","platform":"test"})
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let ready = next_of(&mut s, "host_ready").await;
+    (s, ready["host_id"].as_str().unwrap().to_string())
+}
+
+/// 建一个 Agent 并发一条消息，让调用挂在 running（宿主不发 finish）。
+/// 返回 (宿主WS, 主人WS, 调用id, tools_token, 专属会话id, agent_id)。
+async fn a13_running_invocation(
+    base: &str,
+    u: &TestUser,
+) -> (RawHostWs, RawHostWs, String, String, String, String) {
+    let (mut sh, host_id) = spawn_raw_host(base, u).await;
+    let (st, agent) = create_agent(base, u, &host_id, "tooler").await;
+    assert_eq!(st, 200, "{agent}");
+    let agent_id = agent["id"].as_str().unwrap().to_string();
+    let conv = agent["conversation_id"].as_str().unwrap().to_string();
+    let (mut su, _) = tokio_tungstenite::connect_async(ws_url(base, u).await)
+        .await
+        .unwrap();
+    send_ws(&mut su, &conv, &format!("a13-{}", uniq()), "echo:hold").await;
+    let frames = until_frame(&mut sh, "invocation_start", A01Dur::from_secs(10)).await;
+    let start = frames
+        .iter()
+        .find(|f| f["type"] == "invocation_start")
+        .unwrap();
+    let inv_id = start["invocation_id"].as_str().unwrap().to_string();
+    let token = start["tools_token"]
+        .as_str()
+        .expect("invocation_start 应带 tools_token")
+        .to_string();
+    (sh, su, inv_id, token, conv, agent_id)
+}
+
+/// GET /v1/agent-tools/history；auth 是完整的 Authorization 头值。
+async fn tool_history(base: &str, auth: &str, query: &str) -> reqwest::Response {
+    http()
+        .get(format!("{base}/v1/agent-tools/history{query}"))
+        .header("authorization", auth)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// 宿主侧结束调用（invocation_finish ok:true）
+async fn host_finish(sh: &mut RawHostWs, inv_id: &str) {
+    sh.send(WsMsg::Text(
+        json!({"type":"invocation_finish","invocation_id":inv_id,"ok":true,"text":"done"})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+}
+
+/// 自签调用凭据（测试库 jwt_secret = "test-secret"）。
+fn a13_mint(secret: &str, claims: Value) -> String {
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .unwrap()
+}
+
+/// 主路径：真宿主 + 假 agent（--mcp=http）。两条普通消息后发 tool:read_history，
+/// Agent 的回复里应包含前两条消息正文（工具结果经 MCP 服务 ← GET /v1/agent-tools/history）。
+#[tokio::test]
+async fn a13_tool_read_history_end_to_end() {
+    let base = spawn_named_db(&format!("chat_t_a13e2e_{}", uniq())).await;
+    let a = register(&base, &format!("a13e_{}", uniq())).await;
+    let (ha, host_id) = spawn_host(&base, &a, uuid::Uuid::new_v4()).await;
+    // --mcp=http：假 agent 在 initialize 里声明 agentCapabilities.mcpCapabilities.http
+    let mut args = fake_acp_args();
+    args.push("--mcp=http".into());
+    let r = http()
+        .post(format!("{base}/v1/agents"))
+        .header("authorization", authz(&a.access))
+        .json(&json!({
+            "name": "reader",
+            "host_id": host_id,
+            "runtime": {"command": "node", "args": args},
+            "cwd": "",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let agent: Value = r.json().await.unwrap();
+    let conv = agent["conversation_id"].as_str().unwrap().to_string();
+
+    let (mut sa, _) = tokio_tungstenite::connect_async(ws_url(&base, &a).await)
+        .await
+        .unwrap();
+    send_ws(&mut sa, &conv, "h1", "第一条历史消息").await;
+    send_ws(&mut sa, &conv, "h2", "第二条历史消息").await;
+    send_ws(&mut sa, &conv, "h3", "tool:read_history").await;
+
+    // 三条消息各触发一个调用；等到 3 个 succeeded，期间收集 message 帧
+    let mut frames: Vec<Value> = Vec::new();
+    let deadline = std::time::Instant::now() + A01Dur::from_secs(45);
+    while frames
+        .iter()
+        .filter(|f| f["type"] == "agent_invocation" && f["invocation"]["status"] == "succeeded")
+        .count()
+        < 3
+    {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!left.is_zero(), "三次调用未全部成功: {frames:?}");
+        frames.extend(until_frame(&mut sa, "agent_invocation", left).await);
+    }
+    frames.extend(frames_for(&mut sa, A01Dur::from_millis(500)).await);
+
+    // 第三个调用的 Agent 回复 = 工具结果文本，须包含前两条消息正文
+    let found = frames
+        .iter()
+        .filter(|f| f["type"] == "message" && f["message"]["agent"].is_object())
+        .map(|f| f["message"]["content"].as_str().unwrap_or_default())
+        .any(|c| c.contains("第一条历史消息") && c.contains("第二条历史消息"));
+    assert!(found, "回复应包含两条历史正文: {frames:?}");
+    ha.shutdown().await;
+}
+
+/// 凭据生命周期：running 中可用（返回的是发起会话的消息，带分页参数语义）；
+/// 调用结束（宿主 finish）后同一 token → 401。
+#[tokio::test]
+async fn a13_tools_token_dies_with_invocation() {
+    let base = spawn_named_db(&format!("chat_t_a13tok_{}", uniq())).await;
+    let a = register(&base, &format!("a13t_{}", uniq())).await;
+    let (mut sh, mut su, inv_id, token, conv, _agent_id) = a13_running_invocation(&base, &a).await;
+
+    // running 中：200，返回发起会话的消息
+    let r = tool_history(&base, &format!("Invocation {token}"), "").await;
+    assert_eq!(r.status(), 200);
+    let page: Value = r.json().await.unwrap();
+    let msgs = page["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1, "{page}");
+    assert_eq!(msgs[0]["content"], "echo:hold");
+    assert_eq!(msgs[0]["is_agent"], false);
+    assert_eq!(msgs[0]["seq"].as_i64().unwrap(), 1);
+    assert_eq!(page["has_more"], false);
+
+    // 再发一条（第二个调用并行挂着）：limit=1 只回最新一条且 has_more；
+    // before_seq=2 只回第一条
+    send_ws(&mut su, &conv, "a13-2", "echo:more").await;
+    let _ = until_frame(&mut sh, "invocation_start", A01Dur::from_secs(10)).await;
+    let r = tool_history(&base, &format!("Invocation {token}"), "?limit=1").await;
+    assert_eq!(r.status(), 200);
+    let page: Value = r.json().await.unwrap();
+    let msgs = page["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1, "{page}");
+    assert_eq!(msgs[0]["content"], "echo:more");
+    assert_eq!(page["has_more"], true);
+    let r = tool_history(&base, &format!("Invocation {token}"), "?before_seq=2").await;
+    assert_eq!(r.status(), 200);
+    let page: Value = r.json().await.unwrap();
+    assert_eq!(page["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(page["messages"][0]["seq"].as_i64().unwrap(), 1);
+
+    // 结束第一个调用 → 它的凭据立刻失效（轮询等 finish 落库）
+    host_finish(&mut sh, &inv_id).await;
+    let mut dead = false;
+    for _ in 0..50 {
+        if tool_history(&base, &format!("Invocation {token}"), "")
+            .await
+            .status()
+            == 401
+        {
+            dead = true;
+            break;
+        }
+        tokio::time::sleep(A01Dur::from_millis(100)).await;
+    }
+    assert!(dead, "调用结束后 tools_token 应 401");
+}
+
+/// 两种凭据互不通用：access token 走 Invocation 通道 → 401；
+/// 调用凭据访问普通 REST（Bearer 与 Invocation 两种写法）→ 401。
+#[tokio::test]
+async fn a13_token_kind_isolation() {
+    let base = spawn_named_db(&format!("chat_t_a13iso_{}", uniq())).await;
+    let a = register(&base, &format!("a13i_{}", uniq())).await;
+    let (mut sh, _su, inv_id, token, _conv, _agent_id) = a13_running_invocation(&base, &a).await;
+
+    // 普通 access token 不能当调用凭据用（无论 scheme）
+    for auth in [format!("Invocation {}", a.access), authz(&a.access)] {
+        assert_eq!(
+            tool_history(&base, &auth, "").await.status(),
+            401,
+            "auth={auth}"
+        );
+    }
+    // 调用凭据不能访问普通接口（无论 scheme）
+    for auth in [authz(&token), format!("Invocation {token}")] {
+        let r = http()
+            .get(format!("{base}/v1/conversations"))
+            .header("authorization", auth.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401, "auth={auth}");
+    }
+    host_finish(&mut sh, &inv_id).await;
+}
+
+/// 伪造（错签名/缺 kind/错 kind/指向不存在的调用）与过期凭据 → 401；
+/// 主人被禁用后，仍挂在 running 的调用凭据 → 401。
+#[tokio::test]
+async fn a13_invocation_token_rejects_forgery_and_disabled() {
+    let base = spawn_named_db(&format!("chat_t_a13sec_{}", uniq())).await;
+    // 首个注册用户是管理员；主人单开（管理员账号不可被禁用，不能拿主人当第一用户）
+    let admin = register(&base, &format!("a13adm_{}", uniq())).await;
+    let a = register(&base, &format!("a13s_{}", uniq())).await;
+    let (mut sh, _su, inv_id, token, _conv, agent_id) = a13_running_invocation(&base, &a).await;
+
+    let now = chrono::Utc::now().timestamp();
+    let claims = json!({"kind":"invocation","sub":inv_id,"owner":a.id,
+                        "agent":agent_id,"depth":0,"iat":now,"exp":now+3600});
+    // 对照组：真 token 与正确自签的 token 都是 200（凭据不登记，签名合法即可）
+    assert_eq!(
+        tool_history(&base, &format!("Invocation {token}"), "")
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(
+        tool_history(
+            &base,
+            &format!("Invocation {}", a13_mint("test-secret", claims.clone())),
+            ""
+        )
+        .await
+        .status(),
+        200
+    );
+
+    let mut expired = claims.clone();
+    expired["exp"] = json!(now - 3600);
+    let mut no_kind = claims.clone();
+    no_kind.as_object_mut().unwrap().remove("kind");
+    let mut wrong_kind = claims.clone();
+    wrong_kind["kind"] = json!("access");
+    let mut ghost = claims.clone();
+    ghost["sub"] = json!(uuid::Uuid::new_v4());
+    for (name, t) in [
+        ("bad_sig", a13_mint("other-secret", claims.clone())),
+        ("expired", a13_mint("test-secret", expired)),
+        ("no_kind", a13_mint("test-secret", no_kind)),
+        ("wrong_kind", a13_mint("test-secret", wrong_kind)),
+        ("ghost_invocation", a13_mint("test-secret", ghost)),
+    ] {
+        assert_eq!(
+            tool_history(&base, &format!("Invocation {t}"), "")
+                .await
+                .status(),
+            401,
+            "{name}"
+        );
+    }
+
+    // 主人被禁用 → 调用仍是 running，凭据已死
+    let r = http()
+        .post(format!("{base}/v1/admin/users/{}/disable", a.id))
+        .header("authorization", authz(&admin.access))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    assert_eq!(
+        tool_history(&base, &format!("Invocation {token}"), "")
+            .await
+            .status(),
+        401
+    );
+    host_finish(&mut sh, &inv_id).await;
+}
+
+/// 接口只读发起调用的那个会话：没有会话参数可用来构造越权；
+/// 主人在其它会话里的消息不会出现在返回里。
+#[tokio::test]
+async fn a13_history_scoped_to_invoking_conversation() {
+    let base = spawn_named_db(&format!("chat_t_a13scp_{}", uniq())).await;
+    let a = register(&base, &format!("a13x_{}", uniq())).await;
+    let b = register(&base, &format!("a13y_{}", uniq())).await;
+    befriend(&base, &a, &b).await;
+    let dm = dm_conv(&base, &a).await;
+    let (mut sa, _) = tokio_tungstenite::connect_async(ws_url(&base, &a).await)
+        .await
+        .unwrap();
+    // DM 里放一条不该出现在工具结果里的消息，等它落库（收到 message 帧即已提交）
+    send_ws(&mut sa, &dm, "dm1", "不该被读到的私聊正文").await;
+    let _ = next_of(&mut sa, "message").await;
+
+    let (mut sh, _su, inv_id, token, _conv, _agent_id) = a13_running_invocation(&base, &a).await;
+    let r = tool_history(&base, &format!("Invocation {token}"), "?limit=200").await;
+    assert_eq!(r.status(), 200);
+    let page: Value = r.json().await.unwrap();
+    let msgs = page["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1, "应只返回发起会话的消息: {msgs:?}");
+    assert_eq!(msgs[0]["content"], "echo:hold");
+    host_finish(&mut sh, &inv_id).await;
 }

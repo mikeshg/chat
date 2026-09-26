@@ -99,7 +99,17 @@ pub struct AgentOption {
     pub name: String,
 }
 
-/// 一次调用的输入。配置项与 AgentSpec 同步一份，运行时读这里。
+/// Agent A13：注入给 Agent 的一个 MCP 服务（本次调用的工具入口）。
+/// http_url 指向宿主本地 MCP 服务；bridge 是备选 stdio 桥接（程序 + 固定参数，
+/// 调 ACP session/new 时把 http_url 追加为最后一个参数）。
+#[derive(Debug, Clone)]
+pub struct InjectedMcp {
+    pub name: String,
+    pub http_url: String,
+    pub bridge: Option<(String, Vec<String>)>,
+}
+
+/// 一次调用的输入。
 #[derive(Debug, Clone)]
 pub struct RunRequest {
     pub spec: AgentSpec,
@@ -117,6 +127,8 @@ pub struct RunRequest {
     pub probe: bool,
     /// 主人取消：置 true 后 ACP 先发 session/cancel，最多再等 5 秒。
     pub cancel: watch::Receiver<bool>,
+    /// Agent A13：本次调用注入的 MCP 服务（可空 = 不注入工具）
+    pub mcp_servers: Vec<InjectedMcp>,
 }
 
 impl RunRequest {
@@ -143,6 +155,7 @@ impl RunRequest {
             probe,
             // 默认没人会取消（发送端已丢弃）；普通调用由调用方换成真正的取消信号
             cancel: watch::channel(false).1,
+            mcp_servers: Vec::new(),
         }
     }
 }

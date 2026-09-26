@@ -1072,7 +1072,7 @@ async fn dispatch(
     if inv.status != "running" {
         return;
     }
-    let payload = invocation_start_payload(&st.pool, inv.id, &agent, conv, &prompt).await;
+    let payload = invocation_start_payload(st, inv.id, &agent, conv, &prompt).await;
     if !st.send_to_host(agent.host_id, &payload) {
         if let Some(q) = requeue(&st.pool, inv.id, timeout).await {
             push_invocation(st, member_ids, &q);
@@ -1132,22 +1132,28 @@ async fn insert_queued(
     .await
 }
 
-/// invocation_start 帧：Agent 配置快照（A06）+ 该会话记住的运行时会话（A02）。
-/// 即时派发与宿主上线后清排队共用。
+/// invocation_start 帧：Agent 配置快照（A06）+ 该会话记住的运行时会话（A02）
+/// + 本次调用的工具凭据（A13，只在调用进行中有效）。即时派发与宿主上线后清排队共用。
 async fn invocation_start_payload(
-    pool: &PgPool,
+    st: &SharedState,
     inv_id: Uuid,
     agent: &AgentRow,
     conv: Uuid,
     prompt: &str,
 ) -> String {
-    let session_id = context_session(pool, agent.id, conv).await;
+    let session_id = context_session(&st.pool, agent.id, conv).await;
+    // 签发失败（几乎不可能）时不带凭据：调用照常跑，只是用不了工具
+    let tools_token =
+        crate::auth::mint_invocation(inv_id, agent.owner, agent.id, 0, &st.cfg.jwt_secret)
+            .map_err(|e| tracing::error!(error = ?e, "tools_token mint failed"))
+            .ok();
     json!({
         "type": "invocation_start",
         "invocation_id": inv_id,
         "agent": agent_snapshot(agent),
         "prompt": prompt,
         "context": {"key": conv.to_string(), "session_id": session_id},
+        "tools_token": tools_token,
     })
     .to_string()
 }
@@ -1209,8 +1215,7 @@ pub async fn flush_queued(st: &SharedState, host_id: Uuid) {
             _ => continue,
         };
         let payload =
-            invocation_start_payload(&st.pool, inv.id, &agent, row.conversation_id, &row.prompt)
-                .await;
+            invocation_start_payload(st, inv.id, &agent, row.conversation_id, &row.prompt).await;
         if !st.send_to_host(host_id, &payload) {
             let timeout = queue_timeout_secs(&st.pool, row.agent_id).await;
             if let Some(q) = requeue(&st.pool, inv.id, timeout).await {

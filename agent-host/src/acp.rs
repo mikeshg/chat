@@ -12,7 +12,7 @@
 
 pub use crate::runtime::AgentSpec;
 use crate::runtime::{
-    AgentOption, AgentRuntime, Events, RunEvent, RunFuture, RunOutput, RunRequest,
+    AgentOption, AgentRuntime, Events, InjectedMcp, RunEvent, RunFuture, RunOutput, RunRequest,
 };
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -207,6 +207,32 @@ fn in_options(id: &str, list: &Option<Vec<AgentOption>>) -> bool {
         .is_some_and(|xs| xs.iter().any(|o| o.id == id))
 }
 
+/// Agent A13：按 Agent 声明的能力把注入的 MCP 服务折成 ACP mcpServers 条目。
+/// Agent 声明 mcpCapabilities.http → http 形态直连；否则有桥接配置 → stdio
+/// 桥接条目（URL 追加为最后一个参数）；都不行 → 不注入并告警。
+fn mcp_entries(init: &Value, injected: &[InjectedMcp]) -> Vec<Value> {
+    let http_ok = init
+        .pointer("/agentCapabilities/mcpCapabilities/http")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut out = Vec::new();
+    for m in injected {
+        if http_ok {
+            out.push(json!({"type":"http","name":m.name,"url":m.http_url,"headers":[]}));
+        } else if let Some((cmd, args)) = &m.bridge {
+            let mut a = args.clone();
+            a.push(m.http_url.clone());
+            out.push(json!({"name":m.name,"command":cmd,"args":a,"env":[]}));
+        } else {
+            tracing::warn!(
+                "Agent 未声明 http MCP 能力且未配置桥接：{} 的注入工具不可用",
+                m.name
+            );
+        }
+    }
+    out
+}
+
 /// 主人取消时照样返回 Ok（调用方看取消标志决定要不要回 finish）。
 async fn drive(
     pipe: &mut Pipe,
@@ -227,9 +253,13 @@ async fn drive(
     if *cancel.borrow() {
         return Ok(Driven::default());
     }
+    // 注入的工具（A13）：新建和恢复会话都要带上
+    let mcp = json!(mcp_entries(&init, &req.mcp_servers));
     // 能续上已有会话就续上（probe 不续）：模式、模型、额外目录、附加指令都沿用那个会话，不再设置
     if !req.probe {
-        if let Some(sid) = resume_session(pipe, dir, req.resume_session.as_deref(), &caps).await {
+        if let Some(sid) =
+            resume_session(pipe, dir, req.resume_session.as_deref(), &caps, &mcp).await
+        {
             let prompt = json!([{"type": "text", "text": req.prompt}]);
             prompt_or_cancel(pipe, &json!(sid), prompt, cancel).await?;
             return Ok(Driven {
@@ -240,7 +270,7 @@ async fn drive(
         }
     }
     // 新建会话：额外目录、模式、模型、附加指令都只挂在这条分支上
-    let mut params = json!({"cwd": dir, "mcpServers": []});
+    let mut params = json!({"cwd": dir, "mcpServers": mcp});
     if supports_additional_dirs(&init) && !req.extra_dirs.is_empty() {
         params["additionalDirectories"] = json!(req.extra_dirs);
     }
@@ -319,9 +349,10 @@ async fn resume_session(
     dir: &Path,
     resume: Option<&str>,
     caps: &Value,
+    mcp: &Value,
 ) -> Option<String> {
     let sid = resume.filter(|s| !s.is_empty())?;
-    let params = json!({"sessionId": sid, "cwd": dir, "mcpServers": []});
+    let params = json!({"sessionId": sid, "cwd": dir, "mcpServers": mcp});
     if cap_resume(caps) {
         if let Ok(r) = pipe.call("session/resume", params).await {
             return session_id_of(&r, Some(sid)).ok();

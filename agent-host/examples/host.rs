@@ -6,6 +6,10 @@
 //
 // install_id 是安装级永久标识：不给的话读/写 cwd 下的
 // agent_host_install_id 文件；同一账号同一 id 复用同一 host 记录。
+//
+// Agent A13：`--mcp-stdio-bridge <url>` 时本进程退化成 stdio MCP 桥
+// （供不声明 http MCP 能力的 Agent 用）；宿主把「本程序 + 该参数」
+// 填进 HostConfig.mcp_bridge，作为注入工具的 stdio 兜底。
 
 use agent_host::{spawn, HostConfig, TicketSource};
 use serde_json::{json, Value};
@@ -102,8 +106,17 @@ fn install_id(arg: Option<String>) -> Uuid {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Agent A13：桥接子进程模式（Agent 以 stdio MCP 拉起本程序时命中）
+    if args.first().map(String::as_str) == Some("--mcp-stdio-bridge") {
+        let url = args.get(1).cloned().unwrap_or_default();
+        if let Err(e) = agent_host::mcp_bridge::run(url).await {
+            eprintln!("mcp-stdio-bridge: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    tracing_subscriber::fmt::init();
     let get = |k: &str| arg_value(&args, k);
     let server = get("--server").expect("需要 --server");
     let username = get("--user").expect("需要 --user");
@@ -130,12 +143,20 @@ async fn main() {
     });
     creds.login().await.expect("登录失败");
 
+    // Agent A13：stdio 桥接 = 本程序 + --mcp-stdio-bridge（URL 由运行时追加）
+    let mcp_bridge = std::env::current_exe().ok().map(|exe| {
+        (
+            exe.to_string_lossy().to_string(),
+            vec!["--mcp-stdio-bridge".into()],
+        )
+    });
     let handle = spawn(
         HostConfig {
             server_url: server,
             install_id,
             label,
             platform: platform.into(),
+            mcp_bridge,
         },
         ticket_source(creds),
     );
