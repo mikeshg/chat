@@ -31,6 +31,12 @@ export default function AdminSettings() {
   // V2 P2-1：每用户存储配额（MB 输入框字符串；0 = 不限）
   const [quota, setQuota] = useState("0");
   const [quotaSaving, setQuotaSaving] = useState(false);
+  // V2 P3-3：ntfy 推送服务；令牌只写不读（输入框不回显，placeholder 提示是否已设置）
+  const [ntfyBase, setNtfyBase] = useState("");
+  const [ntfyToken, setNtfyToken] = useState("");
+  const [ntfyTokenSet, setNtfyTokenSet] = useState(false);
+  const [publicUrl, setPublicUrl] = useState("");
+  const [pushSaving, setPushSaving] = useState(false);
   // 创建表单
   const [maxUses, setMaxUses] = useState<number | null>(1);
   const [expHours, setExpHours] = useState<number | null>(24 * 7);
@@ -44,6 +50,10 @@ export default function AdminSettings() {
       const [s, list] = await Promise.all([admin.settings(), admin.invites()]);
       setMode(s.registration_mode);
       setQuota(String(s.storage_quota_mb ?? 0));
+      setNtfyBase(s.push_ntfy_base ?? "");
+      setNtfyTokenSet(s.push_ntfy_token_set === true);
+      setPublicUrl(s.public_url ?? "");
+      setNtfyToken("");
       setInvites(list);
       setErr("");
     } catch (e) {
@@ -91,6 +101,47 @@ export default function AdminSettings() {
       setErr(e instanceof Error ? e.message : "保存失败");
     } finally {
       setQuotaSaving(false);
+    }
+  };
+
+  // ntfy 推送服务：地址类字段每次提交当前值；令牌只在输入了新值时发送（不回显）
+  const savePush = async () => {
+    setPushSaving(true);
+    setErr("");
+    setSaved(false);
+    try {
+      const patch: Parameters<typeof admin.updateSettings>[0] = {
+        push_ntfy_base: ntfyBase.trim(),
+        public_url: publicUrl.trim(),
+      };
+      const t = ntfyToken.trim();
+      if (t) patch.push_ntfy_token = t;
+      const s = await admin.updateSettings(patch);
+      setNtfyBase(s.push_ntfy_base ?? "");
+      setNtfyTokenSet(s.push_ntfy_token_set === true);
+      setPublicUrl(s.public_url ?? "");
+      setNtfyToken("");
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "保存失败");
+    } finally {
+      setPushSaving(false);
+    }
+  };
+
+  const clearPushToken = async () => {
+    if (!confirm("清除 ntfy 访问令牌？自建服务器开了鉴权时推送会失败")) return;
+    setPushSaving(true);
+    setErr("");
+    try {
+      const s = await admin.updateSettings({ push_ntfy_token: "" });
+      setNtfyTokenSet(s.push_ntfy_token_set === true);
+      setNtfyToken("");
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "清除失败");
+    } finally {
+      setPushSaving(false);
     }
   };
 
@@ -186,6 +237,43 @@ export default function AdminSettings() {
         >
           {quotaSaving ? "保存中…" : "保存配额"}
         </button>
+      </div>
+
+      <h3>推送服务（ntfy）</h3>
+      <div className="ad-push">
+        <input
+          placeholder="ntfy 服务器地址，如 https://ntfy.sh（空 = 关闭推送）"
+          value={ntfyBase}
+          disabled={pushSaving}
+          onChange={(e) => setNtfyBase(e.target.value)}
+        />
+        <div className="row">
+          <input
+            className="grow"
+            type="password"
+            placeholder={ntfyTokenSet ? "访问令牌（已设置，输入新值以更换）" : "访问令牌（未设置，自建开鉴权时填）"}
+            value={ntfyToken}
+            disabled={pushSaving}
+            onChange={(e) => setNtfyToken(e.target.value)}
+          />
+          {ntfyTokenSet && (
+            <button disabled={pushSaving} onClick={() => void clearPushToken()}>
+              清除令牌
+            </button>
+          )}
+        </div>
+        <input
+          placeholder="本服务对外访问地址（可选，推送通知点击跳转）"
+          value={publicUrl}
+          disabled={pushSaving}
+          onChange={(e) => setPublicUrl(e.target.value)}
+        />
+        <div className="row">
+          <button className="primary" disabled={pushSaving} onClick={() => void savePush()}>
+            {pushSaving ? "保存中…" : "保存推送设置"}
+          </button>
+          <span className="muted">令牌只写不读；用户只拿到随机订阅地址</span>
+        </div>
       </div>
 
       <h3>邀请码</h3>

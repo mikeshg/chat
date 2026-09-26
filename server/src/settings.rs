@@ -32,6 +32,14 @@ pub struct ServerSettings {
     pub registration_mode: String,
     /// 每用户附件总量上限（MB）；0 = 不限
     pub storage_quota_mb: i64,
+    /// ntfy 服务器地址（http/https，V2 P3-3）；空 = 推送功能关闭
+    pub push_ntfy_base: String,
+    /// ntfy 访问令牌：只写不读——序列化跳过，GET 只暴露 push_ntfy_token_set
+    #[serde(skip_serializing)]
+    pub push_ntfy_token: String,
+    pub push_ntfy_token_set: bool,
+    /// 本服务对外地址，用于推送通知的 Click 跳转；空 = 不带
+    pub public_url: String,
 }
 
 impl Default for ServerSettings {
@@ -39,6 +47,10 @@ impl Default for ServerSettings {
         Self {
             registration_mode: MODE_OPEN.into(),
             storage_quota_mb: 0,
+            push_ntfy_base: String::new(),
+            push_ntfy_token: String::new(),
+            push_ntfy_token_set: false,
+            public_url: String::new(),
         }
     }
 }
@@ -63,6 +75,19 @@ pub async fn load(executor: impl sqlx::PgExecutor<'_>) -> AppResult<ServerSettin
                     s.storage_quota_mb = q;
                 }
             }
+        } else if k == "push_ntfy_base" {
+            if let Some(v) = v.as_str() {
+                s.push_ntfy_base = v.trim_end_matches('/').to_string();
+            }
+        } else if k == "push_ntfy_token" {
+            if let Some(v) = v.as_str() {
+                s.push_ntfy_token_set = !v.is_empty();
+                s.push_ntfy_token = v.to_string();
+            }
+        } else if k == "public_url" {
+            if let Some(v) = v.as_str() {
+                s.public_url = v.trim_end_matches('/').to_string();
+            }
         }
     }
     Ok(s)
@@ -74,6 +99,41 @@ pub struct UpdateSettingsReq {
     pub registration_mode: Option<String>,
     /// 每用户附件存储上限（MB，0 = 不限）；带值时必须为合法整数
     pub storage_quota_mb: Option<serde_json::Value>,
+    /// ntfy 服务器地址（http/https、≤200 字符；V2 P3-3）；空 = 关闭推送
+    pub push_ntfy_base: Option<String>,
+    /// ntfy 访问令牌（只写不读）；空字符串 = 清除
+    pub push_ntfy_token: Option<String>,
+    /// 本服务对外地址（同 push_ntfy_base 的校验规则）；空 = 通知不带 Click
+    pub public_url: Option<String>,
+}
+
+/// 管理员写入的地址类字段：http/https 且 ≤200 字符；空串合法（= 关闭/清除）。
+/// 归一化去首尾空白与末尾斜杠（订阅地址按 "{base}/{topic}" 拼接）。
+fn normalize_http_url(v: &str) -> Option<String> {
+    let v = v.trim().trim_end_matches('/').to_string();
+    (v.is_empty() || (v.len() <= 200 && (v.starts_with("http://") || v.starts_with("https://"))))
+        .then_some(v)
+}
+
+/// 字符串值键的 UPSERT（设置仅存 jsonb 标量，文本经 to_jsonb 落库）
+async fn upsert_text(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    key: &str,
+    value: &str,
+    updated_by: Uuid,
+) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO server_settings (key, value, updated_by)
+         VALUES ($1, to_jsonb($2::text), $3)
+         ON CONFLICT (key) DO UPDATE
+            SET value = EXCLUDED.value, updated_at = now(), updated_by = EXCLUDED.updated_by",
+    )
+    .bind(key)
+    .bind(value)
+    .bind(updated_by)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// 按 patch 逐键 UPSERT（记录 updated_by），返回完整设置
@@ -115,6 +175,21 @@ pub async fn update(
         .execute(&mut **tx)
         .await?;
     }
+    if let Some(v) = &req.push_ntfy_base {
+        let v = normalize_http_url(v).ok_or_else(|| {
+            AppError::bad_request("push_ntfy_base 必须是 http/https 地址（≤200 字符）")
+        })?;
+        upsert_text(tx, "push_ntfy_base", &v, updated_by).await?;
+    }
+    if let Some(v) = &req.push_ntfy_token {
+        upsert_text(tx, "push_ntfy_token", v, updated_by).await?;
+    }
+    if let Some(v) = &req.public_url {
+        let v = normalize_http_url(v).ok_or_else(|| {
+            AppError::bad_request("public_url 必须是 http/https 地址（≤200 字符）")
+        })?;
+        upsert_text(tx, "public_url", &v, updated_by).await?;
+    }
     load(&mut **tx).await
 }
 
@@ -153,7 +228,8 @@ pub async fn consume_invite(executor: impl sqlx::PgExecutor<'_>, code: &str) -> 
 #[derive(Debug, Serialize)]
 pub struct ServerInfo {
     pub registration_mode: String,
-    // 只放可公开字段；后续阶段按需加
+    /// ntfy 推送已配置（V2 P3-3）：客户端据此决定是否展示手机推送入口
+    pub push_available: bool,
 }
 
 /// GET /server-info：公共端点，供登录页决定注册入口形态
@@ -161,6 +237,7 @@ pub async fn server_info(State(st): State<SharedState>) -> AppResult<Json<Server
     let s = load(&st.pool).await?;
     Ok(Json(ServerInfo {
         registration_mode: s.registration_mode,
+        push_available: !s.push_ntfy_base.is_empty(),
     }))
 }
 

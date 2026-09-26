@@ -300,6 +300,8 @@ export type RegistrationMode = "open" | "invite" | "closed";
 /** GET /server-info（公共，旧服务端无此接口 → 客户端按 open 处理） */
 export interface ServerInfo {
   registration_mode: RegistrationMode;
+  /** ntfy 推送已配置（V2 P3-3；旧服务端无此字段 → 视为未配置） */
+  push_available?: boolean;
 }
 
 /** GET/PUT /admin/settings */
@@ -307,6 +309,25 @@ export interface AdminSettings {
   registration_mode: RegistrationMode;
   /** 每用户附件存储上限（MB，0 = 不限；旧服务端缺省） */
   storage_quota_mb?: number;
+  /** ntfy 服务器地址（V2 P3-3，http/https）；空 = 关闭推送 */
+  push_ntfy_base?: string;
+  /** ntfy 访问令牌：只写不读——PUT 提交用，GET 响应里不出现 */
+  push_ntfy_token?: string;
+  /** 令牌是否已设置（GET 只回这个布尔值） */
+  push_ntfy_token_set?: boolean;
+  /** 本服务对外地址，推送通知点击跳转用；空 = 不带 */
+  public_url?: string;
+}
+
+/** GET/PUT /users/me/push 与 rotate/test 返回（V2 P3-3） */
+export interface PushState {
+  /** 服务端已配置 ntfy（管理员侧） */
+  available: boolean;
+  enabled: boolean;
+  /** 通知正文是否带消息内容 */
+  preview: boolean;
+  /** {push_ntfy_base}/{topic}；available=false 时为 null */
+  subscribe_url: string | null;
 }
 
 export interface InviteView {

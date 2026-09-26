@@ -366,6 +366,11 @@ pub enum WsIn {
     Typing {
         conversation_id: Uuid,
     },
+    /// 客户端前台状态上报（V2 P3-3）：连接建立 / 可见性 / 焦点变化时发送；
+    /// 服务端按「至少一条 active 连接」判定是否还有必要发离线推送
+    ClientState {
+        active: bool,
+    },
     Read {
         conversation_id: Uuid,
         seq: i64,

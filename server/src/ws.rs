@@ -11,7 +11,8 @@ use axum::{
 };
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
-use std::time::Duration;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -96,8 +97,14 @@ pub async fn handle_session(
     let _ = tx.send(ConnMsg::Frame(frame(&WsOut::PresenceInit { online })));
 
     let (mut sink, mut stream) = socket.split();
-    let mut ping = tokio::time::interval(Duration::from_secs(30));
+    // V2 P3-3：心跳超时——任何入站帧（含 Pong）都刷新 last_inbound；
+    // 静默超时说明对端已死（手机断网常见），主动断开走正常断开清理。
+    // 周期/超时在 AppState 上可调，测试用 spawn_named_state 后改小。
+    let ping_every = Duration::from_millis(st.ws_ping_interval_ms.load(Ordering::Relaxed).max(10));
+    let idle_timeout = Duration::from_millis(st.ws_idle_timeout_ms.load(Ordering::Relaxed).max(1));
+    let mut ping = tokio::time::interval(ping_every);
     ping.tick().await; // 跳过立即触发
+    let mut last_inbound = Instant::now();
 
     loop {
         tokio::select! {
@@ -118,21 +125,31 @@ pub async fn handle_session(
                 }
             }
             _ = ping.tick() => {
+                if last_inbound.elapsed() > idle_timeout {
+                    let _ = sink.send(Message::Close(None)).await;
+                    break;
+                }
                 if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
                     break;
                 }
             }
             incoming = stream.next() => {
                 match incoming {
-                    Some(Ok(Message::Text(text))) => {
-                        if !on_text(&st, uid, conn_id, grant.session_version, grant.sid, &tx, &text).await {
-                            let _ = sink.send(Message::Close(None)).await;
-                            break;
+                    Some(Ok(msg)) => {
+                        last_inbound = Instant::now();
+                        match msg {
+                            Message::Text(text) => {
+                                if !on_text(&st, uid, conn_id, grant.session_version, grant.sid, &tx, &text).await {
+                                    let _ = sink.send(Message::Close(None)).await;
+                                    break;
+                                }
+                            }
+                            Message::Close(_) => break,
+                            // Ping/Pong/Binary 等其余帧只算活跃，不进业务分发
+                            _ => {}
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Err(_)) => break,
-                    _ => {}
+                    Some(Err(_)) | None => break,
                 }
             }
         }
@@ -230,6 +247,8 @@ pub async fn broadcast_posted(st: &SharedState, conv: Uuid, posted: &domain::Pos
             message: posted.message.clone(),
         });
         st.send_to_users(&posted.member_ids, &p);
+        // V2 P3-3：离线推送（ntfy）——判定与发送全在 spawned 任务里，不拖慢广播
+        crate::push::schedule(st, conv, posted);
     }
     // 新 @本人消息已在事务内解除其归档：偏好帧只发给本人全部连接（其他成员不可见）
     for target in &posted.unarchived {
@@ -351,6 +370,10 @@ async fn on_text(
         }) => {
             let res = reaction(st, uid, tx, message_id, &emoji, false, client_op_id.clone()).await;
             (res, None, client_op_id)
+        }
+        Ok(WsIn::ClientState { active }) => {
+            st.set_conn_active(uid, conn_id, active);
+            (Ok(()), None, None)
         }
         Ok(WsIn::Typing { conversation_id }) => {
             (typing(st, uid, conversation_id).await, None, None)
