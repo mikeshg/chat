@@ -2,11 +2,15 @@ import type {
   AdminOverview,
   AdminSettings,
   AdminUserView,
+  AgentHostView,
+  AgentView,
   AttachmentView,
   AuthResponse,
   BackupCreated,
   BackupList,
   BackupTicket,
+  CreateAgentReq,
+  InvocationView,
   RestoreResult,
   ConversationDetail,
   ConversationPref,
@@ -312,6 +316,19 @@ export const convs = {
   pin: (id: string, messageId: string) => put<void>(`/conversations/${id}/pins/${messageId}`),
   unpin: (id: string, messageId: string) => del<void>(`/conversations/${id}/pins/${messageId}`),
   ticket: () => get<{ ticket: string; expires_in: number }>("/ws/ticket"),
+};
+
+// ---------- Agent A01 ----------
+export const agents = {
+  /** 本人的宿主列表（含实时 online） */
+  hosts: () => get<AgentHostView[]>("/agent-hosts"),
+  /** 本人的 Agent 列表 */
+  list: () => get<AgentView[]>("/agents"),
+  /** 创建 Agent（同时建专属会话）；400 bad_name / 409 name_taken / 404 宿主非本人 */
+  create: (body: CreateAgentReq) => post<AgentView>("/agents", body),
+  /** 会话最近的调用记录（刷新后恢复状态行；仅成员可读） */
+  invocations: (convId: string, limit = 50) =>
+    get<InvocationView[]>(`/conversations/${convId}/agent-invocations?limit=${limit}`),
 };
 
 // ---------- 消息生命周期 ----------

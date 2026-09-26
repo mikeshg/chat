@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod api;
 pub mod auth;
 pub mod backup;
@@ -5,6 +6,7 @@ pub mod config;
 pub mod db;
 pub mod domain;
 pub mod error;
+pub mod host_ws;
 pub mod media;
 pub mod model;
 pub mod push;

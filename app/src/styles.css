@@ -147,6 +147,29 @@ input:focus, textarea:focus { border-color: var(--green); }
   position: absolute; bottom: -1px; right: -1px; width: 10px; height: 10px;
   border-radius: 50%; background: var(--green); border: 2px solid var(--panel);
 }
+/* A01：离线宿主指示（面板里非头像场景用静态圆点） */
+.online-dot.off { background: var(--muted); }
+.agent-avatar { background: var(--warn-bg); color: var(--warn-fg); font-size: 17px; }
+.avatar.sm.agent-avatar { font-size: 15px; }
+/* Agent 发送者标记（消息气泡上方名字右侧） */
+.agent-tag {
+  background: var(--warn-bg); color: var(--warn-fg); font-size: 10px;
+  padding: 0 5px; border-radius: 4px; margin-left: 6px; font-weight: 500;
+}
+/* 触发消息下方的调用状态行 */
+.inv-status { color: var(--muted); font-size: 12px; padding: 2px 0 2px 44px; }
+.inv-status.failed { color: var(--danger); }
+/* 「我」页入口行 / Agent 面板 */
+.me-entry { cursor: pointer; }
+.agent-face { font-size: 18px; }
+.agent-panel { width: 440px; overflow-y: auto; }
+.agent-sec { margin: 4px 0 8px; font-size: 13px; color: var(--muted); }
+.agent-item { padding: 7px 4px; border-radius: 6px; align-items: center; }
+.agent-item.clickable { cursor: pointer; }
+.agent-item.clickable:hover { background: var(--bg); }
+.agent-item .online-dot { position: static; border: none; width: 8px; height: 8px; flex-shrink: 0; }
+.agent-form { display: flex; flex-direction: column; gap: 8px; }
+.agent-form textarea { resize: vertical; }
 .conv-mid { flex: 1; min-width: 0; }
 .conv-title { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conv-sub {

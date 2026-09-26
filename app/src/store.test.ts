@@ -1,11 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
+  applyHostStatus,
+  applyInvocations,
   applyLiveMessage,
   applyPrefUpdate,
   applyRefreshed,
   applySyncMessages,
   applyUpdatedMessage,
+  convTitle,
   fetchForward,
+  invocationErrorText,
+  isOwnMessage,
   mergeConversationLists,
   resolveAck,
   shouldNotify,
@@ -85,6 +90,8 @@ function state(patch: Partial<AppState> = {}): AppState {
     drafts: {},
     avatars: {},
     pendingJump: null,
+    agentHosts: [],
+    invocations: {},
     ...patch,
   };
 }
@@ -399,6 +406,108 @@ describe("V2 P1-1 后台时打开着的会话照常计未读", () => {
   it("后台：打开着的会话计未读，标题与通知才准确", () => {
     const s = state({ activeConv: CONV, me: { id: "me" } as AppState["me"] });
     expect(unread(applyLiveMessage(s, msg({ seq: 2 }), false))).toBe(1);
+  });
+});
+
+// ---------- Agent A01：归属判定 / 会话标题 / 宿主与调用状态 ----------
+
+describe("Agent A01：isOwnMessage", () => {
+  const me = "me";
+  it("无 agent 字段：sender_id 是本人 → 我发的", () => {
+    expect(isOwnMessage(msg({ sender_id: me }), me)).toBe(true);
+    expect(isOwnMessage(msg({ sender_id: "u-b" }), me)).toBe(false);
+    expect(isOwnMessage(msg({ sender_id: me }), null)).toBe(false);
+    expect(isOwnMessage(msg({ sender_id: me }), undefined)).toBe(false);
+  });
+  it("有 agent 字段：sender_id 仍是主人，但不算我发的", () => {
+    const m = msg({ sender_id: me, agent: { id: "ag1", name: "helper" } });
+    expect(isOwnMessage(m, me)).toBe(false);
+    // 顺带：agent 消息会给主人计未读、可触发提示
+    const s = state({ me: { id: me } as AppState["me"] });
+    const next = { ...s, ...applyLiveMessage(s, m, false) };
+    expect(next.conversations?.[0].unread_count).toBe(1);
+    expect(shouldNotify(s, m)).toBe(true);
+  });
+  it("agent: null 与缺省等价（旧服务端形状）", () => {
+    expect(isOwnMessage(msg({ sender_id: me, agent: null }), me)).toBe(true);
+  });
+});
+
+describe("Agent A01：convTitle", () => {
+  it("kind='agent' → Agent 名；缺 agent 字段兜底 'Agent'", () => {
+    expect(
+      convTitle(
+        conv("c", {
+          kind: "agent",
+          name: null,
+          agent: { id: "a1", name: "小助手", host_id: "h1", host_online: true },
+        }),
+      ),
+    ).toBe("小助手");
+    expect(convTitle(conv("c", { kind: "agent", name: null }))).toBe("Agent");
+  });
+  it("既有 kind 不受影响（self/dm/group 回归）", () => {
+    expect(convTitle(conv("c", { kind: "self", name: null }))).toBe("文件传输助手");
+    expect(convTitle(conv("c", { kind: "group", name: "g" }))).toBe("g");
+    expect(
+      convTitle(
+        conv("c", {
+          kind: "dm",
+          peer: { id: "p", username: "p", display_name: "P", role: "user", last_seen_at: null },
+        }),
+      ),
+    ).toBe("P");
+  });
+});
+
+describe("Agent A01：宿主状态与调用记录", () => {
+  const agentConv = () =>
+    conv("ac", {
+      kind: "agent",
+      name: null,
+      agent: { id: "a1", name: "helper", host_id: "h1", host_online: true },
+    });
+
+  it("applyHostStatus：宿主上下线同步翻转宿主表与 agent 会话的在线点", () => {
+    let s = state({
+      conversations: [agentConv()],
+      agentHosts: [
+        { id: "h1", label: "pc", platform: "windows", online: true, last_seen_at: "t" },
+      ],
+    });
+    s = { ...s, ...applyHostStatus(s, "h1", false) };
+    expect(s.agentHosts[0].online).toBe(false);
+    expect(s.conversations[0].agent?.host_online).toBe(false);
+    // 别的宿主不受影响
+    s = { ...s, ...applyHostStatus(s, "other", false) };
+    expect(s.conversations[0].agent?.host_online).toBe(false);
+  });
+
+  it("applyInvocations：按 trigger_message_id 归档，后到的状态覆盖先到的", () => {
+    const running = {
+      id: "i1",
+      agent_id: "a1",
+      conversation_id: "ac",
+      trigger_message_id: "m1",
+      status: "running",
+      error: null,
+      created_at: "t",
+      started_at: "t",
+      finished_at: null,
+    };
+    let s = state({ invocations: { ac: { m1: running } } });
+    const done = { ...running, status: "succeeded", finished_at: "t2" };
+    s = { ...s, ...applyInvocations(s, [done]) };
+    expect(s.invocations.ac.m1.status).toBe("succeeded");
+    // 空批量不动状态
+    expect(applyInvocations(s, [])).toEqual({});
+  });
+
+  it("invocationErrorText：稳定错误码 → 中文文案", () => {
+    expect(invocationErrorText("host_offline")).toBe("Agent 所在电脑不在线");
+    expect(invocationErrorText("host_disconnected")).toBe("Agent 所在电脑断开了");
+    expect(invocationErrorText("boom")).toBe("boom");
+    expect(invocationErrorText(null)).toBe("未知原因");
   });
 });
 

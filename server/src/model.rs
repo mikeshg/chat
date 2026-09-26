@@ -229,6 +229,16 @@ pub struct MessageView {
     pub sender_has_avatar: bool,
     /// 转发消息：原发送者展示名快照
     pub forwarded_from: Option<String>,
+    /// Agent A01：非空 = 本消息由该 Agent 发出（sender_id 仍是主人）。
+    /// 客户端归属判断一律看本字段，不能只看 sender_id。
+    pub agent: Option<AgentRef>,
+}
+
+/// 消息上的 Agent 归属标记（messages.agent_id → agents.id/name 快照读）。
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentRef {
+    pub id: Uuid,
+    pub name: String,
 }
 
 /// 群公告（会话列表随 ConversationView 下发；清空时整字段为 null）。
@@ -273,7 +283,18 @@ pub struct ConversationView {
     pub preference: ConversationPref,
     /// 群公告；私聊 / 文件传输助手 / 未设置时为 null。旧客户端忽略
     pub announcement: Option<AnnouncementView>,
+    /// Agent A01：kind='agent' 时的专属 Agent（含宿主在线态，供列表/标题用）
+    pub agent: Option<ConvAgentRef>,
     pub created_at: DateTime<Utc>,
+}
+
+/// AgentConversation 上的 Agent 摘要。host_id 随帧下发，便于宿主上下线广播直接定位。
+#[derive(Debug, Clone, Serialize)]
+pub struct ConvAgentRef {
+    pub id: Uuid,
+    pub name: String,
+    pub host_id: Uuid,
+    pub host_online: bool,
 }
 
 /// GET /conversations/preferences 的条目：{conversation_id, preference}
@@ -341,6 +362,9 @@ pub struct TicketRes {
 #[derive(Debug, Deserialize)]
 pub struct WsTicketQuery {
     pub ticket: String,
+    /// Agent A01："host" = 桌面端宿主连接（不产生 presence，走 host_hello 握手）；
+    /// 缺省/其它值 = 普通用户连接
+    pub role: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -472,6 +496,74 @@ pub enum WsOut {
         /// 非发送类 mutation 的回执关联；与 client_msg_id 不混用
         client_op_id: Option<Uuid>,
     },
+    /// Agent A01：宿主上/下线，只发给宿主主人的普通连接
+    AgentHostStatus {
+        host_id: Uuid,
+        online: bool,
+    },
+    /// Agent A01：调用状态推进，发给调用会话成员（A01 里即主人）的普通连接
+    AgentInvocation {
+        invocation: InvocationView,
+    },
+}
+
+// ---------- Agent A01：宿主 / Agent / 调用 ----------
+
+/// GET /v1/agent-hosts 的条目：只含本人的宿主
+#[derive(Debug, Serialize)]
+pub struct AgentHostView {
+    pub id: Uuid,
+    pub label: String,
+    pub platform: String,
+    pub online: bool,
+    pub last_seen_at: DateTime<Utc>,
+}
+
+/// GET /v1/agents 与 POST /v1/agents 的视图
+#[derive(Debug, Serialize)]
+pub struct AgentView {
+    pub id: Uuid,
+    pub name: String,
+    pub host_id: Uuid,
+    pub host_online: bool,
+    /// 运行时描述快照；A01 形状 {"command": "...", "args": ["..."]}
+    pub runtime: serde_json::Value,
+    /// 宿主机工作目录；空串 = 宿主决定
+    pub cwd: String,
+    /// 专属 AgentConversation
+    pub conversation_id: Uuid,
+    pub created_at: DateTime<Utc>,
+}
+
+/// POST /v1/agents 请求体
+#[derive(Debug, Deserialize)]
+pub struct CreateAgentReq {
+    pub name: String,
+    pub host_id: Uuid,
+    pub runtime: AgentRuntimeReq,
+    #[serde(default)]
+    pub cwd: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AgentRuntimeReq {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// agent_invocations 行的视图（WS agent_invocation 帧与历史 GET 共用形状）
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct InvocationView {
+    pub id: Uuid,
+    pub agent_id: Uuid,
+    pub conversation_id: Uuid,
+    pub trigger_message_id: Uuid,
+    pub status: String,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
 }
 
 // ---------- 消息生命周期 REST ----------
