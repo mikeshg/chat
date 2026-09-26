@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
 import { convs } from "../api";
+import { refreshCatalogs } from "../ws";
 import { absorbAvatarUsers, setState, useApp } from "../store";
 import type { AttachmentView, ConversationDetail, ConversationView } from "../types";
+import AnnouncementEditor from "./AnnouncementEditor";
 import Avatar from "./Avatar";
 import ConvMedia from "./ConvMedia";
 
@@ -22,6 +24,7 @@ export default function GroupInfo({
   const [newName, setNewName] = useState("");
   const [adding, setAdding] = useState(false);
   const [picked, setPicked] = useState<Set<string>>(new Set());
+  const [editingAnn, setEditingAnn] = useState(false);
 
   const isOwner = detail?.owner_id === s.me?.id;
   const memberIds = new Set(detail?.members.map((m) => m.user.id));
@@ -39,6 +42,7 @@ export default function GroupInfo({
     }));
   };
   useEffect(() => {
+    setEditingAnn(false);
     reload().catch(console.warn);
   }, [conv.id]);
 
@@ -107,6 +111,38 @@ export default function GroupInfo({
                     }}
                   >
                     改名
+                  </button>
+                )}
+              </>
+            )}
+          </div>
+
+          <div className="gi-ann">
+            <h4>群公告</h4>
+            {editingAnn && conv.owner_id === s.me?.id ? (
+              <AnnouncementEditor
+                initial={conv.announcement?.text ?? ""}
+                onCancel={() => setEditingAnn(false)}
+                onSave={async (text) => {
+                  await convs.setAnnouncement(conv.id, text);
+                  await refreshCatalogs();
+                  setEditingAnn(false);
+                }}
+              />
+            ) : (
+              <>
+                <pre className="ann-text">{conv.announcement?.text || "暂无公告"}</pre>
+                {conv.announcement?.updated_by_name && (
+                  <div className="muted">
+                    由 {conv.announcement.updated_by_name} 更新于{" "}
+                    {conv.announcement.updated_at
+                      ? new Date(conv.announcement.updated_at).toLocaleString()
+                      : ""}
+                  </div>
+                )}
+                {conv.owner_id === s.me?.id && (
+                  <button type="button" onClick={() => setEditingAnn(true)}>
+                    编辑
                   </button>
                 )}
               </>

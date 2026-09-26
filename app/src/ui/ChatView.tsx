@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ApiError, convs, files, msgs as msgsApi, session } from "../api";
+import { ApiError, convs, files, msgs as msgsApi, serverInfo, session } from "../api";
 import {
   applyLiveMessage,
   applyRefreshed,
@@ -16,10 +16,13 @@ import {
 import type { AttachmentView, MemberView, MessageView, ReplyPreview } from "../types";
 import { sendChat, sendTyping } from "../ws";
 import RichText from "../richText";
+import AnnouncementBar from "./AnnouncementBar";
 import AudioBubble from "./AudioBubble";
 import ConvMedia from "./ConvMedia";
 import ForwardModal from "./ForwardModal";
 import GroupInfo from "./GroupInfo";
+import { meetingMessage } from "./meeting";
+import PinnedBar from "./PinnedBar";
 import NewPollModal from "./NewPollModal";
 import PollCard from "./PollCard";
 import { imageBubbleSize } from "./mediaFormat";
@@ -161,6 +164,9 @@ export default function ChatView() {
   const [pollBusy, setPollBusy] = useState<Record<string, boolean>>({});
   // V2 P2-4：转发弹窗的源消息（收藏不走弹窗，直接调接口到 self 会话）
   const [fwdMsg, setFwdMsg] = useState<MessageView | null>(null);
+  const [pinReload, setPinReload] = useState(0);
+  const [pinnedIds, setPinnedIds] = useState<Set<string>>(new Set());
+  const [meetingBase, setMeetingBase] = useState("");
   const gen = session();
   const viewOwner = useRef<object | null>(null);
   const mutation = useRef<object | null>(null);
@@ -210,6 +216,47 @@ export default function ChatView() {
     setState({ replyingTo: null, editingMessage: null });
     setText(conv ? (getState().drafts[conv.id] ?? "") : "");
   }, [conv?.id]);
+
+  // 打开会话，以及收到 pins_updated 时，刷新置顶列表与菜单状态
+  useEffect(() => {
+    if (!conv) return;
+    let alive = true;
+    setPinnedIds(new Set());
+    const load = () => {
+      convs
+        .pins(conv.id)
+        .then((rows) => {
+          if (alive) setPinnedIds(new Set(rows.map((p) => p.message.id)));
+        })
+        .catch(() => {
+          if (alive) setPinnedIds(new Set());
+        });
+      setPinReload((n) => n + 1);
+    };
+    load();
+    const onPins = (e: Event) => {
+      if ((e as CustomEvent<string>).detail === conv.id) load();
+    };
+    window.addEventListener("chat:pins", onPins);
+    return () => {
+      alive = false;
+      window.removeEventListener("chat:pins", onPins);
+    };
+  }, [conv?.id]);
+
+  useEffect(() => {
+    let alive = true;
+    serverInfo()
+      .then((info) => {
+        if (alive) setMeetingBase(info.meeting_base_url ?? "");
+      })
+      .catch(() => {
+        if (alive) setMeetingBase("");
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   // 打开会话 → 拉历史（P1-11：每会话至少一次；实时缓存非空也要拉，按 id 合并不覆盖）
   useEffect(() => {
@@ -283,6 +330,33 @@ export default function ChatView() {
   // 成员读得到就能转出去；目标侧权限由服务端逐条判定）
   const canForwardMsg = (m: MessageView) =>
     !m.id.startsWith("client:") && !m.deleted_at && m.kind !== "poll";
+  // 投票可置顶；已删除、乐观消息、只读会话不显示入口
+  const canPinMsg = (m: MessageView) => canActMsg(m);
+
+  const doPin = async (m: MessageView) => {
+    setMsgMenu(null);
+    setMutErr(null);
+    const pinned = pinnedIds.has(m.id);
+    try {
+      if (pinned) await convs.unpin(conv.id, m.id);
+      else await convs.pin(conv.id, m.id);
+      setPinnedIds((prev) => {
+        const next = new Set(prev);
+        if (pinned) next.delete(m.id);
+        else next.add(m.id);
+        return next;
+      });
+      setPinReload((n) => n + 1);
+    } catch (e) {
+      setMutErr(e instanceof Error ? e.message : "置顶失败");
+    }
+  };
+
+  const startMeeting = () => {
+    if (!meetingBase || readonly) return;
+    if (!confirm("发起视频会议？将在本会话发送一条会议链接。")) return;
+    sendChat(conv.id, meetingMessage(meetingBase));
+  };
 
   const onScroll = () => {
     const el = scrollRef.current;
@@ -538,7 +612,12 @@ export default function ChatView() {
   };
 
   // 跳到消息：目标不在本地时拉取以其为中心的窗口（回复预览/搜索结果共用）
-  const jumpToRef = async (id: string, seq: number) => {
+  const jumpToRef = (id: string, seq: number) => {
+    const token = ++jumpRequest.current;
+    void jumpToMessage(id, seq, token);
+  };
+
+  const jumpToMessage = async (id: string, seq: number, token: number) => {
     setShowSearch(false);
     setFlashId(id);
     if (!(getState().messages[conv.id] ?? []).some((x) => x.id === id)) {
@@ -563,12 +642,17 @@ export default function ChatView() {
       }
     }
     stickBottom.current = false;
-    setTimeout(() => {
+    const scrollTo = () => {
+      if (token !== jumpRequest.current) return;
       scrollRef.current
         ?.querySelector(`[data-mid="${id}"]`)
         ?.scrollIntoView({ block: "center" });
-    }, 60);
-    setTimeout(() => setFlashId(null), 2600);
+    };
+    setTimeout(scrollTo, 60);
+    setTimeout(scrollTo, 300);
+    setTimeout(() => {
+      if (token === jumpRequest.current) setFlashId(null);
+    }, 2600);
   };
 
   const jump = (m: MessageView) => jumpToRef(m.id, m.seq);
@@ -648,8 +732,13 @@ export default function ChatView() {
                 : `${conv.member_count} 名成员`}
           </div>
         </div>
+        {meetingBase && conv.kind !== "self" && !readonly && (
+          <button className="icon-btn chat-head-btn" title="发起会议" onClick={startMeeting}>
+            📹 发起会议
+          </button>
+        )}
         <button
-          className="icon-btn"
+          className="icon-btn chat-head-btn"
           title="搜索聊天记录"
           onClick={() => {
             setShowSearch(!showSearch);
@@ -661,13 +750,28 @@ export default function ChatView() {
         </button>
         {/* V2 P3-1：群=群信息（含文件与图片页签）；私聊/文件传输助手=文件与图片入口 */}
         <button
-          className="icon-btn"
+          className="icon-btn chat-head-btn"
           title={conv.kind === "group" ? "群信息" : "文件与图片"}
           onClick={() => setShowInfo(!showInfo)}
         >
           ⋯
         </button>
       </header>
+
+      {conv.kind === "group" && (
+        <AnnouncementBar
+          key={conv.id}
+          convId={conv.id}
+          announcement={conv.announcement}
+          canEdit={conv.owner_id === s.me?.id}
+        />
+      )}
+      <PinnedBar
+        convId={conv.id}
+        readonly={!!readonly}
+        reloadKey={pinReload}
+        onJump={jumpToRef}
+      />
 
       {showSearch && (
         <div className="search-panel">
@@ -719,12 +823,19 @@ export default function ChatView() {
                     size="sm"
                   />
                 )}
-                <div className="msg-body">
+                <div
+                  className="msg-body"
+                  onContextMenu={(e) => {
+                    if (m.deleted_at || (!canActMsg(m) && !canForwardMsg(m) && !canPinMsg(m))) return;
+                    e.preventDefault();
+                    setMsgMenu({ x: e.clientX, y: e.clientY, m });
+                  }}
+                >
                   {!mine && conv.kind === "group" && (
                     <div className="msg-sender">{m.sender_name}</div>
                   )}
                   <div className="bubble-wrap">
-                    {(canActMsg(m) || canForwardMsg(m)) && (
+                    {(canActMsg(m) || canForwardMsg(m) || canPinMsg(m)) && (
                       <div className={`msg-actions ${emojiPick === m.id ? "open" : ""}`}>
                         {emojiPick === m.id && canActMsg(m) ? (
                           <>
@@ -783,6 +894,15 @@ export default function ChatView() {
                                 )}
                               </>
                             )}
+                            {canPinMsg(m) && (
+                              <button
+                                title={pinnedIds.has(m.id) ? "取消置顶" : "置顶"}
+                                aria-label={pinnedIds.has(m.id) ? "取消置顶" : "置顶"}
+                                onClick={() => void doPin(m)}
+                              >
+                                📌
+                              </button>
+                            )}
                             {canForwardMsg(m) && (
                               <>
                                 <button
@@ -815,7 +935,7 @@ export default function ChatView() {
                           m.mentions.includes(s.me?.id ?? "") ? "mentioned" : ""
                         } ${flashId === m.id ? "flash" : ""}`}
                         onContextMenu={(e) => {
-                          if (!canActMsg(m) && !canForwardMsg(m)) return;
+                          if (!canActMsg(m) && !canForwardMsg(m) && !canPinMsg(m)) return;
                           e.preventDefault();
                           setMsgMenu({ x: e.clientX, y: e.clientY, m });
                         }}
@@ -1157,6 +1277,11 @@ export default function ChatView() {
                   </div>
                 )}
               </>
+            )}
+            {canPinMsg(msgMenu.m) && (
+              <div className="ctx-item" onClick={() => void doPin(msgMenu.m)}>
+                {pinnedIds.has(msgMenu.m.id) ? "取消置顶" : "置顶"}
+              </div>
             )}
             {canForwardMsg(msgMenu.m) && (
               <>

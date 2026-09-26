@@ -19,6 +19,8 @@ import type {
   PushState,
   RequestsView,
   SessionView,
+  AnnouncementView,
+  PinEntry,
   ServerInfo,
   StorageView,
   UserPublic,
@@ -299,6 +301,12 @@ export const convs = {
   /** 更新本人偏好：只传要改的字段；返回最新偏好（幂等覆写） */
   setPref: (id: string, body: PrefUpdate) =>
     put<ConversationPref>(`/conversations/${id}/preferences`, body),
+  /** 群主设置公告；null / 空字符串清空 */
+  setAnnouncement: (id: string, text: string | null) =>
+    put<AnnouncementView>(`/conversations/${id}/announcement`, { text }),
+  pins: (id: string) => get<PinEntry[]>(`/conversations/${id}/pins`),
+  pin: (id: string, messageId: string) => put<void>(`/conversations/${id}/pins/${messageId}`),
+  unpin: (id: string, messageId: string) => del<void>(`/conversations/${id}/pins/${messageId}`),
   ticket: () => get<{ ticket: string; expires_in: number }>("/ws/ticket"),
 };
 
@@ -406,6 +414,7 @@ export async function serverInfo(server?: string): Promise<ServerInfo> {
     return {
       registration_mode: m === "invite" || m === "closed" ? m : "open",
       push_available: j.push_available === true,
+      meeting_base_url: typeof j.meeting_base_url === "string" ? j.meeting_base_url : undefined,
     };
   } catch {
     return { registration_mode: "open" };

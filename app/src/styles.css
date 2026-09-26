@@ -850,3 +850,34 @@ button.ctx-item:hover { background: var(--bg); }
   gap: 8px;
   max-width: 560px;
 }
+
+/* ===== V2 P3-2 ===== */
+.chat-head { gap: 8px; }
+.chat-head > div:first-child { flex: 1; min-width: 0; }
+button.icon-btn.chat-head-btn { flex: 0 0 auto; width: auto; height: 32px; white-space: nowrap; padding: 0 8px; }
+.ann-bar, .pin-bar {
+  background: var(--panel); border-bottom: 1px solid var(--line); flex-shrink: 0;
+}
+.ann-bar.ann-new { background: var(--warn-bg); }
+.ann-toggle, .pin-toggle {
+  width: 100%; display: flex; align-items: center; gap: 8px;
+  border: none; background: transparent; text-align: left; padding: 8px 16px; cursor: pointer;
+}
+.ann-preview, .pin-excerpt {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ann-badge {
+  background: var(--panel); color: var(--warn-fg); font-size: 11px;
+  padding: 1px 6px; border-radius: 4px; border: 1px solid var(--warn-fg);
+}
+.ann-body, .pin-panel { padding: 0 16px 10px; }
+.ann-text {
+  margin: 0; white-space: pre-wrap; word-break: break-word; font-family: inherit; font-size: 13px;
+}
+.ann-meta, .pin-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+.ann-meta { color: var(--muted); font-size: 12px; }
+.ann-editor { display: flex; flex-direction: column; gap: 8px; }
+.ann-editor textarea { width: 100%; resize: vertical; }
+.gi-ann { margin: 12px 0; }
+.gi-ann h4 { margin: 0 0 6px; }
+.pin-row .pin-excerpt { color: var(--text); }

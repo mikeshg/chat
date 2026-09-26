@@ -37,6 +37,8 @@ export default function AdminSettings() {
   const [ntfyTokenSet, setNtfyTokenSet] = useState(false);
   const [publicUrl, setPublicUrl] = useState("");
   const [pushSaving, setPushSaving] = useState(false);
+  const [meetingUrl, setMeetingUrl] = useState("");
+  const [meetingSaving, setMeetingSaving] = useState(false);
   // 创建表单
   const [maxUses, setMaxUses] = useState<number | null>(1);
   const [expHours, setExpHours] = useState<number | null>(24 * 7);
@@ -54,6 +56,7 @@ export default function AdminSettings() {
       setNtfyTokenSet(s.push_ntfy_token_set === true);
       setPublicUrl(s.public_url ?? "");
       setNtfyToken("");
+      setMeetingUrl(s.meeting_base_url ?? "");
       setInvites(list);
       setErr("");
     } catch (e) {
@@ -145,6 +148,21 @@ export default function AdminSettings() {
     }
   };
 
+  const saveMeeting = async () => {
+    setMeetingSaving(true);
+    setErr("");
+    setSaved(false);
+    try {
+      const s = await admin.updateSettings({ meeting_base_url: meetingUrl.trim() });
+      setMeetingUrl(s.meeting_base_url ?? "");
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "保存失败");
+    } finally {
+      setMeetingSaving(false);
+    }
+  };
   const create = async () => {
     if (creating) return;
     setCreating(true);
@@ -274,6 +292,24 @@ export default function AdminSettings() {
           </button>
           <span className="muted">令牌只写不读；用户只拿到随机订阅地址</span>
         </div>
+      </div>
+
+      <h3>视频会议地址</h3>
+      <div className="row ad-quota">
+        <input
+          className="grow"
+          value={meetingUrl}
+          disabled={meetingSaving}
+          placeholder="https://meet.jit.si（留空 = 关闭）"
+          onChange={(e) => setMeetingUrl(e.target.value)}
+        />
+        <button
+          className="primary"
+          disabled={meetingSaving}
+          onClick={() => void saveMeeting()}
+        >
+          {meetingSaving ? "保存中…" : "保存"}
+        </button>
       </div>
 
       <h3>邀请码</h3>

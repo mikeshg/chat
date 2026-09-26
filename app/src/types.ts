@@ -183,7 +183,23 @@ export interface ConversationView {
   last_message: MessageView | null;
   /** 本人偏好（置顶/静音/归档）；旧服务端缺省 */
   preference?: ConversationPref | null;
+  /** 群公告；未设置 / 旧服务端缺省为 null */
+  announcement?: AnnouncementView | null;
   created_at: string;
+}
+
+/** 群公告。清空时服务端三字段都为 null */
+export interface AnnouncementView {
+  text: string | null;
+  updated_by_name: string | null;
+  updated_at: string | null;
+}
+
+/** GET /conversations/{id}/pins 的一条 */
+export interface PinEntry {
+  message: MessageView;
+  pinned_by_name: string | null;
+  pinned_at: string;
 }
 
 export interface ConversationDetail {
@@ -249,6 +265,7 @@ export type WsOut =
       preference: ConversationPref;
     }
   | { type: "invalidate"; what: string }
+  | { type: "pins_updated"; conversation_id: string }
   | { type: "force_logout"; reason: string }
   | {
       type: "error";
@@ -302,6 +319,8 @@ export interface ServerInfo {
   registration_mode: RegistrationMode;
   /** ntfy 推送已配置（V2 P3-3；旧服务端无此字段 → 视为未配置） */
   push_available?: boolean;
+  /** 视频会议地址前缀；空字符串 = 关闭按钮。旧服务端缺省 */
+  meeting_base_url?: string;
 }
 
 /** GET/PUT /admin/settings */
@@ -309,6 +328,8 @@ export interface AdminSettings {
   registration_mode: RegistrationMode;
   /** 每用户附件存储上限（MB，0 = 不限；旧服务端缺省） */
   storage_quota_mb?: number;
+  /** 视频会议地址；空字符串 = 关闭。旧服务端缺省 */
+  meeting_base_url?: string;
   /** ntfy 服务器地址（V2 P3-3，http/https）；空 = 关闭推送 */
   push_ntfy_base?: string;
   /** ntfy 访问令牌：只写不读——PUT 提交用，GET 响应里不出现 */
