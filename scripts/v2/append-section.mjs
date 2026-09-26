@@ -9,7 +9,7 @@ const show = (ref) => execSync(`git show ${ref}:${file}`, { encoding: 'utf8', ma
 const ours = show('HEAD');
 const theirs = show(branch);
 const prefix = process.env.SECTION_PREFIX ?? "V2"; // Agent 票用 SECTION_PREFIX=Agent
-const hit = theirs.search(new RegExp(`===== ${prefix} ${task}[ =]`)); // 允许标记后带说明文字
+const hit = theirs.search(new RegExp(`===== ${prefix} ${task}(?![0-9A-Za-z])`)); // 允许标记后带说明文字
 if (hit < 0) throw new Error(`section ${prefix} ${task} not found in ${branch}:${file}`);
 const i = theirs.lastIndexOf('\n', hit) + 1; // 分节注释所在行的行首
 const nl = ours.includes('\r\n') ? '\r\n' : '\n';

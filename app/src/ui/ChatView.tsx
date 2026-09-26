@@ -36,6 +36,7 @@ import AgentAvatar from "./AgentAvatar";
 import Avatar from "./Avatar";
 import VoiceRecorder from "./VoiceRecorder";
 import InvocationStatus from "./InvocationStatus";
+import { LiveRunBubble, StepRecord } from "./AgentRun";
 
 function fmtSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -1060,6 +1061,10 @@ export default function ChatView() {
                       <div className="msg-sender">{m.sender_name}</div>
                     )
                   )}
+                  {/* A03：定稿消息带步骤记录时，气泡上方挂可折叠步骤列表 */}
+                  {!m.deleted_at && m.agent_steps && m.agent_steps.length > 0 && (
+                    <StepRecord steps={m.agent_steps} />
+                  )}
                   <div className="bubble-wrap">
                     {(canActMsg(m) || canForwardMsg(m) || canPinMsg(m)) && (
                       <div className={`msg-actions ${emojiPick === m.id ? "open" : ""}`}>
@@ -1248,17 +1253,33 @@ export default function ChatView() {
                   </div>
                 </div>
               </div>
-              {/* A11：触发消息下的调用状态。群成员看得到，取消只给该 Agent 的主人 */}
-              {rowInvs.map((inv) => (
-                <InvocationStatus
-                  key={inv.id}
-                  inv={inv}
-                  allowCancel={
-                    conv.kind === "agent" || myAgents.some((a) => a.id === inv.agent_id)
-                  }
-                  onCancel={cancelInvocation}
-                />
-              ))}
+              {/* A11/A03/A04：触发消息下每个调用一组：stream 模式的「生成中」气泡（临时输出，不落库）+ 状态行。
+                  群成员看得到，取消只给该 Agent 的主人 */}
+              {rowInvs.map((inv) => {
+                const liveRun = s.agentRuns[conv.id]?.[inv.id];
+                return (
+                  <div key={inv.id} className="inv-group">
+                    {liveRun && (
+                      <LiveRunBubble
+                        agentName={
+                          conv.agent?.name ??
+                          myAgents.find((a) => a.id === inv.agent_id)?.name ??
+                          "Agent"
+                        }
+                        run={liveRun}
+                        emptyHint="正在思考…"
+                      />
+                    )}
+                    <InvocationStatus
+                      inv={inv}
+                      allowCancel={
+                        conv.kind === "agent" || myAgents.some((a) => a.id === inv.agent_id)
+                      }
+                      onCancel={cancelInvocation}
+                    />
+                  </div>
+                );
+              })}
               {topicMarks.filter((t) => t.afterId === m.id).map((t) => topicBreak(t.n))}
             </div>
           );

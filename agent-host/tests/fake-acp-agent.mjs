@@ -6,6 +6,10 @@
 //   echo:<text>  → 至少 2 个 agent_message_chunk 分块，合计恰为 <text>
 //   long:<n>     → 总分块长度 = n（单块 ≤ 997 字符，强迫多块）
 //   sleep:<ms>   → 等 ms 毫秒后回 "done"
+//   steps:<n>    → 依次上报 n 个 tool_call 步骤（每个 tool_call + 文本 chunk +
+//                  tool_call_update completed 穿插），最后回出 "done"
+//   stepfail     → 一个步骤以 status=failed 结束，然后正常回复 "done"
+//   drip:<ms>    → 每 ~30ms 回一个小 chunk，持续 ms 毫秒（服务端限频验证用），最后回 "done"
 //   fail         → JSON-RPC error
 //   crash        → 直接退出（进程码 2）
 //   recall       → 本会话之前收到过的全部指令，用 | 连接；没有则 (empty)
@@ -72,6 +76,25 @@ const chunk = (sessionId, text) =>
         sessionUpdate: "agent_message_chunk",
         content: { type: "text", text },
       },
+    },
+  });
+// A03：步骤上报 = tool_call（开始）+ tool_call_update（终态）
+const toolCall = (sessionId, toolCallId, title, kind) =>
+  send({
+    jsonrpc: "2.0",
+    method: "session/update",
+    params: {
+      sessionId,
+      update: { sessionUpdate: "tool_call", toolCallId, title, kind },
+    },
+  });
+const toolCallUpdate = (sessionId, toolCallId, status) =>
+  send({
+    jsonrpc: "2.0",
+    method: "session/update",
+    params: {
+      sessionId,
+      update: { sessionUpdate: "tool_call_update", toolCallId, status },
     },
   });
 
@@ -294,6 +317,40 @@ rl.on("line", (line) => {
         result(id, { stopReason: "end_turn" });
       }, ms);
       pendingSleep = { id, timer };
+      return;
+    }
+    // A03：N 个步骤，穿插文本 chunk，最后回出 done
+    if (text.startsWith("steps:")) {
+      const n = parseInt(text.slice(6), 10) || 0;
+      for (let i = 1; i <= n; i++) {
+        const tid = `step-${i}`;
+        toolCall(sessionId, tid, `步骤 ${i}`, "other");
+        chunk(sessionId, `第 ${i} 步。\n`);
+        toolCallUpdate(sessionId, tid, "completed");
+      }
+      chunk(sessionId, "done");
+      return result(id, { stopReason: "end_turn" });
+    }
+    // A03：一个步骤以 failed 结束，调用本身仍正常结束
+    if (text === "stepfail") {
+      toolCall(sessionId, "step-x", "读取配置", "read");
+      chunk(sessionId, "步骤失败但继续。\n");
+      toolCallUpdate(sessionId, "step-x", "failed");
+      chunk(sessionId, "done");
+      return result(id, { stopReason: "end_turn" });
+    }
+    // A03 限频验证：持续 ms 毫秒、每 ~30ms 一个小 chunk，最后回 done
+    if (text.startsWith("drip:")) {
+      const ms = parseInt(text.slice(5), 10) || 0;
+      const started = Date.now();
+      const timer = setInterval(() => {
+        chunk(sessionId, ".");
+        if (Date.now() - started >= ms) {
+          clearInterval(timer);
+          chunk(sessionId, "done");
+          result(id, { stopReason: "end_turn" });
+        }
+      }, 30);
       return;
     }
     if (text === "tool:read_history") {

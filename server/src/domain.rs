@@ -214,6 +214,8 @@ pub struct MsgViewRow {
     pub agent_name: Option<String>,
     // Agent A06：消息上的 Agent 头像版本（无 Agent 时为 NULL）
     pub agent_avatar_version: Option<i32>,
+    // Agent A03（0024）：该消息附带的已完成步骤记录
+    pub agent_steps: Option<sqlx::types::Json<Vec<crate::model::AgentStepView>>>,
 }
 
 impl MsgViewRow {
@@ -264,6 +266,7 @@ impl MsgViewRow {
                 name: self.agent_name.unwrap_or_default(),
                 avatar_version: self.agent_avatar_version.unwrap_or(0),
             }),
+            agent_steps: self.agent_steps.map(|j| j.0),
         }
     }
 }
@@ -541,6 +544,9 @@ pub struct PostMessage<'a> {
     /// Agent A01：Some(agent) 表示本条由该 Agent 发出（sender_id 仍是主人）。
     /// 仅服务端宿主回写路径可达。A11：只能写进主人仍是成员的会话。
     pub agent_id: Option<Uuid>,
+    /// Agent A03：随消息落库的已完成步骤（jsonb 数组）；仅 Agent 回写路径用。
+    /// 仅当 agent_id 非空时生效，普通消息路径恒 None。
+    pub agent_steps: Option<serde_json::Value>,
 }
 
 /// 已整形的投票定义（随消息同事务落库）
@@ -846,8 +852,9 @@ async fn write_message(
     let message_id = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO messages
             (conversation_id, seq, sender_id, content, kind, attachment_id,
-             client_msg_id, reply_to_id, forwarded_from, agent_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             client_msg_id, reply_to_id, forwarded_from, agent_id, agent_steps)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                 CASE WHEN $10 IS NULL THEN NULL ELSE $11 END)
          RETURNING id",
     )
     .bind(msg.conversation_id)
@@ -860,6 +867,7 @@ async fn write_message(
     .bind(msg.reply_to_id)
     .bind(msg.forwarded_from)
     .bind(msg.agent_id)
+    .bind(&msg.agent_steps)
     .fetch_one(&mut **tx)
     .await?;
 
@@ -2159,6 +2167,7 @@ pub async fn create_poll(
             forwarded_from: None,
             forward_attachment: None,
             agent_id: None,
+            agent_steps: None,
             poll: Some(PollSpec {
                 question,
                 options,
@@ -2455,6 +2464,7 @@ pub async fn forward_message(
                 forwarded_from: Some(&src.sender_name),
                 forward_attachment: src.att_id,
                 agent_id: None,
+                agent_steps: None,
             },
         )
         .await;

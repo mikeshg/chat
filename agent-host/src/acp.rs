@@ -13,8 +13,10 @@
 pub use crate::runtime::AgentSpec;
 use crate::runtime::{
     AgentOption, AgentRuntime, Events, InjectedMcp, RunEvent, RunFuture, RunOutput, RunRequest,
+    StepRecord,
 };
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -51,6 +53,10 @@ struct Pipe {
     events: Events,
     /// session/load 响应返回前的历史回放，不能算进本次回复
     suppress_chunks: bool,
+    /// 进行中的 tool_call：id → (title, kind)
+    open_steps: HashMap<String, (String, String)>,
+    /// 已完成步骤（按收尾顺序）
+    steps: Vec<StepRecord>,
 }
 
 /// 跑一次调用：起进程、握手、发 prompt、收全部分块文本（同时逐段发 RunEvent::Text）。
@@ -132,6 +138,8 @@ pub async fn run_invocation(req: RunRequest, events: Events) -> Result<RunOutput
         err,
         events,
         suppress_chunks: false,
+        open_steps: HashMap::new(),
+        steps: Vec::new(),
     };
     // 取消信号单独克隆一份：drive 只读 req，等待取消需要可变的 Receiver
     let mut cancel = req.cancel.clone();
@@ -142,6 +150,7 @@ pub async fn run_invocation(req: RunRequest, events: Events) -> Result<RunOutput
         session_id: d.session_id,
         modes: d.modes,
         models: d.models,
+        steps: std::mem::take(&mut pipe.steps),
     })
 }
 
@@ -499,23 +508,61 @@ impl Pipe {
     }
 
     fn on_notify(&mut self, method: &str, params: &Value) {
-        if method == "session/update"
-            && params
-                .pointer("/update/sessionUpdate")
-                .and_then(Value::as_str)
-                == Some("agent_message_chunk")
-        {
-            // load 的历史回放发生在响应返回之前，不能混进本次回复
-            if self.suppress_chunks {
-                return;
+        if method != "session/update" {
+            return;
+        }
+        // load 的历史回放发生在响应返回之前，不能混进本次回复（正文和步骤都不算）
+        if self.suppress_chunks {
+            return;
+        }
+        let upd = &params["update"];
+        match upd["sessionUpdate"].as_str() {
+            Some("agent_message_chunk") => {
+                if let Some(t) = upd.pointer("/content/text").and_then(Value::as_str) {
+                    self.text.push_str(t);
+                    let _ = self.events.send(RunEvent::Text(t.to_string()));
+                }
             }
-            if let Some(t) = params
-                .pointer("/update/content/text")
-                .and_then(Value::as_str)
-            {
-                self.text.push_str(t);
-                let _ = self.events.send(RunEvent::Text(t.to_string()));
+            // A03：tool_call → StepStart；tool_call_update 终态 → StepEnd + 步骤记录
+            Some("tool_call") => {
+                if let Some(id) = upd["toolCallId"].as_str() {
+                    let title = upd["title"].as_str().unwrap_or_default().to_string();
+                    let kind = upd["kind"].as_str().unwrap_or("other").to_string();
+                    self.open_steps
+                        .insert(id.to_string(), (title.clone(), kind.clone()));
+                    let _ = self.events.send(RunEvent::StepStart {
+                        id: id.to_string(),
+                        title,
+                        kind,
+                    });
+                }
             }
+            Some("tool_call_update") => {
+                let Some(id) = upd["toolCallId"].as_str() else {
+                    return;
+                };
+                // 只有终态算“收尾”：completed 成功，failed/stopped 等非成功 → ok=false
+                let ok = match upd["status"].as_str() {
+                    Some("completed") => true,
+                    Some("failed") | Some("stopped") => false,
+                    _ => return,
+                };
+                let (title, kind) = self
+                    .open_steps
+                    .remove(id)
+                    .unwrap_or_else(|| (String::new(), "other".into()));
+                self.steps.push(StepRecord {
+                    id: id.to_string(),
+                    title,
+                    kind,
+                    ok,
+                });
+                let _ = self.events.send(RunEvent::StepEnd {
+                    id: id.to_string(),
+                    ok,
+                });
+            }
+            _ => {}
         }
     }
 

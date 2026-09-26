@@ -979,6 +979,8 @@ struct ConvRow {
     m_agent_id: Option<Uuid>,
     m_agent_name: Option<String>,
     m_agent_avatar_version: Option<i32>,
+    // Agent A03：末条消息附带的步骤记录
+    m_agent_steps: Option<sqlx::types::Json<Vec<crate::model::AgentStepView>>>,
     // Agent A01：专属会话的 Agent 摘要（kind='agent' 时有值）
     c_agent_id: Option<Uuid>,
     c_agent_name: Option<String>,
@@ -1026,6 +1028,7 @@ async fn list_conversations(
                 lm.sender_has_avatar AS m_sender_has_avatar, lm.forwarded_from AS m_forwarded_from,
                 lm.agent_id AS m_agent_id, lm.agent_name AS m_agent_name,
                 lm.agent_avatar_version AS m_agent_avatar_version,
+                lm.agent_steps AS m_agent_steps,
                 ag.id AS c_agent_id, ag.name AS c_agent_name, ag.host_id AS c_agent_host_id,
                 ag.avatar_version AS c_agent_avatar_version,
                 (ag.deleted_at IS NOT NULL) AS c_agent_deleted,
@@ -1063,7 +1066,7 @@ async fn list_conversations(
                       reply_to_id, reply_to, edited_at, edit_version, deleted_at, reactions, poll,
                       att_width, att_height, att_has_thumb, att_duration_ms,
                       sender_avatar_version, sender_has_avatar, forwarded_from,
-                      agent_id, agent_name, agent_avatar_version
+                      agent_id, agent_name, agent_avatar_version, agent_steps
                  FROM message_views
                 WHERE conversation_id = c.id
                 ORDER BY seq DESC
@@ -1139,6 +1142,7 @@ async fn list_conversations(
                     name: r.m_agent_name.clone().unwrap_or_default(),
                     avatar_version: r.m_agent_avatar_version.unwrap_or(0),
                 }),
+                agent_steps: r.m_agent_steps.map(|j| j.0),
             });
             ConversationView {
                 id: r.id,

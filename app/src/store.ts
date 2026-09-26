@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from "react";
+import { applyStreamFrame, dropRun, fmtElapsed, type AgentRuns, type AgentStreamFrame } from "./agentRun";
 import { writeDrafts } from "./drafts";
 import type {
   AgentHostView,
@@ -54,6 +55,8 @@ export interface AppState {
   agentHosts: AgentHostView[];
   /** Agent A01/A11：conv_id -> trigger_message_id -> 调用记录（一条消息可以触发多个 Agent） */
   invocations: Record<string, Record<string, InvocationView[]>>;
+  /** Agent A03：conv_id -> invocation_id -> 进行中调用的临时输出（不落库、不跨设备） */
+  agentRuns: AgentRuns;
 }
 
 /** 头像缓存条目：版本较大的那组才有效。 */
@@ -84,6 +87,7 @@ let state: AppState = {
   pendingJump: null,
   agentHosts: [],
   invocations: {},
+  agentRuns: {},
 };
 
 const listeners = new Set<() => void>();
@@ -556,13 +560,15 @@ export function applyHostStatus(
   };
 }
 
-/** agent_invocation 帧 / 历史 GET 共用合并入口：同一触发消息下按调用 id 覆盖，不同调用都保留 */
+/** agent_invocation 帧 / 历史 GET 共用合并入口：同一触发消息下按调用 id 覆盖，不同调用都保留。
+ *  A03：调用进终态时顺手摘除它的临时流式输出（定稿消息已含全部内容）。 */
 export function applyInvocations(
   s: AppState,
   incoming: InvocationView[],
 ): Partial<AppState> {
   if (incoming.length === 0) return {};
   const invocations = { ...s.invocations };
+  let agentRuns = s.agentRuns;
   for (const inv of incoming) {
     const cur = { ...(invocations[inv.conversation_id] ?? {}) };
     const prev = cur[inv.trigger_message_id] ?? [];
@@ -570,26 +576,68 @@ export function applyInvocations(
     cur[inv.trigger_message_id] =
       idx >= 0 ? prev.map((x, i) => (i === idx ? inv : x)) : [...prev, inv];
     invocations[inv.conversation_id] = cur;
+    const convRuns = agentRuns[inv.conversation_id];
+    if (inv.finished_at != null && convRuns?.[inv.id]) {
+      if (agentRuns === s.agentRuns) agentRuns = { ...agentRuns };
+      const next = dropRun(convRuns, inv.id) ?? {};
+      if (Object.keys(next).length) {
+        agentRuns[inv.conversation_id] = next;
+      } else {
+        delete agentRuns[inv.conversation_id];
+      }
+    }
   }
-  return { invocations };
+  return agentRuns === s.agentRuns ? { invocations } : { invocations, agentRuns };
 }
 
-/** 调用状态标签，按 status 查表。failed 的原因另走 invocationErrorText。
- *  A03 会把这张表收进状态组件；新状态往这里加。
- */
-export const INVOCATION_STATUS_LABEL: Record<string, string> = {
-  running: "⏳ 正在处理",
-  queued: "⏸ 排队中：Agent 所在电脑不在线",
-  cancelled: "已取消",
-  timed_out: "排队超时，已取消",
-};
+/** agent_stream 帧：临时输出追加；调用已知终态后迟到的帧丢弃（防状态残留）。 */
+export function applyAgentStream(
+  s: AppState,
+  f: AgentStreamFrame,
+): Partial<AppState> {
+  const invs = s.invocations[f.conversation_id];
+  const inv = invs && Object.values(invs).flat().find((i) => i.id === f.invocation_id);
+  if (inv?.finished_at != null) return {};
+  const convRuns = s.agentRuns[f.conversation_id];
+  const next = applyStreamFrame(convRuns, f);
+  if (next === convRuns) return {};
+  return { agentRuns: { ...s.agentRuns, [f.conversation_id]: next } };
+}
 
+/** 调用状态标签的查表：running → 进行中标签；failed → 失败原因；其余 → null 不渲染。
+ *  A04 往本表加 queued / cancelled / timed_out 行。 */
+export function invocationStatusView(
+  inv: Pick<InvocationView, "status" | "error" | "current_step">,
+  elapsedSecs: number,
+): { icon: string; text: string } | null {
+  switch (inv.status) {
+    case "running":
+      return inv.current_step
+        ? {
+            icon: "⏳",
+            text: `正在工作 · 已用 ${fmtElapsed(elapsedSecs)} · 当前：${inv.current_step}`,
+          }
+        : { icon: "⏳", text: "正在处理" };
+    case "failed":
+      return { icon: "⚠", text: `失败：${invocationErrorText(inv.error)}` };
+    case "queued":
+      return { icon: "⏸", text: "排队中：Agent 所在电脑不在线" };
+    case "cancelled":
+      return { icon: "", text: "已取消" };
+    case "timed_out":
+      return { icon: "", text: "排队超时，已取消" };
+    default:
+      return null;
+  }
+}
+
+/** 状态标签的纯文本形式（不含已用时长、当前步骤），由 invocationStatusView 派生 */
 export function invocationStatusLabel(
   status: string,
   error: string | null | undefined,
 ): string | null {
-  if (status === "failed") return `⚠ 失败：${invocationErrorText(error)}`;
-  return INVOCATION_STATUS_LABEL[status] ?? null;
+  const v = invocationStatusView({ status, error: error ?? null, current_step: null }, 0);
+  return v ? `${v.icon} ${v.text}`.trim() : null;
 }
 
 /** 主人可以取消的状态：排队、运行中、等待审批 */

@@ -165,6 +165,14 @@ impl RunRequest {
 pub enum RunEvent {
     /// agent 回复正文的一段增量
     Text(String),
+    /// 一步工具调用开始（ACP tool_call）
+    StepStart {
+        id: String,
+        title: String,
+        kind: String,
+    },
+    /// 一步工具调用收尾；ok=false = ACP 报了非 success 终态（如 failed）
+    StepEnd { id: String, ok: bool },
 }
 
 /// 一次调用的结果。
@@ -178,6 +186,17 @@ pub struct RunOutput {
     pub modes: Option<Vec<AgentOption>>,
     /// session/new 带了 models.availableModels 时为 Some
     pub models: Option<Vec<AgentOption>>,
+    /// 已完成的步骤（顺序保持）；单个失败不使整次调用失败
+    pub steps: Vec<StepRecord>,
+}
+
+/// 一条已完成的步骤记录（随 RunOutput 走 invocation_finish 上报）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StepRecord {
+    pub id: String,
+    pub title: String,
+    pub kind: String,
+    pub ok: bool,
 }
 
 /// 事件出口；接收端丢弃时发送静默失败，运行不受影响。

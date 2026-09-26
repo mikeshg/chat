@@ -988,3 +988,29 @@ button.agent-host-name:hover { background: transparent; color: var(--link); }
   font-size: 12px;
 }
 .ad-agent small { color: var(--muted); font-size: 11px; }
+/* ===== Agent A03：三种输出方式 + 调用状态标签 ===== */
+/* stream 模式的「生成中」气泡（触发消息下方的临时气泡，终态即消失） */
+.agent-live {
+  margin: 4px 0 2px 44px; padding: 8px 12px; max-width: 70%;
+  background: var(--panel); border: 1px dashed var(--line); border-radius: 10px;
+  color: var(--fg);
+}
+.agent-live-head { color: var(--warn-fg); font-size: 12px; font-weight: 500; margin-bottom: 4px; }
+.agent-live-text { white-space: pre-wrap; word-break: break-word; font-size: 14px; }
+.agent-live-empty { color: var(--muted); font-size: 13px; }
+/* 可折叠步骤列表（定稿消息气泡上方 / 进行中气泡内；容器已带缩进） */
+.step-record { margin: 2px 0; font-size: 12px; }
+.step-summary {
+  background: none; border: none; padding: 0; cursor: pointer;
+  color: var(--muted); font-size: 12px;
+}
+.step-summary:hover { color: var(--fg); }
+.step-list { margin: 4px 0 0; padding: 0 0 0 4px; list-style: none; }
+.step-list li { padding: 1px 0; color: var(--muted); }
+.step-list li.failed { color: var(--danger); }
+.step-kind { margin-left: 6px; font-size: 10px; opacity: 0.7; }
+/* 气泡上方有步骤记录时，悬浮操作条收进气泡内缘，避免盖住「N 个步骤」摘要按钮 */
+.step-record + .bubble-wrap > .msg-actions { top: 0; }
+
+/* ===== Agent A03+A04 合并：状态行容器 ===== */
+.inv-status-row { display: flex; align-items: center; gap: 8px; }

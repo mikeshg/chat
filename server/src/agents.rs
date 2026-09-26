@@ -13,10 +13,10 @@ use crate::auth;
 use crate::domain::{self, PostError};
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    AgentHostView, AgentUserSettings, AgentView, CreateAgentReq, InvocationView, PatchAgentReq,
-    UpdateAgentUserSettingsReq, WsOut,
+    AgentHostView, AgentStepView, AgentUserSettings, AgentView, CreateAgentReq, InvocationView,
+    PatchAgentReq, StreamStepView, UpdateAgentUserSettingsReq, WsOut,
 };
-use crate::state::SharedState;
+use crate::state::{InvRun, SharedState};
 use axum::{
     extract::{Multipart, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
@@ -873,7 +873,7 @@ pub async fn list_invocations(
     domain::membership(&st.pool, conv, uid)
         .await?
         .ok_or_else(|| AppError::forbidden("not a member of this conversation"))?;
-    let rows = sqlx::query_as::<_, InvocationView>(
+    let mut rows = sqlx::query_as::<_, InvocationView>(
         "SELECT id, agent_id, conversation_id, trigger_message_id, status, error,
                 created_at, started_at, finished_at
            FROM agent_invocations WHERE conversation_id = $1
@@ -883,6 +883,15 @@ pub async fn list_invocations(
     .bind(q.limit.unwrap_or(50).clamp(1, 200))
     .fetch_all(&st.pool)
     .await?;
+    // A03：running 调用的 current_step 只存内存，历史读取时回填
+    for inv in &mut rows {
+        if inv.finished_at.is_none() {
+            inv.current_step = st
+                .inv_runs
+                .get(&inv.id)
+                .and_then(|r| r.open.last().map(|(_, t, _)| t.clone()));
+        }
+    }
     Ok(Json(rows))
 }
 
@@ -1041,6 +1050,7 @@ pub async fn revoke_access(st: &SharedState, user_ids: &[Uuid]) {
                 created_at: inv.created_at,
                 started_at: inv.started_at,
                 finished_at: inv.finished_at,
+                current_step: None,
             },
         );
     }
@@ -1363,12 +1373,41 @@ async fn dispatch(
         tracing::error!("agent_invocation insert failed");
         return;
     };
+    if inv.status == "running" {
+        // A03：登记运行时状态（输出方式、进行中步骤、流式缓冲）。
+        // 必须在 invocation_start 下发前就绪——宿主事件随时可能先回来。
+        let mode = effective_settings(&st.pool, agent.id)
+            .await
+            .map(|s| s.output_mode)
+            .unwrap_or_else(|_| "stream".into());
+        st.inv_runs.insert(
+            inv.id,
+            InvRun {
+                host_id: agent.host_id,
+                conversation_id: conv,
+                member_ids: member_ids.to_vec(),
+                owner: agent.owner,
+                agent_id: agent.id,
+                inv: inv.clone(),
+                mode,
+                open: Vec::new(),
+                steps: Vec::new(),
+                stream_buf: String::new(),
+                // 首个增量立即可推（窗口从派发前起算）
+                last_push: Instant::now()
+                    .checked_sub(Duration::from_millis(STREAM_FLUSH_MS))
+                    .unwrap_or_else(Instant::now),
+                flushing: false,
+            },
+        );
+    }
     push_invocation(st, member_ids, &inv);
     if inv.status != "running" {
         return;
     }
     let payload = invocation_start_payload(st, inv.id, &agent, conv, &prompt).await;
     if !st.send_to_host(agent.host_id, &payload) {
+        st.inv_runs.remove(&inv.id);
         if let Some(q) = requeue(&st.pool, inv.id, timeout).await {
             push_invocation(st, member_ids, &q);
         }
@@ -1661,9 +1700,189 @@ fn push_invocation(st: &SharedState, member_ids: &[Uuid], inv: &InvocationView) 
     st.send_to_users(member_ids, &p);
 }
 
+// ---------- Agent A03：宿主事件流（invocation_event） ----------
+
+/// stream 增量的最小推送间隔：同一次调用每 200ms 至多一帧 delta
+const STREAM_FLUSH_MS: u64 = 200;
+
+/// 宿主回传的 invocation_event：只受理派给本宿主连接的进行中调用；
+/// 事件类型不明/字段残缺一律忽略（不致命，不影响后续事件）。
+pub async fn handle_event(st: &SharedState, host_id: Uuid, v: &serde_json::Value) {
+    let Some(inv_id) = v["invocation_id"]
+        .as_str()
+        .and_then(|s| Uuid::parse_str(s).ok())
+    else {
+        return;
+    };
+    let ev = &v["event"];
+    // steps 模式的步骤消息要进 DashMap 守卫外写库
+    let mut step_msg: Option<(Uuid, Uuid, Uuid, String)> = None;
+    {
+        let Some(mut run) = st.inv_runs.get_mut(&inv_id) else {
+            return; // 未知/已终结的调用：伪造或迟到的事件
+        };
+        if run.host_id != host_id {
+            return;
+        }
+        match ev["type"].as_str() {
+            Some("text") => {
+                if let Some(t) = ev["text"].as_str() {
+                    if !t.is_empty() && run.mode == "stream" {
+                        run.stream_buf.push_str(t);
+                        maybe_flush_stream(st, &mut run, inv_id);
+                    }
+                }
+            }
+            Some("step_start") => {
+                let id = ev["id"].as_str().unwrap_or_default().to_string();
+                if id.is_empty() {
+                    return;
+                }
+                let title: String = ev["title"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(300)
+                    .collect();
+                let kind: String = ev["kind"]
+                    .as_str()
+                    .unwrap_or("other")
+                    .chars()
+                    .take(40)
+                    .collect();
+                // 同 id 重复 start：去掉旧记录，以最新一次为准
+                run.open.retain(|(x, _, _)| x != &id);
+                run.open.push((id.clone(), title.clone(), kind.clone()));
+                match run.mode.as_str() {
+                    "stream" => push_stream(
+                        st,
+                        &mut run,
+                        inv_id,
+                        Some(StreamStepView {
+                            id,
+                            title,
+                            kind,
+                            ok: None,
+                        }),
+                    ),
+                    "status" => push_current_step(st, &run),
+                    _ => {}
+                }
+            }
+            Some("step_end") => {
+                let id = ev["id"].as_str().unwrap_or_default();
+                let ok = ev["ok"].as_bool().unwrap_or(false);
+                // 未知或重复的 step_end（没开过这步）忽略
+                let Some(pos) = run.open.iter().position(|(x, _, _)| x == id) else {
+                    return;
+                };
+                let (_, title, kind) = run.open.remove(pos);
+                run.steps.push(AgentStepView {
+                    id: id.to_string(),
+                    title: title.clone(),
+                    kind: kind.clone(),
+                    ok,
+                });
+                match run.mode.as_str() {
+                    "stream" => push_stream(
+                        st,
+                        &mut run,
+                        inv_id,
+                        Some(StreamStepView {
+                            id: id.to_string(),
+                            title,
+                            kind,
+                            ok: Some(ok),
+                        }),
+                    ),
+                    "status" => push_current_step(st, &run),
+                    // steps：每步完成落一条 Agent 消息
+                    "steps" => {
+                        let title = if title.is_empty() {
+                            "未命名步骤".to_string()
+                        } else {
+                            title
+                        };
+                        let icon = if ok { "✓" } else { "✗" };
+                        step_msg = Some((
+                            run.conversation_id,
+                            run.owner,
+                            run.agent_id,
+                            format!("{icon} {}", title.chars().take(300).collect::<String>()),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some((conv, owner, agent_id, text)) = step_msg {
+        post_agent_text(st, conv, owner, agent_id, &text, None).await;
+    }
+}
+
+/// stream 模式：积压 delta 距上次推送 ≥200ms 立即推，否则挂延迟冲刷任务。
+fn maybe_flush_stream(st: &SharedState, run: &mut InvRun, inv_id: Uuid) {
+    if run.stream_buf.is_empty() {
+        return;
+    }
+    if run.last_push.elapsed() >= Duration::from_millis(STREAM_FLUSH_MS) {
+        push_stream(st, run, inv_id, None);
+    } else if !run.flushing {
+        run.flushing = true;
+        let st2 = st.clone();
+        tokio::spawn(async move { stream_flush_task(st2, inv_id).await });
+    }
+}
+
+/// 延迟冲刷：每 200ms 检查一次缓冲，有货就推；清空后任务退出。
+async fn stream_flush_task(st: SharedState, inv_id: Uuid) {
+    loop {
+        tokio::time::sleep(Duration::from_millis(STREAM_FLUSH_MS)).await;
+        let Some(mut run) = st.inv_runs.get_mut(&inv_id) else {
+            return; // 调用已终结
+        };
+        if run.stream_buf.is_empty() {
+            run.flushing = false;
+            return;
+        }
+        push_stream(&st, &mut run, inv_id, None);
+    }
+}
+
+/// 发一帧 agent_stream：带 step 时顺带冲刷积压 delta（保证文本先于步骤到达）。
+fn push_stream(st: &SharedState, run: &mut InvRun, inv_id: Uuid, step: Option<StreamStepView>) {
+    let delta = if run.stream_buf.is_empty() {
+        None
+    } else {
+        Some(std::mem::take(&mut run.stream_buf))
+    };
+    if delta.is_none() && step.is_none() {
+        return;
+    }
+    let frame = serde_json::to_string(&WsOut::AgentStream {
+        invocation_id: inv_id,
+        conversation_id: run.conversation_id,
+        delta,
+        step,
+    })
+    .unwrap();
+    st.send_to_users(&run.member_ids, &frame);
+    run.last_push = Instant::now();
+}
+
+/// status 模式：步骤开/收把 current_step 填进调用快照再推状态帧。
+fn push_current_step(st: &SharedState, run: &InvRun) {
+    let mut inv = run.inv.clone();
+    inv.current_step = run.open.last().map(|(_, t, _)| t.clone());
+    push_invocation(st, &run.member_ids, &inv);
+}
+
 /// 宿主回传的 invocation_finish：校验该调用确实派给这条宿主连接。
 /// 行锁内推进终态。取消已经落库时这里读到的不是 running，直接忽略，不发回复。
-/// ok:true → 先写 Agent 消息再置 succeeded；ok:false → failed + error（截 500 字符）。
+/// ok:true → 先写 Agent 消息（stream/status 模式的定稿消息带上步骤记录）再置 succeeded；
+/// ok:false → failed + error（截 500 字符）。
 pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Value) {
     let Some(inv_id) = v["invocation_id"]
         .as_str()
@@ -1696,6 +1915,9 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
         return;
     }
 
+    // A03：摘下运行时状态；终结前的滞留增量在定稿消息前冲刷出去
+    let run = st.inv_runs.remove(&inv_id).map(|(_, r)| r);
+
     if v["ok"].as_bool() == Some(true) {
         // 失败的 finish 不进这个分支，因此不会覆盖已记住的运行时会话
         if let Some(sid) = v["session_id"].as_str().filter(|s| !s.is_empty()) {
@@ -1716,8 +1938,36 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
             }
         }
         let text = v["text"].as_str().unwrap_or_default().to_string();
+        // 步骤记录：finish 帧带的 steps 优先（宿主权威记录），缺省退回事件累积
+        let steps: Vec<AgentStepView> = match v["steps"].as_array() {
+            Some(arr) => arr
+                .iter()
+                .filter_map(|s| serde_json::from_value(s.clone()).ok())
+                .collect(),
+            None => run.as_ref().map(|r| r.steps.clone()).unwrap_or_default(),
+        };
+        let mode = run.as_ref().map(|r| r.mode.as_str()).unwrap_or("stream");
+        if let Some(r) = &run {
+            if !r.stream_buf.is_empty() && r.mode == "stream" {
+                let frame = serde_json::to_string(&WsOut::AgentStream {
+                    invocation_id: inv_id,
+                    conversation_id: r.conversation_id,
+                    delta: Some(r.stream_buf.clone()),
+                    step: None,
+                })
+                .unwrap();
+                st.send_to_users(&r.member_ids, &frame);
+            }
+        }
+        // steps 模式的正文不带步骤记录（步骤消息已逐条落库）；
+        // stream/status 的定稿消息带 agent_steps（空集不落列）。
+        let steps_json = match mode {
+            "steps" => None,
+            _ if steps.is_empty() => None,
+            _ => serde_json::to_value(&steps).ok(),
+        };
         // 持锁写回复，取消的 UPDATE 会等这把锁，提交后看到的已是终态
-        post_agent_text(st, conv, owner, agent_id, &text).await;
+        post_agent_text(st, conv, owner, agent_id, &text, steps_json).await;
         let updated = sqlx::query_as::<_, InvocationView>(&format!(
             "UPDATE agent_invocations
                 SET status = 'succeeded', error = NULL, finished_at = now()
@@ -1762,13 +2012,17 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
 }
 
 /// Agent 正文拆条写库 + 逐条广播。空正文不发消息（调用仍算成功）。
+/// steps 只附在最后一个分片消息上（A03：定稿消息的步骤记录）。
 pub async fn post_agent_text(
     st: &SharedState,
     conv: Uuid,
     owner: Uuid,
     agent_id: Uuid,
     text: &str,
+    agent_steps: Option<serde_json::Value>,
 ) {
+    // 预计算分片：非空白片才发；最后一片挂 agent_steps
+    let mut chunks: Vec<&str> = Vec::new();
     let mut rest = text;
     while !rest.is_empty() {
         let take = rest
@@ -1778,15 +2032,18 @@ pub async fn post_agent_text(
             .unwrap_or(rest.len());
         let (head, tail) = rest.split_at(take);
         rest = tail;
-        if head.trim().is_empty() {
-            continue; // 纯空白分片跳过，免得撞上 1-4000 校验
+        if !head.trim().is_empty() {
+            chunks.push(head);
         }
+    }
+    let last = chunks.len().saturating_sub(1);
+    for (i, chunk) in chunks.iter().enumerate() {
         let posted = domain::post_message(
             &st.pool,
             domain::PostMessage {
                 conversation_id: conv,
                 sender_id: owner,
-                content: head,
+                content: chunk,
                 client_msg_id: None,
                 attachment_id: None,
                 reply_to_id: None,
@@ -1794,6 +2051,7 @@ pub async fn post_agent_text(
                 forwarded_from: None,
                 forward_attachment: None,
                 agent_id: Some(agent_id),
+                agent_steps: if i == last { agent_steps.clone() } else { None },
             },
         )
         .await;

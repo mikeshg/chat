@@ -55,6 +55,33 @@ pub struct HostConn {
     pub sid: Option<Uuid>,
 }
 
+/// Agent A03：一次进行中调用的运行时状态（纯内存；调用终结即摘）。
+/// 防伪造：宿主的 invocation_event 只受理 host_id 匹配的调用。
+pub struct InvRun {
+    /// 该调用派给的宿主
+    pub host_id: Uuid,
+    pub conversation_id: Uuid,
+    /// 会话成员（普通连接推送目标；A03 场景 = 主人）
+    pub member_ids: Vec<Uuid>,
+    /// 主人 / Agent id（步骤消息与定稿消息的回写需要）
+    pub owner: Uuid,
+    pub agent_id: Uuid,
+    /// 派发时的调用视图快照（状态推进帧沿用，current_step 每次现填）
+    pub inv: crate::model::InvocationView,
+    /// 生效输出方式：stream / status / steps
+    pub mode: String,
+    /// 进行中步骤（按开始顺序）：(id, title, kind)
+    pub open: Vec<(String, String, String)>,
+    /// 已完成步骤（按收尾顺序）
+    pub steps: Vec<crate::model::AgentStepView>,
+    /// stream 模式待推送的文本增量
+    pub stream_buf: String,
+    /// 上次向成员推送 agent_stream 的时刻（200ms 限频窗口基准）
+    pub last_push: Instant,
+    /// 是否已有延迟冲刷任务在跑
+    pub flushing: bool,
+}
+
 /// 一次性 WS ticket 的内容：签发时的用户、凭据版本与登录会话
 pub struct TicketGrant {
     pub uid: Uuid,
@@ -89,6 +116,8 @@ pub struct AppState {
     /// Agent A04：排队超时清扫间隔（毫秒），默认 30s。
     /// 清扫循环每小段重读这个值，测试调小后不用等完原来的 30 秒。
     pub queue_sweep_interval_ms: AtomicU64,
+    /// Agent A03：invocation_id -> 进行中调用的运行时状态
+    pub inv_runs: DashMap<Uuid, InvRun>,
 }
 
 impl AppState {
@@ -107,6 +136,7 @@ impl AppState {
             backup_busy: AtomicBool::new(false),
             hosts: DashMap::new(),
             queue_sweep_interval_ms: AtomicU64::new(30_000),
+            inv_runs: DashMap::new(),
         });
         crate::agents::spawn_queue_sweeper(st.clone());
         st

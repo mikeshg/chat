@@ -86,6 +86,7 @@ function state(patch: Partial<AppState> = {}): AppState {
     pendingJump: null,
     agentHosts: [],
     invocations: {},
+    agentRuns: {},
     ...patch,
   };
 }
