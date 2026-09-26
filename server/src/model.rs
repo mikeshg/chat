@@ -19,6 +19,8 @@ pub struct UserRow {
     pub avatar_path: Option<String>,
     /// 每次更换/移除 +1，客户端据此失效头像缓存
     pub avatar_version: i32,
+    /// Agent 使用权覆盖。NULL = 跟随全局默认（A08）
+    pub agent_access: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -31,6 +33,9 @@ pub struct UserPublic {
     /// 头像版本（拼进 GET /users/{id}/avatar?v= 做缓存失效）
     pub avatar_version: i32,
     pub has_avatar: bool,
+    /// 生效后的 Agent 使用权。只出现在「自己」的响应里（GET /users/me、登录）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_access: Option<bool>,
 }
 
 impl From<&UserRow> for UserPublic {
@@ -43,7 +48,15 @@ impl From<&UserRow> for UserPublic {
             last_seen_at: u.last_seen_at,
             avatar_version: u.avatar_version,
             has_avatar: u.avatar_path.is_some(),
+            agent_access: None,
         }
+    }
+}
+
+impl UserPublic {
+    pub fn with_agent_access(mut self, allowed: bool) -> Self {
+        self.agent_access = Some(allowed);
+        self
     }
 }
 
@@ -490,7 +503,7 @@ pub enum WsOut {
         preference: ConversationPref,
     },
     Invalidate {
-        what: &'static str, // "friends" | "conversations" | "requests"
+        what: &'static str, // "friends" | "conversations" | "requests" | "me" | "agents"
     },
     /// 置顶列表变更：成员收到后重新拉 GET /conversations/{id}/pins
     PinsUpdated {
@@ -762,6 +775,10 @@ pub struct AdminUserView {
     pub has_avatar: bool,
     /// 该用户附件已用存储（按 storage_path 去重）
     pub storage_bytes: i64,
+    /// 逐用户覆盖；null = 跟随全局默认
+    pub agent_access: Option<bool>,
+    /// 按管理员 / 全局开关 / 覆盖 / 默认算出的生效值
+    pub agent_access_effective: bool,
 }
 
 /// GET /users/me/storage（V2 P2-1）：quota_bytes 为 null 表示不限额

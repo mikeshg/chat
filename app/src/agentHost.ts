@@ -5,6 +5,7 @@
 // （自带 access token 刷新）调 GET /v1/ws/ticket → invoke
 // agent_host_ticket 把 ticket 或 error 回填给 Rust 的 oneshot。
 
+import { canUseAgent } from "./agentAccess";
 import { convs, deviceLabel, getServer } from "./api";
 
 /** 仅 Tauri 桌面壳：浏览器与 Android WebView 都不启动宿主 */
@@ -65,6 +66,17 @@ export async function startAgentHost(): Promise<void> {
   } catch (e) {
     console.warn("agent_host_start failed", e);
   }
+}
+
+/** 按生效使用权拉起或停掉桌面宿主。Web / Android 仍是 no-op。 */
+export async function syncAgentHost(
+  me: { agent_access?: boolean } | null | undefined,
+): Promise<void> {
+  if (!canUseAgent(me)) {
+    await stopAgentHost();
+    return;
+  }
+  await startAgentHost();
 }
 
 /** 退出登录时调用：停掉本机宿主（Web/Android 为 no-op） */

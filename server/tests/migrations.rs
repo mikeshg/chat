@@ -73,6 +73,7 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
         include_str!("../migrations/0021_agent_queue.sql"),
         include_str!("../migrations/0022_agent_contexts.sql"),
         include_str!("../migrations/0023_agent_config.sql"),
+        include_str!("../migrations/0025_agent_access.sql"),
     ] {
         sqlx::raw_sql(script).execute(&pool).await.unwrap();
     }
@@ -126,6 +127,23 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
             assert_eq!(deleted.orphan_files, vec!["migration-shared-path"]);
         }
     }
+    let access_col = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+            SELECT 1 FROM information_schema.columns
+             WHERE table_name = 'users' AND column_name = 'agent_access')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(access_col, "0025 adds users.agent_access on existing data");
+    let enabled = sqlx::query_scalar::<_, Option<bool>>(
+        "SELECT (value = 'true'::jsonb) FROM server_settings WHERE key = 'agent_enabled'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(enabled, Some(true));
+
     pool.close().await;
     sqlx::query(&format!("DROP DATABASE {name}"))
         .execute(&admin)

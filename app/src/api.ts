@@ -487,6 +487,9 @@ export const admin = {
     post(`/admin/users/${id}/role`, { role }),
   resetPassword: (id: string, password: string) =>
     post(`/admin/users/${id}/password`, { password }),
+  /** 逐用户覆盖：true 允许 / false 禁止 / null 跟随默认 */
+  setAgentAccess: (id: string, allowed: boolean | null) =>
+    put<void>(`/admin/users/${id}/agent-access`, { allowed }),
   // ---------- V2 P4-1 备份/恢复 ----------
   backups: () => get<BackupList>("/admin/backups"),
   createBackup: () => post<BackupCreated>("/admin/backups"),

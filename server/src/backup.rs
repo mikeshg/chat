@@ -612,7 +612,13 @@ pub async fn restore(
     let task = tokio::spawn(async move {
         let _busy = busy;
         let _maint = MaintGuard::enter(&st2); // 进维护态；Drop 兜底退出（含 panic/取消路径）
-        let uids: Vec<Uuid> = st2.conns.iter().map(|e| *e.key()).collect();
+                                              // 普通连接和只挂着宿主的用户都踢。kick_user 会连宿主一起断开。
+        let mut uids: Vec<Uuid> = st2.conns.iter().map(|e| *e.key()).collect();
+        for h in st2.hosts.iter() {
+            uids.push(h.user_id);
+        }
+        uids.sort();
+        uids.dedup();
         for uid in uids {
             st2.kick_user(uid, "maintenance");
         }

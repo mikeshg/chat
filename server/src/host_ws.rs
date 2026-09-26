@@ -24,6 +24,15 @@ pub async fn host_session(
     grant: crate::auth::AccessGrant,
 ) -> AppResult<()> {
     let uid = grant.uid;
+    let sid = grant.sid;
+    // 握手（WS 升级）之后立刻看使用权。无权则关闭、不登记、不写宿主行。
+    if !crate::agent_access::user_allows(&st.pool, uid)
+        .await
+        .unwrap_or(false)
+    {
+        let _ = socket.send(Message::Close(None)).await;
+        return Ok(());
+    }
     // 首帧必须是 host_hello：10s 内拿不到合法的握手帧就断开
     let hello = match tokio::time::timeout(Duration::from_secs(10), socket.recv()).await {
         Ok(Some(Ok(Message::Text(t)))) => serde_json::from_str::<Value>(&t).ok(),
@@ -78,7 +87,7 @@ pub async fn host_session(
     let conn_id = Uuid::new_v4();
     let (tx, mut rx) = mpsc::channel::<ConnMsg>(crate::state::CONN_QUEUE);
     // 同 host 重复连接：旧连接收到 host_superseded + 关闭，其清理逻辑按 conn_id 校验不再生效
-    st.register_host(host_id, uid, conn_id, tx.clone());
+    st.register_host(host_id, uid, conn_id, sid, tx.clone());
 
     let _ = tx.try_send(ConnMsg::Frame(
         serde_json::json!({"type": "host_ready", "host_id": host_id}).to_string(),

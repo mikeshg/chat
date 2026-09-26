@@ -114,7 +114,7 @@ pub async fn change_password(
     .bind(sid)
     .execute(&mut *tx)
     .await?;
-    let res = auth::issue_tokens(&mut *tx, &st.cfg, &row, sid).await?;
+    let res = auth::issue_tokens(&mut tx, &st.cfg, &row, sid).await?;
     tx.commit().await?;
 
     // 其他 session 的连接收 force_logout 后断开；本 session 的旧连接 sv 已失效，

@@ -8,6 +8,8 @@ export interface UserPublic {
   /** 头像版本（拼进 /users/{id}/avatar?v=）；旧服务端缺省 */
   avatar_version?: number;
   has_avatar?: boolean;
+  /** 生效后的 Agent 使用权。只在「自己」的资料里出现；false 时藏入口 */
+  agent_access?: boolean;
 }
 
 export interface AuthResponse {
@@ -436,6 +438,10 @@ export interface AdminUserView {
   has_avatar?: boolean;
   /** 该用户附件已用存储（V2 P2-1；旧服务端缺省） */
   storage_bytes?: number;
+  /** 逐用户覆盖；null = 跟随全局默认 */
+  agent_access?: boolean | null;
+  /** 生效值 */
+  agent_access_effective?: boolean;
 }
 
 /** GET /users/me/storage（V2 P2-1）：quota_bytes 为 null/缺省表示不限额 */
@@ -471,6 +477,10 @@ export interface AdminSettings {
   push_ntfy_token_set?: boolean;
   /** 本服务对外地址，推送通知点击跳转用；空 = 不带 */
   public_url?: string;
+  /** 全局是否允许使用 Agent（管理员始终可用） */
+  agent_enabled?: boolean;
+  /** 没有逐用户覆盖时，普通用户默认能否使用 */
+  agent_default_allowed?: boolean;
 }
 
 /** GET/PUT /users/me/push 与 rotate/test 返回（V2 P3-3） */

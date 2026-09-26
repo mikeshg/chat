@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { startAgentHost } from "../agentHost";
+import { syncAgentHost } from "../agentHost";
 import { auth, getServer, saveSession, serverInfo, setServer } from "../api";
 import { readDrafts } from "../drafts";
 import { parseInviteParam } from "../invite";
@@ -64,7 +64,7 @@ export default function AuthScreen() {
       saveSession(r);
       setState({ me: r.user, drafts: readDrafts(localStorage, r.user.id) });
       void startWs();
-      void startAgentHost(); // A01：桌面壳登录后拉起宿主（Web/Android no-op）
+      void syncAgentHost(r.user);
     } catch (ex) {
       setErr(ex instanceof Error ? ex.message : "请求失败");
     } finally {

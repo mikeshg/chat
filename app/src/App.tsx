@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { startAgentHost, stopAgentHost } from "./agentHost";
+import { stopAgentHost, syncAgentHost } from "./agentHost";
 import { auth, loadSession } from "./api";
 import { readDrafts } from "./drafts";
 import { syncWindowTitle, unreadTitle } from "./notify";
@@ -47,7 +47,7 @@ export default function App() {
         const me = await auth.me();
         setState({ me, drafts: readDrafts(localStorage, me.id) });
         void startWs();
-        void startAgentHost(); // A01：桌面壳拉起本机宿主（Web/Android no-op）
+        void syncAgentHost(me); // 桌面壳：有使用权才拉起宿主
       } catch {
         // session 已失效
       } finally {

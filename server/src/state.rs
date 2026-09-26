@@ -51,6 +51,8 @@ pub struct HostConn {
     pub conn_id: Uuid,
     /// 宿主所属用户（agent_hosts.user_id 快照，状态广播用）
     pub user_id: Uuid,
+    /// 这条连接用的登录会话（ticket 里的 sid）。踢设备 / 改密时按它断开。
+    pub sid: Option<Uuid>,
 }
 
 /// 一次性 WS ticket 的内容：签发时的用户、凭据版本与登录会话
@@ -188,7 +190,9 @@ impl AppState {
     /// 踢下线：给该用户所有连接发 force_logout 并主动断开 socket，同时摘掉连接表。
     /// 返回 Some(epoch) 表示刚才还在线，调用方负责广播离线。
     /// 断线清理看到连接已不在表里，不会再广播一次。
+    /// 该用户的宿主连接一并断开（A08：宿主跟随登录会话，禁用 / 恢复备份走这里）。
     pub fn kick_user(&self, uid: Uuid, reason: &str) -> Option<u64> {
+        self.disconnect_hosts(uid, |_| false, reason);
         let Some((_, bucket)) = self.conns.remove(&uid) else {
             return None;
         };
@@ -248,15 +252,17 @@ impl AppState {
         Some(epoch)
     }
 
-    /// 踢掉某个登录会话的全部连接（设备被移出）
+    /// 踢掉某个登录会话的全部连接（设备被移出），含该会话上的宿主。
     pub fn kick_session(&self, uid: Uuid, sid: Uuid, reason: &str) -> Option<u64> {
+        self.disconnect_hosts(uid, |s| s != Some(sid), reason);
         self.kick_matching(uid, reason, |s| s != Some(sid))
     }
 
-    /// 踢掉除 keep 以外登录会话的全部连接（改密/一键退出其他设备）。
+    /// 踢掉除 keep 以外登录会话的全部连接（改密/一键退出其他设备），含对应宿主。
     /// keep=None（老 token 发起的请求）：只踢带 sid 的连接，无 sid 的老连接保留，
     /// 由 session_version 变化在下一帧自然断开。
     pub fn kick_other_sessions(&self, uid: Uuid, keep: Option<Uuid>, reason: &str) -> Option<u64> {
+        self.disconnect_hosts(uid, |s| s == keep, reason);
         self.kick_matching(uid, reason, |s| s == keep)
     }
 
@@ -297,11 +303,13 @@ impl AppState {
     // ---------- Agent A01：宿主连接表 ----------
 
     /// 登记宿主连接；同 host 已有连接时给旧连接发 host_superseded 并断开。
+    /// sid 是这条连接的登录会话，供改密 / 移出设备时对上号。
     pub fn register_host(
         &self,
         host_id: Uuid,
         user_id: Uuid,
         conn_id: Uuid,
+        sid: Option<Uuid>,
         tx: mpsc::Sender<ConnMsg>,
     ) {
         if let Some(old) = self.hosts.insert(
@@ -310,6 +318,7 @@ impl AppState {
                 tx,
                 conn_id,
                 user_id,
+                sid,
             },
         ) {
             let _ = old.tx.try_send(ConnMsg::Shutdown(
@@ -329,6 +338,44 @@ impl AppState {
     /// 宿主当前在线（连接表里有登记）
     pub fn host_online(&self, host_id: Uuid) -> bool {
         self.hosts.contains_key(&host_id)
+    }
+
+    /// 断开该用户全部宿主（使用权收回）。不摘连接表，会话循环自己收尾并标离线。
+    pub fn disconnect_user_hosts(&self, uid: Uuid) {
+        self.disconnect_hosts(uid, |_| false, "agent_access_revoked");
+    }
+
+    /// keep 返回 true 的宿主留下。先发关闭帧，并立刻给主人推 online=false
+    /// （会话循环随后还会再推一次；GET 要等循环摘表才变离线）。
+    fn disconnect_hosts(&self, uid: Uuid, keep: impl Fn(Option<Uuid>) -> bool, reason: &str) {
+        let frame = serde_json::json!({
+            "type": "force_logout",
+            "reason": reason,
+        })
+        .to_string();
+        let ids: Vec<Uuid> = self
+            .hosts
+            .iter()
+            .filter(|e| e.user_id == uid && !keep(e.sid))
+            .map(|e| *e.key())
+            .collect();
+        for host_id in ids {
+            let Some(conn) = self.hosts.get(&host_id) else {
+                continue;
+            };
+            if conn.user_id != uid || keep(conn.sid) {
+                continue;
+            }
+            let _ = conn.tx.try_send(ConnMsg::Shutdown(frame.clone()));
+            drop(conn);
+            let status = serde_json::json!({
+                "type": "agent_host_status",
+                "host_id": host_id,
+                "online": false,
+            })
+            .to_string();
+            self.send_to_user(uid, &status);
+        }
     }
 
     /// 向宿主连接投递一帧；宿主离线或队列满返回 false
