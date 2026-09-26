@@ -52,8 +52,8 @@ export interface AppState {
   pendingJump: { convId: string; messageId: string; seq: number } | null;
   /** Agent A01：本人宿主列表（AgentsPanel 拉取 / agent_host_status 帧更新 online） */
   agentHosts: AgentHostView[];
-  /** Agent A01：conv_id -> trigger_message_id -> 调用记录（状态行展示用） */
-  invocations: Record<string, Record<string, InvocationView>>;
+  /** Agent A01/A11：conv_id -> trigger_message_id -> 调用记录（一条消息可以触发多个 Agent） */
+  invocations: Record<string, Record<string, InvocationView[]>>;
 }
 
 /** 头像缓存条目：版本较大的那组才有效。 */
@@ -553,7 +553,7 @@ export function applyHostStatus(
   };
 }
 
-/** agent_invocation 帧 / 历史 GET 共用合并入口：按 trigger_message_id 归档最新状态 */
+/** agent_invocation 帧 / 历史 GET 共用合并入口：同一触发消息下按调用 id 覆盖，不同调用都保留 */
 export function applyInvocations(
   s: AppState,
   incoming: InvocationView[],
@@ -561,8 +561,12 @@ export function applyInvocations(
   if (incoming.length === 0) return {};
   const invocations = { ...s.invocations };
   for (const inv of incoming) {
-    const cur = invocations[inv.conversation_id] ?? {};
-    invocations[inv.conversation_id] = { ...cur, [inv.trigger_message_id]: inv };
+    const cur = { ...(invocations[inv.conversation_id] ?? {}) };
+    const prev = cur[inv.trigger_message_id] ?? [];
+    const idx = prev.findIndex((x) => x.id === inv.id);
+    cur[inv.trigger_message_id] =
+      idx >= 0 ? prev.map((x, i) => (i === idx ? inv : x)) : [...prev, inv];
+    invocations[inv.conversation_id] = cur;
   }
   return { invocations };
 }

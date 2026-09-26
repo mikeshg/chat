@@ -4,7 +4,8 @@
 //   GET /v1/conversations/{id}/agent-invocations —— 一律只作用于本人资源，
 //   别人的宿主/Agent 按 id 访问返回 404，不泄露存在性。
 //   POST /v1/conversations/{id}/agent-context/reset —— 成员清空本会话上下文。
-// - 派发挂点在 ws::broadcast_posted：专属会话里的主人文字消息触发一次调用；
+// - 派发挂点在 ws::broadcast_posted：专属会话里主人的文字消息触发该 Agent；
+//   私聊 / 群里则按 agent_targets 与手打 @ 解析出发送者自己未删除的 Agent（A11）。
 //   宿主在线 → running + invocation_start；离线 → queued（queue_deadline = now + 生效超时，
 //   超时 0 则 NULL）。宿主 host_ready 后按 created_at 把排队调用改成 running 再下发。
 
@@ -581,7 +582,10 @@ pub async fn delete_agent(
     for inv in &invs {
         let cancel = json!({"type": "invocation_cancel", "invocation_id": inv.id}).to_string();
         st.send_to_host(host_id, &cancel);
-        push_invocation(&st, &[owner], inv);
+        let members = domain::member_ids(&st.pool, inv.conversation_id)
+            .await
+            .unwrap_or_else(|_| vec![owner]);
+        push_invocation(&st, &members, inv);
     }
     // 会话列表要带上 deleted；Agent 列表面板重拉
     crate::api::notify(&st, &[owner], "conversations");
@@ -922,6 +926,7 @@ pub async fn cancel_invocation(
 
 // ---------- 调用派发（挂在 broadcast_posted 上） ----------
 
+#[derive(Clone)]
 struct AgentRow {
     id: Uuid,
     owner: Uuid,
@@ -1022,29 +1027,134 @@ fn agent_snapshot(a: &AgentRow) -> Value {
     })
 }
 
-/// 新文字消息落库后的挂点：专属会话里主人发的普通文字触发一次调用。
-/// Agent 自己的回写（message.agent 非空）与幂等重放不触发。
+/// 新文字消息落库后的唯一挂点。
+/// 专属会话：主人发的普通文字调用它的 Agent（prompt 用全文）。
+/// 私聊 / 群：显式 agent_targets（属于发送者且未删除）∪ 手打 @token
+/// （先匹配发送者自己的 Agent，不区分大小写）。别人的 id 与非主人的同名都不触发。
+/// Agent 自己的回写与幂等重放不触发。
 pub async fn maybe_invoke(st: &SharedState, conv: Uuid, posted: &domain::Posted) {
     if !posted.inserted || posted.message.agent.is_some() || posted.message.kind != "text" {
         return;
     }
-    let agent = match agent_of_conv(&st.pool, conv).await {
-        Ok(Some(a)) => a,
-        _ => return,
-    };
-    // 只有主人本人的消息触发；专属会话唯一成员即主人，显式校验防结构漂移
-    if agent.deleted_at.is_some() || posted.message.sender_id != agent.owner {
+    match agent_of_conv(&st.pool, conv).await {
+        Ok(Some(agent)) => {
+            // 只有主人本人的消息触发；专属会话唯一成员即主人，显式校验防结构漂移
+            if agent.deleted_at.is_some() || posted.message.sender_id != agent.owner {
+                return;
+            }
+            dispatch(
+                st,
+                agent,
+                conv,
+                posted.message.id,
+                posted.message.content.clone(),
+                &posted.member_ids,
+            )
+            .await;
+        }
+        Ok(None) => {
+            invoke_in_place(st, conv, posted).await;
+        }
+        Err(e) => tracing::error!(error = %e, "读取会话 Agent 失败"),
+    }
+}
+
+/// 私聊 / 群：为每个解析出的 Agent 建一次调用。prompt 去掉用来点名的 @token。
+async fn invoke_in_place(st: &SharedState, conv: Uuid, posted: &domain::Posted) {
+    let kind: Option<String> = sqlx::query_scalar("SELECT type FROM conversations WHERE id = $1")
+        .bind(conv)
+        .fetch_optional(&st.pool)
+        .await
+        .ok()
+        .flatten();
+    if kind.as_deref() != Some("dm") && kind.as_deref() != Some("group") {
         return;
     }
-    dispatch(
-        st,
-        agent,
-        conv,
-        posted.message.id,
-        posted.message.content.clone(),
-        &posted.member_ids,
-    )
-    .await;
+    let mine = sender_agents(&st.pool, posted.message.sender_id).await;
+    let targets = resolve_agent_targets(&mine, &posted.message.content, &posted.agent_targets);
+    if targets.is_empty() {
+        return;
+    }
+    let names: Vec<String> = targets.iter().map(|a| a.name.clone()).collect();
+    let prompt = prompt_without_agent_tokens(&posted.message.content, &names);
+    for agent in targets {
+        dispatch(
+            st,
+            agent,
+            conv,
+            posted.message.id,
+            prompt.clone(),
+            &posted.member_ids,
+        )
+        .await;
+    }
+}
+
+async fn sender_agents(pool: &PgPool, owner: Uuid) -> Vec<AgentRow> {
+    sqlx::query_as::<_, AgentCfgRow>(&format!(
+        "{AGENT_CFG_SQL}
+           FROM agents a
+          WHERE a.owner_id = $1 AND a.deleted_at IS NULL
+          ORDER BY a.created_at, a.id"
+    ))
+    .bind(owner)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(row_to_agent)
+    .collect()
+}
+
+/// 显式 id 在前，手打且尚未指定的 @token 在后。同 id 只留一次。
+fn resolve_agent_targets(mine: &[AgentRow], content: &str, explicit: &[Uuid]) -> Vec<AgentRow> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for id in explicit {
+        if let Some(agent) = mine.iter().find(|a| a.id == *id) {
+            if seen.insert(agent.id) {
+                out.push(agent.clone());
+            }
+        }
+    }
+    let taken: std::collections::HashSet<String> =
+        out.iter().map(|a| a.name.to_ascii_lowercase()).collect();
+    for tok in domain::scan_at_tokens(content) {
+        if taken.contains(&tok.name.to_ascii_lowercase()) {
+            continue;
+        }
+        if let Some(agent) = mine.iter().find(|a| a.name.eq_ignore_ascii_case(&tok.name)) {
+            if seen.insert(agent.id) {
+                out.push(agent.clone());
+            }
+        }
+    }
+    out
+}
+
+/// 去掉点名用的 @Agent（及紧跟的一个空格）。剥完只剩空白时退回原文。
+fn prompt_without_agent_tokens(content: &str, names: &[String]) -> String {
+    let tokens = domain::scan_at_tokens(content);
+    let mut out = String::new();
+    let mut cursor = 0;
+    for tok in &tokens {
+        if !names.iter().any(|n| n.eq_ignore_ascii_case(&tok.name)) {
+            continue;
+        }
+        out.push_str(&content[cursor..tok.start]);
+        let mut next = tok.end;
+        if content.as_bytes().get(next) == Some(&b' ') {
+            next += 1;
+        }
+        cursor = next;
+    }
+    out.push_str(&content[cursor..]);
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        content.to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 async fn dispatch(
@@ -1175,12 +1285,39 @@ struct QueuedStart {
     conversation_id: Uuid,
     agent_id: Uuid,
     prompt: String,
+    trigger_message_id: Uuid,
+}
+
+/// 排队时 prompt 没落库。私聊 / 群上线补发时，按这条触发消息上的全部目标 Agent 再剥一次 @。
+/// 专属会话保持原文，与在线派发一致。
+async fn prompt_for_flushed(pool: &PgPool, conv: Uuid, trigger: Uuid, content: &str) -> String {
+    let kind: Option<String> = sqlx::query_scalar("SELECT type FROM conversations WHERE id = $1")
+        .bind(conv)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+    if kind.as_deref() == Some("agent") {
+        return content.to_string();
+    }
+    let names = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT a.name
+           FROM agent_invocations i
+           JOIN agents a ON a.id = i.agent_id
+          WHERE i.trigger_message_id = $1",
+    )
+    .bind(trigger)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    prompt_without_agent_tokens(content, &names)
 }
 
 /// host_ready 之后：该宿主上所有 queued 调用按 created_at 逐个改成 running 并下发。
 pub async fn flush_queued(st: &SharedState, host_id: Uuid) {
     let rows = sqlx::query_as::<_, QueuedStart>(
-        "SELECT i.id, i.conversation_id, a.id AS agent_id, m.content AS prompt
+        "SELECT i.id, i.conversation_id, a.id AS agent_id, m.content AS prompt,
+                i.trigger_message_id
            FROM agent_invocations i
            JOIN agents a ON a.id = i.agent_id
            JOIN messages m ON m.id = i.trigger_message_id
@@ -1208,9 +1345,15 @@ pub async fn flush_queued(st: &SharedState, host_id: Uuid) {
             Ok(Some(a)) => a,
             _ => continue,
         };
+        let prompt = prompt_for_flushed(
+            &st.pool,
+            row.conversation_id,
+            row.trigger_message_id,
+            &row.prompt,
+        )
+        .await;
         let payload =
-            invocation_start_payload(&st.pool, inv.id, &agent, row.conversation_id, &row.prompt)
-                .await;
+            invocation_start_payload(&st.pool, inv.id, &agent, row.conversation_id, &prompt).await;
         if !st.send_to_host(host_id, &payload) {
             let timeout = queue_timeout_secs(&st.pool, row.agent_id).await;
             if let Some(q) = requeue(&st.pool, inv.id, timeout).await {
@@ -1329,11 +1472,10 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
             return;
         }
     };
-    let row = sqlx::query_as::<_, (String, Option<Uuid>, Uuid, Uuid, Uuid)>(
-        "SELECT i.status, c.owner_id, i.conversation_id, a.id, a.host_id
+    let row = sqlx::query_as::<_, (String, Uuid, Uuid, Uuid, Uuid)>(
+        "SELECT i.status, a.owner_id, i.conversation_id, a.id, a.host_id
            FROM agent_invocations i
            JOIN agents a ON a.id = i.agent_id
-           JOIN conversations c ON c.id = i.conversation_id
           WHERE i.id = $1
           FOR UPDATE OF i",
     )
@@ -1347,8 +1489,6 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
     if status != "running" || real_host != host_id {
         return;
     }
-    let owner = owner.unwrap_or_default();
-    let member_ids = vec![owner];
 
     if v["ok"].as_bool() == Some(true) {
         // 失败的 finish 不进这个分支，因此不会覆盖已记住的运行时会话
@@ -1385,6 +1525,9 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
             return;
         }
         if let Ok(Some(inv)) = updated {
+            let member_ids = domain::member_ids(&st.pool, conv)
+                .await
+                .unwrap_or_else(|_| vec![owner]);
             push_invocation(st, &member_ids, &inv);
         }
     } else {
@@ -1404,6 +1547,9 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
             return;
         }
         if let Ok(Some(inv)) = updated {
+            let member_ids = domain::member_ids(&st.pool, conv)
+                .await
+                .unwrap_or_else(|_| vec![owner]);
             push_invocation(st, &member_ids, &inv);
         }
     }

@@ -539,7 +539,7 @@ pub struct PostMessage<'a> {
     /// 与 attachment_id 互斥——attachment_id 仍要求 uploader=发送者，此路径不可达普通发送。
     pub forward_attachment: Option<Uuid>,
     /// Agent A01：Some(agent) 表示本条由该 Agent 发出（sender_id 仍是主人）。
-    /// 仅服务端宿主回写路径可达；写入时校验该 Agent 恰属于目标会话。
+    /// 仅服务端宿主回写路径可达。A11：只能写进主人仍是成员的会话。
     pub agent_id: Option<Uuid>,
 }
 
@@ -559,6 +559,8 @@ pub struct Posted {
     /// 本条消息 @到且原已归档的用户：其 archived_at 已在事务内清除，
     /// 广播方负责给这些用户本人推送 preference_updated（仅本人可见）
     pub unarchived: Vec<Uuid>,
+    /// A11：本条 WS 显式选中的 Agent。post_message 留空，send_message 在广播前填上。
+    pub agent_targets: Vec<Uuid>,
 }
 
 #[derive(Debug)]
@@ -712,10 +714,22 @@ async fn write_message(
         }
     }
 
-    // Agent 消息只能写进该 Agent 的专属会话（A01：宿主回写路径在锁外已验主，
-    // 这里再锁内核对会话绑定关系，防跨会话/伪造 agent_id）
+    // Agent 消息只能写进主人仍是成员的会话（专属会话、私聊、群）。
+    // sender_id 必须是该 Agent 的主人。已删除 Agent 的专属会话在上面已拒绝。
     if let Some(aid) = msg.agent_id {
-        if kind_name != "agent" || conv_agent != Some(aid) {
+        let allowed = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                SELECT 1 FROM agents a
+                JOIN memberships m
+                  ON m.conversation_id = $2 AND m.user_id = a.owner_id
+               WHERE a.id = $1 AND a.owner_id = $3)",
+        )
+        .bind(aid)
+        .bind(msg.conversation_id)
+        .bind(msg.sender_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !allowed {
             return Err(
                 PostError::deny("bad_request", "agent message outside its conversation").into(),
             );
@@ -798,7 +812,8 @@ async fn write_message(
         None => normalize_body(msg.content, attachment.as_ref())?,
     };
 
-    let mentions = if kind_name == "group" {
+    // Agent 消息不解析 @。手打 @token 若命中发送者自己仍在用的 Agent，也不算成员提及。
+    let mentions = if kind_name == "group" && msg.agent_id.is_none() {
         let members = sqlx::query_as::<_, (Uuid, String)>(
             "SELECT m.user_id, u.username::text FROM memberships m
              JOIN users u ON u.id = m.user_id WHERE m.conversation_id = $1",
@@ -806,7 +821,8 @@ async fn write_message(
         .bind(msg.conversation_id)
         .fetch_all(&mut **tx)
         .await?;
-        parse_mentions(&content, &members, msg.sender_id)
+        let agent_names = live_agent_names(tx, msg.sender_id).await?;
+        parse_mentions(&content, &members, msg.sender_id, &agent_names)
     } else {
         Vec::new()
     };
@@ -1076,6 +1092,7 @@ async fn load_posted(
         inserted,
         member_ids,
         unarchived,
+        agent_targets: Vec::new(),
     })
 }
 
@@ -1122,6 +1139,7 @@ async fn load_by_client_key(
         member_ids,
         // 幂等回放：归档解除已在首个事务生效，不重复推送偏好帧
         unarchived: Vec::new(),
+        agent_targets: Vec::new(),
     })
 }
 
@@ -1151,29 +1169,86 @@ async fn dm_writable(
     .await
 }
 
-/// 从消息内容提取 @username，匹配群成员（去重、不含发送者）。
-fn parse_mentions(content: &str, members: &[(Uuid, String)], sender: Uuid) -> Vec<Uuid> {
-    let mut out = Vec::new();
+/// 正文里的一个 @token。`name` 可含连字符（Agent 名）；`member_name` 在 `-` 处截断（用户名规则）。
+pub(crate) struct AtToken {
+    pub name: String,
+    pub member_name: String,
+    /// `@` 的字节下标
+    pub start: usize,
+    /// token 结束后的字节下标（不含 `@` 后的空格）
+    pub end: usize,
+}
+
+/// 扫出全部 @token。`@` 前不要求空白，与原提及解析一致。
+pub(crate) fn scan_at_tokens(content: &str) -> Vec<AtToken> {
     let b = content.as_bytes();
+    let mut out = Vec::new();
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'@' {
-            let start = i + 1;
-            let mut end = start;
-            while end < b.len() && (b[end].is_ascii_alphanumeric() || b[end] == b'_') {
-                end += 1;
-            }
-            if end > start {
-                let name = &content[start..end];
-                if let Some((uid, _)) = members.iter().find(|(_, u)| u == name) {
-                    if *uid != sender && !out.contains(uid) {
-                        out.push(*uid);
-                    }
+            let start_name = i + 1;
+            if start_name < b.len()
+                && (b[start_name].is_ascii_alphanumeric() || b[start_name] == b'_')
+            {
+                let mut end = start_name + 1;
+                while end < b.len()
+                    && (b[end].is_ascii_alphanumeric() || b[end] == b'_' || b[end] == b'-')
+                {
+                    end += 1;
                 }
+                let name = content[start_name..end].to_string();
+                let cut = name
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(name.len());
+                let member_name = name[..cut].to_string();
+                out.push(AtToken {
+                    name,
+                    member_name,
+                    start: i,
+                    end,
+                });
+                i = end;
+                continue;
             }
-            i = end.max(i + 1);
-        } else {
-            i += 1;
+        }
+        i += 1;
+    }
+    out
+}
+
+async fn live_agent_names(
+    tx: &mut Transaction<'_, Postgres>,
+    owner: Uuid,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT name FROM agents WHERE owner_id = $1 AND deleted_at IS NULL")
+        .bind(owner)
+        .fetch_all(&mut **tx)
+        .await
+}
+
+/// 从消息内容提取 @username，匹配群成员（去重、不含发送者）。
+/// `agent_names` 里的 token（不区分大小写，含连字符）先被当成发送者自己的 Agent，不再提及同名成员。
+fn parse_mentions(
+    content: &str,
+    members: &[(Uuid, String)],
+    sender: Uuid,
+    agent_names: &[String],
+) -> Vec<Uuid> {
+    let mut out = Vec::new();
+    for tok in scan_at_tokens(content) {
+        if agent_names
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(&tok.name))
+        {
+            continue;
+        }
+        if tok.member_name.is_empty() {
+            continue;
+        }
+        if let Some((uid, _)) = members.iter().find(|(_, u)| u == &tok.member_name) {
+            if *uid != sender && !out.contains(uid) {
+                out.push(*uid);
+            }
         }
     }
     out
@@ -1380,7 +1455,8 @@ async fn edit_in_tx(
         .bind(m.conversation_id)
         .fetch_all(&mut **tx)
         .await?;
-        for uid in parse_mentions(content, &members, editor) {
+        let agent_names = live_agent_names(tx, editor).await?;
+        for uid in parse_mentions(content, &members, editor, &agent_names) {
             sqlx::query(
                 "INSERT INTO message_mentions (message_id, user_id) VALUES ($1, $2)
                  ON CONFLICT DO NOTHING",
