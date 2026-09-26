@@ -131,7 +131,7 @@ export default function RegistryPicker({
               )}
               {confirmId === entry.id && (
                 <div className="row">
-                  <span className="muted">确认安装 {entry.name} {entry.version}？</span>
+                  <span className="muted">确认安装 {entry.name} {entry.version} 的 ACP 适配器？</span>
                   <button type="button" className="primary" onClick={() => void install(entry)}>
                     确认安装
                   </button>

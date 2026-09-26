@@ -11,12 +11,12 @@ describe("registryEntryUi", () => {
     });
   });
 
-  it("installable 显示安装，还不能选", () => {
+  it("installable 显示安装适配器和说明，还不能选", () => {
     expect(registryEntryUi("installable")).toEqual({
       selectable: false,
-      installLabel: "安装",
-      reasonLabel: null,
-      statusText: "可安装",
+      installLabel: "安装适配器",
+      reasonLabel: "要先装一次它的 ACP 适配器（装在 Chat 自己的目录里，不动本机已装的 CLI，沿用本机的登录和配置）",
+      statusText: "需安装",
     });
   });
 

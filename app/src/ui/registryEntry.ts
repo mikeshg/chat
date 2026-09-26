@@ -15,7 +15,12 @@ export function registryEntryUi(status: string, reason?: string): RegistryEntryU
     return { selectable: true, installLabel: null, reasonLabel: null, statusText: "可用" };
   }
   if (status === "installable") {
-    return { selectable: false, installLabel: "安装", reasonLabel: null, statusText: "可安装" };
+    return {
+      selectable: false,
+      installLabel: "安装适配器",
+      reasonLabel: "要先装一次它的 ACP 适配器（装在 Chat 自己的目录里，不动本机已装的 CLI，沿用本机的登录和配置）",
+      statusText: "需安装",
+    };
   }
   return {
     selectable: false,
