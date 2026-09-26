@@ -49,7 +49,7 @@ tasks.forEach((task, i) => {
   run('git', ['-C', REPO, 'worktree', 'add', '-b', `v2-${t}`, wt, 'v2']);
 
   const container = `chat-v2-s${slot}`;
-  const pgPort = 55600 + slot;
+  const pgPort = 45600 + slot; // 避开 Windows 临时端口段 49152–65535（会被随机进程占用）
   const pw = randomBytes(18).toString('hex');
   spawnSync('wsl', ['docker', 'rm', '-f', container], { encoding: 'utf8' });
   run('wsl', ['docker', 'run', '-d', '--rm', '--pull=never', '--name', container,

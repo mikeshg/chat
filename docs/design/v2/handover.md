@@ -12,7 +12,7 @@
 
 - 范围（2026-09-25 选定，详见 plan.md 第 1 节）：做 A1、A2（后台开关 + 邀请）、A4（管理页备份：生成本地文件、下载、上传恢复）、B1–B5 全部、C 除 Webhook 外全部、D 前三个；**不做** A3（安全默认值，「离上线还远」）、A5（内置 HTTPS）、C4 Webhook。
 - 流程：先总计划 → 分阶段 → 每阶段拆子任务、写详细任务单 → 同时派多个 Devin 在 **worktree 并行开发** → 阶段全部完成后主会话**合并验收 → 提交** → 下一阶段。
-- **模型分配（2026-09-25 调整）**：同时最多 **2 个 `swe-2-max`**（同时开 4 个会报容量不足），其余任务用 **`grok-4-7-xhigh`**（用户说的「grok 4.7 fast xhigh」没有 fast 档，这是最接近的）。`run-devin.sh` 用环境变量 `DEVIN_MODEL` 切换。
+- **执行者分配（2026-09-26 用户澄清）**：同时最多 **2 个 Devin `swe-2-max`**（同时开 4 个会报容量不足），其余任务用 **Grok Build 命令行**（`C:\Users\xie_f\.grok\bin\grok.exe`，模型 `grok-4.7-build-fast`、`--reasoning-effort xhigh`），用 `scripts/v2/run-grok.sh <任务号> <提示文件绝对路径>` 跑。**不是** Devin 里的 grok 模型——第 2 阶段误用了 Devin 的 `grok-4-7-xhigh`，第 3 阶段因此把 Devin 当日额度用完。
 - **每 10–20 分钟检查一次** Devin 进度（用户明确要求）。
 - **cua-driver**：需要时先问；用户同意过在第 2 阶段验收时用它测 Tauri 桌面端（已完成）。以后再用前仍要先问。Devin 自己**禁止**使用 cua-driver，只能用无头 Playwright。
 - 「不行就停下来，明天再试」——模型不可用时停，别空转。
@@ -76,11 +76,11 @@
 
 | 文件 | 作用 |
 |---|---|
-| `wt-setup.mjs` | 一个阶段的任务 → 分支 `v2-<任务>` + worktree `../chat-wt/<任务>` + tmpfs Postgres（槽位 1..N：库 55601+、后端 18101+、前端 15101+）+ `.env.local`（随机口令）+ `.devin/config.local.json`（Exec 白名单）+ pnpm 离线安装 + 生成启动提示 |
+| `wt-setup.mjs` | 一个阶段的任务 → 分支 `v2-<任务>` + worktree `../chat-wt/<任务>` + tmpfs Postgres（槽位 1..N：库 45601+、后端 18101+、前端 15101+）+ `.env.local`（随机口令）+ `.devin/config.local.json`（Exec 白名单）+ pnpm 离线安装 + 生成启动提示 |
 | `prompt.template.md` | Devin 启动提示模板（`{TASK}`、`{SPEC}`） |
 | `run-devin.sh` | 跑一个 Devin：注入环境变量、看门狗、被拒自动续跑、容量不足退避、释放端口 |
 | `continue.prompt.md` | 续跑时发给 Devin 的提示 |
-| `acc-env.mjs` | 验收库 `chat-v2-acc`（55610），`up` 每次都是全新库 |
+| `acc-env.mjs` | 验收库 `chat-v2-acc`（45610），`up` 每次都是全新库 |
 | `acc-server.mjs` | 验收后端 18110（托管 `app/dist`），`start` / `stop` |
 | `union.mjs` | 合并冲突「两边都保留」（CRLF 兼容），只用于确认是纯追加的冲突；`--theirs-first` 把另一分支的块放前面（两边都往同一结构体末尾加字段、而 HEAD 还在后面接了新定义时用） |
 | `append-section.mjs` | `node scripts/v2/append-section.mjs v2-p2-2 P2-2 server/tests/it.rs`：文件末尾追加冲突 = HEAD + 另一分支 `===== V2 <任务号>` 分节之后的整段 |
@@ -127,6 +127,8 @@ BASE_URL=http://127.0.0.1:18110 node scripts/e2e.mjs phase2
 - 权限模式用 `smart` + 白名单，没用 `dangerous`。
 - **不要在包装脚本运行时编辑它**：bash 边执行边读文件，改了会读错位。要改就另存新文件。
 - 会话名从 `%APPDATA%/devin/cli/logs/devin_*.log` 里按 worktree 路径匹配 `for session <name>` 取得，`-r <name>` 续跑。
+- **WSL 空闲会自动关机，测试库容器随之消失**（Docker 跑在 WSL 的 Debian 里，没有前台 wsl 会话时虚拟机约一分钟后关闭）。第 1、2 阶段没出事，是因为 V1 遗留脚本一直挂着一个 wsl 前台进程；机器重启后它没了，第 3 阶段开工 15 分钟就丢了库。派发前先在后台常驻保活：`wsl -d Debian -- sh -c "exec sleep 86400"`；库丢了用 `node scripts/v2/wt-db-up.mjs P3-1,P3-2,P3-3` 按原口令、原端口重建。
+- **测试库端口要避开 Windows 临时端口段 49152–65535**（会被随机进程占用，第 3 阶段 55602 就被厂商托盘程序占了），现在用 45601 起。
 
 ## 10. 当前资源状态
 
