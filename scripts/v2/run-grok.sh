@@ -8,6 +8,7 @@
 # - --output-format streaming-json 持续输出进度；30 分钟无输出视为卡住，结束整棵进程树
 # - 结束时没写交付文档 → 用同一 session id 续跑（最多 5 次）
 set -u
+PROG="${PROG:-v2}"   # 开发计划目录 docs/design/$PROG（交付文档路径）
 T="$1"
 TOOL="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$TOOL/../.." && pwd)"
@@ -61,15 +62,16 @@ run_one() {
 
 CONT="$S/$T.grok-continue.md"
 cat > "$CONT" <<'EOF'
-继续完成你的任务单。先用 git status / git diff --stat 回顾已完成的部分，从中断处继续；全部完成后按 docs/design/v2/devin-rules.md 第 5 节写交付文档并输出状态表。启动后端做浏览器实测用 `node C:/Users/xie_f/projects/other/chat/scripts/v2/wt-server.mjs start|stop`。
+继续完成你的任务单。先用 git status / git diff --stat 回顾已完成的部分，从中断处继续；全部完成后按 docs/design/__PROG__/devin-rules.md 第 5 节写交付文档并输出状态表。启动后端做浏览器实测用 `node C:/Users/xie_f/projects/other/chat/scripts/v2/wt-server.mjs start|stop`。
 EOF
+sed -i "s#__PROG__#$PROG#" "$CONT"
 
 n=0
 free_ports
 run_one "$S/$T.grok-run$n.log" --prompt-file "$PROMPT" -s "$SID" "${COMMON[@]}"
-while [ ! -f "docs/design/v2/delivery/$T.md" ] && [ $n -lt 5 ]; do
+while [ ! -f "docs/design/$PROG/delivery/$T.md" ] && [ $n -lt 5 ]; do
   n=$((n+1))
   echo "$(date +%H:%M) grok resume #$n session=$SID" >> "$S/$T.resume.log"
   run_one "$S/$T.grok-run$n.log" -r "$SID" --prompt-file "$CONT" "${COMMON[@]}"
 done
-echo "$T finished: runs=$((n+1)) delivery=$(ls docs/design/v2/delivery/$T.md 2>/dev/null || echo missing)"
+echo "$T finished: runs=$((n+1)) delivery=$(ls docs/design/$PROG/delivery/$T.md 2>/dev/null || echo missing)"

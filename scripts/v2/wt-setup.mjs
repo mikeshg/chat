@@ -1,5 +1,6 @@
 // V2 并行开发：为一个阶段的任务建 worktree + 独立测试库 + 环境 + Devin 权限 + 启动提示
 // 用法（仓库根目录）: node scripts/v2/wt-setup.mjs P2-1,P2-2,P2-3,P2-4
+// 其他开发计划：PROG=agent BASE=main node scripts/v2/wt-setup.mjs A01（任务单在 docs/design/$PROG/tasks，分支 $PROG-<task> 基于 $BASE）
 // 每个任务：分支 v2-<task>（基于当前 v2 头）、worktree ../chat-wt/<task>、tmpfs Postgres 容器 chat-v2-s<槽位>、
 // .env.local（随机口令，gitignored）、.devin/config.local.json（Exec 白名单）、pnpm 离线安装、
 // ../chat-wt/_runtime/devin/<task>.prompt.md（由 prompt.template.md 生成）。
@@ -14,6 +15,9 @@ const REPO = join(TOOL, '..', '..');
 const WT_ROOT = join(REPO, '..', 'chat-wt');
 const RUNTIME = join(WT_ROOT, '_runtime');
 const tasks = (process.argv[2] ?? '').split(',').filter(Boolean);
+const PROG = process.env.PROG ?? 'v2';
+const BASE = process.env.BASE ?? 'v2';
+const DOCS = `docs/design/${PROG}`;
 if (!tasks.length) throw new Error('usage: node scripts/v2/wt-setup.mjs P2-1,P2-2,...');
 
 const run = (cmd, args, opts = {}) => {
@@ -36,7 +40,7 @@ const deny = [
   'Exec(cargo clean)', 'Exec(docker)', 'Exec(wsl)', 'Exec(wsl.exe)', 'Exec(sudo)',
 ];
 const template = readFileSync(join(TOOL, 'prompt.template.md'), 'utf8');
-const specs = readdirSync(join(REPO, 'docs/design/v2/tasks'));
+const specs = readdirSync(join(REPO, DOCS, 'tasks'));
 
 mkdirSync(join(RUNTIME, 'devin'), { recursive: true });
 tasks.forEach((task, i) => {
@@ -44,9 +48,9 @@ tasks.forEach((task, i) => {
   const t = task.toLowerCase();
   const wt = join(WT_ROOT, t);
   const spec = specs.find((f) => f.startsWith(`${task}-`));
-  if (!spec) throw new Error(`no spec docs/design/v2/tasks/${task}-*.md`);
+  if (!spec) throw new Error(`no spec ${DOCS}/tasks/${task}-*.md`);
   if (existsSync(wt)) throw new Error(`worktree exists: ${wt}`);
-  run('git', ['-C', REPO, 'worktree', 'add', '-b', `v2-${t}`, wt, 'v2']);
+  run('git', ['-C', REPO, 'worktree', 'add', '-b', `${PROG}-${t}`, wt, BASE]);
 
   const container = `chat-v2-s${slot}`;
   const pgPort = 45600 + slot; // 避开 Windows 临时端口段 49152–65535（会被随机进程占用）
@@ -77,6 +81,6 @@ tasks.forEach((task, i) => {
   writeFileSync(join(wt, '.devin/config.local.json'), JSON.stringify({ permissions: { allow, deny } }, null, 2));
   run('pnpm', ['install', '--frozen-lockfile', '--offline'], { cwd: wt, shell: true });
   writeFileSync(join(RUNTIME, 'devin', `${task}.prompt.md`),
-    template.replaceAll('{TASK}', task).replaceAll('{SPEC}', `docs/design/v2/tasks/${spec}`));
-  console.log(`${task}: slot ${slot} wt=${wt} branch=v2-${t} pg=${pgPort} api=${18100 + slot} spec=${spec}`);
+    template.replaceAll('{TASK}', task).replaceAll('{SPEC}', `${DOCS}/tasks/${spec}`).replaceAll('{DOCS}', DOCS));
+  console.log(`${task}: slot ${slot} wt=${wt} branch=${PROG}-${t} pg=${pgPort} api=${18100 + slot} spec=${spec}`);
 });

@@ -11,6 +11,7 @@
 # - 看门狗：被拒后 60s 无新输出、或 10 分钟无新输出 → 结束整棵进程树（Devin 起的后台 vite/后端会让进程挂住）
 # - 每轮结束释放本槽位端口；日志与续跑记录在 ../chat-wt/_runtime/devin/
 set -u
+PROG="${PROG:-v2}"   # 开发计划目录 docs/design/$PROG（交付文档路径）
 T="$1"; MODE="$2"
 TOOL="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$TOOL/../.." && pwd)"
@@ -85,11 +86,11 @@ while :; do
     sleep 180
     continue
   fi
-  if grep -q "rejected a tool call" "$log" || [ ! -f "docs/design/v2/delivery/$T.md" ]; then
+  if grep -q "rejected a tool call" "$log" || [ ! -f "docs/design/$PROG/delivery/$T.md" ]; then
     rej=$((rej+1)); [ $rej -ge 15 ] && break
     echo "$(date +%H:%M) resume #$rej session=$(sid)" >> "$S/$T.resume.log"
     continue
   fi
   break
 done
-echo "$T finished: runs=$n rejects=$rej capacity=$cap delivery=$(ls docs/design/v2/delivery/$T.md 2>/dev/null || echo missing)"
+echo "$T finished: runs=$n rejects=$rej capacity=$cap delivery=$(ls docs/design/$PROG/delivery/$T.md 2>/dev/null || echo missing)"
