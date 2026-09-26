@@ -120,6 +120,10 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
             get(crate::agents::list_invocations),
         )
         .route(
+            "/conversations/{id}/agent-context/reset",
+            post(crate::agents::reset_context),
+        )
+        .route(
             "/files",
             post(upload_file).layer(DefaultBodyLimit::max(
                 cfg.upload_max_bytes + UPLOAD_BODY_MARGIN,

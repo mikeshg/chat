@@ -933,3 +933,7 @@ button.icon-btn.chat-head-btn { flex: 0 0 auto; width: auto; height: 32px; white
   height: 100%; background: var(--accent);
   transition: width 0.15s ease-out;
 }
+
+/* ===== Agent A02 ===== */
+button.icon-btn.chat-head-btn.topic-btn { font-size: 13px; }
+button.icon-btn.chat-head-btn.topic-btn:disabled { opacity: 0.5; }

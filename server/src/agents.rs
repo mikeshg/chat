@@ -3,6 +3,7 @@
 // - REST：GET /v1/agent-hosts、GET|POST /v1/agents、
 //   GET /v1/conversations/{id}/agent-invocations —— 一律只作用于本人资源，
 //   别人的宿主/Agent 按 id 访问返回 404，不泄露存在性。
+//   POST /v1/conversations/{id}/agent-context/reset —— 成员清空本会话上下文。
 // - 派发挂点在 ws::broadcast_posted：专属会话里的主人文字消息触发一次调用；
 //   宿主在线 → invocation_start 下发宿主连接，离线 → 立即 failed/host_offline。
 
@@ -16,7 +17,7 @@ use crate::model::{
 use crate::state::SharedState;
 use axum::{
     extract::{Path, Query, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use chrono::{DateTime, Utc};
@@ -365,6 +366,40 @@ pub async fn list_invocations(
     Ok(Json(rows))
 }
 
+/// POST /conversations/{id}/agent-context/reset
+/// 删掉这个会话对应的 AgentContext。仅成员；非 agent 会话 400；没有记录也 204。
+pub async fn reset_context(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(conv): Path<Uuid>,
+) -> AppResult<StatusCode> {
+    let uid = uid(&headers, &st).await?;
+    domain::membership(&st.pool, conv, uid)
+        .await?
+        .ok_or_else(|| AppError::forbidden("not a member of this conversation"))?;
+    let row = sqlx::query_as::<_, (String, Option<Uuid>)>(
+        "SELECT type, agent_id FROM conversations WHERE id = $1",
+    )
+    .bind(conv)
+    .fetch_optional(&st.pool)
+    .await?;
+    let Some((ty, agent_id)) = row else {
+        return Err(AppError::bad_request("not an agent conversation"));
+    };
+    if ty != "agent" {
+        return Err(AppError::bad_request("not an agent conversation"));
+    }
+    let Some(agent_id) = agent_id else {
+        return Err(AppError::bad_request("not an agent conversation"));
+    };
+    sqlx::query("DELETE FROM agent_contexts WHERE agent_id = $1 AND context_key = $2")
+        .bind(agent_id)
+        .bind(conv.to_string())
+        .execute(&st.pool)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ---------- 调用派发（挂在 broadcast_posted 上） ----------
 
 struct AgentRow {
@@ -374,6 +409,20 @@ struct AgentRow {
     name: String,
     runtime: serde_json::Value,
     cwd: String,
+}
+
+/// 该 Agent 在这个会话上记住的运行时会话 id。没有或查询失败都当新会话。
+async fn context_session(pool: &PgPool, agent_id: Uuid, conv: Uuid) -> Option<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT runtime_session_id FROM agent_contexts
+          WHERE agent_id = $1 AND context_key = $2",
+    )
+    .bind(agent_id)
+    .bind(conv.to_string())
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
 }
 
 async fn agent_of_conv(pool: &PgPool, conv: Uuid) -> Result<Option<AgentRow>, sqlx::Error> {
@@ -454,11 +503,13 @@ async fn dispatch(
     if inv.status != "running" {
         return;
     }
+    let session_id = context_session(&st.pool, agent.id, conv).await;
     let payload = serde_json::json!({
         "type": "invocation_start",
         "invocation_id": inv.id,
         "agent": {"id": agent.id, "name": agent.name, "runtime": agent.runtime, "cwd": agent.cwd},
         "prompt": prompt,
+        "context": {"key": conv.to_string(), "session_id": session_id},
     })
     .to_string();
     // 发不出去（恰在检查后断开等）→ 与离线同语义：failed/host_offline
@@ -568,6 +619,24 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
     }
 
     if v["ok"].as_bool() == Some(true) {
+        // 失败的 finish 不进这个分支，因此不会覆盖已记住的运行时会话
+        if let Some(sid) = v["session_id"].as_str().filter(|s| !s.is_empty()) {
+            if let Err(e) = sqlx::query(
+                "INSERT INTO agent_contexts (agent_id, context_key, runtime_session_id, updated_at)
+                 VALUES ($1, $2, $3, now())
+                 ON CONFLICT (agent_id, context_key)
+                 DO UPDATE SET runtime_session_id = EXCLUDED.runtime_session_id,
+                               updated_at = now()",
+            )
+            .bind(agent_id)
+            .bind(conv.to_string())
+            .bind(sid)
+            .execute(&st.pool)
+            .await
+            {
+                tracing::error!(error = %e, "agent_context upsert failed");
+            }
+        }
         let text = v["text"].as_str().unwrap_or_default().to_string();
         post_agent_text(st, conv, owner, agent_id, &text).await;
         let _ = finish_invocation(st, inv_id, "succeeded", None, &member_ids).await;

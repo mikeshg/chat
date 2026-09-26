@@ -51,6 +51,8 @@ pub struct RunRequest {
     pub prompt: String,
     /// spec.cwd 为空时的工作目录
     pub data_dir: PathBuf,
+    /// 要续上的运行时会话 id。空则新开会话。
+    pub resume_session: Option<String>,
 }
 
 /// 运行过程中的事件（按发生顺序）。
@@ -65,6 +67,8 @@ pub enum RunEvent {
 pub struct RunOutput {
     /// 完整回复正文（= 全部 Text 事件拼接）
     pub text: String,
+    /// 本次实际使用的运行时会话 id（新开或恢复成功）
+    pub session_id: Option<String>,
 }
 
 /// 事件出口；接收端丢弃时发送静默失败，运行不受影响。

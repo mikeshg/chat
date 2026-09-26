@@ -70,6 +70,7 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
         include_str!("../migrations/0018_push.sql"),
         include_str!("../migrations/0019_agents.sql"),
         include_str!("../migrations/0020_agent_settings.sql"),
+        include_str!("../migrations/0022_agent_contexts.sql"),
     ] {
         sqlx::raw_sql(script).execute(&pool).await.unwrap();
     }
