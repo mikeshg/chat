@@ -30,6 +30,7 @@
 - 视频会议：会话内打开会议链接（默认 Jitsi，管理员可改地址或关闭）
 - 手机推送：管理员配置 ntfy 后，用户在「我」页开启
 - 备份与恢复：管理后台一键生成备份（数据库全部表 + 附件 / 头像文件，tar.gz）、下载到本地；上传备份文件恢复（需键入 RESTORE 确认，恢复后所有用户需重新登录）
+- Agent：本地 agent（ACP，如 Claude Code、Codex，登记表里可以一键安装）。在专属会话里直接发消息，或在任意会话里 `@名字` 调用。输出可以是实时流式、只显示状态和最终结果，或每步一条消息。权限分只读、可改工作目录、完全放开，超出档位要主人审批。宿主离线时调用会排队。Agent 之间可以互调，也可以定时调用。管理员可以关掉整个功能，或按用户允许、禁止
 - 实时：WebSocket（一次性 ticket 鉴权）、多设备同时在线、在线状态、正在输入、未读数、已读同步
 - 部署：`docker compose up -d` 一条命令（Postgres + 服务端托管前端，单端口 8080）
 
@@ -64,7 +65,7 @@ pnpm test    # cargo test：auth/好友流/会话权限/seq/WS/群规则 集成�
 # 避免「非管理员 403」整批误报。管理员流程和注册开关需要 E2E_ADMIN_USER / E2E_ADMIN_PASS。
 E2E_ADMIN_USER=<管理员用户名> E2E_ADMIN_PASS=<密码> node scripts/e2e.mjs
 docker compose down && docker compose up -d --wait
-node scripts/e2e.mjs phase2   # phase2：验证数据持久化（含头像、文件传输助手、公告、置顶）
+node scripts/e2e.mjs phase2   # phase2：验证数据持久化（含头像、文件传输助手、公告、置顶、Agent）
 ```
 
 ## 推送（ntfy）
@@ -102,6 +103,34 @@ cd gen/android && ./gradlew assembleDebug \
 
 需要 NDK（`sdkmanager "ndk;<ver>"`）+ `rustup target add aarch64-linux-android` 等。
 
+## Agent
+
+桌面端登录后就是这台电脑的 Agent 宿主：自动上线。关掉窗口后留在系统托盘里继续跑。开机自启在「我」页打开，默认关。Web 和 Android 只能管理和调用，不能当宿主。
+
+添加 Agent 有两种方式，都在任意已登录的客户端上完成，不用坐在那台电脑前：
+
+- 从登记表选择（Claude Code、Codex 等）。这台宿主上还没装的，确认后由宿主安装。
+- 自定义命令：登记表里没有的程序，手填启动命令和参数。
+
+每个 Agent 固定在添加时选的那台宿主上。权限档位决定什么可以自动做：
+
+- 只读：读取、搜索一类操作自动放行，其余要审批。往其他会话发消息也要审批。
+- 可改工作目录：在只读之上，工作目录和额外目录里的修改自动放行。执行命令，以及目录外的写入，要审批。往其他会话发消息自动放行。
+- 完全放开：全部自动放行。
+
+超出档位时，审批卡片发到该 Agent 的专属会话，原会话只显示「等待主人批准」。
+
+真 agent 冒烟默认不跑。需要本机已登录 Claude Code 和 Codex，并且 PATH 上有 Node.js（登记表条目若走 npx，会装到临时目录），会消耗 token：
+
+```bash
+cd agent-host
+CHAT_REAL_AGENT_SMOKE=1 cargo test -p agent-host --test smoke -- --nocapture --test-threads=1
+```
+
+每个适配器发一次「只回复 pong」，再发一次会在当前目录创建文件的指令。权限请求按当前规则拒绝，并断言至少拒绝过一次。
+
+已知限制：Agent 的环境变量和密钥以明文存在服务器上，管理员和备份都能看到。macOS / Linux 的桌面安装包要在对应系统上编译，仓库里不附带现成的包。
+
 ## 局域网访问
 
 - **同一台机器只跑一个服务端实例**：多实例共享数据库但 WS 连接表各自独立，跨实例的消息只能落库、推不到对端（表现为"必须刷新才看到新消息"）。开发调试也统一用 docker。
@@ -115,6 +144,7 @@ cd gen/android && ./gradlew assembleDebug \
 ```
 app/            React + TS + Vite（Web/Tauri 共用 UI）
   src-tauri/    Tauri v2 壳（Windows/Android）
+agent-host/     宿主运行时库（ACP 客户端；桌面端拉起，测试也可直接驱动）
 server/         axum + sqlx + PostgreSQL
   src/api.rs    REST：auth/users/friends/conversations/messages/群管理/ws ticket
   src/ws.rs     WS：连接注册、消息广播、presence、typing、read、sync
