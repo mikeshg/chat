@@ -5,11 +5,12 @@
 // 不改 run 的签名；某个 CLI 需要原生对接时，在 runtime_for 里按 spec 选实现。
 
 use serde_json::Value;
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
-use tokio::sync::{mpsc, watch};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{mpsc, oneshot, watch};
 use uuid::Uuid;
 
 /// invocation_start / agent_probe 帧里 agent 字段的运行时描述。
@@ -29,6 +30,8 @@ pub struct AgentSpec {
     pub model: String,
     pub mode: String,
     pub extra_dirs: Vec<String>,
+    /// read_only / workspace / full。旧快照没有这个字段时按只读。
+    pub permission_tier: String,
     /// 登记表形状。调用前由宿主解析成 command / args；自定义命令时为 None。
     pub registry: Option<RegistryPin>,
 }
@@ -120,8 +123,65 @@ impl AgentSpec {
                 .to_string(),
             extra_dirs: json_string_list(v, "extra_dirs"),
             registry,
+            permission_tier: v
+                .get("permission_tier")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("read_only")
+                .to_string(),
         })
     }
+}
+
+/// 一次超档审批：宿主先登记等待槽，再把通知交给连接层发出去。
+#[derive(Debug)]
+pub struct ApprovalNotice {
+    pub request_id: String,
+    pub tool_call: Value,
+    pub options: Value,
+}
+
+/// 进行中的审批等待。连接层收到 approval_decision 时 resolve；
+/// 调用结束或断线时 finish / clear，避免 ACP 侧一直挂着。
+#[derive(Debug, Default)]
+pub struct ApprovalRegistry {
+    pending: Mutex<HashMap<String, oneshot::Sender<String>>>,
+}
+
+impl ApprovalRegistry {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// 登记必须发生在把帧发给服务端之前，决定才不会落空。
+    pub fn insert(&self, request_id: String, tx: oneshot::Sender<String>) {
+        self.pending.lock().unwrap().insert(request_id, tx);
+    }
+
+    /// 主人选定的 optionId。没有对应等待（已取消 / 已结束）则忽略。
+    pub fn resolve(&self, request_id: &str, option_id: String) -> bool {
+        match self.pending.lock().unwrap().remove(request_id) {
+            Some(tx) => tx.send(option_id).is_ok(),
+            None => false,
+        }
+    }
+
+    /// 调用方不再等了：摘掉发送端。已经被 resolve 取走时是空操作。
+    pub fn finish(&self, request_id: &str) {
+        self.pending.lock().unwrap().remove(request_id);
+    }
+
+    /// 连接断开：全部等待以 Err 醒来。
+    pub fn clear(&self) {
+        self.pending.lock().unwrap().clear();
+    }
+}
+
+/// 一次调用上的审批通道。没有它时，超档请求直接回 cancelled，不挂起。
+#[derive(Clone, Debug)]
+pub struct ApprovalLink {
+    pub tx: mpsc::UnboundedSender<ApprovalNotice>,
+    pub registry: Arc<ApprovalRegistry>,
 }
 
 /// 宿主上报给服务端的一个模型或模式选项。
@@ -161,6 +221,10 @@ pub struct RunRequest {
     pub cancel: watch::Receiver<bool>,
     /// Agent A13：本次调用注入的 MCP 服务（可空 = 不注入工具）
     pub mcp_servers: Vec<InjectedMcp>,
+    /// 服务端下发的权限档位。空串按只读。
+    pub permission_tier: String,
+    /// 超档时向服务端要审批。None = 单测 / 无连接，超档直接取消。
+    pub approvals: Option<ApprovalLink>,
 }
 
 impl RunRequest {
@@ -181,6 +245,7 @@ impl RunRequest {
             model: spec.model.clone(),
             mode: spec.mode.clone(),
             extra_dirs: spec.extra_dirs.clone(),
+            permission_tier: spec.permission_tier.clone(),
             spec,
             prompt,
             data_dir,
@@ -188,6 +253,7 @@ impl RunRequest {
             // 默认没人会取消（发送端已丢弃）；普通调用由调用方换成真正的取消信号
             cancel: watch::channel(false).1,
             mcp_servers: Vec::new(),
+            approvals: None,
         }
     }
 }

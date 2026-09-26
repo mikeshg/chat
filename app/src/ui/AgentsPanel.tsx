@@ -8,6 +8,7 @@ import AgentAvatar from "./AgentAvatar";
 import AgentEditor from "./AgentEditor";
 import AgentSettings from "./AgentSettings";
 import RegistryPicker from "./RegistryPicker";
+import PermissionTierField from "./PermissionTierField";
 
 /** Agent A01：「我」页的 Agent 管理面板（宿主列表 / Agent 列表 / 添加 Agent） */
 export default function AgentsPanel({ onClose }: { onClose: () => void }) {
@@ -21,6 +22,7 @@ export default function AgentsPanel({ onClose }: { onClose: () => void }) {
   const [cwd, setCwd] = useState("");
   const [runtimeTab, setRuntimeTab] = useState<"registry" | "custom">("registry");
   const [picked, setPicked] = useState<RegistryEntry | null>(null);
+  const [permissionTier, setPermissionTier] = useState("read_only");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
   const [showForm, setShowForm] = useState(false);
@@ -132,6 +134,7 @@ export default function AgentsPanel({ onClose }: { onClose: () => void }) {
         host_id: hostId,
         runtime,
         cwd: cwd.trim(),
+        permission_tier: permissionTier,
       });
       setList((l) => [...l, a]);
       setName("");
@@ -139,6 +142,7 @@ export default function AgentsPanel({ onClose }: { onClose: () => void }) {
       setArgs("");
       setCwd("");
       setPicked(null);
+      setPermissionTier("read_only");
       setShowForm(false);
     } catch (e) {
       // 400 bad_name / 409 name_taken / 404 宿主不存在 —— 保留服务端文案
@@ -319,6 +323,7 @@ export default function AgentsPanel({ onClose }: { onClose: () => void }) {
               value={cwd}
               onChange={(e) => setCwd(e.target.value)}
             />
+            <PermissionTierField value={permissionTier} onChange={setPermissionTier} />
             {err && <div className="auth-err">{err}</div>}
             <div className="row end">
               <button onClick={() => setShowForm(false)}>取消</button>

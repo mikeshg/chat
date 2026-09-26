@@ -19,6 +19,7 @@ describe("shapeAgentPatch", () => {
       ],
       outputMode: "",
       queueTimeout: "",
+      permissionTier: "workspace",
     });
     expect(body.name).toBe("coder");
     expect(body.runtime).toEqual({ command: "node", args: ["a", "b"] });
@@ -31,6 +32,7 @@ describe("shapeAgentPatch", () => {
     // 空串 = 跟随默认，必须是 null 而不是 0（0 表示永不超时）
     expect(body.output_mode).toBeNull();
     expect(body.queue_timeout_secs).toBeNull();
+    expect(body.permission_tier).toBe("workspace");
   });
 
   it("选了覆盖项就原样放进请求体", () => {
@@ -46,9 +48,11 @@ describe("shapeAgentPatch", () => {
       envRows: [],
       outputMode: "steps",
       queueTimeout: "0",
+      permissionTier: "full",
     });
     expect(body.output_mode).toBe("steps");
     expect(body.queue_timeout_secs).toBe(0);
+    expect(body.permission_tier).toBe("full");
     expect(body.runtime).toEqual({ command: "node", args: [] });
     expect(body.extra_dirs).toEqual([]);
     expect(body.env).toEqual({});

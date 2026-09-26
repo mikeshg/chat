@@ -22,6 +22,8 @@ export interface AgentFormInput {
   queueTimeout: string;
   /** 有它就按登记表形状提交，不再带自定义命令 */
   registry?: { id: string; version: string };
+  /** read_only / workspace / full */
+  permissionTier: string;
 }
 
 function lines(text: string): string[] {
@@ -52,5 +54,6 @@ export function shapeAgentPatch(input: AgentFormInput): PatchAgentReq {
     env,
     output_mode: input.outputMode === "" ? null : (input.outputMode as AgentOutputMode),
     queue_timeout_secs: input.queueTimeout === "" ? null : Number(input.queueTimeout),
+    permission_tier: input.permissionTier || "read_only",
   };
 }

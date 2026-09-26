@@ -124,7 +124,8 @@ const AGENT_SELECT: &str = "SELECT a.id, a.name, a.host_id, a.runtime, a.cwd, a.
         a.output_mode, a.queue_timeout_secs,
         a.extra_dirs, a.model, a.mode, a.instructions, a.env,
         a.avatar_version, a.reported_options,
-        (a.deleted_at IS NOT NULL) AS deleted
+        (a.deleted_at IS NOT NULL) AS deleted,
+        a.permission_tier
    FROM agents a";
 
 #[derive(sqlx::FromRow)]
@@ -146,6 +147,7 @@ struct AgentDbRow {
     avatar_version: i32,
     reported_options: Value,
     deleted: bool,
+    permission_tier: String,
 }
 
 fn agent_view(st: &SharedState, r: AgentDbRow) -> AgentView {
@@ -168,6 +170,7 @@ fn agent_view(st: &SharedState, r: AgentDbRow) -> AgentView {
         reported_options: r.reported_options,
         avatar_version: r.avatar_version,
         deleted: r.deleted,
+        permission_tier: r.permission_tier,
     }
 }
 
@@ -206,6 +209,7 @@ pub async fn create_agent(
         return Err(AppError::bad_request("bad_name"));
     }
     let (runtime, cwd) = normalize_runtime(&req.runtime, &req.cwd)?;
+    let permission_tier = normalize_tier(req.permission_tier.as_deref())?;
 
     let mut tx = st.pool.begin().await?;
     // 宿主必须属于当前用户；否则 404（不暴露他人资源存在性）
@@ -220,14 +224,15 @@ pub async fn create_agent(
     }
 
     let agent_id = match sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO agents (owner_id, host_id, name, runtime, cwd)
-         VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        "INSERT INTO agents (owner_id, host_id, name, runtime, cwd, permission_tier)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
     )
     .bind(uid)
     .bind(req.host_id)
     .bind(&req.name)
     .bind(&runtime)
     .bind(&cwd)
+    .bind(&permission_tier)
     .fetch_one(&mut *tx)
     .await
     {
@@ -276,6 +281,7 @@ pub async fn create_agent(
         reported_options: json!({}),
         avatar_version: 0,
         deleted: false,
+        permission_tier,
     }))
 }
 
@@ -317,6 +323,19 @@ fn check_pin(s: &str, max: usize) -> AppResult<String> {
         return Err(AppError::bad_request("bad_runtime"));
     }
     Ok(s.to_string())
+}
+
+fn valid_tier(tier: &str) -> bool {
+    matches!(tier, "read_only" | "workspace" | "full")
+}
+
+/// 缺省 = 只读。非法值 400。
+fn normalize_tier(tier: Option<&str>) -> AppResult<String> {
+    match tier.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok("read_only".into()),
+        Some(t) if valid_tier(t) => Ok(t.to_string()),
+        Some(_) => Err(AppError::bad_request("bad_permission_tier")),
+    }
 }
 
 fn check_instructions(s: &str) -> AppResult<()> {
@@ -515,6 +534,10 @@ pub async fn patch_agent(
         Some(v) => Some(check_env(v)?),
         None => None,
     };
+    let permission_tier = match req.permission_tier.as_deref() {
+        Some(t) => Some(normalize_tier(Some(t))?),
+        None => None,
+    };
 
     let mut tx = st.pool.begin().await?;
     let row = sqlx::query_as::<_, (Uuid, Option<DateTime<Utc>>)>(
@@ -607,6 +630,13 @@ pub async fn patch_agent(
             .execute(&mut *tx)
             .await?;
     }
+    if let Some(tier) = permission_tier {
+        sqlx::query("UPDATE agents SET permission_tier = $2, updated_at = now() WHERE id = $1")
+            .bind(id)
+            .bind(tier)
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
     Ok(Json(load_agent_view(&st, id).await?))
 }
@@ -662,6 +692,7 @@ pub async fn delete_agent(
             .await
             .unwrap_or_else(|_| vec![owner]);
         push_invocation(&st, &members, inv);
+        crate::approvals::expire_invocation(&st, inv.id).await;
     }
     // 会话列表要带上 deleted；Agent 列表面板重拉
     crate::api::notify(&st, &[owner], "conversations");
@@ -1003,9 +1034,13 @@ pub async fn cancel_invocation(
         })
         .to_string();
         let _ = st.send_to_host(host_id, &payload);
+        st.inv_runs.remove(&id);
     }
     let members = domain::member_ids(&st.pool, conv).await.unwrap_or_default();
     push_invocation(&st, &members, &inv);
+    if status == "running" || status == "awaiting_approval" {
+        crate::approvals::expire_invocation(&st, id).await;
+    }
     Ok(Json(inv))
 }
 
@@ -1076,6 +1111,7 @@ pub async fn revoke_access(st: &SharedState, user_ids: &[Uuid]) {
                 current_step: None,
             },
         );
+        crate::approvals::expire_invocation(st, inv.id).await;
     }
     for uid in user_ids {
         st.disconnect_user_hosts(*uid);
@@ -1148,6 +1184,7 @@ struct AgentRow {
     mode: String,
     instructions: String,
     env: Value,
+    permission_tier: String,
     deleted_at: Option<DateTime<Utc>>,
 }
 
@@ -1164,6 +1201,7 @@ struct AgentCfgRow {
     mode: String,
     instructions: String,
     env: Value,
+    permission_tier: String,
     deleted_at: Option<DateTime<Utc>>,
 }
 
@@ -1180,12 +1218,13 @@ fn row_to_agent(r: AgentCfgRow) -> AgentRow {
         mode: r.mode,
         instructions: r.instructions,
         env: r.env,
+        permission_tier: r.permission_tier,
         deleted_at: r.deleted_at,
     }
 }
 
 const AGENT_CFG_SQL: &str = "SELECT a.id, a.owner_id, a.host_id, a.name, a.runtime, a.cwd,
-        a.extra_dirs, a.model, a.mode, a.instructions, a.env, a.deleted_at";
+        a.extra_dirs, a.model, a.mode, a.instructions, a.env, a.permission_tier, a.deleted_at";
 
 async fn load_cfg(pool: &PgPool, id: Uuid) -> Result<Option<AgentRow>, sqlx::Error> {
     sqlx::query_as::<_, AgentCfgRow>(&format!("{AGENT_CFG_SQL} FROM agents a WHERE a.id = $1"))
@@ -1233,6 +1272,7 @@ fn agent_snapshot(a: &AgentRow) -> Value {
         "mode": a.mode,
         "instructions": a.instructions,
         "env": a.env,
+        "permission_tier": a.permission_tier,
     })
 }
 
@@ -1513,7 +1553,7 @@ async fn queue_timeout_secs(pool: &PgPool, agent_id: Uuid) -> i32 {
         .unwrap_or(86400)
 }
 
-const INV_RETURNING: &str =
+pub(crate) const INV_RETURNING: &str =
     "RETURNING id, agent_id, conversation_id, trigger_message_id, schedule_id, status, error,
                    created_at, started_at, finished_at";
 
@@ -2039,8 +2079,9 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
         schedule_id,
         schedule_name,
     } = row;
-    // 已取消 / 已超时 / 已结束，或不是这条宿主的调用：不发回复
-    if status != "running" || real_host != host_id {
+    // 已取消 / 已超时 / 已结束，或不是这条宿主的调用：不发回复。
+    // awaiting_approval 仍是进行中（进程崩了也会回 finish）。
+    if (status != "running" && status != "awaiting_approval") || real_host != host_id {
         return;
     }
     let context_key = match schedule_id {
@@ -2109,7 +2150,7 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
         let updated = sqlx::query_as::<_, InvocationView>(&format!(
             "UPDATE agent_invocations
                 SET status = 'succeeded', error = NULL, finished_at = now()
-              WHERE id = $1 AND status = 'running'
+              WHERE id = $1 AND status IN ('running', 'awaiting_approval')
              {INV_RETURNING}"
         ))
         .bind(inv_id)
@@ -2124,13 +2165,14 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
                 .unwrap_or_else(|_| vec![owner]);
             push_invocation(st, &member_ids, &inv);
         }
+        crate::approvals::expire_invocation(st, inv_id).await;
     } else {
         let err = v["error"].as_str().unwrap_or("agent error");
         let err: String = err.chars().take(500).collect();
         let updated = sqlx::query_as::<_, InvocationView>(&format!(
             "UPDATE agent_invocations
                 SET status = 'failed', error = $2, finished_at = now()
-              WHERE id = $1 AND status = 'running'
+              WHERE id = $1 AND status IN ('running', 'awaiting_approval')
              {INV_RETURNING}"
         ))
         .bind(inv_id)
@@ -2146,6 +2188,7 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
                 .unwrap_or_else(|_| vec![owner]);
             push_invocation(st, &member_ids, &inv);
         }
+        crate::approvals::expire_invocation(st, inv_id).await;
     }
 }
 
@@ -2190,6 +2233,7 @@ pub async fn post_agent_text(
                 forward_attachment: None,
                 agent_id: Some(agent_id),
                 agent_steps: if i == last { agent_steps.clone() } else { None },
+                approval: None,
             },
         )
         .await;

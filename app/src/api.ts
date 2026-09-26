@@ -375,6 +375,9 @@ export const agents = {
   patchSchedule: (id: string, body: PatchScheduleReq) =>
     patch<ScheduleView>(`/agent-schedules/${id}`, body),
   deleteSchedule: (id: string) => del<void>(`/agent-schedules/${id}`),
+  /** 主人决定一张审批卡片。404 不是主人，409 已不是 pending，400 选项不对 */
+  decideApproval: (id: string, optionId: string) =>
+    post<MessageView>(`/agent-approvals/${id}/decide`, { option_id: optionId }),
 };
 
 // ---------- 消息生命周期 ----------

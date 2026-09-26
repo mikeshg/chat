@@ -230,6 +230,7 @@ async fn acp_tool_e2e(mode: &str) -> String {
         mode: String::new(),
         extra_dirs: Vec::new(),
         registry: None,
+        permission_tier: "read_only".into(),
     };
     let (events, _) = tokio::sync::mpsc::unbounded_channel();
     let mut req =

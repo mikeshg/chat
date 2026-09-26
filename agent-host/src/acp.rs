@@ -8,12 +8,14 @@
 // 都不支持或恢复调用失败则退回 session/new，不把恢复失败当成这次调用失败。
 //
 // 宿主作为 ACP client 声明空 clientCapabilities：理论上 agent 不应发起
-// fs/terminal 等反向请求；万一发起（含 session/request_permission）一律拒绝。
+// fs/terminal 等反向请求；万一发起一律拒绝。session/request_permission 按
+// 权限档位自动放行，超档则等服务端的审批决定（A12）。
 
+use crate::permission;
 pub use crate::runtime::AgentSpec;
 use crate::runtime::{
-    AgentOption, AgentRuntime, Events, InjectedMcp, RunEvent, RunFuture, RunOutput, RunRequest,
-    StepRecord,
+    AgentOption, AgentRuntime, ApprovalLink, ApprovalNotice, Events, InjectedMcp, RunEvent,
+    RunFuture, RunOutput, RunRequest, StepRecord,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -23,7 +25,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdin;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
+use uuid::Uuid;
 
 /// 收到 session/cancel 后，最多再等这么久让 session/prompt 返回，然后杀进程。
 const CANCEL_GRACE: Duration = Duration::from_secs(5);
@@ -59,6 +62,12 @@ struct Pipe {
     open_steps: HashMap<String, (String, String)>,
     /// 已完成步骤（按收尾顺序）
     steps: Vec<StepRecord>,
+    /// 权限档位（空串已归一成 read_only）
+    tier: String,
+    /// 工作目录在前，后面是额外目录
+    roots: Vec<PathBuf>,
+    approvals: Option<ApprovalLink>,
+    cancel: watch::Receiver<bool>,
 }
 
 /// 跑一次调用：起进程、握手、发 prompt、收全部分块文本（同时逐段发 RunEvent::Text）。
@@ -143,6 +152,14 @@ pub async fn run_invocation(req: RunRequest, events: Events) -> Result<RunOutput
         suppress_chunks: false,
         open_steps: HashMap::new(),
         steps: Vec::new(),
+        tier: if req.permission_tier.is_empty() {
+            "read_only".into()
+        } else {
+            req.permission_tier.clone()
+        },
+        roots: permission_roots(&dir, &req.extra_dirs),
+        approvals: req.approvals.clone(),
+        cancel: req.cancel.clone(),
     };
     // 取消信号单独克隆一份：drive 只读 req，等待取消需要可变的 Receiver
     let mut cancel = req.cancel.clone();
@@ -484,32 +501,81 @@ impl Pipe {
         Ok(None)
     }
 
-    /// agent→client 请求：A01 一律不许写盘/跑终端；权限请求也选拒绝项。
+    /// agent→client 请求：写盘/跑终端仍拒绝。权限请求按档位自动放行或等审批。
     async fn answer_request(&mut self, msg: &Value) -> Result<(), String> {
         let id = msg["id"].clone();
         let method = msg["method"].as_str().unwrap_or_default();
         let resp = if method == "session/request_permission" {
-            self.permissions_rejected += 1;
-            let deny = msg
-                .pointer("/params/options")
-                .and_then(Value::as_array)
-                .and_then(|os| {
-                    os.iter()
-                        .find(|o| o["kind"].as_str().unwrap_or_default().contains("reject"))
-                        .and_then(|o| o["optionId"].as_str())
-                        .map(str::to_string)
-                });
-            match deny {
-                Some(option_id) => json!({"jsonrpc":"2.0","id":id,
-                    "result":{"outcome":{"outcome":"selected","optionId":option_id}}}),
-                None => json!({"jsonrpc":"2.0","id":id,
-                    "result":{"outcome":{"outcome":"cancelled"}}}),
+            let resp = self.permission_response(id, &msg["params"]).await?;
+            // 没被放行（取消或选了拒绝类选项）的次数：真 agent 冒烟用它断言权限请求确实走到了宿主
+            if !granted(&resp, &msg["params"]) {
+                self.permissions_rejected += 1;
             }
+            resp
         } else {
             json!({"jsonrpc":"2.0","id":id,
                 "error":{"code":-32601,"message":"unsupported by chat agent host"}})
         };
         self.write(&resp).await
+    }
+
+    /// Ok(response) 写回 agent。Err 表示审批通道断了，整次调用失败（不把取消写成成功）。
+    async fn permission_response(&mut self, id: Value, params: &Value) -> Result<Value, String> {
+        let tool = permission::summarize_tool(&params["toolCall"]);
+        let options = params.get("options").cloned().unwrap_or(Value::Null);
+        let kind = tool["kind"].as_str().unwrap_or("other");
+        let locations = permission::location_strings(&tool["locations"]);
+        if permission::within_tier(&self.tier, kind, &locations, &self.roots) {
+            if let Some(option_id) = permission::pick_allow(&options) {
+                return Ok(selected(&id, &option_id));
+            }
+        }
+        // 没有可选项就没法等主人挑，直接取消。
+        if !permission::has_option(&options) {
+            return Ok(cancelled_outcome(&id));
+        }
+        let Some(link) = self.approvals.clone() else {
+            return Ok(cancelled_outcome(&id));
+        };
+        let request_id = Uuid::new_v4().to_string();
+        let (tx, mut rx) = oneshot::channel();
+        link.registry.insert(request_id.clone(), tx);
+        if link
+            .tx
+            .send(ApprovalNotice {
+                request_id: request_id.clone(),
+                tool_call: tool,
+                options,
+            })
+            .is_err()
+        {
+            link.registry.finish(&request_id);
+            return Err("审批通道已关闭".into());
+        }
+        if *self.cancel.borrow() {
+            link.registry.finish(&request_id);
+            return Ok(cancelled_outcome(&id));
+        }
+        let decided = loop {
+            tokio::select! {
+                biased;
+                res = self.cancel.changed() => {
+                    if res.is_err() || *self.cancel.borrow() {
+                        link.registry.finish(&request_id);
+                        return Ok(cancelled_outcome(&id));
+                    }
+                }
+                ans = &mut rx => {
+                    link.registry.finish(&request_id);
+                    break ans;
+                }
+            }
+        };
+        match decided {
+            Ok(option_id) => Ok(selected(&id, &option_id)),
+            // 连接断开清掉了等待槽：不要再回一个让 agent 继续的结果。
+            Err(_) => Err("审批等待被中断".into()),
+        }
     }
 
     fn on_notify(&mut self, method: &str, params: &Value) {
@@ -596,4 +662,39 @@ impl Pipe {
 
 fn trunc(s: &str) -> String {
     s.chars().take(500).collect()
+}
+
+fn permission_roots(cwd: &Path, extra: &[String]) -> Vec<PathBuf> {
+    let mut roots = vec![cwd.to_path_buf()];
+    for dir in extra {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            roots.push(PathBuf::from(dir));
+        }
+    }
+    roots
+}
+
+fn selected(id: &Value, option_id: &str) -> Value {
+    json!({"jsonrpc":"2.0","id":id,
+        "result":{"outcome":{"outcome":"selected","optionId":option_id}}})
+}
+
+fn cancelled_outcome(id: &Value) -> Value {
+    json!({"jsonrpc":"2.0","id":id,
+        "result":{"outcome":{"outcome":"cancelled"}}})
+}
+
+/// 权限回复是否放行：选中的选项 kind 含 allow 才算；取消或拒绝类选项都不算。
+fn granted(resp: &Value, params: &Value) -> bool {
+    let outcome = &resp["result"]["outcome"];
+    if outcome["outcome"].as_str() != Some("selected") {
+        return false;
+    }
+    let picked = outcome["optionId"].as_str().unwrap_or_default();
+    params["options"]
+        .as_array()
+        .and_then(|os| os.iter().find(|o| o["optionId"].as_str() == Some(picked)))
+        .and_then(|o| o["kind"].as_str())
+        .is_some_and(|k| k.contains("allow"))
 }

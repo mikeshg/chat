@@ -6,6 +6,7 @@ import { shapeAgentPatch } from "./agentForm";
 import { runtimeLabel } from "./registryEntry";
 import AgentAvatar from "./AgentAvatar";
 import AgentSchedules from "./AgentSchedules";
+import PermissionTierField from "./PermissionTierField";
 import { OUTPUT_MODE_OPTIONS, QUEUE_TIMEOUT_OPTIONS } from "./AgentSettings";
 
 function errText(e: unknown): string {
@@ -22,6 +23,7 @@ function errText(e: unknown): string {
     host_immutable: "不能更换宿主",
     bad_output_mode: "输出方式不合法",
     bad_queue_timeout: "排队超时不合法",
+    bad_permission_tier: "权限档位不合法",
     host_offline: "宿主不在线",
   };
   if (e.status === 400) return known[e.message] ?? `参数不合法：${e.message}`;
@@ -61,6 +63,7 @@ export default function AgentEditor({
   const [queueTimeout, setQueueTimeout] = useState(
     agent.queue_timeout_secs == null ? "" : String(agent.queue_timeout_secs),
   );
+  const [permissionTier, setPermissionTier] = useState(agent.permission_tier || "read_only");
   const [reported, setReported] = useState<ReportedOptions>(agent.reported_options ?? {});
   const [avatarVersion, setAvatarVersion] = useState(agent.avatar_version ?? 0);
   const [err, setErr] = useState("");
@@ -118,6 +121,7 @@ export default function AgentEditor({
           outputMode,
           queueTimeout,
           registry: pin,
+          permissionTier,
         }),
       );
       onSaved(updated);
@@ -230,6 +234,7 @@ export default function AgentEditor({
         value={cwd}
         onChange={(e) => setCwd(e.target.value)}
       />
+      <PermissionTierField value={permissionTier} onChange={setPermissionTier} />
       <textarea
         aria-label="额外目录"
         placeholder="额外目录（每行一个）"

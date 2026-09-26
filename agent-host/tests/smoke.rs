@@ -63,6 +63,8 @@ fn spec_from(name: &str, launch: Launch, cwd: &str) -> AgentSpec {
         mode: String::new(),
         extra_dirs: Vec::new(),
         registry: None,
+        // 没有审批通道：超档请求会被取消，冒烟据此断言权限请求确实到了宿主
+        permission_tier: "read_only".into(),
     }
 }
 

@@ -1,7 +1,7 @@
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    AttachmentView, ConversationPref, CreatePollReq, MessageView, PollOptionView, PollView,
-    PrefUpdateReq, ReactionView, ReplyPreview,
+    ApprovalView, AttachmentView, ConversationPref, CreatePollReq, MessageView, PollOptionView,
+    PollView, PrefUpdateReq, ReactionView, ReplyPreview,
 };
 use chrono::{DateTime, Utc};
 use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
@@ -216,6 +216,8 @@ pub struct MsgViewRow {
     pub agent_avatar_version: Option<i32>,
     // Agent A03（0024）：该消息附带的已完成步骤记录
     pub agent_steps: Option<sqlx::types::Json<Vec<crate::model::AgentStepView>>>,
+    // Agent A12（0028）：kind='approval' 的卡片；墓碑为 NULL
+    pub approval: Option<sqlx::types::Json<ApprovalView>>,
 }
 
 impl MsgViewRow {
@@ -267,6 +269,7 @@ impl MsgViewRow {
                 avatar_version: self.agent_avatar_version.unwrap_or(0),
             }),
             agent_steps: self.agent_steps.map(|j| j.0),
+            approval: self.approval.map(|j| j.0),
         }
     }
 }
@@ -547,6 +550,15 @@ pub struct PostMessage<'a> {
     /// Agent A03：随消息落库的已完成步骤（jsonb 数组）；仅 Agent 回写路径用。
     /// 仅当 agent_id 非空时生效，普通消息路径恒 None。
     pub agent_steps: Option<serde_json::Value>,
+    /// Agent A12：Some 时本条消息 kind='approval'，同事务写入 agent_approvals。
+    pub approval: Option<ApprovalDraft<'a>>,
+}
+
+/// 审批卡片随消息一起落库的种子。request / options 由调用方整形。
+pub struct ApprovalDraft<'a> {
+    pub invocation_id: Uuid,
+    pub request: &'a serde_json::Value,
+    pub options: &'a serde_json::Value,
 }
 
 /// 已整形的投票定义（随消息同事务落库）
@@ -821,10 +833,18 @@ async fn write_message(
         Some(src) => clone_attachment(tx, src, msg.conversation_id).await?,
         None => load_attachment(tx, msg).await?,
     };
-    let (content, kind) = match &msg.poll {
-        // 旧客户端 fallback：content 里始终有 '[投票] 问题' 可读文本
-        Some(spec) => (format!("[投票] {}", spec.question), "poll"),
-        None => normalize_body(msg.content, attachment.as_ref())?,
+    let (content, kind) = if msg.approval.is_some() {
+        let content = msg.content.trim();
+        if content.is_empty() || content.chars().count() > 4000 {
+            return Err(PostError::deny("bad_message", "message must be 1-4000 chars").into());
+        }
+        (content.to_string(), "approval")
+    } else {
+        match &msg.poll {
+            // 旧客户端 fallback：content 里始终有 '[投票] 问题' 可读文本
+            Some(spec) => (format!("[投票] {}", spec.question), "poll"),
+            None => normalize_body(msg.content, attachment.as_ref())?,
+        }
     };
 
     // Agent 消息不解析 @。手打 @token 若命中发送者自己仍在用的 Agent，也不算成员提及。
@@ -936,6 +956,19 @@ async fn write_message(
             .execute(&mut **tx)
             .await?;
         }
+    }
+
+    if let Some(ap) = &msg.approval {
+        sqlx::query(
+            "INSERT INTO agent_approvals (invocation_id, message_id, request, options, status)
+             VALUES ($1, $2, $3, $4, 'pending')",
+        )
+        .bind(ap.invocation_id)
+        .bind(message_id)
+        .bind(ap.request)
+        .bind(ap.options)
+        .execute(&mut **tx)
+        .await?;
     }
 
     Ok(load_posted(
@@ -2168,6 +2201,7 @@ pub async fn create_poll(
             forward_attachment: None,
             agent_id: None,
             agent_steps: None,
+            approval: None,
             poll: Some(PollSpec {
                 question,
                 options,
@@ -2465,6 +2499,7 @@ pub async fn forward_message(
                 forward_attachment: src.att_id,
                 agent_id: None,
                 agent_steps: None,
+                approval: None,
             },
         )
         .await;
