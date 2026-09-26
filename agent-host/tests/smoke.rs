@@ -5,7 +5,9 @@
 //
 //   CHAT_REAL_AGENT_SMOKE=1 cargo test -p agent-host --test smoke -- --nocapture --test-threads=1
 //
-// 各发一次「只回复 pong」和一次会触发权限请求的指令。权限在本票仍是拒绝。
+// 只跑其中一个：CHAT_REAL_AGENT_SMOKE=codex（或 claude）。
+//
+// 各发一次「只回复 pong」和一次往工作目录外写文件的指令（一定触发权限请求，冒烟里拒绝）。
 
 use agent_host::acp::run_invocation;
 use agent_host::registry::{self, Launch};
@@ -14,8 +16,12 @@ use serde_json::Value;
 use std::path::PathBuf;
 use uuid::Uuid;
 
-fn enabled() -> bool {
-    std::env::var("CHAT_REAL_AGENT_SMOKE").ok().as_deref() == Some("1")
+fn wanted(needle: &str) -> bool {
+    match std::env::var("CHAT_REAL_AGENT_SMOKE").ok().as_deref() {
+        Some("1") => true,
+        Some(v) => v == needle,
+        None => false,
+    }
 }
 
 fn score(agent: &Value, needle: &str) -> i32 {
@@ -95,11 +101,14 @@ async fn one(data: &PathBuf, url: &str, agent: &Value, work: &PathBuf) {
     .unwrap_or_else(|e| panic!("{id} pong 失败: {e}"));
     assert!(!pong.text.trim().is_empty(), "{id} pong 正文为空");
 
+    // 工作目录外：Codex 的沙箱总允许写工作目录，只有目录外的写入一定会来问
+    let outside = data.join(format!("outside-{id}"));
+    std::fs::create_dir_all(&outside).unwrap();
     let (events, _) = tokio::sync::mpsc::unbounded_channel();
     let perm = run_invocation(
         RunRequest::for_invocation(
             spec_from(name, launch, &cwd),
-            "在当前目录创建文件 smoke.txt".into(),
+            format!("在目录 {} 里创建文件 smoke.txt", outside.display()),
             work.clone(),
         ),
         events,
@@ -112,11 +121,15 @@ async fn one(data: &PathBuf, url: &str, agent: &Value, work: &PathBuf) {
         "{id} 应拒绝权限请求，实际 {}",
         perm.permissions_rejected
     );
+    assert!(
+        !outside.join("smoke.txt").exists(),
+        "{id} 被拒后仍写出了文件"
+    );
 }
 
 #[tokio::test]
 async fn real_registry_agents_smoke() {
-    if !enabled() {
+    if !wanted("claude") && !wanted("codex") {
         eprintln!("skip: 设置 CHAT_REAL_AGENT_SMOKE=1 才跑真 agent 冒烟");
         return;
     }
@@ -131,8 +144,10 @@ async fn real_registry_agents_smoke() {
     )
     .await
     .expect("拉取登记表");
-    let claude = pick(&doc, "claude").expect("Claude Code");
-    let codex = pick(&doc, "codex").expect("Codex");
-    one(&data, url, claude, &work).await;
-    one(&data, url, codex, &work).await;
+    for needle in ["claude", "codex"] {
+        if wanted(needle) {
+            let agent = pick(&doc, needle).expect(needle);
+            one(&data, url, agent, &work).await;
+        }
+    }
 }

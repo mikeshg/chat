@@ -293,6 +293,19 @@ fn option_list(v: Option<&Value>, id_keys: &[&str]) -> Option<Vec<AgentOption>> 
     )
 }
 
+/// 主人没选模式时，切到「凡事先问」的模式，让档位决定放行什么。codex-acp 用
+/// `_meta.kind = "standard"` 标它；它的默认模式 auto_review 会自己批掉请求，档位就管不到了。
+/// 没有这个标记的 agent（如 Claude 默认就先问）不动。
+fn ask_first_mode(modes: Option<&Value>) -> Option<String> {
+    let modes = modes?;
+    let id = modes["availableModes"]
+        .as_array()?
+        .iter()
+        .find(|m| m.pointer("/_meta/kind").and_then(Value::as_str) == Some("standard"))?["id"]
+        .as_str()?;
+    (modes["currentModeId"].as_str() != Some(id)).then(|| id.to_string())
+}
+
 fn in_options(id: &str, list: &Option<Vec<AgentOption>>) -> bool {
     list.as_ref()
         .is_some_and(|xs| xs.iter().any(|o| o.id == id))
@@ -387,10 +400,15 @@ async fn drive(
             .await;
         return Ok(Driven::default());
     }
-    if !req.mode.is_empty() && in_options(&req.mode, &modes) {
+    let mode = if req.mode.is_empty() {
+        ask_first_mode(new.get("modes"))
+    } else {
+        in_options(&req.mode, &modes).then(|| req.mode.clone())
+    };
+    if let Some(mode) = mode {
         pipe.call(
             "session/set_mode",
-            json!({"sessionId": session_id, "modeId": req.mode}),
+            json!({"sessionId": session_id, "modeId": mode}),
         )
         .await?;
     }
@@ -762,4 +780,26 @@ fn granted(resp: &Value, params: &Value) -> bool {
         .and_then(|os| os.iter().find(|o| o["optionId"].as_str() == Some(picked)))
         .and_then(|o| o["kind"].as_str())
         .is_some_and(|k| k.contains("allow"))
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::ask_first_mode;
+    use serde_json::json;
+
+    #[test]
+    fn picks_standard_mode_unless_already_current() {
+        let codex = json!({"currentModeId": "agent", "availableModes": [
+            {"id": "read-only", "_meta": {"kind": "standard"}},
+            {"id": "agent", "_meta": {"kind": "auto_review"}},
+        ]});
+        assert_eq!(ask_first_mode(Some(&codex)).as_deref(), Some("read-only"));
+        let current = json!({"currentModeId": "read-only", "availableModes": [
+            {"id": "read-only", "_meta": {"kind": "standard"}},
+        ]});
+        assert_eq!(ask_first_mode(Some(&current)), None);
+        let claude = json!({"currentModeId": "default", "availableModes": [{"id": "default"}, {"id": "plan"}]});
+        assert_eq!(ask_first_mode(Some(&claude)), None);
+        assert_eq!(ask_first_mode(None), None);
+    }
 }
