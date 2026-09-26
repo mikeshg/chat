@@ -3,6 +3,7 @@ import { auth, getServer } from "../api";
 import { setState, useApp } from "../store";
 import { stopWs } from "../ws";
 import NotifySettings from "./NotifySettings";
+import PushSettings from "./PushSettings";
 import ThemeSetting from "./ThemeSetting";
 import SecuritySettings from "./SecuritySettings";
 import StorageUsage from "./StorageUsage";
@@ -57,6 +58,7 @@ export default function MePanel() {
       </section>
 
       <NotifySettings />
+      <PushSettings />
       <StorageUsage />
       <ThemeSetting />
       <SecuritySettings />

@@ -40,6 +40,34 @@ const syncedSeq = new Map<string, number>(); // conv_id → 已确认连续的�
 const syncInflight = new Set<string>(); // 每会话只允许一个未完成 sync
 const readSeq = new Map<string, number>(); // conv_id → 已应用的最大 read_sync seq（P2-4 单调）
 
+// ---- V2 P3-3：前台状态上报 ----
+// active = 页面可见且窗口有焦点；服务端按「至少一条 active 连接」决定是否发 ntfy 离线推送。
+// 旧服务端不认识 client_state 帧会忽略，不影响。
+const CLIENT_STATE_DEBOUNCE_MS = 500;
+let clientStateTimer: ReturnType<typeof setTimeout> | null = null;
+let reportedActive: boolean | null = null; // 已上报值；null = 未上报（连接建立时强制报一次）
+
+/** 当前客户端是否「在前台」：页面可见且窗口有焦点 */
+export function clientActive(): boolean {
+  return inForeground();
+}
+
+/** 上报前台状态；immediate=false 时 500ms 去抖——visibilitychange/focus/blur 连发只报一次 */
+export function reportClientState(immediate = false) {
+  if (clientStateTimer != null) {
+    clearTimeout(clientStateTimer);
+    clientStateTimer = null;
+  }
+  const send = () => {
+    const active = clientActive();
+    if (active === reportedActive) return; // 值没变不重复报
+    reportedActive = active;
+    wsSend({ type: "client_state", active });
+  };
+  if (immediate) send();
+  else clientStateTimer = setTimeout(send, CLIENT_STATE_DEBOUNCE_MS);
+}
+
 type Outgoing = {
   convId: string;
   clientMsgId: string;
@@ -75,6 +103,11 @@ export function stopWs() {
   syncedSeq.clear();
   syncInflight.clear();
   readSeq.clear();
+  if (clientStateTimer != null) {
+    clearTimeout(clientStateTimer);
+    clientStateTimer = null;
+  }
+  reportedActive = null;
   if (ws) {
     ws.onclose = null;
     ws.close();
@@ -138,6 +171,8 @@ async function connect() {
   sock.onopen = () => {
     if (gen !== wsGen || gen !== session() || ws !== sock) return;
     attempts = 0;
+    reportedActive = null; // 新连接先报一次当前前台状态（P3-3）
+    reportClientState(true);
     setState({ wsReady: true });
     void afterOpen(sock, gen);
   };
@@ -418,6 +453,10 @@ function readActiveOnReturn() {
 if (typeof window !== "undefined") {
   window.addEventListener("focus", readActiveOnReturn);
   document.addEventListener("visibilitychange", readActiveOnReturn);
+  // P3-3：焦点/可见性变化 → 去抖上报 client_state（服务端据此判定是否离线推送）
+  window.addEventListener("focus", () => reportClientState());
+  window.addEventListener("blur", () => reportClientState());
+  document.addEventListener("visibilitychange", () => reportClientState());
 }
 
 function onMessage(m: MessageView) {

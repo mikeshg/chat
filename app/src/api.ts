@@ -16,6 +16,7 @@ import type {
   MessagesPage,
   MessageView,
   PrefUpdate,
+  PushState,
   RequestsView,
   SessionView,
   ServerInfo,
@@ -243,6 +244,15 @@ export const auth = {
   revokeOtherSessions: () => post<void>("/users/me/sessions/revoke-others"),
   /** 本人附件用量与配额（V2 P2-1） */
   storage: () => get<StorageView>("/users/me/storage"),
+  /** ntfy 推送设置（V2 P3-3）；首次访问时服务端生成随机主题 */
+  push: () => get<PushState>("/users/me/push"),
+  /** 部分更新：只传要改的字段；服务器未配置时 enabled=true 返回 400 */
+  updatePush: (patch: { enabled?: boolean; preview?: boolean }) =>
+    put<PushState>("/users/me/push", patch),
+  /** 换主题：旧主题作废，需在 ntfy App 重新订阅 */
+  rotatePush: () => post<PushState>("/users/me/push/rotate"),
+  /** 立即发一条测试推送（不受 30s 合并限制）；失败 502 */
+  testPush: () => post<PushState>("/users/me/push/test"),
   searchUser: async (q: string) => {
     const r = await get<unknown>(`/users/search?q=${encodeURIComponent(q)}`);
     // 兼容旧服务端返回单对象的形态
@@ -392,7 +402,11 @@ export async function serverInfo(server?: string): Promise<ServerInfo> {
     if (!res.ok) return { registration_mode: "open" };
     const j = (await res.json()) as Partial<ServerInfo>;
     const m = j.registration_mode;
-    return { registration_mode: m === "invite" || m === "closed" ? m : "open" };
+    // push_available 缺省（旧服务端）按未配置处理
+    return {
+      registration_mode: m === "invite" || m === "closed" ? m : "open",
+      push_available: j.push_available === true,
+    };
   } catch {
     return { registration_mode: "open" };
   }

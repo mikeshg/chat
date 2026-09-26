@@ -66,6 +66,7 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
         include_str!("../migrations/0012_v2_media.sql"),
         include_str!("../migrations/0015_self_conversations.sql"),
         include_str!("../migrations/0016_search_trgm.sql"),
+        include_str!("../migrations/0018_push.sql"),
     ] {
         sqlx::raw_sql(script).execute(&pool).await.unwrap();
     }
@@ -228,6 +229,12 @@ async fn upgrade_backfills_self_conversations() {
             .await
             .unwrap();
     assert_eq!(member_count, 1);
+
+    // 0018：push_settings 建表
+    sqlx::raw_sql(include_str!("../migrations/0018_push.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
 
     pool.close().await;
     sqlx::query(&format!("DROP DATABASE {name}"))

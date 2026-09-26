@@ -820,3 +820,33 @@ button.ctx-item:hover { background: var(--bg); }
 .cm-audio { padding: 6px 4px; }
 .cm-audio-meta { color: var(--muted); font-size: 11px; margin-bottom: 2px; }
 .cm-empty { color: var(--muted); text-align: center; padding: 24px 0; font-size: 13px; }
+
+/* ===== V2 P3-3 ===== */
+/* 「我」页手机推送卡片（ntfy）：订阅地址 / 操作按钮 */
+.push-url {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.push-url-text {
+  flex: 1;
+  min-width: 0;
+  word-break: break-all;
+  font-size: 12px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+}
+.push-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+/* 管理后台 ntfy 配置栏 */
+.ad-push {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 560px;
+}

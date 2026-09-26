@@ -53,6 +53,12 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
             "/users/me/sessions/{id}",
             delete(crate::sessions::revoke_session),
         )
+        .route(
+            "/users/me/push",
+            get(crate::push::get_push).put(crate::push::put_push),
+        )
+        .route("/users/me/push/rotate", post(crate::push::rotate_push))
+        .route("/users/me/push/test", post(crate::push::test_push))
         .route("/users/search", get(search_user))
         .route("/search", get(global_search))
         .route("/friends", get(list_friends))
