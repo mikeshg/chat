@@ -9594,8 +9594,9 @@ async fn agent_invoke_concurrent() {
         .await
         .unwrap();
     let t0 = std::time::Instant::now();
-    send_ws(&mut sa, &conv, "p1", "sleep:1500").await;
-    send_ws(&mut sa, &conv, "p2", "sleep:1500").await;
+    // 各睡 3s：并行约 3s + 起进程开销，串行至少 6s；阈值留足余量，机器繁忙时也不误报
+    send_ws(&mut sa, &conv, "p1", "sleep:3000").await;
+    send_ws(&mut sa, &conv, "p2", "sleep:3000").await;
 
     let mut frames: Vec<Value> = Vec::new();
     while frames
@@ -9608,8 +9609,8 @@ async fn agent_invoke_concurrent() {
     }
     let elapsed = t0.elapsed();
     assert!(
-        elapsed < A01Dur::from_millis(2900),
-        "并发两次 1.5s 调用应约 1.5-2s 完成，实际 {elapsed:?}（串行会 ~3s+）"
+        elapsed < A01Dur::from_millis(5500),
+        "并发两次 3s 调用应约 3-4s 完成，实际 {elapsed:?}（串行会 6s+）"
     );
     ha.shutdown().await;
 }
