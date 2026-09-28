@@ -1123,3 +1123,15 @@ button.agent-host-name:hover { background: transparent; color: var(--link); }
 }
 .nest-reason { color: var(--muted); }
 .nest-deeper { color: var(--muted); font-size: 12px; margin-top: 2px; }
+
+/* ===== Agent A20 ===== */
+.approval-detail summary { color: var(--muted); font-size: 12px; cursor: pointer; }
+.approval-detail pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 4px 0 0;
+  max-height: 240px;
+  overflow-y: auto;
+  font-size: 13px;
+  color: var(--text);
+}

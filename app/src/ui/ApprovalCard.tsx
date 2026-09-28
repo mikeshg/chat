@@ -15,6 +15,7 @@ export default function ApprovalCard({
   const [err, setErr] = useState("");
   const req = approval.request ?? {};
   const locations = Array.isArray(req.locations) ? req.locations.filter(Boolean) : [];
+  const detail = typeof req.detail === "string" ? req.detail : "";
   const options = Array.isArray(approval.options) ? approval.options : [];
   const picked = options.find((o) => o.optionId === approval.decision);
 
@@ -46,6 +47,13 @@ export default function ApprovalCard({
         类型：{approvalKindLabel(req.kind)}
         {locations.length > 0 && <span> · 路径：{locations.join("、")}</span>}
       </div>
+      {/* A20：detail 是批准后实际发出的完整正文，必须全文可见；长文可折叠但不能丢内容 */}
+      {detail && (
+        <details className="approval-detail" open>
+          <summary>完整正文</summary>
+          <pre>{detail}</pre>
+        </details>
+      )}
       {approval.status === "pending" && (
         <div className="approval-actions">
           {options.map((o) => (

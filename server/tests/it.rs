@@ -17113,3 +17113,172 @@ async fn a22_decide_last_races_new_request() {
     let msgs = conv_messages(&base, &a, &conv).await;
     assert_eq!(a22_pending_count(&msgs), 0, "{msgs:?}");
 }
+
+// ===== Agent A20 =====
+// 发消息审批的完整披露：宿主上报的 tool_call.detail（完整正文）原样进卡片
+// request（含内嵌 tool_call），超过 4000 字按字截断；locations 照旧。
+
+/// 裸宿主连接（role=host）：host_hello 登记后返回 (ws, host_id)。
+/// 只用来收 invocation_start 和上报 approval_request，不跑真实运行时。
+async fn a20_raw_host(
+    base: &str,
+    u: &TestUser,
+) -> (
+    impl StreamExt<Item = Result<WsMsg, tokio_tungstenite::tungstenite::Error>>
+        + SinkExt<WsMsg, Error = tokio_tungstenite::tungstenite::Error>
+        + Unpin,
+    String,
+) {
+    let ticket: Value = http()
+        .get(format!("{base}/v1/ws/ticket"))
+        .header("authorization", authz(&u.access))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let url = format!(
+        "{}/v1/ws?ticket={}&role=host",
+        base.replacen("http://", "ws://", 1),
+        ticket["ticket"].as_str().unwrap()
+    );
+    let (mut hb, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    hb.send(WsMsg::Text(
+        json!({"type":"host_hello","install_id":uuid::Uuid::new_v4(),
+               "label":"a20","platform":"windows"})
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let ready = until_frame(&mut hb, "host_ready", A01Dur::from_secs(10)).await;
+    let host_id = ready.iter().find(|f| f["type"] == "host_ready").unwrap()["host_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    (hb, host_id)
+}
+
+/// 往专属会话发一条消息发起调用，从宿主连接上拿到 invocation_start 的调用号。
+async fn a20_invoke<S, H>(sa: &mut S, hb: &mut H, conv: &str, cmid: &str) -> String
+where
+    S: SinkExt<WsMsg> + Unpin,
+    <S as futures_util::Sink<WsMsg>>::Error: std::fmt::Debug,
+    H: StreamExt<Item = Result<WsMsg, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    send_ws(sa, conv, cmid, "干活").await;
+    let frames = until_frame(hb, "invocation_start", A01Dur::from_secs(15)).await;
+    frames
+        .iter()
+        .rev()
+        .find(|f| f["type"] == "invocation_start")
+        .expect("宿主应收到 invocation_start")["invocation_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+async fn a20_ask<H>(hb: &mut H, inv: &str, request_id: &str, detail: &str)
+where
+    H: SinkExt<WsMsg> + Unpin,
+    <H as futures_util::Sink<WsMsg>>::Error: std::fmt::Debug,
+{
+    hb.send(WsMsg::Text(
+        json!({
+            "type": "approval_request",
+            "invocation_id": inv,
+            "request_id": request_id,
+            "tool_call": {
+                "title": "发消息到「专属会话」",
+                "kind": "send_message",
+                "locations": ["C:\\tmp\\a.txt"],
+                "detail": detail,
+            },
+            "options": [
+                {"optionId": "allow_once", "name": "本次允许", "kind": "allow_once"},
+                {"optionId": "reject_once", "name": "拒绝", "kind": "reject_once"},
+            ],
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a20_approval_detail_preserved_and_truncated() {
+    let base = spawn_named_db(&format!("chat_it_a20_{}", uniq())).await;
+    let a = register(&base, &format!("a20_{}", uniq())).await;
+    let (mut hb, host_id) = a20_raw_host(&base, &a).await;
+    let (st, agent) = create_agent(&base, &a, &host_id, "discloser").await;
+    assert_eq!(st, 200, "{agent}");
+    let conv = agent["conversation_id"].as_str().unwrap().to_string();
+    let (mut sa, _) = tokio_tungstenite::connect_async(ws_url(&base, &a).await)
+        .await
+        .unwrap();
+
+    // 完整保留：detail（含换行）原样进卡片 request 与内嵌 tool_call
+    let inv1 = a20_invoke(&mut sa, &mut hb, &conv, "d1").await;
+    let detail = "第一行\n第二行\n第三行";
+    a20_ask(&mut hb, &inv1, "a20-r1", detail).await;
+    let card = wait_pending_approval(&base, &a, &conv).await;
+    let req = &card["approval"]["request"];
+    assert_eq!(req["detail"].as_str().unwrap(), detail, "{req}");
+    assert_eq!(
+        req["tool_call"]["detail"].as_str().unwrap(),
+        detail,
+        "{req}"
+    );
+    assert_eq!(req["locations"], json!(["C:\\tmp\\a.txt"]), "{req}");
+    decide_approval(
+        &base,
+        &a,
+        card["approval"]["id"].as_str().unwrap(),
+        "reject_once",
+    )
+    .await;
+
+    // 超过 4000 字：request 与内嵌 tool_call 都按字截断到 4000
+    let inv2 = a20_invoke(&mut sa, &mut hb, &conv, "d2").await;
+    let long = "字".repeat(4500);
+    a20_ask(&mut hb, &inv2, "a20-r2", &long).await;
+    let card = wait_pending_approval(&base, &a, &conv).await;
+    let req = &card["approval"]["request"];
+    assert_eq!(
+        req["detail"].as_str().unwrap().chars().count(),
+        4000,
+        "detail 应截断到 4000 字：{req}"
+    );
+    assert_eq!(
+        req["tool_call"]["detail"].as_str().unwrap().chars().count(),
+        4000,
+        "内嵌 tool_call.detail 同样截断：{req}"
+    );
+    decide_approval(
+        &base,
+        &a,
+        card["approval"]["id"].as_str().unwrap(),
+        "reject_once",
+    )
+    .await;
+
+    // 没有 detail 的老请求照常处理，不破坏旧宿主
+    let inv3 = a20_invoke(&mut sa, &mut hb, &conv, "d3").await;
+    hb.send(WsMsg::Text(
+        json!({
+            "type": "approval_request",
+            "invocation_id": inv3,
+            "request_id": "a20-r3",
+            "tool_call": {"title": "改文件", "kind": "edit", "locations": ["C:\\x"]},
+            "options": [{"optionId": "allow", "name": "允许", "kind": "allow_once"}],
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let card = wait_pending_approval(&base, &a, &conv).await;
+    assert_eq!(card["approval"]["request"]["kind"], "edit");
+}

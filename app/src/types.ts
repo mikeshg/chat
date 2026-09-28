@@ -167,6 +167,8 @@ export interface ApprovalRequest {
   title?: string;
   kind?: string;
   locations?: string[];
+  /** A20：完整正文（只读档发消息审批展示的内容就是实际发出的），旧服务端缺省 */
+  detail?: string;
   request_id?: string;
   invocation_id?: string;
 }
