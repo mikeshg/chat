@@ -16756,3 +16756,360 @@ async fn agent_reset_context_in_group_only_touches_own_agents() {
     assert_eq!(reset(&outsider, &gid).await.unwrap().status().as_u16(), 403);
     host.shutdown().await;
 }
+
+// ===== Agent A22 =====
+// 同一次调用可以有多张 pending 审批。假宿主连发 approval_request；
+// 决定一张不把调用放回 running，直到没有剩余 pending。
+
+fn a22_approval_frame(inv_id: &str, request_id: &str, title: &str) -> Value {
+    json!({
+        "type": "approval_request",
+        "invocation_id": inv_id,
+        "request_id": request_id,
+        "tool_call": {"title": title, "kind": "execute", "locations": [title]},
+        "options": [
+            {"optionId": "allow", "name": "允许", "kind": "allow_once"},
+            {"optionId": "reject", "name": "拒绝", "kind": "reject_once"}
+        ]
+    })
+}
+
+async fn a22_send_approval(sh: &mut RawHostWs, inv_id: &str, request_id: &str, title: &str) {
+    sh.send(WsMsg::Text(
+        a22_approval_frame(inv_id, request_id, title)
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+}
+
+fn a22_find_approval(msgs: &[Value], request_id: &str) -> Option<Value> {
+    msgs.iter()
+        .find(|m| m["kind"] == "approval" && m["approval"]["request"]["request_id"] == request_id)
+        .cloned()
+}
+
+fn a22_pending_count(msgs: &[Value]) -> usize {
+    msgs.iter()
+        .filter(|m| m["kind"] == "approval" && m["approval"]["status"] == "pending")
+        .count()
+}
+
+async fn a22_inv_status(base: &str, u: &TestUser, conv: &str) -> String {
+    latest_inv_status(&list_inv(base, u, conv).await)
+        .unwrap_or("")
+        .to_string()
+}
+
+async fn a22_wait_approval(base: &str, u: &TestUser, conv: &str, request_id: &str) -> Value {
+    let deadline = std::time::Instant::now() + A01Dur::from_secs(10);
+    loop {
+        let msgs = conv_messages(base, u, conv).await;
+        if let Some(m) = a22_find_approval(&msgs, request_id) {
+            return m;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "等审批 {request_id} 超时：{msgs:?}"
+        );
+        tokio::time::sleep(A01Dur::from_millis(40)).await;
+    }
+}
+
+async fn a22_wait_decision(sh: &mut RawHostWs, request_id: &str) -> Value {
+    let deadline = std::time::Instant::now() + A01Dur::from_secs(10);
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!left.is_zero(), "等 approval_decision {request_id} 超时");
+        let frames = until_frame(sh, "approval_decision", left).await;
+        if let Some(f) = frames
+            .into_iter()
+            .rev()
+            .find(|f| f["request_id"] == request_id)
+        {
+            return f;
+        }
+    }
+}
+
+/// 用户连接上的 agent_stream 步骤，用来确认宿主侧 approval_request 已经处理完。
+async fn a22_wait_step(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Value>, step_id: &str) {
+    let deadline = tokio::time::Instant::now() + A01Dur::from_secs(10);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!left.is_zero(), "等步骤 {step_id} 超时");
+        match tokio::time::timeout(left, rx.recv()).await {
+            Ok(Some(v)) if v["type"] == "agent_stream" && v["step"]["id"] == step_id => return,
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("用户连接已关，没等到步骤 {step_id}"),
+            Err(_) => panic!("等步骤 {step_id} 超时"),
+        }
+    }
+}
+
+fn a22_step_frame(inv_id: &str, step_id: &str) -> Value {
+    json!({
+        "type": "invocation_event",
+        "invocation_id": inv_id,
+        "event": {"type": "step_start", "id": step_id, "title": "barrier", "kind": "other"}
+    })
+}
+
+/// 主路径：同一调用两张卡都进专属会话；决定第一张后仍 awaiting_approval，
+/// 宿主收到对应 approval_decision；决定第二张后调用回到 running。
+#[tokio::test]
+async fn a22_two_approvals_decide_one_by_one() {
+    let base = spawn_named_db(&format!("chat_it_a22two_{}", uniq())).await;
+    let a = register(&base, &format!("a22t_{}", uniq())).await;
+    let (mut sh, _su, inv_id, _token, conv, _agent) = a13_running_invocation(&base, &a).await;
+
+    a22_send_approval(&mut sh, &inv_id, "req-a", "first-tool").await;
+    a22_send_approval(&mut sh, &inv_id, "req-b", "second-tool").await;
+
+    let card_a = a22_wait_approval(&base, &a, &conv, "req-a").await;
+    let card_b = a22_wait_approval(&base, &a, &conv, "req-b").await;
+    assert_eq!(card_a["approval"]["status"], "pending");
+    assert_eq!(card_b["approval"]["status"], "pending");
+    assert!(
+        card_a["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("first-tool"),
+        "{card_a}"
+    );
+    assert!(
+        card_b["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("second-tool"),
+        "{card_b}"
+    );
+    assert_eq!(card_a["conversation_id"], conv.as_str());
+    assert_eq!(card_b["conversation_id"], conv.as_str());
+    let msgs = conv_messages(&base, &a, &conv).await;
+    assert_eq!(
+        msgs.iter().filter(|m| m["kind"] == "approval").count(),
+        2,
+        "专属会话应正好两张卡: {msgs:?}"
+    );
+    assert_eq!(a22_inv_status(&base, &a, &conv).await, "awaiting_approval");
+
+    let id_a = card_a["approval"]["id"].as_str().unwrap();
+    let (st, body) = decide_approval(&base, &a, id_a, "allow").await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(body["approval"]["status"], "decided");
+    assert_eq!(body["approval"]["decision"], "allow");
+    let dec_a = a22_wait_decision(&mut sh, "req-a").await;
+    assert_eq!(dec_a["type"], "approval_decision");
+    assert_eq!(dec_a["option_id"], "allow");
+    assert_eq!(a22_inv_status(&base, &a, &conv).await, "awaiting_approval");
+    let mid = conv_messages(&base, &a, &conv).await;
+    assert_eq!(
+        a22_find_approval(&mid, "req-a").unwrap()["approval"]["status"],
+        "decided"
+    );
+    assert_eq!(
+        a22_find_approval(&mid, "req-b").unwrap()["approval"]["status"],
+        "pending"
+    );
+
+    let id_b = card_b["approval"]["id"].as_str().unwrap();
+    let (st, body) = decide_approval(&base, &a, id_b, "reject").await;
+    assert_eq!(st, 200, "{body}");
+    let dec_b = a22_wait_decision(&mut sh, "req-b").await;
+    assert_eq!(dec_b["option_id"], "reject");
+    assert_eq!(a22_inv_status(&base, &a, &conv).await, "running");
+    let done = conv_messages(&base, &a, &conv).await;
+    assert_eq!(
+        a22_find_approval(&done, "req-a").unwrap()["approval"]["decision"],
+        "allow"
+    );
+    assert_eq!(
+        a22_find_approval(&done, "req-b").unwrap()["approval"]["status"],
+        "decided"
+    );
+    assert_eq!(
+        a22_find_approval(&done, "req-b").unwrap()["approval"]["decision"],
+        "reject"
+    );
+    assert_eq!(a22_pending_count(&done), 0);
+}
+
+/// 两张 pending 时取消：全部 expired。取消之后再来的审批请求不再建卡。
+#[tokio::test]
+async fn a22_cancel_expires_all_pending_approvals() {
+    let base = spawn_named_db(&format!("chat_it_a22c_{}", uniq())).await;
+    let a = register(&base, &format!("a22c_{}", uniq())).await;
+    let (mut sh, _su, inv_id, _token, conv, _agent) = a13_running_invocation(&base, &a).await;
+
+    a22_send_approval(&mut sh, &inv_id, "c-1", "cancel-one").await;
+    a22_send_approval(&mut sh, &inv_id, "c-2", "cancel-two").await;
+    let card1 = a22_wait_approval(&base, &a, &conv, "c-1").await;
+    let card2 = a22_wait_approval(&base, &a, &conv, "c-2").await;
+    assert_eq!(a22_inv_status(&base, &a, &conv).await, "awaiting_approval");
+
+    let (st, body) = cancel_inv(&base, &a, &inv_id).await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(body["status"], "cancelled");
+    let id1 = card1["approval"]["id"].as_str().unwrap();
+    let id2 = card2["approval"]["id"].as_str().unwrap();
+    let gone1 = wait_approval_status(&base, &a, &conv, id1, "expired").await;
+    let gone2 = wait_approval_status(&base, &a, &conv, id2, "expired").await;
+    assert!(gone1["approval"]["decision"].is_null());
+    assert!(gone2["approval"]["decision"].is_null());
+
+    a22_send_approval(&mut sh, &inv_id, "c-late", "too-late").await;
+    tokio::time::sleep(A01Dur::from_millis(500)).await;
+    let msgs = conv_messages(&base, &a, &conv).await;
+    assert!(
+        a22_find_approval(&msgs, "c-late").is_none(),
+        "已取消的调用不应再收卡: {msgs:?}"
+    );
+    assert_eq!(msgs.iter().filter(|m| m["kind"] == "approval").count(), 2);
+    assert_eq!(a22_inv_status(&base, &a, &conv).await, "cancelled");
+}
+
+/// 不是这条调用所属宿主的连接发 approval_request：不建卡。
+#[tokio::test]
+async fn a22_other_host_approval_is_ignored() {
+    let base = spawn_named_db(&format!("chat_it_a22h_{}", uniq())).await;
+    let a = register(&base, &format!("a22h_{}", uniq())).await;
+    let (mut sh, _su, inv_id, _token, conv, _agent) = a13_running_invocation(&base, &a).await;
+    let (mut other, other_host) = spawn_raw_host(&base, &a).await;
+    assert_ne!(other_host, "");
+
+    a22_send_approval(&mut other, &inv_id, "foreign", "stolen").await;
+    let quiet = std::time::Instant::now() + A01Dur::from_millis(800);
+    while std::time::Instant::now() < quiet {
+        let msgs = conv_messages(&base, &a, &conv).await;
+        assert!(
+            a22_find_approval(&msgs, "foreign").is_none(),
+            "别的宿主不能给这次调用建卡: {msgs:?}"
+        );
+        assert!(msgs.iter().all(|m| m["kind"] != "approval"));
+        tokio::time::sleep(A01Dur::from_millis(40)).await;
+    }
+
+    a22_send_approval(&mut sh, &inv_id, "real", "owned").await;
+    let card = a22_wait_approval(&base, &a, &conv, "real").await;
+    assert_eq!(card["approval"]["status"], "pending");
+    tokio::time::sleep(A01Dur::from_millis(400)).await;
+    let msgs = conv_messages(&base, &a, &conv).await;
+    assert!(a22_find_approval(&msgs, "foreign").is_none(), "{msgs:?}");
+    assert_eq!(msgs.iter().filter(|m| m["kind"] == "approval").count(), 1);
+    let _ = other.send(WsMsg::Close(None)).await;
+}
+
+/// 宿主断开：awaiting_approval 的调用失败，全部 pending 一起 expired。
+#[tokio::test]
+async fn a22_host_disconnect_expires_all_pending_approvals() {
+    let base = spawn_named_db(&format!("chat_it_a22d_{}", uniq())).await;
+    let a = register(&base, &format!("a22d_{}", uniq())).await;
+    let (mut sh, _su, _inv, _token, conv, _agent) = a13_running_invocation(&base, &a).await;
+    let rows = list_inv(&base, &a, &conv).await;
+    let inv_id = rows.as_array().unwrap()[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    a22_send_approval(&mut sh, &inv_id, "d-1", "disc-one").await;
+    a22_send_approval(&mut sh, &inv_id, "d-2", "disc-two").await;
+    let card1 = a22_wait_approval(&base, &a, &conv, "d-1").await;
+    let card2 = a22_wait_approval(&base, &a, &conv, "d-2").await;
+
+    sh.close(None).await.unwrap();
+    drop(sh);
+
+    let deadline = std::time::Instant::now() + A01Dur::from_secs(8);
+    loop {
+        let rows = list_inv(&base, &a, &conv).await;
+        let row = &rows.as_array().unwrap()[0];
+        if row["status"] == "failed" && row["error"] == "host_disconnected" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "断线后调用应失败: {rows}"
+        );
+        tokio::time::sleep(A01Dur::from_millis(50)).await;
+    }
+    let id1 = card1["approval"]["id"].as_str().unwrap();
+    let id2 = card2["approval"]["id"].as_str().unwrap();
+    wait_approval_status(&base, &a, &conv, id1, "expired").await;
+    wait_approval_status(&base, &a, &conv, id2, "expired").await;
+}
+
+/// 决定最后一张与新的 approval_request 同时到达：不能出现 running 且仍有 pending 卡。
+/// 新请求在调用仍进行时一定建卡，所以结束后应是 awaiting_approval。
+#[tokio::test]
+async fn a22_decide_last_races_new_request() {
+    let base = spawn_named_db(&format!("chat_it_a22r_{}", uniq())).await;
+    let a = register(&base, &format!("a22r_{}", uniq())).await;
+    let (mut sh, su, inv_id, _token, conv, _agent) = a13_running_invocation(&base, &a).await;
+
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut su = su;
+        while let Some(Ok(msg)) = su.next().await {
+            if let WsMsg::Text(t) = msg {
+                if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                    let _ = frame_tx.send(v);
+                }
+            }
+        }
+    });
+
+    let mut open_req = "req-0".to_string();
+    a22_send_approval(&mut sh, &inv_id, &open_req, "seed").await;
+    let mut open_card = a22_wait_approval(&base, &a, &conv, &open_req).await;
+    assert_eq!(a22_inv_status(&base, &a, &conv).await, "awaiting_approval");
+
+    for i in 1..=6 {
+        let new_req = format!("req-{i}");
+        let step_id = format!("barrier-{i}");
+        let approval_id = open_card["approval"]["id"].as_str().unwrap().to_string();
+        let decide = decide_approval(&base, &a, &approval_id, "allow");
+        let send = async {
+            a22_send_approval(&mut sh, &inv_id, &new_req, "raced").await;
+            sh.send(WsMsg::Text(
+                a22_step_frame(&inv_id, &step_id).to_string().into(),
+            ))
+            .await
+            .unwrap();
+        };
+        let ((st, body), ()) = tokio::join!(decide, send);
+        assert_eq!(st, 200, "第 {i} 轮决定失败: {body}");
+        a22_wait_step(&mut frame_rx, &step_id).await;
+        let dec = a22_wait_decision(&mut sh, &open_req).await;
+        assert_eq!(dec["request_id"], open_req);
+        assert_eq!(dec["option_id"], "allow");
+
+        let new_card = a22_wait_approval(&base, &a, &conv, &new_req).await;
+        assert_eq!(new_card["approval"]["status"], "pending", "{new_card}");
+        let msgs = conv_messages(&base, &a, &conv).await;
+        assert_eq!(
+            a22_find_approval(&msgs, &open_req).unwrap()["approval"]["status"],
+            "decided"
+        );
+        let status = a22_inv_status(&base, &a, &conv).await;
+        let pending = a22_pending_count(&msgs);
+        assert!(
+            !(status == "running" && pending > 0),
+            "第 {i} 轮出现 running 但仍有 pending 卡: status={status} pending={pending} msgs={msgs:?}"
+        );
+        assert_eq!(status, "awaiting_approval", "{msgs:?}");
+        assert!(pending >= 1, "{msgs:?}");
+        open_req = new_req;
+        open_card = new_card;
+    }
+
+    let last_id = open_card["approval"]["id"].as_str().unwrap();
+    let (st, body) = decide_approval(&base, &a, last_id, "reject").await;
+    assert_eq!(st, 200, "{body}");
+    let dec = a22_wait_decision(&mut sh, &open_req).await;
+    assert_eq!(dec["option_id"], "reject");
+    assert_eq!(a22_inv_status(&base, &a, &conv).await, "running");
+    let msgs = conv_messages(&base, &a, &conv).await;
+    assert_eq!(a22_pending_count(&msgs), 0, "{msgs:?}");
+}
