@@ -37,7 +37,7 @@ export interface AppState {
   friends: FriendView[];
   requests: RequestsView;
   wsReady: boolean;
-  tab: "chats" | "contacts" | "me" | "admin";
+  tab: "chats" | "contacts" | "agents" | "me" | "admin";
   /** composer 引用卡片：正在回复的目标消息（null=普通发送） */
   replyingTo: MessageView | null;
   /** composer 编辑态：正在编辑的消息（expected_version 取其当前 edit_version） */
@@ -52,8 +52,10 @@ export interface AppState {
   avatars: Record<string, AvatarInfo>;
   /** 全局搜索跳转目标（V2 P3-1）：打开会话后由 ChatView 消费并清空 */
   pendingJump: { convId: string; messageId: string; seq: number } | null;
-  /** Agent A01：本人宿主列表（AgentsPanel 拉取 / agent_host_status 帧更新 online） */
+  /** Agent A01：本人电脑列表（管理页拉取 / agent_host_status 帧更新 online） */
   agentHosts: AgentHostView[];
+  /** 桌面端宿主就绪后的本机 host id。网页、Android、尚未就绪时为 null。 */
+  localHostId: string | null;
   /** Agent A01/A11：conv_id -> trigger_message_id -> 调用记录（一条消息可以触发多个 Agent） */
   invocations: Record<string, Record<string, InvocationView[]>>;
   /** Agent A03：conv_id -> invocation_id -> 进行中调用的临时输出（不落库、不跨设备） */
@@ -89,6 +91,7 @@ let state: AppState = {
   avatars: {},
   pendingJump: null,
   agentHosts: [],
+  localHostId: null,
   invocations: {},
   agentRuns: {},
   childInvocations: {},

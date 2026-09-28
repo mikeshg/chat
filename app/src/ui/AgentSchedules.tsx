@@ -60,13 +60,15 @@ const WEEK = [
   [7, "日"],
 ] as const;
 
-/** Agent 编辑器里的定时任务：列表、开关、删除、新建。 */
+/** Agent 编辑器里的定时任务：列表、开关、删除、新建。改动立即生效。 */
 export default function AgentSchedules({
   agentId,
   conversationId,
+  onCount,
 }: {
   agentId: string;
   conversationId: string;
+  onCount?: (n: number) => void;
 }) {
   const [rows, setRows] = useState<ScheduleView[]>([]);
   const [targets, setTargets] = useState<{ id: string; label: string }[]>([]);
@@ -90,6 +92,10 @@ export default function AgentSchedules({
       .schedules(agentId)
       .then(setRows)
       .catch((e) => setErr(errText(e)));
+
+  useEffect(() => {
+    onCount?.(rows.length);
+  }, [rows.length, onCount]);
 
   useEffect(() => {
     let alive = true;
@@ -192,119 +198,109 @@ export default function AgentSchedules({
   };
 
   return (
-    <div className="agent-schedules">
-      <h4 className="agent-sec">定时任务</h4>
-      {!loaded ? (
-        <div className="muted">加载中…</div>
-      ) : rows.length === 0 ? (
-        <div className="muted">还没有定时任务</div>
-      ) : (
-        <div className="sched-list">
-          {rows.map((row) => (
-            <div className="sched-row" key={row.id}>
-              <div className="sched-main">
-                <div className="sched-name">{row.name}</div>
-                <div className="sched-meta">{describeSchedule(row.spec, row.timezone)}</div>
-                <div className="sched-meta">下次运行 {formatWhen(row.next_run_at)}</div>
-                {row.disabled_reason && <div className="sched-meta">{reasonText(row.disabled_reason)}</div>}
-              </div>
-              <label className="sched-enable">
-                <input
-                  type="checkbox"
-                  checked={row.enabled}
-                  aria-label={`启用 ${row.name}`}
-                  disabled={busyId === row.id}
-                  onChange={(e) => void toggle(row, e.target.checked)}
-                />
-                启用
-              </label>
-              <button
-                type="button"
-                className="danger"
-                aria-label={`删除定时任务 ${row.name}`}
-                disabled={busyId === row.id}
-                onClick={() => void remove(row)}
-              >
-                删除
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
+    <div className="am-sched-wrap">
+      <div className="am-field">
+        <span className="am-lb">定时任务</span>
+        {!loaded ? (
+          <div className="am-hint">加载中…</div>
+        ) : rows.length === 0 ? (
+          <div className="am-hint">还没有定时任务。</div>
+        ) : (
+          <div className="am-sched">
+            {rows.map((row) => {
+              const targetLabel = targets.find((t) => t.id === row.target_conversation_id)?.label ?? "会话";
+              return (
+                <div className="am-sched-row" key={row.id}>
+                  <div className="grow">
+                    <b>{row.name}</b>
+                    <span>
+                      {describeSchedule(row.spec, row.timezone)} · 发到{targetLabel}
+                      {row.next_run_at ? ` · 下次 ${formatWhen(row.next_run_at)}` : ""}
+                    </span>
+                    {row.disabled_reason ? <span>{reasonText(row.disabled_reason)}</span> : null}
+                  </div>
+                  <button
+                    type="button"
+                    className="am-switch"
+                    role="switch"
+                    aria-checked={row.enabled}
+                    aria-label={`启用 ${row.name}`}
+                    disabled={busyId === row.id}
+                    onClick={() => void toggle(row, !row.enabled)}
+                  />
+                  <button
+                    type="button"
+                    className="am-ghost"
+                    aria-label={`删除 ${row.name}`}
+                    disabled={busyId === row.id}
+                    onClick={() => void remove(row)}
+                  >
+                    ✕
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
 
-      <div className="sched-form">
-        <input
-          aria-label="定时任务名称"
-          placeholder="名称（1–40 字）"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-        />
-        <textarea
-          aria-label="定时任务指令"
-          placeholder="到点执行的指令"
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          rows={2}
-        />
-        <label className="agent-field">
-          <span className="muted">目标会话</span>
-          <select aria-label="目标会话" value={target} onChange={(e) => setTarget(e.target.value)}>
+      <details className="am-adv" open>
+        <summary>新建定时任务</summary>
+        <div className="am-adv-in">
+          <input
+            aria-label="名称"
+            placeholder="名称，例如：每日站会摘要"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+          />
+          <textarea
+            aria-label="到点执行的指令"
+            placeholder="到点让它做什么，例如：总结昨天合并的提交"
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            rows={3}
+          />
+          <select aria-label="发到哪个会话" value={target} onChange={(e) => setTarget(e.target.value)}>
             {targets.map((t) => (
               <option key={t.id} value={t.id}>
-                {t.label}
+                发到{t.label}
               </option>
             ))}
           </select>
-        </label>
-        <label className="agent-field">
-          <span className="muted">时间表</span>
-          <select
-            aria-label="时间表类型"
-            value={kind}
-            onChange={(e) => setKind(e.target.value as typeof kind)}
-          >
-            <option value="daily">每天</option>
-            <option value="weekly">每周</option>
-            <option value="once">一次</option>
-            <option value="interval">每隔</option>
-          </select>
-        </label>
-        {kind === "weekly" && (
-          <div className="sched-days">
-            {WEEK.map(([n, label]) => (
-              <label key={n}>
-                <input
-                  type="checkbox"
-                  checked={days.includes(n)}
-                  onChange={(e) =>
-                    setDays((cur) => (e.target.checked ? [...cur, n] : cur.filter((d) => d !== n)))
-                  }
-                />
-                周{label}
-              </label>
-            ))}
+          <div className="am-row">
+            <select aria-label="重复" value={kind} onChange={(e) => setKind(e.target.value as typeof kind)}>
+              <option value="daily">每天</option>
+              <option value="weekly">每周</option>
+              <option value="once">一次</option>
+              <option value="interval">每隔</option>
+            </select>
+            {(kind === "daily" || kind === "weekly") && (
+              <input aria-label="时刻" type="time" value={time} onChange={(e) => setTime(e.target.value)} />
+            )}
           </div>
-        )}
-        {(kind === "daily" || kind === "weekly") && (
-          <label className="agent-field">
-            <span className="muted">时刻</span>
-            <input aria-label="定时时刻" type="time" value={time} onChange={(e) => setTime(e.target.value)} />
-          </label>
-        )}
-        {kind === "once" && (
-          <label className="agent-field">
-            <span className="muted">运行时间</span>
+          {kind === "weekly" && (
+            <div className="am-days">
+              {WEEK.map(([n, label]) => (
+                <button
+                  key={n}
+                  type="button"
+                  aria-pressed={days.includes(n)}
+                  onClick={() => setDays((cur) => (cur.includes(n) ? cur.filter((d) => d !== n) : [...cur, n]))}
+                >
+                  周{label}
+                </button>
+              ))}
+            </div>
+          )}
+          {kind === "once" && (
             <input
               aria-label="运行时间"
               type="datetime-local"
               value={onceLocal}
               onChange={(e) => setOnceLocal(e.target.value)}
             />
-          </label>
-        )}
-        {kind === "interval" && (
-          <label className="agent-field">
-            <span className="muted">间隔（分钟，至少 5）</span>
+          )}
+          {kind === "interval" && (
             <input
               aria-label="间隔分钟"
               type="number"
@@ -312,17 +308,16 @@ export default function AgentSchedules({
               value={minutes}
               onChange={(e) => setMinutes(e.target.value)}
             />
-          </label>
-        )}
-        <label className="agent-field">
-          <span className="muted">时区</span>
+          )}
           <input aria-label="时区" value={timezone} onChange={(e) => setTimezone(e.target.value)} />
-        </label>
-        {err && <div className="auth-err">{err}</div>}
-        <button type="button" className="primary" disabled={busy} onClick={() => void create()}>
-          {busy ? "添加中…" : "添加定时任务"}
-        </button>
-      </div>
+          {err && <div className="auth-err">{err}</div>}
+          <div>
+            <button type="button" className="primary" disabled={busy} onClick={() => void create()}>
+              {busy ? "添加中…" : "添加"}
+            </button>
+          </div>
+        </div>
+      </details>
     </div>
   );
 }

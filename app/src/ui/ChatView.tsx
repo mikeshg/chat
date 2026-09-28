@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { canUseAgent } from "../agentAccess";
+import { computerTitle } from "./agentPage";
 import { agents as agentsApi, ApiError, convs, files, msgs as msgsApi, serverInfo, session } from "../api";
 import {
   applyInvocations,
@@ -952,7 +953,7 @@ export default function ChatView() {
             {conv.kind === "self"
               ? "在你的设备间同步消息与文件"
               : conv.kind === "agent"
-                ? `${agentHost ? (agentHost.label || "宿主") + (agentHost.platform ? ` (${agentHost.platform})` : "") : "宿主"} · ${agentDeleted ? "已删除" : conv.agent?.host_online ? "在线" : "离线"}`
+                ? `${agentHost ? computerTitle(agentHost.label, agentHost.platform) : "电脑"} · ${agentDeleted ? "已删除" : conv.agent?.host_online ? "在线" : "离线"}`
                 : conv.kind === "dm"
                   ? peerOnline
                     ? "在线"

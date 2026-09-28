@@ -7,6 +7,7 @@
 
 import { canUseAgent } from "./agentAccess";
 import { convs, deviceLabel, getServer } from "./api";
+import { setState } from "./store";
 
 /** 仅 Tauri 桌面壳：浏览器与 Android WebView 都不启动宿主 */
 export function isDesktopShell(): boolean {
@@ -53,11 +54,30 @@ function ensureTicketBridge(): Promise<void> {
   return listening;
 }
 
+let hostIdListening: Promise<void> | null = null;
+
+/** 宿主就绪后 Rust 推 `agent-host://local-host`。网页 / Android 不会走到这里。 */
+function ensureLocalHostBridge(): Promise<void> {
+  if (hostIdListening) return hostIdListening;
+  hostIdListening = (async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    await listen<{ host_id?: string | null }>("agent-host://local-host", (e) => {
+      const id = e.payload?.host_id;
+      setState({ localHostId: typeof id === "string" && id.trim() ? id.trim() : null });
+    });
+  })();
+  hostIdListening.catch(() => {
+    hostIdListening = null;
+  });
+  return hostIdListening;
+}
+
 /** 登录成功后调用：桌面端拉起宿主（同源部署时 server_url 用 location.origin） */
 export async function startAgentHost(): Promise<void> {
   if (!isDesktopShell()) return;
   try {
     await ensureTicketBridge();
+    await ensureLocalHostBridge();
     const { invoke } = await import("@tauri-apps/api/core");
     await invoke("agent_host_start", {
       serverUrl: getServer() || location.origin,
@@ -83,6 +103,7 @@ export async function syncAgentHost(
 /** 退出登录时调用：停掉本机宿主（Web/Android 为 no-op） */
 export async function stopAgentHost(): Promise<void> {
   if (!isDesktopShell()) return;
+  setState({ localHostId: null });
   try {
     const { invoke } = await import("@tauri-apps/api/core");
     await invoke("agent_host_stop");

@@ -1,9 +1,9 @@
 import type { AgentHostView, AgentView } from "../types";
 
-/** 组标题用的宿主名：去掉首尾空白，空则「宿主」。排序也用这个名字。 */
+/** 组标题用的电脑名：去掉首尾空白，空则「电脑」。排序也用这个名字。 */
 export function hostDisplayName(host: AgentHostView): string {
   const name = host.label.trim();
-  return name || "宿主";
+  return name || "电脑";
 }
 
 export interface AgentHostGroup {

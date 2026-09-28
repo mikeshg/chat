@@ -33,6 +33,7 @@ export default function App() {
         drafts: {},
         avatars: {},
         pendingJump: null,
+        localHostId: null,
       });
     };
     window.addEventListener("chat:logout", onLogout);

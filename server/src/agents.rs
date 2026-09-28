@@ -204,7 +204,11 @@ pub async fn create_agent(
     headers: HeaderMap,
     Json(req): Json<CreateAgentReq>,
 ) -> AppResult<Json<AgentView>> {
-    let uid = uid(&headers, &st).await?;
+    let ctx = auth::require_auth(&st, &headers).await?;
+    let uid = ctx.user.id;
+    if !crate::agent_access::user_allows(&st.pool, uid).await? {
+        return Err(AppError::forbidden("agent_access_denied"));
+    }
     if !valid_name(&req.name) {
         return Err(AppError::bad_request("bad_name"));
     }
@@ -221,6 +225,10 @@ pub async fn create_agent(
             .ok_or_else(|| AppError::not_found("host not found"))?;
     if host_user != uid {
         return Err(AppError::not_found("host not found"));
+    }
+    // 只能加到「这次登录」正在跑桌面端的那台电脑上。编辑等其他接口不走这里。
+    if !st.host_is_local_session(req.host_id, ctx.sid) {
+        return Err(AppError::forbidden("host_not_local"));
     }
 
     let agent_id = match sqlx::query_scalar::<_, Uuid>(
