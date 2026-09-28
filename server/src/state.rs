@@ -386,6 +386,15 @@ impl AppState {
         self.hosts.contains_key(&host_id)
     }
 
+    /// 添加 Agent 用：这条在线连接的登录会话是不是这次请求的会话。
+    /// 没有 sid、电脑离线、或会话对不上，都不是本机。
+    pub fn host_is_local_session(&self, host_id: Uuid, sid: Option<Uuid>) -> bool {
+        let Some(sid) = sid else {
+            return false;
+        };
+        self.hosts.get(&host_id).is_some_and(|c| c.sid == Some(sid))
+    }
+
     /// 断开该用户全部宿主（使用权收回）。不摘连接表，会话循环自己收尾并标离线。
     pub fn disconnect_user_hosts(&self, uid: Uuid) {
         self.disconnect_hosts(uid, |_| false, "agent_access_revoked");

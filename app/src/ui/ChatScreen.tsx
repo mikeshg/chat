@@ -1,9 +1,11 @@
 import { useEffect } from "react";
+import { canUseAgent } from "../agentAccess";
 import { dismissToast, setState, useApp } from "../store";
 import { openConversation, refreshCatalogs } from "../ws";
 import ConvList from "./ConvList";
 import ChatView from "./ChatView";
 import ContactsPanel from "./ContactsPanel";
+import AgentManager from "./AgentManager";
 import MePanel from "./MePanel";
 import AdminPanel from "./AdminPanel";
 import Avatar from "./Avatar";
@@ -45,6 +47,15 @@ export default function ChatScreen() {
           联系人
           {pendingCount > 0 && <i className="badge">{pendingCount}</i>}
         </button>
+        {canUseAgent(s.me) && (
+          <button
+            className={`rail-btn ${s.tab === "agents" ? "on" : ""}`}
+            onClick={() => setState({ tab: "agents" })}
+            title="Agent"
+          >
+            Agent
+          </button>
+        )}
         <button
           className={`rail-btn ${s.tab === "me" ? "on" : ""}`}
           onClick={() => setState({ tab: "me" })}
@@ -73,6 +84,7 @@ export default function ChatScreen() {
         </>
       )}
       {s.tab === "contacts" && <ContactsPanel />}
+      {s.tab === "agents" && canUseAgent(s.me) && <AgentManager />}
       {s.tab === "me" && <MePanel />}
       {s.tab === "admin" && s.me?.role === "admin" && <AdminPanel />}
 

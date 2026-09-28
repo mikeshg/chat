@@ -112,6 +112,11 @@ impl HostHandle {
         *self.host_id_rx.borrow()
     }
 
+    /// 订阅 host id。断线重连期间会先变成 None，再次 host_ready 后恢复。
+    pub fn watch_host_id(&self) -> watch::Receiver<Option<Uuid>> {
+        self.host_id_rx.clone()
+    }
+
     /// 等到第一次拿到 host_id；连接被顶替/关闭返回 None
     pub async fn wait_host_id(&self) -> Option<Uuid> {
         let mut rx = self.host_id_rx.clone();

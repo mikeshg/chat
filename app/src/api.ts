@@ -363,7 +363,7 @@ export const agents = {
     patch<AgentHostView>(`/agent-hosts/${id}`, { label }),
   /** 本人的 Agent 列表 */
   list: () => get<AgentView[]>("/agents"),
-  /** 创建 Agent（同时建专属会话）；400 bad_name / 409 name_taken / 404 宿主非本人 */
+  /** 创建 Agent（同时建专属会话）；400 bad_name / 409 name_taken / 404 电脑非本人 / 403 host_not_local */
   create: (body: CreateAgentReq) => post<AgentView>("/agents", body),
   /** 向在线宿主要登记表。离线 409 host_offline，别人的宿主 404，20 秒无响应 504 */
   registry: (hostId: string) => get<RegistryList>(`/agent-hosts/${hostId}/registry`),

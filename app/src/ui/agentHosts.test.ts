@@ -26,10 +26,10 @@ function agent(id: string, hostId: string): AgentView {
 }
 
 describe("Agent A09：按宿主分组", () => {
-  it("展示名去掉首尾空白，空名显示为「宿主」", () => {
+  it("展示名去掉首尾空白，空名显示为「电脑」", () => {
     expect(hostDisplayName(host({ id: "h", label: "  家里  " }))).toBe("家里");
-    expect(hostDisplayName(host({ id: "h", label: "" }))).toBe("宿主");
-    expect(hostDisplayName(host({ id: "h", label: "   " }))).toBe("宿主");
+    expect(hostDisplayName(host({ id: "h", label: "" }))).toBe("电脑");
+    expect(hostDisplayName(host({ id: "h", label: "   " }))).toBe("电脑");
   });
 
   it("在线在前，其次按名称，同名按 id", () => {

@@ -9504,12 +9504,12 @@ async fn agent_invoke_fail_and_crash() {
 async fn agent_invoke_host_offline() {
     let base = spawn_named_db(&format!("chat_t_a01off_{}", uniq())).await;
     let a = register(&base, &format!("a01i_{}", uniq())).await;
-    // 宿主连过一次再断：留下 host 行 + 离线态
+    // 先在本机会话上建好 Agent，再断开：留下 host 行 + 离线态（A26 起离线不能创建）
     let (ha, host_id) = spawn_host(&base, &a, uuid::Uuid::new_v4()).await;
+    let (st, agent) = create_agent(&base, &a, &host_id, "off").await;
+    assert_eq!(st, 200, "{agent}");
     ha.shutdown().await;
     tokio::time::sleep(A01Dur::from_millis(300)).await;
-    let (_, agent) = create_agent(&base, &a, &host_id, "off").await;
-    assert_eq!(agent["host_online"], false);
     let conv = agent["conversation_id"].as_str().unwrap().to_string();
 
     let (mut sa, _) = tokio_tungstenite::connect_async(ws_url(&base, &a).await)
@@ -10500,11 +10500,11 @@ where
 async fn offline_agent(base: &str, u: &TestUser, name: &str) -> (String, String, uuid::Uuid) {
     let install = uuid::Uuid::new_v4();
     let (h, host_id) = spawn_host(base, u, install).await;
-    h.shutdown().await;
-    tokio::time::sleep(A01Dur::from_millis(300)).await;
+    // A26：只能在这台电脑在线、且用宿主连接所在的登录会话时添加。先建好再断开。
     let (st, agent) = create_agent(base, u, &host_id, name).await;
     assert_eq!(st, 200, "{agent}");
-    assert_eq!(agent["host_online"], false);
+    h.shutdown().await;
+    tokio::time::sleep(A01Dur::from_millis(300)).await;
     let conv = agent["conversation_id"].as_str().unwrap().to_string();
     (conv, agent["id"].as_str().unwrap().to_string(), install)
 }
@@ -11783,10 +11783,10 @@ async fn a11_group_offline_queues_for_members() {
     let member = register(&base, &format!("a11m_{}", uniq())).await;
     let install = uuid::Uuid::new_v4();
     let (h, host_id) = spawn_host(&base, &owner, install).await;
-    h.shutdown().await;
-    tokio::time::sleep(A01Dur::from_millis(300)).await;
     let (st, _) = create_agent(&base, &owner, &host_id, "bot").await;
     assert_eq!(st, 200);
+    h.shutdown().await;
+    tokio::time::sleep(A01Dur::from_millis(300)).await;
     let gid = a11_group(&base, &owner, &[&member]).await;
     let (mut so, _) = tokio_tungstenite::connect_async(ws_url(&base, &owner).await)
         .await
@@ -18534,4 +18534,71 @@ async fn a24_registered_host_disconnects_on_ping_after_revoke() {
         tokio::time::sleep(A01Dur::from_millis(20)).await;
     }
     assert!(!st.host_online(hid), "断开后宿主应离线");
+}
+
+// ===== Agent A26 =====
+
+/// 添加 Agent 必须走这台电脑当前宿主连接所属的登录会话。
+#[tokio::test]
+async fn a26_create_agent_requires_local_host_session() {
+    let base = spawn_named_db(&format!("chat_it_a26_{}", uniq())).await;
+    let name = format!("a26_{}", uniq());
+    let a = register(&base, &name).await;
+    let (ha, host_id) = spawn_host(&base, &a, uuid::Uuid::new_v4()).await;
+
+    let (st, agent) = create_agent(&base, &a, &host_id, "localbot").await;
+    assert_eq!(st, 200, "本机会话应能添加: {agent}");
+    assert_eq!(agent["name"], "localbot");
+
+    let other = login_device(&base, &name, "secret123", "phone").await;
+    let (st, body) = create_agent(&base, &other, &host_id, "remote").await;
+    assert_eq!(st, 403, "另一登录会话应拒绝: {body}");
+    assert_eq!(body["error"], "host_not_local");
+
+    let uid = uuid::Uuid::parse_str(&a.id).unwrap();
+    let (tok, _) = chat_server::auth::mint_access(uid, 0, None, "test-secret").unwrap();
+    let r = http()
+        .post(format!("{base}/v1/agents"))
+        .header("authorization", authz(&tok))
+        .json(&json!({
+            "name": "nosid",
+            "host_id": host_id,
+            "runtime": {"command": "node", "args": []},
+            "cwd": "",
+        }))
+        .send()
+        .await
+        .unwrap();
+    let no_sid = r.status().as_u16();
+    let no_sid_body: Value = r.json().await.unwrap_or(json!(null));
+    assert_eq!(no_sid, 403, "没有 sid 的 token 应拒绝: {no_sid_body}");
+    assert_eq!(no_sid_body["error"], "host_not_local");
+
+    ha.shutdown().await;
+    let deadline = std::time::Instant::now() + A01Dur::from_secs(5);
+    loop {
+        let hosts: Value = http()
+            .get(format!("{base}/v1/agent-hosts"))
+            .header("authorization", authz(&a.access))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let online = hosts.as_array().unwrap().iter().any(|h| {
+            h["id"].as_str() == Some(host_id.as_str()) && h["online"].as_bool() == Some(true)
+        });
+        if !online {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "电脑没有离线: {hosts}"
+        );
+        tokio::time::sleep(A01Dur::from_millis(50)).await;
+    }
+    let (st, body) = create_agent(&base, &a, &host_id, "later").await;
+    assert_eq!(st, 403, "电脑离线应拒绝: {body}");
+    assert_eq!(body["error"], "host_not_local");
 }

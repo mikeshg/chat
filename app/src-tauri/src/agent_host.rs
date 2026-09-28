@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::oneshot;
@@ -21,6 +22,8 @@ type Pending = Arc<Mutex<HashMap<Uuid, oneshot::Sender<Result<String, String>>>>
 pub struct AgentHostState {
     handle: Mutex<Option<agent_host::HostHandle>>,
     pending: Pending,
+    /// 每次启动 / 停止加一。旧的 host id 监听看到代次变了就退出，避免停机后还回写。
+    watch_gen: AtomicU64,
 }
 
 impl AgentHostState {
@@ -28,8 +31,42 @@ impl AgentHostState {
         Self {
             handle: Mutex::new(None),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            watch_gen: AtomicU64::new(0),
         }
     }
+}
+
+/// host_ready 之后把本机 host id 推给前端；断线期间是 null。
+fn watch_gen(app: &AppHandle) -> u64 {
+    app.try_state::<AgentHostState>()
+        .map(|s| s.watch_gen.load(Ordering::SeqCst))
+        .unwrap_or(0)
+}
+
+fn watch_local_host(
+    app: AppHandle,
+    mut watch: tokio::sync::watch::Receiver<Option<Uuid>>,
+    gen: u64,
+) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            if watch_gen(&app) != gen {
+                break;
+            }
+            let host_id = (*watch.borrow()).map(|id| id.to_string());
+            // 代次在读 id 和发出之间变了（停机 / 重启）就不要把旧 id 写回去。
+            if watch_gen(&app) != gen {
+                break;
+            }
+            let _ = app.emit(
+                "agent-host://local-host",
+                serde_json::json!({ "host_id": host_id }),
+            );
+            if watch.changed().await.is_err() {
+                break;
+            }
+        }
+    });
 }
 
 /// TicketSource 的桌面实现：发事件给前端，等 agent_host_ticket 命令回填。
@@ -115,6 +152,7 @@ pub async fn agent_host_start(
     if let Some(old) = old {
         old.shutdown().await;
     }
+    let gen = state.watch_gen.fetch_add(1, Ordering::SeqCst) + 1;
     // Agent A13：stdio MCP 桥接 = 本程序 + --agent-mcp-bridge（main.rs 入口拦截）；
     // Agent 不声明 http MCP 能力时经它拿到注入工具。
     let mcp_bridge = std::env::current_exe().ok().map(|exe| {
@@ -143,7 +181,9 @@ pub async fn agent_host_start(
         pending: state.pending.clone(),
     });
     let handle = agent_host::spawn(cfg, tickets);
+    let watch = handle.watch_host_id();
     *state.handle.lock().unwrap() = Some(handle);
+    watch_local_host(app, watch, gen);
     Ok(())
 }
 
@@ -154,10 +194,18 @@ pub(crate) fn take_handle(this: &AgentHostState) -> Option<agent_host::HostHandl
 
 /// 退出登录时由前端调用：停宿主（关 WS、杀在跑的 Agent 进程、不再重连）。
 #[tauri::command]
-pub async fn agent_host_stop(state: State<'_, AgentHostState>) -> Result<(), String> {
+pub async fn agent_host_stop(
+    app: AppHandle,
+    state: State<'_, AgentHostState>,
+) -> Result<(), String> {
+    state.watch_gen.fetch_add(1, Ordering::SeqCst);
     if let Some(h) = take_handle(&state) {
         h.shutdown().await;
     }
+    let _ = app.emit(
+        "agent-host://local-host",
+        serde_json::json!({ "host_id": serde_json::Value::Null }),
+    );
     Ok(())
 }
 
