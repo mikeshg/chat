@@ -18658,3 +18658,35 @@ async fn a26_create_agent_requires_local_host_session() {
     assert_eq!(st, 403, "电脑离线应拒绝: {body}");
     assert_eq!(body["error"], "host_not_local");
 }
+
+// ===== 未知 /v1 路径 =====
+// 客户端比服务端新时调用了不存在的接口：回带 CORS 的 JSON 404，而不是落到静态托管的 405
+#[tokio::test]
+async fn unknown_api_is_json_404_with_cors() {
+    let base = spawn().await;
+    let c = reqwest::Client::new();
+    let r = c
+        .post(format!(
+            "{base}/v1/agent-hosts/{}/no-such-thing",
+            uuid::Uuid::nil()
+        ))
+        .header("Origin", "http://tauri.localhost")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 404);
+    assert!(r.headers().contains_key("access-control-allow-origin"));
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["error"], "unknown_api");
+
+    let pre = c
+        .request(reqwest::Method::OPTIONS, format!("{base}/v1/no-such-thing"))
+        .header("Origin", "http://tauri.localhost")
+        .header("Access-Control-Request-Method", "POST")
+        .send()
+        .await
+        .unwrap();
+    assert!(pre.status().is_success(), "预检应放行: {}", pre.status());
+    assert!(pre.headers().contains_key("access-control-allow-origin"));
+}

@@ -204,6 +204,8 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
     try {
       msg = JSON.parse(text).error ?? text;
     } catch {}
+    // 服务端没有这个接口（客户端更新了、服务端还没更新）
+    if (res.status === 404 && msg === "unknown_api") msg = "服务端版本较旧，不支持这个操作，请更新服务端";
     throw new ApiError(res.status, msg);
   }
   return JSON.parse(text) as T;
