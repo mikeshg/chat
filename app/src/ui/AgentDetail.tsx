@@ -23,6 +23,7 @@ import { PERMISSION_TIERS } from "./approval";
 import AgentAvatar from "./AgentAvatar";
 import AgentSchedules from "./AgentSchedules";
 import ChoiceCards from "./ChoiceCards";
+import ModelModeFields from "./ModelModeFields";
 
 const TABS = [
   ["basic", "基本"],
@@ -66,6 +67,7 @@ export default function AgentDetail({
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
   const [probing, setProbing] = useState(false);
+  const [probeErr, setProbeErr] = useState("");
   const [confirmDel, setConfirmDel] = useState(false);
   const [schedCount, setSchedCount] = useState(0);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -151,16 +153,24 @@ export default function AgentDetail({
   };
 
   const probe = async () => {
-    setErr("");
+    setProbeErr("");
     setProbing(true);
     try {
-      await agents.probe(agent.id);
+      const res = await agents.probe(agent.id);
+      if (res.error) setProbeErr(res.error);
+      else setReported({ modes: res.modes, models: res.models });
     } catch (e) {
-      setErr(agentErrText(e));
+      setProbeErr(agentErrText(e));
     } finally {
       setProbing(false);
     }
   };
+
+  // 从没读到过可选项（新建的 Agent）且电脑在线：自动读一次
+  const neverProbed = !agent.reported_options?.modes && !agent.reported_options?.models;
+  useEffect(() => {
+    if (neverProbed && online) void probe();
+  }, [agent.id, online]);
 
   const onAvatar = async (file: File | undefined) => {
     if (!file) return;
@@ -191,8 +201,6 @@ export default function AgentDetail({
     }
   };
 
-  const modes = reported.modes ?? [];
-  const models = reported.models ?? [];
   const outNow = settings ? outputModeLabel(settings.output_mode) : "…";
   const queueNow = settings ? queueTimeoutLabel(settings.queue_timeout_secs) : "…";
   const timeoutKnown =
@@ -326,50 +334,17 @@ export default function AgentDetail({
                   </div>
                 </>
               )}
-              <div className="am-field">
-                <span className="am-lb">模型和模式</span>
-                <div className="am-row">
-                  <select
-                    id="f-model"
-                    aria-label="模型"
-                    value={draft.model}
-                    onChange={(e) => patchDraft({ model: e.target.value })}
-                  >
-                    <option value="">模型：默认</option>
-                    {draft.model && !models.some((m) => m.id === draft.model) && (
-                      <option value={draft.model}>{draft.model}</option>
-                    )}
-                    {models.map((m) => (
-                      <option key={m.id} value={m.id}>
-                        {m.name}
-                      </option>
-                    ))}
-                  </select>
-                  <select
-                    id="f-mode"
-                    aria-label="模式"
-                    value={draft.mode}
-                    onChange={(e) => patchDraft({ mode: e.target.value })}
-                  >
-                    <option value="">模式：默认</option>
-                    {draft.mode && !modes.some((m) => m.id === draft.mode) && (
-                      <option value={draft.mode}>{draft.mode}</option>
-                    )}
-                    {modes.map((m) => (
-                      <option key={m.id} value={m.id}>
-                        {m.name}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <span className="am-hint">
-                  可选项来自程序自己上报；列表不全时点
-                  <button type="button" className="am-link" disabled={probing || busy} onClick={() => void probe()}>
-                    {probing ? "读取中…" : "重新读取"}
-                  </button>
-                  （电脑需在线）。
-                </span>
-              </div>
+              <ModelModeFields
+                model={draft.model}
+                mode={draft.mode}
+                options={reported}
+                probing={probing}
+                error={probeErr}
+                disabled={busy}
+                onModel={(model) => patchDraft({ model })}
+                onMode={(mode) => patchDraft({ mode })}
+                onReload={() => void probe()}
+              />
               <div className="am-field">
                 <label htmlFor="f-instr">附加指令</label>
                 <textarea

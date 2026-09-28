@@ -127,7 +127,7 @@ pub struct AppState {
     pub inv_runs: DashMap<Uuid, InvRun>,
     /// Agent A17：定时调用扫描间隔（毫秒），默认 30s。测试调小后不用等完原来的 30 秒。
     pub schedule_sweep_interval_ms: AtomicU64,
-    /// Agent A07：登记表请求 request_id → 等宿主回 registry_result。超时从这里摘掉。
+    /// Agent A07：登记表 / 试读请求 request_id → 等宿主回 registry_result / probe_result。超时从这里摘掉。
     pub registry_wait: DashMap<Uuid, tokio::sync::oneshot::Sender<serde_json::Value>>,
 }
 

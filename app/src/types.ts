@@ -261,6 +261,13 @@ export interface ReportedOptions {
   models?: AgentOptionItem[];
 }
 
+/** 试读可选项的结果；程序起不来时 error 是原因 */
+export interface ProbeResult {
+  modes: AgentOptionItem[];
+  models: AgentOptionItem[];
+  error: string | null;
+}
+
 /** GET /agents 单条 Agent 视图（A01；A06 补配置与头像） */
 export interface AgentView {
   id: string;
@@ -365,6 +372,9 @@ export interface CreateAgentReq {
   runtime: AgentRuntime;
   cwd?: string;
   permission_tier?: string;
+  /** 空串 = 程序自己的默认 */
+  model?: string;
+  mode?: string;
 }
 
 /** 一次 Agent 调用记录。status：queued / running / awaiting_approval / succeeded / failed / cancelled / timed_out */

@@ -10223,7 +10223,7 @@ async fn a06_whoami_uses_new_config() {
     h.shutdown().await;
 }
 
-/// probe：在线 202 后 reported_options 有两个 mode；宿主离线 409。
+/// probe：在线时等到结果返回，reported_options 有两个 mode；宿主离线 409。
 #[tokio::test]
 async fn a06_probe_online_then_offline() {
     let base = spawn_named_db(&format!("chat_t_a06r_{}", uniq())).await;
@@ -10238,7 +10238,10 @@ async fn a06_probe_online_then_offline() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status().as_u16(), 202);
+    assert_eq!(r.status().as_u16(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["modes"].as_array().map(|a| a.len()), Some(2), "{body}");
+    assert!(body["error"].is_null(), "{body}");
 
     let mut modes = 0;
     for _ in 0..50 {
@@ -10283,6 +10286,59 @@ async fn a06_probe_online_then_offline() {
     let body: Value = r.json().await.unwrap();
     assert_eq!(status, 409, "{body}");
     assert_eq!(body["error"], "host_offline");
+}
+
+/// 添加前试读：本机宿主回可选项；启动失败带原因；创建时可直接带上模型和模式。
+#[tokio::test]
+async fn a06_probe_runtime_before_create() {
+    let base = spawn_named_db(&format!("chat_t_a06p_{}", uniq())).await;
+    let a = register(&base, &format!("a06p_{}", uniq())).await;
+    let (h, host_id) = spawn_host(&base, &a, uuid::Uuid::new_v4()).await;
+    let probe = |runtime: Value| {
+        http()
+            .post(format!("{base}/v1/agent-hosts/{host_id}/probe"))
+            .header("authorization", authz(&a.access))
+            .json(&json!({"runtime": runtime}))
+            .send()
+    };
+
+    let r = probe(json!({"command": "node", "args": fake_acp_args()}))
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["models"][1]["id"], "smart", "{body}");
+    assert_eq!(body["modes"].as_array().map(|a| a.len()), Some(2), "{body}");
+    assert!(body["error"].is_null(), "{body}");
+
+    let r = probe(json!({"command": "chat-no-such-cmd-a06p", "args": []}))
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert!(
+        body["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "{body}"
+    );
+
+    let r = http()
+        .post(format!("{base}/v1/agents"))
+        .header("authorization", authz(&a.access))
+        .json(&json!({
+            "name": "picked",
+            "host_id": host_id,
+            "runtime": {"command": "node", "args": fake_acp_args()},
+            "model": "smart",
+            "mode": "code",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let agent: Value = r.json().await.unwrap();
+    assert_eq!(agent["model"], "smart");
+    assert_eq!(agent["mode"], "code");
+    h.shutdown().await;
 }
 
 /// 删除：发消息被拒且不产生调用；列表消失；会话 deleted；同名可重建；运行中的调用失败。

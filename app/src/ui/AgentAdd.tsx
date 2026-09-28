@@ -1,10 +1,11 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { agents } from "../api";
-import type { AgentHostView, AgentView, RegistryEntry } from "../types";
+import type { AgentHostView, AgentRuntime, AgentView, RegistryEntry, ReportedOptions } from "../types";
 import { hostDisplayName } from "./agentHosts";
 import { agentErrText, platformLabel } from "./agentPage";
 import { PERMISSION_TIERS } from "./approval";
 import ChoiceCards from "./ChoiceCards";
+import ModelModeFields from "./ModelModeFields";
 import RegistryPicker from "./RegistryPicker";
 
 type Pick =
@@ -29,8 +30,14 @@ export default function AgentAdd({
   const [args, setArgs] = useState("");
   const [cwd, setCwd] = useState("");
   const [tier, setTier] = useState("read_only");
+  const [model, setModel] = useState("");
+  const [mode, setMode] = useState("");
+  const [options, setOptions] = useState<ReportedOptions>({});
+  const [probing, setProbing] = useState(false);
+  const [probeErr, setProbeErr] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
+  const probeSeq = useRef(0);
 
   const ready = pick?.kind === "cmd" || (pick?.kind === "reg" && pick.entry.status === "ready");
   const os = platformLabel(host.platform);
@@ -41,27 +48,63 @@ export default function AgentAdd({
     setErr("");
   };
 
+  const runtimeOf = (p: NonNullable<Pick>): AgentRuntime =>
+    p.kind === "reg"
+      ? { registry: { id: p.entry.id, version: p.entry.version } }
+      : {
+          command: command.trim(),
+          args: args
+            .split("\n")
+            .map((x) => x.trim())
+            .filter(Boolean),
+        };
+
+  /** 换了程序：清掉上一个程序的可选项和选择，丢弃还在路上的读取结果。 */
+  const resetOptions = () => {
+    probeSeq.current++;
+    setProbing(false);
+    setOptions({});
+    setModel("");
+    setMode("");
+    setProbeErr("");
+  };
+
+  /** 在这台电脑上试起一次程序，读它提供的模型和模式。 */
+  const probe = async (p: NonNullable<Pick>) => {
+    resetOptions();
+    const seq = probeSeq.current;
+    setProbing(true);
+    try {
+      const res = await agents.probeRuntime(host.id, { runtime: runtimeOf(p), cwd: cwd.trim() });
+      if (seq !== probeSeq.current) return;
+      if (res.error) setProbeErr(res.error);
+      else setOptions({ modes: res.modes, models: res.models });
+    } catch (e) {
+      if (seq === probeSeq.current) setProbeErr(agentErrText(e));
+    } finally {
+      if (seq === probeSeq.current) setProbing(false);
+    }
+  };
+
+  // 选中已安装的登记表程序就自动读；自定义命令填好后点「重新读取」
+  useEffect(() => {
+    if (pick?.kind === "reg" && pick.entry.status === "ready" && host.online) void probe(pick);
+    else resetOptions();
+  }, [pick]);
+
   const create = async () => {
     if (busy || !pick || !ready) return;
     setBusy(true);
     setErr("");
     try {
-      const runtime =
-        pick.kind === "reg"
-          ? { registry: { id: pick.entry.id, version: pick.entry.version } }
-          : {
-              command: command.trim(),
-              args: args
-                .split("\n")
-                .map((x) => x.trim())
-                .filter(Boolean),
-            };
       const created = await agents.create({
         name: name.trim(),
         host_id: host.id,
-        runtime,
+        runtime: runtimeOf(pick),
         cwd: cwd.trim(),
         permission_tier: tier,
+        model,
+        mode,
       });
       onCreated(created);
     } catch (e) {
@@ -142,6 +185,17 @@ export default function AgentAdd({
                   </div>
                 </>
               )}
+              <ModelModeFields
+                model={model}
+                mode={mode}
+                options={options}
+                probing={probing}
+                error={probeErr}
+                disabled={pick.kind === "cmd" && !command.trim()}
+                onModel={setModel}
+                onMode={setMode}
+                onReload={() => void probe(pick)}
+              />
               <div className="am-field">
                 <label htmlFor="n-name">名字</label>
                 <input id="n-name" value={name} onChange={(e) => setName(e.target.value)} />

@@ -357,34 +357,60 @@ fn start_invocation(s: &Arc<Shared>, v: &Value) {
 }
 
 /// agent_probe：只握手并新建会话，把可选项报回去，不起调用。
+/// 已有 Agent（id 非空）成功时照旧发 agent_options；帧里带 request_id 时另回
+/// probe_result（含失败原因），服务端据此同步应答。添加前的试读 id 为全零。
 fn start_probe(s: &Arc<Shared>, v: &Value) {
+    let request_id = v.get("request_id").cloned().filter(|r| !r.is_null());
+    let lane = s.lane.clone();
     let Some(spec) = AgentSpec::from_json(&v["agent"]) else {
+        if let Some(rid) = request_id {
+            send_probe_result(&lane, rid, Err("运行时描述不完整".into()));
+        }
         return;
     };
     let agent_id = spec.id;
-    let lane = s.lane.clone();
     let running = s.running.clone();
     let dir = s.data_dir.clone();
     let registry_url = s.cfg.registry_url.clone();
     let key = Uuid::new_v4();
     let task = tokio::spawn(async move {
-        let spec = match materialize(spec, &dir, &registry_url).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("probe 无法解析登记表运行时: {e}");
-                running.lock().unwrap().remove(&key);
-                return;
+        let got = match materialize(spec, &dir, &registry_url).await {
+            Ok(spec) => {
+                let rt = runtime::runtime_for(&spec);
+                let (events, _) = tokio::sync::mpsc::unbounded_channel();
+                rt.run(runtime::RunRequest::for_probe(spec, dir), events)
+                    .await
             }
+            Err(e) => Err(e),
         };
-        let rt = runtime::runtime_for(&spec);
-        let (events, _) = tokio::sync::mpsc::unbounded_channel();
-        let req = runtime::RunRequest::for_probe(spec, dir);
-        if let Ok(out) = rt.run(req, events).await {
-            send_options(&lane, agent_id, &out, true);
+        match &got {
+            Ok(out) if !agent_id.is_nil() => send_options(&lane, agent_id, out, true),
+            Ok(_) => {}
+            Err(e) => warn!("probe 失败: {e}"),
+        }
+        if let Some(rid) = request_id {
+            send_probe_result(&lane, rid, got);
         }
         running.lock().unwrap().remove(&key);
     });
     s.running.lock().unwrap().insert(key, task);
+}
+
+fn send_probe_result(
+    lane: &crate::outbound::Outbound,
+    request_id: Value,
+    got: Result<RunOutput, String>,
+) {
+    let v = match got {
+        Ok(out) => json!({
+            "type": "probe_result",
+            "request_id": request_id,
+            "modes": options_json(out.modes.as_deref()),
+            "models": options_json(out.models.as_deref()),
+        }),
+        Err(e) => json!({"type": "probe_result", "request_id": request_id, "error": e}),
+    };
+    lane.emit_ephemeral(Message::Text(v.to_string().into()));
 }
 
 /// 登记表形状在这里换成本机命令；没装就返回 registry_not_installed。

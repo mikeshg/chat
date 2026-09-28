@@ -173,8 +173,10 @@ pub async fn host_session(
                                 "agent_options" => {
                                     agents::handle_options(&st, host_id, &v).await;
                                 }
-                                // A07：登记表查询结果 / 安装进度
-                                "registry_result" => agents::handle_registry_result(&st, &v),
+                                // A07：登记表查询结果 / 安装进度；试读可选项的结果同样按 request_id 配对
+                                "registry_result" | "probe_result" => {
+                                    agents::handle_registry_result(&st, &v)
+                                }
                                 "registry_install_progress" => {
                                     agents::handle_registry_progress(&st, host_id, &v);
                                 }

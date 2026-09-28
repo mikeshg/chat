@@ -190,8 +190,8 @@ export function agentSaveBar(dirty: boolean): { visible: boolean; text: string }
 /** 创建 / 保存失败时给用户看的句子。沿用原来编辑表单的错误码。 */
 export function agentErrText(e: unknown): string {
   if (!(e instanceof ApiError)) return e instanceof Error ? e.message : "保存失败";
-  if (e.status === 409 || e.message === "name_taken") return "名字已被占用（不区分大小写）";
   const known: Record<string, string> = {
+    name_taken: "名字已被占用（不区分大小写）",
     bad_name: "名字不合法（1–32 位字母数字 _ -，不能以 - 开头）",
     bad_runtime: "命令、参数或工作目录不合法",
     bad_extra_dirs: "额外目录过多或某一行过长（最多 10 行，每行 500 字）",
@@ -206,8 +206,10 @@ export function agentErrText(e: unknown): string {
     host_offline: "电脑不在线",
     host_not_local: "只能添加到正在运行 Chat 桌面端的这台电脑",
     bad_label: "名称需要 1–60 个字符",
+    probe_timeout: "读取超时，程序可能卡在启动或登录",
   };
   if (known[e.message]) return known[e.message];
+  if (e.status === 409) return known.name_taken;
   if (e.status === 400) return `参数不合法：${e.message}`;
   if (e.status === 404) return "找不到这台电脑或这个 Agent";
   return e.message || "保存失败";
