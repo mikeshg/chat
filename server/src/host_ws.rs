@@ -90,6 +90,15 @@ pub async fn host_session(
     // 同 host 重复连接：旧连接收到 host_superseded + 关闭，其清理逻辑按 conn_id 校验不再生效
     st.register_host(host_id, uid, conn_id, sid, tx.clone());
 
+    // A24：登记后立刻复核一次（与 ws.rs connection_valid 同条件）。升级后、hello 前
+    // 被撤销/禁用/改密的连接，kick_session 只断开已登记宿主会漏掉它——这里兜底：
+    // 不通过就摘掉登记、关连接，不发 host_ready、不补发排队调用、不广播上线。
+    if !crate::auth::grant_valid(&st.pool, uid, grant.session_version, sid).await {
+        st.unregister_host(host_id, conn_id);
+        let _ = socket.send(Message::Close(None)).await;
+        return Ok(());
+    }
+
     let _ = tx.try_send(ConnMsg::Frame(
         serde_json::json!({"type": "host_ready", "host_id": host_id}).to_string(),
     ));
@@ -130,6 +139,12 @@ pub async fn host_session(
             }
             _ = ping.tick() => {
                 if last_inbound.elapsed() > idle_timeout {
+                    send_timed(&mut sink, Message::Close(None), idle_timeout).await;
+                    break;
+                }
+                // A24：每个 ping 周期复核一次登录会话（禁用/改密/移出设备按时断开）；
+                // 不逐帧查库——流式事件可达 ~100ms/帧。失败走正常断开收尾。
+                if !crate::auth::grant_valid(&st.pool, uid, grant.session_version, sid).await {
                     send_timed(&mut sink, Message::Close(None), idle_timeout).await;
                     break;
                 }

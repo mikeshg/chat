@@ -31,20 +31,7 @@ pub async fn ws_handler(
         return Err(crate::error::AppError::unauthorized("ticket expired"));
     }
     // ticket 签发后被禁用/改密/移出设备的缝隙：升级前再确认一次（禁用、凭据版本、登录会话都要仍有效）
-    let ok = sqlx::query_scalar::<_, bool>(
-        "SELECT disabled_at IS NULL AND session_version = $2
-            AND ($3::uuid IS NULL OR EXISTS(
-                 SELECT 1 FROM sessions s
-                  WHERE s.id = $3 AND s.user_id = users.id AND s.revoked_at IS NULL))
-           FROM users WHERE id = $1",
-    )
-    .bind(grant.uid)
-    .bind(grant.session_version)
-    .bind(grant.sid)
-    .fetch_one(&st.pool)
-    .await
-    .unwrap_or(false);
-    if !ok {
+    if !crate::auth::grant_valid(&st.pool, grant.uid, grant.session_version, grant.sid).await {
         return Err(crate::error::AppError::unauthorized(
             "session expired, please login again",
         ));
@@ -315,20 +302,8 @@ async fn connection_valid(
     session_version: i64,
     sid: Option<Uuid>,
 ) -> bool {
-    let valid = sqlx::query_scalar::<_, bool>(
-        "SELECT disabled_at IS NULL AND session_version = $2
-            AND ($3::uuid IS NULL OR EXISTS(
-                 SELECT 1 FROM sessions s
-                  WHERE s.id = $3 AND s.user_id = users.id AND s.revoked_at IS NULL))
-           FROM users WHERE id = $1",
-    )
-    .bind(uid)
-    .bind(session_version)
-    .bind(sid)
-    .fetch_one(&st.pool)
-    .await
-    .unwrap_or(false);
-    valid && st.conn_alive(uid, conn_id)
+    crate::auth::grant_valid(&st.pool, uid, session_version, sid).await
+        && st.conn_alive(uid, conn_id)
 }
 
 async fn on_text(
