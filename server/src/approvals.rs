@@ -371,17 +371,26 @@ fn sanitize_request(tool: &Value, request_id: &str, inv_id: Uuid) -> Value {
         .chars()
         .take(40)
         .collect();
+    // A20：完整正文（审批卡展示用），与消息正文同上限 4000 字
+    let detail: String = tool["detail"]
+        .as_str()
+        .unwrap_or("")
+        .chars()
+        .take(4000)
+        .collect();
     let locations = sanitize_locations(&tool["locations"]);
     json!({
         "title": title,
         "kind": kind,
         "locations": locations,
+        "detail": detail,
         "request_id": request_id,
         "invocation_id": inv_id,
         "tool_call": {
             "title": title,
             "kind": kind,
             "locations": locations,
+            "detail": detail,
         },
     })
 }

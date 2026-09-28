@@ -566,7 +566,14 @@ async fn lookup_title(st: &McpState, b: &Binding, id: &str) -> Result<String, St
     Ok(title.unwrap_or_else(|| id.to_string()))
 }
 
-async fn await_send_approval(b: &Binding, title: &str) -> Result<(), String> {
+/// A20：审批请求带完整正文（detail）与待上传文件的绝对路径（locations），
+/// 让主人看到的就是批准后实际发出的内容。
+async fn await_send_approval(
+    b: &Binding,
+    title: &str,
+    detail: &str,
+    locations: &[String],
+) -> Result<(), String> {
     let Some(link) = b.approvals.clone() else {
         return Err("审批通道不可用".into());
     };
@@ -574,7 +581,8 @@ async fn await_send_approval(b: &Binding, title: &str) -> Result<(), String> {
     let tool_call = json!({
         "title": title,
         "kind": "send_message",
-        "locations": [],
+        "locations": locations,
+        "detail": detail,
     });
     let options = json!([
         {"optionId": "allow_once", "name": "本次允许", "kind": "allow_once"},
@@ -682,13 +690,39 @@ async fn send_message(st: &McpState, b: &Binding, args: &Value) -> Result<String
     } else {
         b.permission_tier.as_str()
     };
+    // A20：只读档审批卡展示完整正文和待上传路径清单；批准后上传的就是这份清单。
+    // 展示不下（超过服务端审批上限）就不发审批、不上传，直接报错给 Agent。
+    let mut upload_paths = paths;
     if !sends_directly(tier) {
+        let text_len = text.chars().count();
+        if text_len > 4000 {
+            return Err(format!("正文 {text_len} 字超过上限 4000，无法发起审批"));
+        }
+        if upload_paths.len() > 20 {
+            return Err(format!(
+                "file_paths 共 {} 个，超过审批展示上限 20",
+                upload_paths.len()
+            ));
+        }
+        for p in &mut upload_paths {
+            // 展示的路径 = upload_local 实际读取的路径（同一解析基准：进程当前目录）
+            let abs = std::path::absolute(p.as_str())
+                .map_err(|e| format!("路径 {p} 转绝对路径失败: {e}"))?;
+            let Some(s) = abs.to_str() else {
+                return Err(format!("路径 {p} 含非 UTF-8 字符，无法在审批卡展示"));
+            };
+            let s = s.to_string();
+            if s.chars().count() > 500 {
+                return Err(format!("路径超过展示上限 500 字，无法发起审批：{s}"));
+            }
+            *p = s;
+        }
         let title_conv = lookup_title(st, b, conv).await?;
         let title = format!("发消息到「{title_conv}」：{}", preview80(text));
-        await_send_approval(b, &title).await?;
+        await_send_approval(b, &title, text, &upload_paths).await?;
     }
     let mut ids = Vec::new();
-    for path in &paths {
+    for path in &upload_paths {
         ids.push(upload_local(st, b, conv, path).await?);
     }
     let body = json!({

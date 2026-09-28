@@ -414,6 +414,238 @@ async fn send_message_read_only_reject_does_not_post() {
     assert!(seen.lock().unwrap().iter().all(|s| !s.starts_with("POST")));
 }
 
+// ===== Agent A20 =====
+// 只读档发消息审批要完整披露：tool_call.detail = 完整正文、locations = 将上传的
+// 绝对路径；展示不下的（正文 >4000 / 路径 >20 条 / 单条 >500 字）直接报错，
+// 不发审批也不上传。批准后只上传审批时展示的那一份清单。
+
+/// 假服务端：列会话 + 收消息 + 收文件上传，全部按序记录。
+async fn fake_send_upload_backend() -> (String, tokio::task::JoinHandle<()>, Arc<Mutex<Vec<String>>>)
+{
+    use axum::body::Bytes;
+    use axum::extract::Multipart;
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen_get = seen.clone();
+    let seen_msg = seen.clone();
+    let seen_file = seen.clone();
+    let app = Router::new()
+        .route(
+            "/v1/agent-tools/conversations",
+            get(move || {
+                let seen = seen_get.clone();
+                async move {
+                    push_seen(&seen, "GET", "", "");
+                    Json(json!([{
+                        "id": A16_CONV,
+                        "kind": "group",
+                        "title": "项目群",
+                        "member_count": 2,
+                        "last_seq": 1,
+                        "readonly": false
+                    }]))
+                }
+            }),
+        )
+        .route(
+            "/v1/agent-tools/messages",
+            post(move |body: Bytes| {
+                let seen = seen_msg.clone();
+                async move {
+                    push_seen(&seen, "POST", "", &String::from_utf8_lossy(&body));
+                    Json(json!({"message_id": "msg-1"}))
+                }
+            }),
+        )
+        .route(
+            "/v1/agent-tools/files",
+            post(move |mut mp: Multipart| {
+                let seen = seen_file.clone();
+                async move {
+                    while let Ok(Some(field)) = mp.next_field().await {
+                        let name = field.file_name().unwrap_or("?").to_string();
+                        let data = field.bytes().await.unwrap_or_default();
+                        push_seen(&seen, "UPLOAD", "", &format!("{name}:{}", data.len()));
+                    }
+                    Json(json!({"attachment_id": "att-1"}))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let t = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://127.0.0.1:{port}"), t, seen)
+}
+
+fn send_call(url: String, args: Value) -> tokio::task::JoinHandle<(u16, Option<Value>)> {
+    tokio::spawn(async move {
+        rpc(
+            &url,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                   "params":{"name":"send_message","arguments":args}}),
+        )
+        .await
+    })
+}
+
+fn is_err_text(v: &Value) -> &str {
+    assert_eq!(v["result"]["isError"], true, "{v}");
+    v["result"]["content"][0]["text"].as_str().unwrap()
+}
+
+/// 主路径：detail 是完整正文（不止前 80 字），locations 是实际读取的绝对路径；
+/// 批准前不上传不发消息，批准后只上传展示过的那份清单。
+#[tokio::test]
+async fn send_message_read_only_discloses_full_text_and_paths() {
+    let (backend, _bt, seen) = fake_send_upload_backend().await;
+    let mcp = McpServer::start().unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let registry = agent_host::runtime::ApprovalRegistry::new();
+    let link = agent_host::runtime::ApprovalLink {
+        tx,
+        registry: registry.clone(),
+    };
+    let h = mcp.register_with(backend, "TOK".into(), "read_only".into(), Some(link));
+    let url = h.url.clone();
+
+    // 真实文件，用带 .. 的绝对路径传入：展示/上传的应是规范化后的绝对路径
+    let dir = std::env::temp_dir().join(format!("a20-{}", Uuid::new_v4().simple()));
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    let fp = dir.join("note.txt");
+    std::fs::write(&fp, b"file-body").unwrap();
+    let given = dir.join("sub").join("..").join("note.txt");
+    let shown = std::path::absolute(&given).unwrap();
+    let shown = shown.to_str().expect("路径应可展示").to_string();
+    let text = format!("第一行\n{}", "字".repeat(120));
+    let call = send_call(
+        url,
+        json!({"conversation_id": A16_CONV, "text": text,
+               "file_paths": [given.to_str().unwrap()]}),
+    );
+
+    let notice = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("应发出审批")
+        .expect("审批通道未关");
+    let tc = &notice.tool_call;
+    assert_eq!(tc["kind"], "send_message");
+    assert_eq!(tc["detail"].as_str().unwrap(), text, "detail 应是完整正文");
+    assert_eq!(
+        tc["locations"],
+        json!([shown]),
+        "locations 应是实际读取的绝对路径"
+    );
+    assert!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .all(|s| !s.starts_with("POST") && !s.starts_with("UPLOAD")),
+        "批准前不应上传或发消息：{:?}",
+        seen.lock().unwrap()
+    );
+
+    assert!(registry.resolve(&notice.request_id, "allow_once".into()));
+    let (st, v) = call.await.unwrap();
+    assert_eq!(st, 200);
+    let out = v.unwrap()["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(out.contains("已发送"), "{out}");
+    let log = seen.lock().unwrap().clone();
+    let up = log
+        .iter()
+        .position(|s| s == "UPLOAD  note.txt:9")
+        .expect("应上传一次 note.txt");
+    let post = log
+        .iter()
+        .position(|s| s.starts_with("POST") && s.contains("att-1"))
+        .expect("批准后应发消息");
+    assert!(up < post, "应先上传再发消息：{log:?}");
+    assert_eq!(
+        log.iter().filter(|s| s.starts_with("UPLOAD")).count(),
+        1,
+        "只上传审批展示的那份清单：{log:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 超限直接报错：正文 >4000、路径 >20 条、单条路径 >500 字 —— 不发审批、不上传。
+/// 边界：正文恰好 4000 字照常发审批，detail 一字不少。
+#[tokio::test]
+async fn send_message_read_only_over_limit_no_approval() {
+    let (backend, _bt, seen) = fake_send_upload_backend().await;
+    let mcp = McpServer::start().unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let registry = agent_host::runtime::ApprovalRegistry::new();
+    let link = agent_host::runtime::ApprovalLink {
+        tx,
+        registry: registry.clone(),
+    };
+    let h = mcp.register_with(backend, "TOK".into(), "read_only".into(), Some(link));
+
+    let (st, v) = rpc(
+        &h.url,
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+               "params":{"name":"send_message","arguments":{
+                   "conversation_id": A16_CONV, "text": "超".repeat(4001)}}}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert!(is_err_text(&v.unwrap()).contains("4000"), "应提示正文超限");
+
+    let many: Vec<String> = (0..21).map(|i| format!("f{i}.txt")).collect();
+    let (_st, v) = rpc(
+        &h.url,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+               "params":{"name":"send_message","arguments":{
+                   "conversation_id": A16_CONV, "text": "t", "file_paths": many}}}),
+    )
+    .await;
+    assert!(is_err_text(&v.unwrap()).contains("20"), "应提示条数超限");
+
+    let long_path = format!("C:\\{}.txt", "长".repeat(600));
+    let (_st, v) = rpc(
+        &h.url,
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+               "params":{"name":"send_message","arguments":{
+                   "conversation_id": A16_CONV, "text": "t", "file_paths": [long_path]}}}),
+    )
+    .await;
+    assert!(
+        is_err_text(&v.unwrap()).contains("500"),
+        "应提示单条路径超限"
+    );
+
+    assert!(rx.try_recv().is_err(), "超限场景不应发出任何审批通知");
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "超限场景不应有任何上传 / 发消息 / 查会话：{:?}",
+        seen.lock().unwrap()
+    );
+
+    // 边界：4000 字正文照常发审批，detail 完整保留
+    let text = "界".repeat(4000);
+    let call = send_call(
+        h.url.clone(),
+        json!({"conversation_id": A16_CONV, "text": text}),
+    );
+    let notice = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("4000 字应照常发审批")
+        .expect("审批通道未关");
+    assert_eq!(
+        notice.tool_call["detail"].as_str().unwrap().chars().count(),
+        4000
+    );
+    assert!(registry.resolve(&notice.request_id, "reject_once".into()));
+    let (_st, v) = call.await.unwrap();
+    assert!(is_err_text(&v.unwrap()).contains("主人拒绝了发送"));
+}
+
 /// workspace / full 不走审批，直接 POST。
 #[tokio::test]
 async fn send_message_workspace_and_full_post_directly() {
