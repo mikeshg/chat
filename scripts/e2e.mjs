@@ -861,11 +861,12 @@ async function runAgent(A, B) {
 
   const host = new Ws();
   let hostId = null;
+  const installId = randomUUID();
   try {
     await host.connect(ta, { role: 'host' });
     host.send({
       type: 'host_hello',
-      install_id: randomUUID(),
+      install_id: installId,
       label: saved.hostLabel,
       platform: saved.hostPlatform,
     });
@@ -979,17 +980,42 @@ async function runAgent(A, B) {
       const inv = mine[0];
       ok('invocation running while host online', inv?.status === 'running', `status=${inv?.status} error=${inv?.error}`);
       host.close();
-      let failed = null;
-      const deadline = Date.now() + 10000;
-      while (Date.now() < deadline) {
+      let still = null;
+      const stayUntil = Date.now() + 1500;
+      while (Date.now() < stayUntil) {
         const r = await api(ta, 'GET', `/conversations/${gid}/agent-invocations`);
-        failed = (r.json || []).find((i) => i.id === inv?.id) || null;
-        if (failed?.status === 'failed') break;
+        still = (r.json || []).find((i) => i.id === inv?.id) || null;
         await sleep(200);
       }
-      ok('host disconnect fails the invocation',
-        failed?.status === 'failed' && failed?.error === 'host_disconnected',
-        `status=${failed?.status} error=${failed?.error}`);
+      ok('invocation stays running after host disconnect',
+        still?.status === 'running',
+        `status=${still?.status} error=${still?.error}`);
+      const host2 = new Ws();
+      try {
+        await host2.connect(ta, { role: 'host' });
+        host2.send({
+          type: 'host_hello',
+          install_id: installId,
+          label: saved.hostLabel,
+          platform: saved.hostPlatform,
+        });
+        await host2.waitType('host_ready');
+        let failed = null;
+        const deadline = Date.now() + 10000;
+        while (Date.now() < deadline) {
+          const r = await api(ta, 'GET', `/conversations/${gid}/agent-invocations`);
+          failed = (r.json || []).find((i) => i.id === inv?.id) || null;
+          if (failed?.status === 'failed') break;
+          await sleep(200);
+        }
+        ok('reconnect without running fails the invocation',
+          failed?.status === 'failed' && failed?.error === 'host_disconnected',
+          `status=${failed?.status} error=${failed?.error}`);
+      } catch (e) {
+        ok('reconnect without running fails the invocation', false, String(e?.message || e));
+      } finally {
+        host2.close();
+      }
     } catch (e) {
       ok('agent mention flow', false, String(e?.message || e));
     } finally {

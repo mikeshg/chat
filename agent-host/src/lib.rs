@@ -10,6 +10,7 @@ mod conn;
 pub mod files;
 pub mod mcp;
 pub mod mcp_bridge;
+mod outbound;
 pub mod permission;
 pub mod registry;
 pub mod runtime;
@@ -89,8 +90,12 @@ pub(crate) struct Shared {
     pub data_dir: std::path::PathBuf,
     /// Agent A13：本地 MCP 服务；起不来的话本次运行不注入工具（仅告警）
     pub mcp: Option<mcp::McpServer>,
-    /// Agent A12：进行中的审批等待（跨本次进程的各次连接共用，断线时清空）
+    /// Agent A12：进行中的审批等待。断线不清，等重连后的决定或调用被取消。
     pub approvals: Arc<runtime::ApprovalRegistry>,
+    /// Agent A23：跨连接的出站队列（finish / 审批请求断线后补发）
+    pub lane: outbound::Outbound,
+    /// Agent A23：先于 start 到达的取消
+    pub pre_cancel: outbound::PreCancel,
     /// Agent A05：附件下载（能力 URL）与产出上传（Invocation 凭据）共用的 HTTP 客户端
     pub http: reqwest::Client,
 }
@@ -129,7 +134,9 @@ impl HostHandle {
 
     /// 主动停宿主：关 WS、杀所有在跑的 Agent 进程、结束重连循环
     pub async fn shutdown(self) {
+        // 先标记取消，再摘出站。摘出站会停写任务并放开套接字；取消保证不会立刻重连。
         self.task.abort();
+        self.shared.lane.retire();
         {
             let mut running = self.shared.running.lock().unwrap();
             for (_, h) in running.drain() {
@@ -155,6 +162,8 @@ pub fn spawn(cfg: HostConfig, tickets: Arc<dyn TicketSource>) -> HostHandle {
         superseded: std::sync::atomic::AtomicBool::new(false),
         mcp: mcp::McpServer::start(),
         approvals: runtime::ApprovalRegistry::new(),
+        lane: outbound::Outbound::new(),
+        pre_cancel: outbound::PreCancel::new(),
         http: reqwest::Client::new(),
     });
     let _ = std::fs::create_dir_all(&shared.data_dir);
