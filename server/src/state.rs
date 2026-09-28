@@ -117,6 +117,12 @@ pub struct AppState {
     /// Agent A04：排队超时清扫间隔（毫秒），默认 30s。
     /// 清扫循环每小段重读这个值，测试调小后不用等完原来的 30 秒。
     pub queue_sweep_interval_ms: AtomicU64,
+    /// Agent A23：宿主离线后，进行中的调用再等多久判 host_disconnected（毫秒）。默认 10 分钟。
+    /// 和排队清扫共用一个循环；测试调小。起点在 agent_hosts.offline_since，重启后仍在。
+    pub host_offline_grace_ms: AtomicU64,
+    /// 下发 invocation_start 和 invocation_cancel 共用这把锁，避免取消帧早于启动帧。
+    /// 全局锁：只包一次状态查询和一次非阻塞发送。吞吐成问题时按调用 id 分锁。
+    pub inv_gate: tokio::sync::Mutex<()>,
     /// Agent A03：invocation_id -> 进行中调用的运行时状态
     pub inv_runs: DashMap<Uuid, InvRun>,
     /// Agent A17：定时调用扫描间隔（毫秒），默认 30s。测试调小后不用等完原来的 30 秒。
@@ -141,6 +147,8 @@ impl AppState {
             backup_busy: AtomicBool::new(false),
             hosts: DashMap::new(),
             queue_sweep_interval_ms: AtomicU64::new(30_000),
+            host_offline_grace_ms: AtomicU64::new(600_000),
+            inv_gate: tokio::sync::Mutex::new(()),
             inv_runs: DashMap::new(),
             schedule_sweep_interval_ms: AtomicU64::new(30_000),
             registry_wait: DashMap::new(),

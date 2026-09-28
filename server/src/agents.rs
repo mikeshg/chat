@@ -1019,8 +1019,9 @@ fn terminal_status(status: &str) -> bool {
 
 /// POST /v1/agent-invocations/{id}/cancel
 /// 只有该调用所属 Agent 的主人能取消；别人或不存在一律 404。
-/// queued → cancelled；running / awaiting_approval → cancelled，并通知宿主；
-/// 已是终态 → 409 already_finished。
+/// queued / running / awaiting_approval → cancelled。
+/// 只要取消成功就通知宿主，不看更新前读到的状态：排队转运行可能已经把 start 发出去了。
+/// 宿主离线时这一帧送不出去，重连核对时再补。已是终态 → 409 already_finished。
 pub async fn cancel_invocation(
     State(st): State<SharedState>,
     headers: HeaderMap,
@@ -1058,21 +1059,12 @@ pub async fn cancel_invocation(
     let Some(inv) = inv else {
         return Err(AppError::conflict("already_finished"));
     };
-    if status == "running" || status == "awaiting_approval" {
-        let payload = serde_json::json!({
-            "type": "invocation_cancel",
-            "invocation_id": id,
-        })
-        .to_string();
-        let _ = st.send_to_host(host_id, &payload);
-        st.inv_runs.remove(&id);
-    }
+    // 更新前的 status 只用来拒绝已经结束的；通知与否看这次 UPDATE 是否成功。
+    notify_host_cancel(&st, host_id, id).await;
     let members = domain::member_ids(&st.pool, conv).await.unwrap_or_default();
     let members = with_root_members(&st, &members, &inv).await;
     push_invocation(&st, &members, &inv);
-    if status == "running" || status == "awaiting_approval" {
-        crate::approvals::expire_invocation(&st, id).await;
-    }
+    crate::approvals::expire_invocation(&st, id).await;
     // 未结束的后代一并取消（排队的也算）
     cascade_cancel(&st, &[id], None).await;
     Ok(Json(inv))
@@ -1123,12 +1115,7 @@ pub async fn revoke_access(st: &SharedState, user_ids: &[Uuid]) {
         Vec::new()
     });
     for inv in &invs {
-        let payload = json!({
-            "type": "invocation_cancel",
-            "invocation_id": inv.id,
-        })
-        .to_string();
-        st.send_to_host(inv.host_id, &payload);
+        notify_host_cancel(st, inv.host_id, inv.id).await;
         let view = InvocationView {
             id: inv.id,
             agent_id: inv.agent_id,
@@ -1691,13 +1678,69 @@ async fn deliver_invocation(
     }
     register_run(st, agent, &inv, &member_ids).await;
     let payload = invocation_start_payload(st, &inv, agent, context_key, prompt, session_id).await;
-    if !st.send_to_host(agent.host_id, &payload) {
-        st.inv_runs.remove(&inv.id);
-        let timeout = queue_timeout_secs(&st.pool, agent.id).await;
-        if let Some(q) = requeue(&st.pool, inv.id, timeout).await {
-            push_invocation(st, &member_ids, &q);
+    match send_start_if_current(st, agent.host_id, inv.id, &payload).await {
+        StartSend::Sent => {}
+        // 取消已经落库：队列里的运行时条目摘掉，不再推流式帧。
+        StartSend::Dead => {}
+        StartSend::Offline => {
+            st.inv_runs.remove(&inv.id);
+            let timeout = queue_timeout_secs(&st.pool, agent.id).await;
+            if let Some(q) = requeue(&st.pool, inv.id, timeout).await {
+                push_invocation(st, &member_ids, &q);
+            }
         }
     }
+}
+
+enum StartSend {
+    Sent,
+    /// 调用已经不是进行中（取消、超时等抢先）
+    Dead,
+    /// 还是 running，但宿主连接没接住这一帧
+    Offline,
+}
+
+/// 和 notify_host_cancel 共用 inv_gate：要么先发出 start，要么发现已终态后不再发。
+async fn send_start_if_current(
+    st: &SharedState,
+    host_id: Uuid,
+    id: Uuid,
+    payload: &str,
+) -> StartSend {
+    let _gate = st.inv_gate.lock().await;
+    let status: Option<String> = sqlx::query_scalar(
+        "SELECT status FROM agent_invocations WHERE id = $1 AND finished_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(&st.pool)
+    .await
+    .ok()
+    .flatten();
+    if !matches!(
+        status.as_deref(),
+        Some("running") | Some("awaiting_approval")
+    ) {
+        st.inv_runs.remove(&id);
+        return StartSend::Dead;
+    }
+    if st.send_to_host(host_id, payload) {
+        StartSend::Sent
+    } else {
+        StartSend::Offline
+    }
+}
+
+/// 取消通知。调用方已经把行改成终态。锁内摘掉运行时条目再发帧，
+/// 这样不会出现「cancel 已入队、start 随后又发出去」。
+async fn notify_host_cancel(st: &SharedState, host_id: Uuid, id: Uuid) {
+    let _gate = st.inv_gate.lock().await;
+    st.inv_runs.remove(&id);
+    let payload = json!({
+        "type": "invocation_cancel",
+        "invocation_id": id,
+    })
+    .to_string();
+    let _ = st.send_to_host(host_id, &payload);
 }
 
 /// A03：登记进行中调用的运行时状态（输出方式、进行中步骤、流式缓冲）。
@@ -2089,6 +2132,9 @@ pub fn spawn_queue_sweeper(st: SharedState) {
             if let Err(e) = sweep_timed_out(&st).await {
                 tracing::warn!(error = %e, "排队超时清扫失败");
             }
+            if let Err(e) = sweep_host_grace(&st).await {
+                tracing::warn!(error = %e, "宿主离线宽限清扫失败");
+            }
         }
     });
 }
@@ -2123,6 +2169,218 @@ async fn sweep_timed_out(st: &SharedState) -> Result<(), sqlx::Error> {
             .unwrap_or_default();
         let members = with_root_members(st, &members, &inv).await;
         push_invocation(st, &members, &inv);
+    }
+    Ok(())
+}
+
+/// 宿主重连（host_ready 已入队之后）：
+/// - 报告还在跑、库里也是进行中 → 保持；内存里没有运行时条目就重建；
+/// - 没报告 → failed/host_disconnected，过期审批，推帧；
+/// - 报告还在跑、库里已是终态 → 补发 invocation_cancel。
+pub(crate) async fn on_host_ready(
+    st: &SharedState,
+    host_id: Uuid,
+    reported: &[Uuid],
+    approval_ids: &[String],
+) {
+    cancel_terminal_reported(st, host_id, reported).await;
+    fail_unreported(st, host_id, reported).await;
+    rebuild_reported(st, host_id, reported).await;
+    crate::approvals::replay_decisions(st, host_id, approval_ids).await;
+}
+
+async fn cancel_terminal_reported(st: &SharedState, host_id: Uuid, reported: &[Uuid]) {
+    if reported.is_empty() {
+        return;
+    }
+    let ids = sqlx::query_scalar::<_, Uuid>(
+        "SELECT i.id
+           FROM agent_invocations i
+           JOIN agents a ON a.id = i.agent_id
+          WHERE a.host_id = $1
+            AND i.id = ANY($2)
+            AND i.status IN ('succeeded', 'failed', 'cancelled', 'timed_out')",
+    )
+    .bind(host_id)
+    .bind(reported)
+    .fetch_all(&st.pool)
+    .await
+    .unwrap_or_default();
+    for id in ids {
+        notify_host_cancel(st, host_id, id).await;
+    }
+}
+
+async fn fail_unreported(st: &SharedState, host_id: Uuid, reported: &[Uuid]) {
+    let invs = sqlx::query_as::<_, InvocationView>(&format!(
+        "UPDATE agent_invocations AS i
+            SET status = 'failed', error = 'host_disconnected', finished_at = now()
+           FROM agents a
+          WHERE i.agent_id = a.id
+            AND a.host_id = $1
+            AND i.finished_at IS NULL
+            AND i.status IN ('running', 'awaiting_approval')
+            AND NOT (i.id = ANY($2))
+         RETURNING i.id, i.agent_id, i.conversation_id, i.trigger_message_id, i.schedule_id,
+                   i.status, i.error, i.attachment_ids, i.created_at, i.started_at, i.finished_at,
+                   i.parent_invocation_id, i.root_conversation_id,
+                   (SELECT name FROM agents WHERE id = i.agent_id) AS agent_name"
+    ))
+    .bind(host_id)
+    .bind(reported)
+    .fetch_all(&st.pool)
+    .await
+    .unwrap_or_default();
+    for inv in invs {
+        st.inv_runs.remove(&inv.id);
+        let members = domain::member_ids(&st.pool, inv.conversation_id)
+            .await
+            .unwrap_or_default();
+        let members = with_root_members(st, &members, &inv).await;
+        push_invocation(st, &members, &inv);
+        crate::approvals::expire_invocation(st, inv.id).await;
+    }
+}
+
+async fn rebuild_reported(st: &SharedState, host_id: Uuid, reported: &[Uuid]) {
+    if reported.is_empty() {
+        return;
+    }
+    let invs = sqlx::query_as::<_, InvocationView>(
+        "SELECT i.id, i.agent_id, i.conversation_id, i.trigger_message_id, i.schedule_id,
+                i.status, i.error, i.attachment_ids, i.created_at, i.started_at, i.finished_at,
+                i.parent_invocation_id, i.root_conversation_id,
+                (SELECT name FROM agents WHERE id = i.agent_id) AS agent_name
+           FROM agent_invocations i
+           JOIN agents a ON a.id = i.agent_id
+          WHERE a.host_id = $1
+            AND i.id = ANY($2)
+            AND i.finished_at IS NULL
+            AND i.status IN ('running', 'awaiting_approval')",
+    )
+    .bind(host_id)
+    .bind(reported)
+    .fetch_all(&st.pool)
+    .await
+    .unwrap_or_default();
+    for inv in invs {
+        if st.inv_runs.contains_key(&inv.id) {
+            continue;
+        }
+        let Some(agent) = load_cfg(&st.pool, inv.agent_id).await.ok().flatten() else {
+            continue;
+        };
+        if agent.host_id != host_id {
+            continue;
+        }
+        let members = domain::member_ids(&st.pool, inv.conversation_id)
+            .await
+            .unwrap_or_default();
+        let members = with_root_members(st, &members, &inv).await;
+        register_run(st, &agent, &inv, &members).await;
+    }
+}
+
+/// 宽限到期，或服务端重启后才发现宿主已经不在。起点只认 `offline_since`。
+/// 在线宿主即使列里残留起点也不判失败，并把该列清掉（断开收尾和重连可能交错写上它）。
+async fn sweep_host_grace(st: &SharedState) -> Result<(), sqlx::Error> {
+    stamp_unobserved_offline(st).await?;
+    clear_online_offline_since(st).await?;
+    let grace_ms = st.host_offline_grace_ms.load(Ordering::Relaxed).max(1);
+    let grace_secs = grace_ms as f64 / 1000.0;
+    let expired = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM agent_hosts
+          WHERE offline_since IS NOT NULL
+            AND offline_since < now() - make_interval(secs => $1::double precision)",
+    )
+    .bind(grace_secs)
+    .fetch_all(&st.pool)
+    .await?;
+    let offline: Vec<Uuid> = expired
+        .into_iter()
+        .filter(|id| !st.host_online(*id))
+        .collect();
+    if offline.is_empty() {
+        return Ok(());
+    }
+    let invs = sqlx::query_as::<_, InvocationView>(&format!(
+        "UPDATE agent_invocations AS i
+            SET status = 'failed', error = 'host_disconnected', finished_at = now()
+           FROM agents a
+           JOIN agent_hosts h ON h.id = a.host_id
+          WHERE i.agent_id = a.id
+            AND a.host_id = ANY($2)
+            AND i.finished_at IS NULL
+            AND i.status IN ('running', 'awaiting_approval')
+            AND h.offline_since IS NOT NULL
+            AND h.offline_since < now() - make_interval(secs => $1::double precision)
+         RETURNING i.id, i.agent_id, i.conversation_id, i.trigger_message_id, i.schedule_id,
+                   i.status, i.error, i.attachment_ids, i.created_at, i.started_at, i.finished_at,
+                   i.parent_invocation_id, i.root_conversation_id,
+                   (SELECT name FROM agents WHERE id = i.agent_id) AS agent_name"
+    ))
+    .bind(grace_secs)
+    .bind(&offline)
+    .fetch_all(&st.pool)
+    .await?;
+    for inv in invs {
+        st.inv_runs.remove(&inv.id);
+        let members = domain::member_ids(&st.pool, inv.conversation_id)
+            .await
+            .unwrap_or_default();
+        let members = with_root_members(st, &members, &inv).await;
+        push_invocation(st, &members, &inv);
+        crate::approvals::expire_invocation(st, inv.id).await;
+    }
+    Ok(())
+}
+
+/// 在线却还带着离线起点：清掉，避免下一轮把进行中的调用判成断线失败。
+async fn clear_online_offline_since(st: &SharedState) -> Result<(), sqlx::Error> {
+    let ids =
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM agent_hosts WHERE offline_since IS NOT NULL")
+            .fetch_all(&st.pool)
+            .await?;
+    for id in ids {
+        if !st.host_online(id) {
+            continue;
+        }
+        sqlx::query(
+            "UPDATE agent_hosts SET offline_since = NULL
+              WHERE id = $1 AND offline_since IS NOT NULL",
+        )
+        .bind(id)
+        .execute(&st.pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// 内存里没有这条宿主、库里却有进行中的调用、又没有离线起点：
+/// 多半是进程重启前它还连着。从现在开始算宽限。
+async fn stamp_unobserved_offline(st: &SharedState) -> Result<(), sqlx::Error> {
+    let ids = sqlx::query_scalar::<_, Uuid>(
+        "SELECT DISTINCT a.host_id
+           FROM agent_invocations i
+           JOIN agents a ON a.id = i.agent_id
+           JOIN agent_hosts h ON h.id = a.host_id
+          WHERE i.finished_at IS NULL
+            AND i.status IN ('running', 'awaiting_approval')
+            AND h.offline_since IS NULL",
+    )
+    .fetch_all(&st.pool)
+    .await?;
+    for id in ids {
+        if st.host_online(id) {
+            continue;
+        }
+        sqlx::query(
+            "UPDATE agent_hosts SET offline_since = now()
+              WHERE id = $1 AND offline_since IS NULL",
+        )
+        .bind(id)
+        .execute(&st.pool)
+        .await?;
     }
     Ok(())
 }
@@ -2237,10 +2495,10 @@ pub(crate) async fn cascade_cancel(st: &SharedState, roots: &[Uuid], error: Opti
     }
     let rows = sqlx::query_as::<_, Cascaded>(
         "WITH RECURSIVE tree AS (
-            SELECT id, status FROM agent_invocations
+            SELECT id FROM agent_invocations
              WHERE parent_invocation_id = ANY($1) AND finished_at IS NULL
             UNION
-            SELECT i.id, i.status FROM agent_invocations i
+            SELECT i.id FROM agent_invocations i
             JOIN tree t ON i.parent_invocation_id = t.id
              WHERE i.finished_at IS NULL
         )
@@ -2252,8 +2510,7 @@ pub(crate) async fn cascade_cancel(st: &SharedState, roots: &[Uuid], error: Opti
                   i.status, i.error, i.created_at, i.started_at, i.finished_at,
                   i.parent_invocation_id, i.root_conversation_id,
                   (SELECT name FROM agents WHERE id = i.agent_id) AS agent_name,
-                  (SELECT host_id FROM agents WHERE id = i.agent_id) AS host_id,
-                  tree.status AS prev_status",
+                  (SELECT host_id FROM agents WHERE id = i.agent_id) AS host_id",
     )
     .bind(roots)
     .bind(error)
@@ -2267,16 +2524,8 @@ pub(crate) async fn cascade_cancel(st: &SharedState, roots: &[Uuid], error: Opti
         let id = row.id;
         let host_id = row.host_id;
         let conv = row.conversation_id;
-        let prev = row.prev_status.clone();
-        if prev == "running" || prev == "awaiting_approval" {
-            let payload = json!({
-                "type": "invocation_cancel",
-                "invocation_id": id,
-            })
-            .to_string();
-            st.send_to_host(host_id, &payload);
-            st.inv_runs.remove(&id);
-        }
+        // 子调用可能刚被派发出去，读到的旧状态不能决定是否通知。
+        notify_host_cancel(st, host_id, id).await;
         let members = domain::member_ids(&st.pool, conv).await.unwrap_or_default();
         let view = row.into_view();
         let members = with_root_members(st, &members, &view).await;
@@ -2301,7 +2550,6 @@ struct Cascaded {
     root_conversation_id: Option<Uuid>,
     agent_name: String,
     host_id: Uuid,
-    prev_status: String,
 }
 
 impl Cascaded {

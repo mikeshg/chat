@@ -4,8 +4,9 @@
 // - 不计入 conns —— 不产生 presence、不被 send_to_user 业务帧打扰；
 // - 首帧 10s 内必须是 host_hello（install_id/label/platform），否则断开；
 // - 同一 (user, install_id) 再连：新连接顶替，旧连接收到 host_superseded 后关闭；
-// - 断开 = 宿主离线：广播 agent_host_status；running / awaiting_approval
-//   置 failed/host_disconnected。queued 保持排队（A04）。
+// - 断开 = 宿主离线：广播 agent_host_status，记下 offline_since。
+//   running / awaiting_approval 保持原状态（A23），等重连核对或宽限到期。
+//   queued 保持排队（A04）。
 
 use crate::agents;
 use crate::error::AppResult;
@@ -64,14 +65,18 @@ pub async fn host_session(
         .chars()
         .take(60)
         .collect();
+    // 旧宿主不带这两个字段，按空处理：重连时进行中的调用一律视为没报告。
+    let reported = hello_uuids(&hello, "running");
+    let pending_approvals = hello_strings(&hello, "pending_approvals");
 
     // install_id 是桌面端永久标识：(user_id, install_id) 唯一 → 重连复用同一 host 记录。
     // label 只在第一次登记时写入；改名走 PATCH，重连不再覆盖。platform / last_seen_at 仍更新。
+    // 重连清掉离线宽限起点。
     let host_id = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO agent_hosts (user_id, install_id, label, platform)
          VALUES ($1, $2, $3, $4)
          ON CONFLICT (user_id, install_id)
-         DO UPDATE SET platform = EXCLUDED.platform, last_seen_at = now()
+         DO UPDATE SET platform = EXCLUDED.platform, last_seen_at = now(), offline_since = NULL
          RETURNING id",
     )
     .bind(uid)
@@ -93,8 +98,10 @@ pub async fn host_session(
     let _ = tx.try_send(ConnMsg::Frame(
         serde_json::json!({"type": "host_ready", "host_id": host_id}).to_string(),
     ));
+    // host_ready 已入队。先按宿主报告的进行中调用核对，再补发排队。
+    // 取消帧和审批决定排在 host_ready 之后、排队的 invocation_start 之前。
+    agents::on_host_ready(&st, host_id, &reported, &pending_approvals).await;
     broadcast_status(&st, uid, host_id, true);
-    // host_ready 已入队，再按 created_at 补发排队调用（invocation_start 排在其后）
     agents::flush_queued(&st, host_id).await;
 
     let (mut sink, mut stream) = socket.split();
@@ -174,14 +181,43 @@ pub async fn host_session(
 
     // 只有我这条连接还登记在册才算离线；被顶替时新连接已接管
     if st.unregister_host(host_id, conn_id) {
-        let _ = sqlx::query("UPDATE agent_hosts SET last_seen_at = now() WHERE id = $1")
-            .bind(host_id)
-            .execute(&st.pool)
-            .await;
+        // 宽限从这一刻起算。已经有起点（重复断开）就保留原来的。
+        let _ = sqlx::query(
+            "UPDATE agent_hosts
+                SET last_seen_at = now(), offline_since = COALESCE(offline_since, now())
+              WHERE id = $1",
+        )
+        .bind(host_id)
+        .execute(&st.pool)
+        .await;
         broadcast_status(&st, uid, host_id, false);
-        fail_running(&st, host_id).await;
     }
     Ok(())
+}
+
+fn hello_uuids(v: &Value, key: &str) -> Vec<Uuid> {
+    v.get(key)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str())
+                .filter_map(|s| Uuid::parse_str(s).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn hello_strings(v: &Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str())
+                .map(|s| s.chars().take(80).collect::<String>())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn send_timed<S>(sink: &mut S, m: Message, limit: Duration) -> bool
@@ -200,38 +236,4 @@ fn broadcast_status(st: &SharedState, owner: Uuid, host_id: Uuid, online: bool) 
     })
     .unwrap();
     st.send_to_user(owner, &p);
-}
-
-/// 宿主断开：只把 running / awaiting_approval 置 failed/host_disconnected。
-/// queued 保持排队，等这个宿主下次 host_ready 再按创建顺序执行。
-async fn fail_running(st: &SharedState, host_id: Uuid) {
-    let invs = sqlx::query_as::<_, crate::model::InvocationView>(
-        "UPDATE agent_invocations SET status = 'failed', error = 'host_disconnected',
-                finished_at = now()
-          WHERE finished_at IS NULL
-            AND status IN ('running', 'awaiting_approval')
-            AND agent_id IN (SELECT id FROM agents WHERE host_id = $1)
-         RETURNING id, agent_id, conversation_id, trigger_message_id, schedule_id, status, error,
-                   attachment_ids, created_at, started_at, finished_at, parent_invocation_id,
-                   root_conversation_id,
-                   (SELECT name FROM agents WHERE id = agent_invocations.agent_id) AS agent_name",
-    )
-    .bind(host_id)
-    .fetch_all(&st.pool)
-    .await
-    .unwrap_or_default();
-    for inv in invs {
-        // A03：摘下运行时状态（缓冲丢弃，终态由下面的 failed 帧广播）
-        st.inv_runs.remove(&inv.id);
-        let members = crate::domain::member_ids(&st.pool, inv.conversation_id)
-            .await
-            .unwrap_or_default();
-        let members = agents::with_root_members(&st, &members, &inv).await;
-        let p = serde_json::to_string(&WsOut::AgentInvocation {
-            invocation: inv.clone(),
-        })
-        .unwrap();
-        st.send_to_users(&members, &p);
-        crate::approvals::expire_invocation(st, inv.id).await;
-    }
 }

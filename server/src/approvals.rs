@@ -288,6 +288,40 @@ pub async fn decide(
     Ok(Json(view_row.into_view(uid)))
 }
 
+/// 宿主重连时，按它报告的 request_id 把离线期间已经决定的结果补发回去。
+pub(crate) async fn replay_decisions(st: &SharedState, host_id: Uuid, request_ids: &[String]) {
+    if request_ids.is_empty() {
+        return;
+    }
+    let rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT ap.request->>'request_id', ap.decision
+           FROM agent_approvals ap
+           JOIN agent_invocations i ON i.id = ap.invocation_id
+           JOIN agents a ON a.id = i.agent_id
+          WHERE a.host_id = $1
+            AND ap.status = 'decided'
+            AND ap.decision IS NOT NULL
+            AND ap.request->>'request_id' = ANY($2)",
+    )
+    .bind(host_id)
+    .bind(request_ids)
+    .fetch_all(&st.pool)
+    .await
+    .unwrap_or_default();
+    for rid in request_ids {
+        let Some((_, option_id)) = rows.iter().find(|(id, _)| id == rid) else {
+            continue;
+        };
+        let frame = json!({
+            "type": "approval_decision",
+            "request_id": rid,
+            "option_id": option_id,
+        })
+        .to_string();
+        let _ = st.send_to_host(host_id, &frame);
+    }
+}
+
 /// 调用离开「还能被决定」的状态时，把它剩下的全部 pending 审批标成 expired 并刷新卡片。
 /// 不假设一个调用只有一张卡。取消、调用结束和宿主断开都走这里。
 pub async fn expire_invocation(st: &SharedState, inv_id: Uuid) {

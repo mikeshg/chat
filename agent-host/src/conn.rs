@@ -1,11 +1,13 @@
 // 宿主 WS 连接循环：连上→host_hello→host_ready→收 invocation_start 起任务。
 
+use crate::outbound::OutItem;
 use crate::runtime::{
     self, AgentOption, AgentSpec, ApprovalLink, ApprovalNotice, InjectedMcp, RunEvent, RunOutput,
 };
 use crate::Shared;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,8 +19,6 @@ use tracing::warn;
 use uuid::Uuid;
 
 type Sock = WebSocketStream<MaybeTlsStream<TcpStream>>;
-// 出站帧统一走这个队列（连接读循环 + 各 invocation 任务共用）
-type Out = mpsc::UnboundedSender<Message>;
 
 pub(crate) async fn run(s: Arc<Shared>) {
     let mut backoff = Duration::from_secs(1);
@@ -63,12 +63,21 @@ async fn connect_once(s: &Arc<Shared>) -> Result<(), String> {
         .map_err(|e| format!("ws connect: {e}"))?;
     let (mut sink, mut stream) = sock.split();
 
+    let running: Vec<String> = hello_running(s)
+        .into_iter()
+        .map(|id| id.to_string())
+        .collect();
+    let mut pending = s.approvals.request_ids();
+    pending.sort();
     sink.send(Message::Text(
         json!({
             "type": "host_hello",
             "install_id": s.cfg.install_id,
             "label": s.cfg.label,
             "platform": s.cfg.platform,
+            // 旧服务端忽略未知字段。进行中含 finish 已生成但还没写进套接字的。
+            "running": running,
+            "pending_approvals": pending,
         })
         .to_string()
         .into(),
@@ -96,28 +105,60 @@ async fn connect_once(s: &Arc<Shared>) -> Result<(), String> {
     let _ = s.host_id.send(Some(host_id));
     tracing::info!(%host_id, "宿主已就绪");
 
-    // 写循环：读循环与 invocation 任务共用一个出站队列
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
+    // 写循环吃的是跨连接队列：断线只摘掉这一条，调用任务继续往队列里放。
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<OutItem>();
+    let gen = s.lane.engage(out_tx);
+    let lane = s.lane.clone();
     let writer = tokio::spawn(async move {
-        while let Some(m) = out_rx.recv().await {
-            if sink.send(m).await.is_err() {
+        while let Some(item) = out_rx.recv().await {
+            let (seq, msg) = match item {
+                OutItem::Eph(m) => (None, m),
+                OutItem::Durable { seq, body } => (Some(seq), Message::Text(body.into())),
+            };
+            if sink.send(msg).await.is_err() {
                 break;
+            }
+            if let Some(seq) = seq {
+                lane.ack(gen, seq);
             }
         }
         let _ = sink.close().await;
     });
+    s.lane.attach_writer(writer);
+    // 本函数以任何方式结束（读完、出错、宿主 shutdown 把任务取消）都摘掉出站并关掉套接字。
+    // finish / 审批请求留在队列里；等审批的调用不叫醒。
+    let _guard = LaneGuard {
+        lane: s.lane.clone(),
+    };
 
-    let res = read_loop(s, &mut stream, &out_tx).await;
-    writer.abort();
-    // 连接没了：还在等审批的调用以错误醒来，不要一直占着 agent 进程。
-    s.approvals.clear();
-    res
+    read_loop(s, &mut stream).await
+}
+
+/// connect_once 结束时关掉当前连接的写侧。Drop 覆盖中途取消，避免套接字被写任务握着不放。
+struct LaneGuard {
+    lane: crate::outbound::Outbound,
+}
+
+impl Drop for LaneGuard {
+    fn drop(&mut self) {
+        self.lane.retire();
+    }
+}
+
+/// 还在跑的调用，加上 finish 已经生成但套接字还没写成功的。
+fn hello_running(s: &Shared) -> Vec<Uuid> {
+    let mut ids: HashSet<Uuid> = s.cancels.lock().unwrap().keys().copied().collect();
+    for id in s.lane.invocation_ids() {
+        ids.insert(id);
+    }
+    let mut v: Vec<Uuid> = ids.into_iter().collect();
+    v.sort();
+    v
 }
 
 async fn read_loop(
     s: &Arc<Shared>,
     stream: &mut futures_util::stream::SplitStream<Sock>,
-    out: &Out,
 ) -> Result<(), String> {
     loop {
         let msg = stream
@@ -127,7 +168,7 @@ async fn read_loop(
             .map_err(|e| e.to_string())?;
         match msg {
             Message::Ping(p) => {
-                let _ = out.send(Message::Pong(p));
+                s.lane.emit_ephemeral(Message::Pong(p));
             }
             Message::Close(_) => return Ok(()),
             Message::Text(t) => {
@@ -141,19 +182,22 @@ async fn read_loop(
                         s.superseded.store(true, Ordering::SeqCst);
                         return Ok(());
                     }
-                    "invocation_start" => start_invocation(s, out, &v),
-                    "agent_probe" => start_probe(s, out, &v),
-                    "registry_list" => start_registry_list(s, out, &v),
-                    "registry_install" => start_registry_install(s, out, &v),
+                    "invocation_start" => start_invocation(s, &v),
+                    "agent_probe" => start_probe(s, &v),
+                    "registry_list" => start_registry_list(s, &v),
+                    "registry_install" => start_registry_install(s, &v),
                     "invocation_cancel" => {
                         // 不直接 abort：让 ACP 先发 session/cancel，最多再等 5 秒才杀进程。
                         // 这次调用不再回 invocation_finish。
+                        // 还没登记的 id 先记住，后面的 start 直接丢掉。
                         if let Some(id) = v["invocation_id"]
                             .as_str()
                             .and_then(|x| Uuid::parse_str(x).ok())
                         {
                             if let Some(tx) = s.cancels.lock().unwrap().get(&id) {
                                 let _ = tx.send(true);
+                            } else {
+                                s.pre_cancel.remember(id);
                             }
                         }
                     }
@@ -174,17 +218,24 @@ async fn read_loop(
     }
 }
 
-fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
+fn start_invocation(s: &Arc<Shared>, v: &Value) {
     let Some(inv_id) = v["invocation_id"]
         .as_str()
         .and_then(|x| Uuid::parse_str(x).ok())
     else {
         return;
     };
+    // 取消先到：不起进程，也不回 finish（服务端已经是终态）。
+    if s.pre_cancel.take(inv_id) {
+        return;
+    }
+    if s.cancels.lock().unwrap().contains_key(&inv_id) {
+        return;
+    }
     let spec = match AgentSpec::from_json(&v["agent"]) {
         Some(x) => x,
         None => {
-            send_finish(out, inv_id, Err("agent 描述非法".into()), Vec::new(), 0);
+            send_finish(&s.lane, inv_id, Err("agent 描述非法".into()), Vec::new(), 0);
             return;
         }
     };
@@ -235,13 +286,14 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
     let att_metas = crate::files::parse_attachments(&v["attachments"]);
     let http_base = http_base(&s.cfg.server_url);
     let http = s.http.clone();
-    let out2 = out.clone();
+    let lane = s.lane.clone();
+    let lane_finish = lane.clone();
     let running = s.running.clone();
     let cancels = s.cancels.clone();
     let dir = s.data_dir.clone();
     let registry_url = s.cfg.registry_url.clone();
     let cancel_flag = cancel_rx.clone();
-    let ask_out = out.clone();
+    let ask_lane = lane.clone();
     let task = tokio::spawn(async move {
         // 映射的生命周期钉在这次调用上：任务结束/被 abort 时 drop
         let _mcp_handle = mcp_handle;
@@ -249,20 +301,26 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
             Ok(s) => s,
             Err(e) => {
                 if !*cancel_flag.borrow() {
-                    send_finish(&out2, inv_id, Err(e), Vec::new(), 0);
+                    send_finish(&lane_finish, inv_id, Err(e), Vec::new(), 0);
                 }
                 running.lock().unwrap().remove(&inv_id);
                 cancels.lock().unwrap().remove(&inv_id);
                 return;
             }
         };
-        let bridge = tokio::spawn(forward_approvals(ask_rx, ask_out, inv_id));
+        let bridge = tokio::spawn(forward_approvals(ask_rx, ask_lane, inv_id));
         // A05：工作目录随任务存活，结束时整树删除（inv-<id>/）
         let (_wd, in_dir, out_dir) = crate::files::WorkDir::create(&dir, inv_id);
         let rt = runtime::runtime_for(&spec);
-        // A03：事件经 invocation_event 帧外发；文本段 ~100ms 窗口合并
+        // A03：事件经 invocation_event 帧外发；文本段 ~100ms 窗口合并。
+        // 离线时增量丢掉，finish 里仍有全文。
         let (events, ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let fwd = tokio::spawn(forward_events(ev_rx, out2.clone(), inv_id));
+        let lane_ev = lane.clone();
+        let fwd = tokio::spawn(forward_events(
+            ev_rx,
+            move |m| lane_ev.emit_ephemeral(m),
+            inv_id,
+        ));
         let mut req = runtime::RunRequest::for_invocation(spec, prompt, dir);
         req.resume_session = resume_session;
         req.cancel = cancel_rx;
@@ -288,9 +346,9 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
             };
             if let Ok(out) = &r {
                 // 正常调用结束后也上报一次可选项（session/new 里有才发）
-                send_options(&out2, agent_id, out, false);
+                send_options(&lane, agent_id, out, false);
             }
-            send_finish(&out2, inv_id, r, files, files_skipped);
+            send_finish(&lane_finish, inv_id, r, files, files_skipped);
         }
         running.lock().unwrap().remove(&inv_id);
         cancels.lock().unwrap().remove(&inv_id);
@@ -299,12 +357,12 @@ fn start_invocation(s: &Arc<Shared>, out: &Out, v: &Value) {
 }
 
 /// agent_probe：只握手并新建会话，把可选项报回去，不起调用。
-fn start_probe(s: &Arc<Shared>, out: &Out, v: &Value) {
+fn start_probe(s: &Arc<Shared>, v: &Value) {
     let Some(spec) = AgentSpec::from_json(&v["agent"]) else {
         return;
     };
     let agent_id = spec.id;
-    let out2 = out.clone();
+    let lane = s.lane.clone();
     let running = s.running.clone();
     let dir = s.data_dir.clone();
     let registry_url = s.cfg.registry_url.clone();
@@ -322,7 +380,7 @@ fn start_probe(s: &Arc<Shared>, out: &Out, v: &Value) {
         let (events, _) = tokio::sync::mpsc::unbounded_channel();
         let req = runtime::RunRequest::for_probe(spec, dir);
         if let Ok(out) = rt.run(req, events).await {
-            send_options(&out2, agent_id, &out, true);
+            send_options(&lane, agent_id, &out, true);
         }
         running.lock().unwrap().remove(&key);
     });
@@ -346,10 +404,9 @@ async fn materialize(
     Ok(spec)
 }
 
-fn start_registry_list(s: &Arc<Shared>, out: &Out, v: &Value) {
+fn start_registry_list(s: &Arc<Shared>, v: &Value) {
     let request_id = v["request_id"].clone();
     let s = s.clone();
-    let out = out.clone();
     tokio::spawn(async move {
         let outcome = crate::registry::list_local(&s.data_dir, &s.cfg.registry_url).await;
         let msg = json!({
@@ -358,18 +415,17 @@ fn start_registry_list(s: &Arc<Shared>, out: &Out, v: &Value) {
             "entries": outcome.entries,
             "error": outcome.error,
         });
-        let _ = out.send(Message::Text(msg.to_string().into()));
+        s.lane.emit_ephemeral(Message::Text(msg.to_string().into()));
     });
 }
 
-fn start_registry_install(s: &Arc<Shared>, out: &Out, v: &Value) {
+fn start_registry_install(s: &Arc<Shared>, v: &Value) {
     let entry_id = v["entry_id"].as_str().unwrap_or_default().to_string();
     let version = v["version"].as_str().unwrap_or_default().to_string();
     let s = s.clone();
-    let out = out.clone();
     tokio::spawn(async move {
         let entry_for_cb = entry_id.clone();
-        let out_cb = out.clone();
+        let lane = s.lane.clone();
         crate::registry::install(
             &s.data_dir,
             &s.cfg.registry_url,
@@ -386,14 +442,14 @@ fn start_registry_install(s: &Arc<Shared>, out: &Out, v: &Value) {
                         msg["error"] = json!(e);
                     }
                 }
-                let _ = out_cb.send(Message::Text(msg.to_string().into()));
+                lane.emit_ephemeral(Message::Text(msg.to_string().into()));
             },
         )
         .await;
     });
 }
 
-fn send_options(out: &Out, agent_id: Uuid, got: &RunOutput, force: bool) {
+fn send_options(lane: &crate::outbound::Outbound, agent_id: Uuid, got: &RunOutput, force: bool) {
     if !force && got.modes.is_none() && got.models.is_none() {
         return;
     }
@@ -405,7 +461,7 @@ fn send_options(out: &Out, agent_id: Uuid, got: &RunOutput, force: bool) {
         "modes": modes,
         "models": models,
     });
-    let _ = out.send(Message::Text(v.to_string().into()));
+    lane.emit_ephemeral(Message::Text(v.to_string().into()));
 }
 
 fn options_json(list: Option<&[AgentOption]>) -> Vec<Value> {
@@ -417,7 +473,10 @@ fn options_json(list: Option<&[AgentOption]>) -> Vec<Value> {
 
 /// RunEvent 流 → invocation_event 帧。Text 事件在 100ms 窗口内合并成一帧；
 /// 步骤事件先发走积压的文本再原样透传。通道关闭 = 运行结束，冲刷后退出。
-async fn forward_events(mut rx: mpsc::UnboundedReceiver<RunEvent>, out: Out, inv_id: Uuid) {
+async fn forward_events<F>(mut rx: mpsc::UnboundedReceiver<RunEvent>, emit: F, inv_id: Uuid)
+where
+    F: Fn(Message) + Send,
+{
     let mut buf = String::new();
     let flush_after = Duration::from_millis(100);
     let mut deadline: Option<tokio::time::Instant> = None;
@@ -431,22 +490,22 @@ async fn forward_events(mut rx: mpsc::UnboundedReceiver<RunEvent>, out: Out, inv
                     }
                 }
                 Some(RunEvent::StepStart { id, title, kind }) => {
-                    send_event(&out, inv_id, &mut buf,
+                    send_event(&emit, inv_id, &mut buf,
                         json!({"type":"step_start","id":id,"title":title,"kind":kind}));
                     deadline = None;
                 }
                 Some(RunEvent::StepEnd { id, ok }) => {
-                    send_event(&out, inv_id, &mut buf,
+                    send_event(&emit, inv_id, &mut buf,
                         json!({"type":"step_end","id":id,"ok":ok}));
                     deadline = None;
                 }
                 None => {
-                    send_event(&out, inv_id, &mut buf, Value::Null);
+                    send_event(&emit, inv_id, &mut buf, Value::Null);
                     return;
                 }
             },
             _ = wait_deadline(deadline) => {
-                send_event(&out, inv_id, &mut buf, Value::Null);
+                send_event(&emit, inv_id, &mut buf, Value::Null);
                 deadline = None;
             }
         }
@@ -462,20 +521,20 @@ async fn wait_deadline(d: Option<tokio::time::Instant>) {
 }
 
 /// 冲刷积压文本（若有）后再发 ev（Null = 只冲刷不发步骤帧）。
-fn send_event(out: &Out, inv_id: Uuid, buf: &mut String, ev: Value) {
+fn send_event(emit: &impl Fn(Message), inv_id: Uuid, buf: &mut String, ev: Value) {
     if !buf.is_empty() {
         let t = std::mem::take(buf);
-        send_event_frame(out, inv_id, json!({"type":"text","text":t}));
+        send_event_frame(emit, inv_id, json!({"type":"text","text":t}));
     }
     if !ev.is_null() {
-        send_event_frame(out, inv_id, ev);
+        send_event_frame(emit, inv_id, ev);
     }
 }
 
-/// 把超档请求原样转成 approval_request 帧。通道关闭 = 这次调用结束。
+/// 把超档请求转成 approval_request。离线时进补发队列，不中断等待。
 async fn forward_approvals(
     mut rx: mpsc::UnboundedReceiver<ApprovalNotice>,
-    out: Out,
+    lane: crate::outbound::Outbound,
     inv_id: Uuid,
 ) {
     while let Some(ask) = rx.recv().await {
@@ -486,14 +545,12 @@ async fn forward_approvals(
             "tool_call": ask.tool_call,
             "options": ask.options,
         });
-        if out.send(Message::Text(frame.to_string().into())).is_err() {
-            break;
-        }
+        lane.emit_durable(inv_id, frame.to_string());
     }
 }
 
-fn send_event_frame(out: &Out, inv_id: Uuid, ev: Value) {
-    let _ = out.send(Message::Text(
+fn send_event_frame(emit: &impl Fn(Message), inv_id: Uuid, ev: Value) {
+    emit(Message::Text(
         json!({"type":"invocation_event","invocation_id":inv_id,"event":ev})
             .to_string()
             .into(),
@@ -503,7 +560,7 @@ fn send_event_frame(out: &Out, inv_id: Uuid, ev: Value) {
 /// A05：files 是本次调用上传到服务端的产出附件 id（按上传顺序），
 /// files_skipped 是因配额被拒的数量（服务端追加提示到正文）。
 fn send_finish(
-    out: &Out,
+    lane: &crate::outbound::Outbound,
     id: Uuid,
     r: Result<RunOutput, String>,
     files: Vec<String>,
@@ -517,7 +574,8 @@ fn send_finish(
         Err(e) => json!({"type":"invocation_finish","invocation_id":id,"ok":false,
             "error":e.chars().take(500).collect::<String>()}),
     };
-    let _ = out.send(Message::Text(v.to_string().into()));
+    // 离线也要留下，重连后补发。正文和步骤都在这一帧里。
+    lane.emit_durable(id, v.to_string());
 }
 
 #[cfg(test)]
@@ -537,7 +595,16 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let (out, mut got) = mpsc::unbounded_channel();
         let inv = Uuid::new_v4();
-        let fwd = tokio::spawn(forward_events(rx, out, inv));
+        let fwd = tokio::spawn(async move {
+            forward_events(
+                rx,
+                move |m| {
+                    let _ = out.send(m);
+                },
+                inv,
+            )
+            .await;
+        });
         for t in ["a", "b", "c"] {
             tx.send(RunEvent::Text(t.into())).unwrap();
         }
@@ -565,7 +632,16 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let (out, mut got) = mpsc::unbounded_channel();
         let inv = Uuid::new_v4();
-        let fwd = tokio::spawn(forward_events(rx, out, inv));
+        let fwd = tokio::spawn(async move {
+            forward_events(
+                rx,
+                move |m| {
+                    let _ = out.send(m);
+                },
+                inv,
+            )
+            .await;
+        });
         tx.send(RunEvent::Text("partial".into())).unwrap();
         tx.send(RunEvent::StepStart {
             id: "s1".into(),

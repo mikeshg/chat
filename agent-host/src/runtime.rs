@@ -141,8 +141,8 @@ pub struct ApprovalNotice {
     pub options: Value,
 }
 
-/// 进行中的审批等待。连接层收到 approval_decision 时 resolve；
-/// 调用结束或断线时 finish / clear，避免 ACP 侧一直挂着。
+/// 进行中的审批等待。连接层收到 approval_decision 时 resolve。
+/// 断线不清空：等重连后的决定，或调用被取消时 finish。
 #[derive(Debug, Default)]
 pub struct ApprovalRegistry {
     pending: Mutex<HashMap<String, oneshot::Sender<String>>>,
@@ -171,7 +171,12 @@ impl ApprovalRegistry {
         self.pending.lock().unwrap().remove(request_id);
     }
 
-    /// 连接断开：全部等待以 Err 醒来。
+    /// 还在等决定的 request_id（host_hello 带给服务端，重连后补发决定）。
+    pub fn request_ids(&self) -> Vec<String> {
+        self.pending.lock().unwrap().keys().cloned().collect()
+    }
+
+    /// 宿主进程要停时：全部等待以 Err 醒来。普通断线不调用。
     pub fn clear(&self) {
         self.pending.lock().unwrap().clear();
     }

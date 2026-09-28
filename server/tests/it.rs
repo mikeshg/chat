@@ -9526,7 +9526,7 @@ async fn agent_invoke_host_offline() {
     assert!(inv["invocation"]["started_at"].is_null());
 }
 
-/// 调用跑到一半宿主断开 → failed + host_disconnected。
+/// 调用跑到一半宿主断开 → 宽限内仍是 running（A23：不立刻判失败）。
 #[tokio::test]
 async fn agent_invoke_host_disconnect_mid_run() {
     let base = spawn_named_db(&format!("chat_t_a01dc_{}", uniq())).await;
@@ -9549,13 +9549,23 @@ async fn agent_invoke_host_disconnect_mid_run() {
     let inv_id = inv["invocation"]["id"].as_str().unwrap().to_string();
 
     ha.shutdown().await; // 宿主进程下线
-    let frames = until_frame(&mut sa, "agent_invocation", A01Dur::from_secs(10)).await;
-    let done = frames
+    tokio::time::sleep(A01Dur::from_millis(800)).await;
+    let rows = list_inv(&base, &a, &conv).await;
+    let row = rows
+        .as_array()
+        .unwrap()
         .iter()
-        .find(|f| f["type"] == "agent_invocation" && f["invocation"]["id"] == inv_id.as_str())
-        .expect("断线后应有终态帧");
-    assert_eq!(done["invocation"]["status"], "failed");
-    assert_eq!(done["invocation"]["error"], "host_disconnected");
+        .find(|r| r["id"] == inv_id)
+        .unwrap();
+    assert_eq!(row["status"], "running", "断线后宽限内应保持运行: {row}");
+    assert!(row["error"].is_null(), "{row}");
+    let frames = frames_for(&mut sa, A01Dur::from_millis(300)).await;
+    assert!(
+        frames
+            .iter()
+            .all(|f| f["invocation"]["error"] != "host_disconnected"),
+        "宽限内不应判断开失败: {frames:?}"
+    );
 }
 
 /// long:9000 → 三条按序 Agent 消息，拼接等于原输出。
@@ -10424,7 +10434,8 @@ async fn a06_avatar_upload_and_acl() {
 }
 
 // ===== Agent A04 =====
-// 离线排队、上线按创建顺序执行、超时清扫、取消、断线只失败运行中的调用。
+// 离线排队、上线按创建顺序执行、超时清扫、取消。
+// 断线后运行中的调用在宽限内保持（A23），重连且不报告该调用时才 failed。
 
 async fn cancel_inv(base: &str, u: &TestUser, id: &str) -> (u16, Value) {
     let r = http()
@@ -10810,7 +10821,7 @@ async fn agent_a04_cancel_ignore() {
     h.shutdown().await;
 }
 
-/// 7. 运行中断开：running → failed/host_disconnected；并存的 queued 保持，重连后执行。
+/// 7. 运行中断开：宽限内仍 running，排队保持；重连不报告该调用时才 failed，排队的接着执行。
 #[tokio::test]
 async fn agent_a04_disconnect_keeps_queue() {
     let (base, st) = spawn_named_state(&format!("chat_it_a04dc_{}", uniq())).await;
@@ -10853,14 +10864,15 @@ async fn agent_a04_disconnect_keeps_queue() {
     assert_eq!(n, 1, "第二条应还在 running，才能拨回 queued");
 
     h.shutdown().await;
-    let failed = wait_inv(
-        &mut sa,
-        |f| f["invocation"]["id"] == id_a && f["invocation"]["status"] == "failed",
-        A01Dur::from_secs(10),
-    )
-    .await;
-    assert_eq!(failed["invocation"]["error"], "host_disconnected");
+    tokio::time::sleep(A01Dur::from_millis(500)).await;
     let rows = list_inv(&base, &a, &conv).await;
+    let arow = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == id_a)
+        .unwrap();
+    assert_eq!(arow["status"], "running", "断线后宽限内应保持运行: {arow}");
     let b = rows
         .as_array()
         .unwrap()
@@ -10869,7 +10881,15 @@ async fn agent_a04_disconnect_keeps_queue() {
         .unwrap();
     assert_eq!(b["status"], "queued");
 
+    // 新进程不报告旧调用 → 核对时判 host_disconnected，排队的按创建顺序执行。
     let (h2, _) = spawn_host(&base, &a, install).await;
+    let failed = wait_inv(
+        &mut sa,
+        |f| f["invocation"]["id"] == id_a && f["invocation"]["status"] == "failed",
+        A01Dur::from_secs(15),
+    )
+    .await;
+    assert_eq!(failed["invocation"]["error"], "host_disconnected");
     wait_inv(
         &mut sa,
         |f| f["invocation"]["id"] == id_b && f["invocation"]["status"] == "succeeded",
@@ -17001,9 +17021,9 @@ async fn a22_other_host_approval_is_ignored() {
     let _ = other.send(WsMsg::Close(None)).await;
 }
 
-/// 宿主断开：awaiting_approval 的调用失败，全部 pending 一起 expired。
+/// 宿主断开：宽限内调用仍是 awaiting_approval，pending 卡不过期（A23）。
 #[tokio::test]
-async fn a22_host_disconnect_expires_all_pending_approvals() {
+async fn a22_host_disconnect_keeps_pending_approvals() {
     let base = spawn_named_db(&format!("chat_it_a22d_{}", uniq())).await;
     let a = register(&base, &format!("a22d_{}", uniq())).await;
     let (mut sh, _su, _inv, _token, conv, _agent) = a13_running_invocation(&base, &a).await;
@@ -17021,23 +17041,25 @@ async fn a22_host_disconnect_expires_all_pending_approvals() {
     sh.close(None).await.unwrap();
     drop(sh);
 
-    let deadline = std::time::Instant::now() + A01Dur::from_secs(8);
-    loop {
-        let rows = list_inv(&base, &a, &conv).await;
-        let row = &rows.as_array().unwrap()[0];
-        if row["status"] == "failed" && row["error"] == "host_disconnected" {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "断线后调用应失败: {rows}"
-        );
-        tokio::time::sleep(A01Dur::from_millis(50)).await;
-    }
-    let id1 = card1["approval"]["id"].as_str().unwrap();
-    let id2 = card2["approval"]["id"].as_str().unwrap();
-    wait_approval_status(&base, &a, &conv, id1, "expired").await;
-    wait_approval_status(&base, &a, &conv, id2, "expired").await;
+    tokio::time::sleep(A01Dur::from_millis(600)).await;
+    let rows = list_inv(&base, &a, &conv).await;
+    assert_eq!(
+        rows.as_array().unwrap()[0]["status"],
+        "awaiting_approval",
+        "断线后宽限内应继续等待审批: {rows}"
+    );
+    let _ = (card1, card2);
+    let msgs = conv_messages(&base, &a, &conv).await;
+    assert_eq!(
+        a22_find_approval(&msgs, "d-1").unwrap()["approval"]["status"],
+        "pending",
+        "{msgs:?}"
+    );
+    assert_eq!(
+        a22_find_approval(&msgs, "d-2").unwrap()["approval"]["status"],
+        "pending",
+        "{msgs:?}"
+    );
 }
 
 /// 决定最后一张与新的 approval_request 同时到达：不能出现 running 且仍有 pending 卡。
@@ -17856,4 +17878,523 @@ async fn agent_a21_stale_epoch_without_run_does_not_restore_session() {
         "下一次派发仍不应带上被拒绝的会话: {}",
         next["context"]
     );
+}
+
+// ===== Agent A23 =====
+// 宿主掉线不终止进行中的调用；重连按 host_hello 核对并补发取消 / 审批决定。
+// 取消与排队转运行并发时，start 不会落在最后一条 cancel 之后。
+
+struct A23Run {
+    host: RawHostWs,
+    user: RawHostWs,
+    inv_id: String,
+    conv: String,
+    host_id: String,
+    install: uuid::Uuid,
+}
+
+async fn a23_open_host(
+    base: &str,
+    u: &TestUser,
+    install: uuid::Uuid,
+    running: &[String],
+    pending: &[String],
+) -> (RawHostWs, String) {
+    let (mut s, _) =
+        tokio_tungstenite::connect_async(format!("{}&role=host", ws_url(base, u).await))
+            .await
+            .unwrap();
+    s.send(WsMsg::Text(
+        json!({
+            "type": "host_hello",
+            "install_id": install,
+            "label": "a23",
+            "platform": "test",
+            "running": running,
+            "pending_approvals": pending,
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let ready = next_of(&mut s, "host_ready").await;
+    (s, ready["host_id"].as_str().unwrap().to_string())
+}
+
+async fn a23_running(base: &str, u: &TestUser) -> A23Run {
+    let install = uuid::Uuid::new_v4();
+    let (mut host, host_id) = a23_open_host(base, u, install, &[], &[]).await;
+    let (code, agent) = create_agent(base, u, &host_id, "a23bot").await;
+    assert_eq!(code, 200, "{agent}");
+    let conv = agent["conversation_id"].as_str().unwrap().to_string();
+    let (mut user, _) = tokio_tungstenite::connect_async(ws_url(base, u).await)
+        .await
+        .unwrap();
+    send_ws(&mut user, &conv, &format!("a23-{}", uniq()), "hold").await;
+    let frames = until_frame(&mut host, "invocation_start", A01Dur::from_secs(10)).await;
+    let inv_id = frames
+        .iter()
+        .find(|f| f["type"] == "invocation_start")
+        .unwrap()["invocation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    A23Run {
+        host,
+        user,
+        inv_id,
+        conv,
+        host_id,
+        install,
+    }
+}
+
+fn a23_row<'a>(rows: &'a Value, id: &str) -> &'a Value {
+    rows.as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == id)
+        .unwrap()
+}
+
+/// 运行中断线仍是 running；重连报告该 id（并清掉内存快照）后，事件和 finish 都被受理。
+#[tokio::test]
+async fn a23_reconnect_reports_running_and_finish_lands() {
+    let (base, st) = spawn_named_state(&format!("chat_it_a23fin_{}", uniq())).await;
+    let a = register(&base, &format!("a23f_{}", uniq())).await;
+    let mut run = a23_running(&base, &a).await;
+    run.host.close(None).await.ok();
+    drop(run.host);
+
+    tokio::time::sleep(A01Dur::from_millis(300)).await;
+    let rows = list_inv(&base, &a, &run.conv).await;
+    assert_eq!(a23_row(&rows, &run.inv_id)["status"], "running", "{rows}");
+
+    let inv_uuid = uuid::Uuid::parse_str(&run.inv_id).unwrap();
+    assert!(
+        st.inv_runs.remove(&inv_uuid).is_some(),
+        "断线不应摘掉运行时条目"
+    );
+
+    let (mut host, _) = a23_open_host(&base, &a, run.install, &[run.inv_id.clone()], &[]).await;
+    assert!(
+        st.inv_runs.contains_key(&inv_uuid),
+        "重连报告后应重建运行时条目"
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut user = run.user;
+    tokio::spawn(async move {
+        while let Some(Ok(msg)) = user.next().await {
+            if let WsMsg::Text(t) = msg {
+                if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                    let _ = tx.send(v);
+                }
+            }
+        }
+    });
+    host.send(WsMsg::Text(
+        json!({
+            "type": "invocation_event",
+            "invocation_id": run.inv_id,
+            "event": {"type": "text", "text": "live-bit"}
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let deadline = tokio::time::Instant::now() + A01Dur::from_secs(5);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!left.is_zero(), "重建后的调用应推流式帧");
+        let v = tokio::time::timeout(left, rx.recv())
+            .await
+            .expect("等流式帧超时")
+            .expect("用户连接已关");
+        if v["type"] == "agent_stream" && v["delta"] == "live-bit" {
+            break;
+        }
+    }
+
+    host_finish(&mut host, &run.inv_id).await;
+    // host_finish 写的是 "done"。再发一条带正文的会当重复 finish 被忽略。
+    // 上面 helper 固定 text=done，这里直接再断言 done。
+    let deadline = std::time::Instant::now() + A01Dur::from_secs(8);
+    loop {
+        let rows = list_inv(&base, &a, &run.conv).await;
+        if a23_row(&rows, &run.inv_id)["status"] == "succeeded" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "补发的 finish 应被受理: {rows}"
+        );
+        tokio::time::sleep(A01Dur::from_millis(40)).await;
+    }
+    let texts = agent_texts(&conv_messages(&base, &a, &run.conv).await);
+    assert_eq!(texts, vec!["done".to_string()], "{texts:?}");
+    assert!(st.inv_runs.get(&inv_uuid).is_none());
+}
+
+/// 重连但不报告该调用 → failed/host_disconnected。
+#[tokio::test]
+async fn a23_reconnect_without_report_fails() {
+    let base = spawn_named_db(&format!("chat_it_a23miss_{}", uniq())).await;
+    let a = register(&base, &format!("a23m_{}", uniq())).await;
+    let mut run = a23_running(&base, &a).await;
+    run.host.close(None).await.ok();
+    drop(run.host);
+    tokio::time::sleep(A01Dur::from_millis(200)).await;
+    let rows = list_inv(&base, &a, &run.conv).await;
+    assert_eq!(a23_row(&rows, &run.inv_id)["status"], "running");
+
+    let (_host, _) = a23_open_host(&base, &a, run.install, &[], &[]).await;
+    let deadline = std::time::Instant::now() + A01Dur::from_secs(5);
+    loop {
+        let rows = list_inv(&base, &a, &run.conv).await;
+        let row = a23_row(&rows, &run.inv_id);
+        if row["status"] == "failed" {
+            assert_eq!(row["error"], "host_disconnected", "{row}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "不报告的调用应失败: {rows}"
+        );
+        tokio::time::sleep(A01Dur::from_millis(40)).await;
+    }
+}
+
+/// 离线期间取消：重连报告该 id 时收到 invocation_cancel。
+#[tokio::test]
+async fn a23_offline_cancel_replayed_on_reconnect() {
+    let base = spawn_named_db(&format!("chat_it_a23can_{}", uniq())).await;
+    let a = register(&base, &format!("a23c_{}", uniq())).await;
+    let mut run = a23_running(&base, &a).await;
+    run.host.close(None).await.ok();
+    drop(run.host);
+    tokio::time::sleep(A01Dur::from_millis(200)).await;
+
+    let (code, body) = cancel_inv(&base, &a, &run.inv_id).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["status"], "cancelled");
+
+    let (mut host, _) = a23_open_host(&base, &a, run.install, &[run.inv_id.clone()], &[]).await;
+    let frames = until_frame(&mut host, "invocation_cancel", A01Dur::from_secs(5)).await;
+    let cancel = frames
+        .iter()
+        .find(|f| f["type"] == "invocation_cancel")
+        .unwrap();
+    assert_eq!(cancel["invocation_id"], run.inv_id);
+    let rows = list_inv(&base, &a, &run.conv).await;
+    assert_eq!(a23_row(&rows, &run.inv_id)["status"], "cancelled");
+}
+
+/// 离线期间决定审批：重连后按报告的 request_id 补发 approval_decision。
+#[tokio::test]
+async fn a23_offline_approval_decision_replayed() {
+    let base = spawn_named_db(&format!("chat_it_a23ap_{}", uniq())).await;
+    let a = register(&base, &format!("a23a_{}", uniq())).await;
+    let mut run = a23_running(&base, &a).await;
+    a22_send_approval(&mut run.host, &run.inv_id, "a23-req", "离线审批").await;
+    let card = a22_wait_approval(&base, &a, &run.conv, "a23-req").await;
+    assert_eq!(
+        a22_inv_status(&base, &a, &run.conv).await,
+        "awaiting_approval"
+    );
+
+    run.host.close(None).await.ok();
+    drop(run.host);
+    tokio::time::sleep(A01Dur::from_millis(300)).await;
+    assert_eq!(
+        a22_inv_status(&base, &a, &run.conv).await,
+        "awaiting_approval"
+    );
+
+    let approval_id = card["approval"]["id"].as_str().unwrap();
+    let (code, body) = decide_approval(&base, &a, approval_id, "allow").await;
+    assert_eq!(code, 200, "{body}");
+
+    let (mut host, _) = a23_open_host(
+        &base,
+        &a,
+        run.install,
+        &[run.inv_id.clone()],
+        &["a23-req".into()],
+    )
+    .await;
+    let dec = a22_wait_decision(&mut host, "a23-req").await;
+    assert_eq!(dec["option_id"], "allow", "{dec}");
+    assert_eq!(a22_inv_status(&base, &a, &run.conv).await, "running");
+}
+
+/// 宽限期看数据库里的 offline_since，不看内存。调小原子量后，回拨起点才会失败。
+#[tokio::test]
+async fn a23_grace_reads_offline_since() {
+    let (base, st) = spawn_named_state(&format!("chat_it_a23gr_{}", uniq())).await;
+    st.queue_sweep_interval_ms
+        .store(50, std::sync::atomic::Ordering::Relaxed);
+    st.host_offline_grace_ms
+        .store(60_000, std::sync::atomic::Ordering::Relaxed);
+    let a = register(&base, &format!("a23g_{}", uniq())).await;
+    let mut run = a23_running(&base, &a).await;
+    let host_uuid = uuid::Uuid::parse_str(&run.host_id).unwrap();
+    run.host.close(None).await.ok();
+    drop(run.host);
+
+    let deadline = std::time::Instant::now() + A01Dur::from_secs(5);
+    loop {
+        let set: bool =
+            sqlx::query_scalar("SELECT offline_since IS NOT NULL FROM agent_hosts WHERE id = $1")
+                .bind(host_uuid)
+                .fetch_one(&st.pool)
+                .await
+                .unwrap();
+        if set {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "断开后应写下离线起点");
+        tokio::time::sleep(A01Dur::from_millis(40)).await;
+    }
+    // 内存快照丢掉也不影响宽限（重启后只剩这一列）。
+    st.inv_runs.clear();
+    let rows = list_inv(&base, &a, &run.conv).await;
+    assert_eq!(a23_row(&rows, &run.inv_id)["status"], "running");
+
+    sqlx::query(
+        "UPDATE agent_hosts SET offline_since = now() - interval '30 seconds' WHERE id = $1",
+    )
+    .bind(host_uuid)
+    .execute(&st.pool)
+    .await
+    .unwrap();
+    tokio::time::sleep(A01Dur::from_millis(700)).await;
+    let rows = list_inv(&base, &a, &run.conv).await;
+    assert_eq!(
+        a23_row(&rows, &run.inv_id)["status"],
+        "running",
+        "30 秒前离线、宽限 60 秒，不应失败: {rows}"
+    );
+
+    sqlx::query(
+        "UPDATE agent_hosts SET offline_since = now() - interval '2 minutes' WHERE id = $1",
+    )
+    .bind(host_uuid)
+    .execute(&st.pool)
+    .await
+    .unwrap();
+    let deadline = std::time::Instant::now() + A01Dur::from_secs(5);
+    loop {
+        let rows = list_inv(&base, &a, &run.conv).await;
+        let row = a23_row(&rows, &run.inv_id);
+        if row["status"] == "failed" {
+            assert_eq!(row["error"], "host_disconnected", "{row}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "超过宽限应失败: {rows}"
+        );
+        tokio::time::sleep(A01Dur::from_millis(40)).await;
+    }
+}
+
+/// 在线宿主的 offline_since 被拨到过去：清扫不清调用，并把该列清掉。
+#[tokio::test]
+async fn a23_grace_sweep_leaves_online_host_running() {
+    let (base, st) = spawn_named_state(&format!("chat_it_a23on_{}", uniq())).await;
+    st.queue_sweep_interval_ms
+        .store(50, std::sync::atomic::Ordering::Relaxed);
+    st.host_offline_grace_ms
+        .store(60_000, std::sync::atomic::Ordering::Relaxed);
+    let a = register(&base, &format!("a23on_{}", uniq())).await;
+    let run = a23_running(&base, &a).await;
+    let host_uuid = uuid::Uuid::parse_str(&run.host_id).unwrap();
+    assert!(st.host_online(host_uuid), "宿主连接应仍在");
+
+    // 读走服务端的 ping，避免这条连接被写成卡住后拆掉。
+    let mut host = run.host;
+    let reader = tokio::spawn(async move { while let Some(Ok(_)) = host.next().await {} });
+
+    sqlx::query(
+        "UPDATE agent_hosts SET offline_since = now() - interval '2 minutes' WHERE id = $1",
+    )
+    .bind(host_uuid)
+    .execute(&st.pool)
+    .await
+    .unwrap();
+
+    let deadline = std::time::Instant::now() + A01Dur::from_secs(5);
+    loop {
+        let rows = list_inv(&base, &a, &run.conv).await;
+        let row = a23_row(&rows, &run.inv_id);
+        assert_eq!(
+            row["status"], "running",
+            "在线宿主不应被宽限清扫判失败: {row}"
+        );
+        let cleared: bool =
+            sqlx::query_scalar("SELECT offline_since IS NULL FROM agent_hosts WHERE id = $1")
+                .bind(host_uuid)
+                .fetch_one(&st.pool)
+                .await
+                .unwrap();
+        if cleared {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "清扫应清掉在线宿主的 offline_since"
+        );
+        tokio::time::sleep(A01Dur::from_millis(40)).await;
+    }
+    tokio::time::sleep(A01Dur::from_millis(300)).await;
+    let rows = list_inv(&base, &a, &run.conv).await;
+    assert_eq!(a23_row(&rows, &run.inv_id)["status"], "running");
+    let still_clear: bool =
+        sqlx::query_scalar("SELECT offline_since IS NULL FROM agent_hosts WHERE id = $1")
+            .bind(host_uuid)
+            .fetch_one(&st.pool)
+            .await
+            .unwrap();
+    assert!(still_clear, "在线宿主的离线起点应保持清空");
+    reader.abort();
+}
+
+/// 排队转运行和取消并发：宿主要么看不到 start，要么 start 后面还有 cancel。
+#[tokio::test]
+async fn a23_cancel_races_queue_flush() {
+    let (base, st) = spawn_named_state(&format!("chat_it_a23race_{}", uniq())).await;
+    let a = register(&base, &format!("a23r_{}", uniq())).await;
+    let install = uuid::Uuid::new_v4();
+    let (mut first, host_id) = a23_open_host(&base, &a, install, &[], &[]).await;
+    let (code, agent) = create_agent(&base, &a, &host_id, "racer").await;
+    assert_eq!(code, 200, "{agent}");
+    let conv = agent["conversation_id"].as_str().unwrap().to_string();
+    first.close(None).await.ok();
+    drop(first);
+    tokio::time::sleep(A01Dur::from_millis(200)).await;
+
+    let (mut sa, _) = tokio_tungstenite::connect_async(ws_url(&base, &a).await)
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for i in 0..12 {
+        send_ws(&mut sa, &conv, &format!("race-{i}"), "echo:x").await;
+    }
+    while ids.len() < 12 {
+        let f = wait_inv(
+            &mut sa,
+            |f| f["invocation"]["status"] == "queued",
+            A01Dur::from_secs(10),
+        )
+        .await;
+        let id = f["invocation"]["id"].as_str().unwrap().to_string();
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+
+    let (hb, _) =
+        tokio_tungstenite::connect_async(format!("{}&role=host", ws_url(&base, &a).await))
+            .await
+            .unwrap();
+    let (mut sink, mut stream) = hb.split();
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(Ok(msg)) = stream.next().await {
+            if let WsMsg::Text(t) = msg {
+                if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                    let _ = frame_tx.send(v);
+                }
+            }
+        }
+    });
+
+    let base_c = base.clone();
+    let access = a.access.clone();
+    let ids_c = ids.clone();
+    let canceller = tokio::spawn(async move {
+        let u = TestUser {
+            id: String::new(),
+            username: String::new(),
+            access,
+            refresh: String::new(),
+        };
+        for _ in 0..50 {
+            for id in &ids_c {
+                let _ = cancel_inv(&base_c, &u, id).await;
+            }
+            tokio::time::sleep(A01Dur::from_millis(5)).await;
+        }
+    });
+
+    sink.send(WsMsg::Text(
+        json!({
+            "type": "host_hello",
+            "install_id": install,
+            "label": "a23",
+            "platform": "test",
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let deadline = std::time::Instant::now() + A01Dur::from_secs(10);
+    loop {
+        let rows = list_inv(&base, &a, &conv).await;
+        let done = rows.as_array().unwrap().iter().all(|r| {
+            matches!(
+                r["status"].as_str(),
+                Some("cancelled") | Some("succeeded") | Some("failed")
+            )
+        });
+        if done && rows.as_array().unwrap().len() >= 12 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "取消应在超时前落定: {rows}"
+        );
+        tokio::time::sleep(A01Dur::from_millis(30)).await;
+    }
+    tokio::time::sleep(A01Dur::from_millis(300)).await;
+    canceller.abort();
+    drop(sink);
+
+    let mut frames = Vec::new();
+    while let Ok(v) = frame_rx.try_recv() {
+        frames.push(v);
+    }
+    for id in &ids {
+        let mut saw_start = false;
+        let mut cancel_after_start = false;
+        for f in &frames {
+            if f["invocation_id"].as_str() != Some(id.as_str()) {
+                continue;
+            }
+            match f["type"].as_str() {
+                Some("invocation_start") => {
+                    saw_start = true;
+                    cancel_after_start = false;
+                }
+                Some("invocation_cancel") if saw_start => cancel_after_start = true,
+                _ => {}
+            }
+        }
+        if saw_start {
+            assert!(
+                cancel_after_start,
+                "{id} 收到 start 之后没有 cancel；帧={frames:?}"
+            );
+        }
+        let uid = uuid::Uuid::parse_str(id).unwrap();
+        assert!(
+            st.inv_runs.get(&uid).is_none(),
+            "{id} 取消后不应残留运行时条目"
+        );
+    }
 }
