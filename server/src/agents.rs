@@ -980,7 +980,7 @@ pub async fn list_invocations(
 }
 
 /// POST /conversations/{id}/agent-context/reset（专属会话，或请求者自己的 Agent 在私聊 / 群里的上下文）
-/// 删掉这个会话对应的 AgentContext。仅成员；非 agent 会话 400；没有记录也 204。
+/// 把对应上下文的运行时会话清掉，代次加一。仅成员；非 agent 会话 400；没有 Agent 也 204。
 pub async fn reset_context(
     State(st): State<SharedState>,
     headers: HeaderMap,
@@ -1000,25 +1000,13 @@ pub async fn reset_context(
         return Err(AppError::bad_request("not an agent conversation"));
     };
     match (ty.as_str(), agent_id) {
-        // 专属会话：清它那个 Agent 在本会话的上下文
+        // 专属会话：只动它那个 Agent、键为本会话的上下文。schedule:<id> 不在这里。
         ("agent", Some(agent_id)) => {
-            sqlx::query("DELETE FROM agent_contexts WHERE agent_id = $1 AND context_key = $2")
-                .bind(agent_id)
-                .bind(conv.to_string())
-                .execute(&st.pool)
-                .await?;
+            clear_context(&st.pool, agent_id, &conv.to_string()).await?;
         }
         // 私聊 / 群：只清请求者自己的 Agent 在本会话的上下文，别人的 Agent 不受影响
         ("dm" | "group", _) => {
-            sqlx::query(
-                "DELETE FROM agent_contexts
-                  WHERE context_key = $1
-                    AND agent_id IN (SELECT id FROM agents WHERE owner_id = $2)",
-            )
-            .bind(conv.to_string())
-            .bind(uid)
-            .execute(&st.pool)
-            .await?;
+            clear_own_contexts(&st.pool, uid, &conv.to_string()).await?;
         }
         _ => return Err(AppError::bad_request("not an agent conversation")),
     }
@@ -1289,18 +1277,122 @@ async fn load_cfg(pool: &PgPool, id: Uuid) -> Result<Option<AgentRow>, sqlx::Err
         .map(|r| r.map(row_to_agent))
 }
 
-/// 该 Agent 在这个上下文键上记住的运行时会话 id。没有或查询失败都当新会话。
-async fn context_session(pool: &PgPool, agent_id: Uuid, context_key: &str) -> Option<String> {
-    sqlx::query_scalar::<_, String>(
-        "SELECT runtime_session_id FROM agent_contexts
+/// 一条语句读出运行时会话和代次。没有行 = 新会话、代次 0。空串会话也当没有。
+/// 查询失败同样当新会话，避免把读失败变成「续上一个没拿到的旧会话」。
+async fn read_context_epoch(
+    pool: &PgPool,
+    agent_id: Uuid,
+    context_key: &str,
+) -> (Option<String>, i64) {
+    let row = sqlx::query_as::<_, (String, i64)>(
+        "SELECT runtime_session_id, epoch FROM agent_contexts
           WHERE agent_id = $1 AND context_key = $2",
     )
     .bind(agent_id)
     .bind(context_key)
     .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()
+    .await;
+    match row {
+        Ok(Some((sid, epoch))) => {
+            let session = if sid.is_empty() { None } else { Some(sid) };
+            (session, epoch)
+        }
+        Ok(None) => (None, 0),
+        Err(e) => {
+            tracing::error!(error = %e, "读取 Agent 上下文失败");
+            (None, 0)
+        }
+    }
+}
+
+/// 下发 invocation_start 之前把这次读到的代次记在调用行上。完成时只认这一列。
+async fn stamp_context_epoch(pool: &PgPool, inv_id: Uuid, epoch: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE agent_invocations SET context_epoch = $2 WHERE id = $1")
+        .bind(inv_id)
+        .bind(epoch)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// 开新话题：没有行就插入空会话、代次 1；有行则清空会话并把代次加一。
+async fn clear_context(pool: &PgPool, agent_id: Uuid, context_key: &str) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO agent_contexts (agent_id, context_key, runtime_session_id, epoch, updated_at)
+         VALUES ($1, $2, '', 1, now())
+         ON CONFLICT (agent_id, context_key)
+         DO UPDATE SET runtime_session_id = '',
+                       epoch = agent_contexts.epoch + 1,
+                       updated_at = now()",
+    )
+    .bind(agent_id)
+    .bind(context_key)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// 私聊 / 群：请求者名下每个 Agent 各清一条，同一条语句完成。
+async fn clear_own_contexts(pool: &PgPool, owner: Uuid, context_key: &str) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO agent_contexts (agent_id, context_key, runtime_session_id, epoch, updated_at)
+         SELECT id, $2, '', 1, now() FROM agents WHERE owner_id = $1
+         ON CONFLICT (agent_id, context_key)
+         DO UPDATE SET runtime_session_id = '',
+                       epoch = agent_contexts.epoch + 1,
+                       updated_at = now()",
+    )
+    .bind(owner)
+    .bind(context_key)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// 成功的 finish 才写回。代次来自调用行（不是内存）。
+/// NULL 是迁移前派发的老调用，照常覆盖。有代次则只在上下文代次仍相等时覆盖，且不改代次本身。
+async fn persist_runtime_session(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    agent_id: Uuid,
+    context_key: &str,
+    session_id: &str,
+    context_epoch: Option<i64>,
+) -> Result<(), sqlx::Error> {
+    match context_epoch {
+        Some(epoch) => {
+            sqlx::query(
+                "INSERT INTO agent_contexts
+                     (agent_id, context_key, runtime_session_id, epoch, updated_at)
+                 VALUES ($1, $2, $3, $4, now())
+                 ON CONFLICT (agent_id, context_key)
+                 DO UPDATE SET runtime_session_id = EXCLUDED.runtime_session_id,
+                               updated_at = now()
+                 WHERE agent_contexts.epoch = $4",
+            )
+            .bind(agent_id)
+            .bind(context_key)
+            .bind(session_id)
+            .bind(epoch)
+            .execute(&mut **tx)
+            .await?;
+        }
+        None => {
+            sqlx::query(
+                "INSERT INTO agent_contexts
+                     (agent_id, context_key, runtime_session_id, updated_at)
+                 VALUES ($1, $2, $3, now())
+                 ON CONFLICT (agent_id, context_key)
+                 DO UPDATE SET runtime_session_id = EXCLUDED.runtime_session_id,
+                               updated_at = now()",
+            )
+            .bind(agent_id)
+            .bind(context_key)
+            .bind(session_id)
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 async fn agent_of_conv(pool: &PgPool, conv: Uuid) -> Result<Option<AgentRow>, sqlx::Error> {
@@ -1592,8 +1684,13 @@ async fn deliver_invocation(
     if inv.status != "running" {
         return;
     }
+    // 一条 SELECT 读会话和代次，先写进调用行，再下发 invocation_start。
+    let (session_id, epoch) = read_context_epoch(&st.pool, agent.id, context_key).await;
+    if let Err(e) = stamp_context_epoch(&st.pool, inv.id, epoch).await {
+        tracing::error!(error = %e, "记下调用上下文代次失败");
+    }
     register_run(st, agent, &inv, &member_ids).await;
-    let payload = invocation_start_payload(st, &inv, agent, context_key, prompt).await;
+    let payload = invocation_start_payload(st, &inv, agent, context_key, prompt, session_id).await;
     if !st.send_to_host(agent.host_id, &payload) {
         st.inv_runs.remove(&inv.id);
         let timeout = queue_timeout_secs(&st.pool, agent.id).await;
@@ -1803,8 +1900,8 @@ async fn invocation_start_payload(
     agent: &AgentRow,
     context_key: &str,
     prompt: &str,
+    session_id: Option<String>,
 ) -> String {
-    let session_id = context_session(&st.pool, agent.id, context_key).await;
     // 深度以调用行为准（主人直接发起是 0）。签发失败时不带凭据，调用照常跑。
     let depth: i32 = sqlx::query_scalar("SELECT depth FROM agent_invocations WHERE id = $1")
         .bind(inv.id)
@@ -2062,6 +2159,51 @@ fn push_invocation(st: &SharedState, member_ids: &[Uuid], inv: &InvocationView) 
     })
     .unwrap();
     st.send_to_users(member_ids, &p);
+}
+
+/// 成员变更提交后重算进行中调用的接收者。
+/// 命中调用会话或根会话是 `conv` 的运行；新名单是两侧当前成员的并集，
+/// 所以人还留在另一侧会话时不会被拿掉。查询失败就保持原快照。
+pub(crate) async fn refresh_run_members(st: &SharedState, conv: Uuid) {
+    let ids: Vec<Uuid> = st
+        .inv_runs
+        .iter()
+        .filter(|e| {
+            let run = e.value();
+            run.conversation_id == conv || run.inv.root_conversation_id == Some(conv)
+        })
+        .map(|e| *e.key())
+        .collect();
+    for id in ids {
+        let Some(inv) = st.inv_runs.get(&id).map(|r| r.inv.clone()) else {
+            continue;
+        };
+        if inv.conversation_id != conv && inv.root_conversation_id != Some(conv) {
+            continue;
+        }
+        let Ok(mut members) = domain::member_ids(&st.pool, inv.conversation_id).await else {
+            tracing::warn!(%conv, %id, "重算调用接收者时读成员失败");
+            continue;
+        };
+        if let Some(root) = inv.root_conversation_id {
+            if root != inv.conversation_id {
+                let Ok(extra) = domain::member_ids(&st.pool, root).await else {
+                    tracing::warn!(%conv, %id, "重算调用接收者时读根会话成员失败");
+                    continue;
+                };
+                for uid in extra {
+                    if !members.contains(&uid) {
+                        members.push(uid);
+                    }
+                }
+            }
+        }
+        if let Some(mut run) = st.inv_runs.get_mut(&id) {
+            if run.conversation_id == inv.conversation_id {
+                run.member_ids = members;
+            }
+        }
+    }
 }
 
 /// 会话成员，再加上根会话里还没包括的人。根会话就是本会话时不重复查。
@@ -2485,6 +2627,7 @@ fn push_stream(st: &SharedState, run: &mut InvRun, inv_id: Uuid, step: Option<St
         step,
     })
     .unwrap();
+    // 接收者在成员变更提交后重算，这里不查库（流式大约每 200ms 一帧）。
     st.send_to_users(&run.member_ids, &frame);
     run.last_push = Instant::now();
 }
@@ -2506,6 +2649,8 @@ struct FinishHead {
     schedule_id: Option<Uuid>,
     schedule_name: Option<String>,
     context_key: Option<String>,
+    /// 派发时记下的代次。NULL = 迁移前已经派发的调用。
+    context_epoch: Option<i64>,
 }
 
 /// 宿主回传的 invocation_finish：校验该调用确实派给这条宿主连接。
@@ -2529,7 +2674,7 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
     };
     let row = sqlx::query_as::<_, FinishHead>(
         "SELECT i.status, a.owner_id, i.conversation_id, a.id AS agent_id, a.host_id,
-                i.schedule_id, s.name AS schedule_name, i.context_key
+                i.schedule_id, s.name AS schedule_name, i.context_key, i.context_epoch
            FROM agent_invocations i
            JOIN agents a ON a.id = i.agent_id
            LEFT JOIN agent_schedules s ON s.id = i.schedule_id
@@ -2551,6 +2696,7 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
         schedule_id,
         schedule_name,
         context_key: stored_key,
+        context_epoch,
     } = row;
     // 已取消 / 已超时 / 已结束，或不是这条宿主的调用：不发回复。
     // awaiting_approval 仍是进行中（进程崩了也会回 finish）。
@@ -2568,24 +2714,7 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
     let run = st.inv_runs.remove(&inv_id).map(|(_, r)| r);
 
     if v["ok"].as_bool() == Some(true) {
-        // 失败的 finish 不进这个分支，因此不会覆盖已记住的运行时会话
-        if let Some(sid) = v["session_id"].as_str().filter(|s| !s.is_empty()) {
-            if let Err(e) = sqlx::query(
-                "INSERT INTO agent_contexts (agent_id, context_key, runtime_session_id, updated_at)
-                 VALUES ($1, $2, $3, now())
-                 ON CONFLICT (agent_id, context_key)
-                 DO UPDATE SET runtime_session_id = EXCLUDED.runtime_session_id,
-                               updated_at = now()",
-            )
-            .bind(agent_id)
-            .bind(&context_key)
-            .bind(sid)
-            .execute(&st.pool)
-            .await
-            {
-                tracing::error!(error = %e, "agent_context upsert failed");
-            }
-        }
+        // 失败的 finish 不进这个分支，因此不会覆盖已记住的运行时会话。
         let mut text = v["text"].as_str().unwrap_or_default().to_string();
         if !text.is_empty() {
             if let Some(name) = schedule_name.as_deref().filter(|s| !s.is_empty()) {
@@ -2632,6 +2761,15 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
         post_agent_text(st, conv, owner, agent_id, &text, steps_json).await;
         // A05：正文之后按序发产出附件；files 里只认本次调用凭据上传的附件
         post_agent_files(st, conv, owner, agent_id, inv_id, &v["files"]).await;
+        // 代次取调用行（上面 FOR UPDATE 锁住的那一列），不看内存里的运行时快照。
+        if let Some(sid) = v["session_id"].as_str().filter(|s| !s.is_empty()) {
+            if let Err(e) =
+                persist_runtime_session(&mut tx, agent_id, &context_key, sid, context_epoch).await
+            {
+                tracing::error!(error = %e, "agent_context upsert failed");
+                return;
+            }
+        }
         // 成功时记下完整回复（截 100k 字符），供互调查询。失败不写。
         let stored: String = text.chars().take(100_000).collect();
         let updated = sqlx::query_as::<_, InvocationView>(&format!(

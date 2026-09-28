@@ -1902,6 +1902,7 @@ async fn leave_conversation(
         }
     }
     tx.commit().await?;
+    crate::agents::refresh_run_members(&st, conv).await;
 
     notify(&st, &others, "conversations");
     notify(&st, &[uid], "conversations");
@@ -1947,6 +1948,7 @@ async fn kick_member(
     }
     let rest = domain::member_ids(&mut *tx, conv).await?;
     tx.commit().await?;
+    crate::agents::refresh_run_members(&st, conv).await;
 
     notify(&st, &rest, "conversations");
     notify(&st, &[target], "conversations");
@@ -2164,6 +2166,7 @@ async fn dissolve_conversation(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    crate::agents::refresh_run_members(&st, conv).await;
     notify(&st, &members, "conversations");
     Ok(StatusCode::NO_CONTENT)
 }
