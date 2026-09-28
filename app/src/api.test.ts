@@ -33,6 +33,7 @@ describe("session-owned HTTP requests", () => {
   });
 
   it("keeps refresh promises and finalizers isolated across generations", async () => {
+    vi.stubGlobal("navigator", {}); // 无 Web Locks 环境（A25 起真实环境会串行排队刷新）
     vi.useFakeTimers();
     const oldRefresh = deferred<Response>();
     const newRefresh = deferred<Response>();
@@ -105,5 +106,102 @@ describe("device labels", () => {
     expect(JSON.parse(String(fetcher.mock.calls[0][1]?.body)).device_label).toBe("Chrome · Windows");
     await auth.register("u", "secret123");
     expect(JSON.parse(String(fetcher.mock.calls[1][1]?.body)).device_label).toBe("Chrome · Windows");
+  });
+});
+
+// ===== Agent A25 =====
+describe("cross-tab refresh", () => {
+  const creds = (access: string, refresh: string): AuthResponse => ({
+    ...login("u"),
+    access_token: access,
+    refresh_token: refresh,
+  });
+  /** 刷新响应手动放行的假后端：非刷新接口仅认 Bearer a2，其余 401 */
+  const fakeBackend = () => {
+    const refreshes: { token: string; respond: (r: Response) => void }[] = [];
+    const authorized: string[] = [];
+    const fetcher = vi.fn((url: string, init?: RequestInit) => {
+      if (url.endsWith("/v1/auth/refresh")) {
+        const d = deferred<Response>();
+        refreshes.push({ token: JSON.parse(String(init?.body)).refresh_token, respond: d.resolve });
+        return d.promise;
+      }
+      const at = (init?.headers as Record<string, string>).authorization;
+      authorized.push(at);
+      return Promise.resolve(
+        at === "Bearer a2" ? Response.json(login("u").user) : new Response("{}", { status: 401 }),
+      );
+    });
+    return { fetcher, refreshes, authorized };
+  };
+  /** 两个共享同一 localStorage 的独立模块实例，模拟两个标签页 */
+  const freshPair = async () => {
+    vi.resetModules();
+    const a = await import("./api");
+    vi.resetModules();
+    const b = await import("./api");
+    return [a, b];
+  };
+
+  it("keeps the rotated tokens when this tab's refresh is rejected", async () => {
+    vi.stubGlobal("navigator", {}); // 无 Web Locks → 走「令牌已被换掉」退路
+    const { fetcher, refreshes, authorized } = fakeBackend();
+    vi.stubGlobal("fetch", fetcher);
+    const [A, B] = await freshPair();
+    const logout = vi.fn();
+    window.addEventListener("chat:logout", logout);
+
+    const ra = A.auth.me();
+    const rb = B.auth.me();
+    await vi.waitFor(() => expect(refreshes.length).toBe(2));
+    // 先到的标签页刷新成功并写回 r2；后到的拿旧令牌被服务端拒绝
+    refreshes[0].respond(Response.json(creds("a2", "r2")));
+    await vi.waitFor(() => expect(localStorage.getItem("chat_refresh")).toBe("r2"));
+    refreshes[1].respond(new Response("{}", { status: 401 }));
+    expect(await ra).toEqual(login("u").user);
+    expect(await rb).toEqual(login("u").user);
+    expect(refreshes.map((r) => r.token)).toEqual(["old-refresh", "old-refresh"]);
+    expect(localStorage.getItem("chat_access")).toBe("a2");
+    expect(authorized.filter((a) => a === "Bearer a2").length).toBe(2);
+    expect(logout).not.toHaveBeenCalled();
+  });
+
+  it("serializes refreshes through Web Locks so the server sees one request", async () => {
+    let tail: Promise<unknown> = Promise.resolve();
+    const request = vi.fn((_name: string, cb: () => Promise<boolean>) => {
+      const p = tail.then(cb);
+      tail = p.then(() => undefined, () => undefined);
+      return p;
+    });
+    vi.stubGlobal("navigator", { locks: { request } });
+    const { fetcher, refreshes } = fakeBackend();
+    vi.stubGlobal("fetch", fetcher);
+    const [A, B] = await freshPair();
+    const logout = vi.fn();
+    window.addEventListener("chat:logout", logout);
+
+    const ra = A.auth.me();
+    const rb = B.auth.me();
+    // 第二个标签页拿到锁时发现令牌已换，不再请求服务端
+    await vi.waitFor(() => expect(refreshes.length).toBe(1));
+    refreshes[0].respond(Response.json(creds("a2", "r2")));
+    expect(await ra).toEqual(login("u").user);
+    expect(await rb).toEqual(login("u").user);
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(refreshes.length).toBe(1);
+    expect(localStorage.getItem("chat_access")).toBe("a2");
+    expect(logout).not.toHaveBeenCalled();
+  });
+
+  it("clears the session and emits chat:logout when the token is untouched and the server rejects", async () => {
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("{}", { status: 401 }))));
+    const logout = vi.fn();
+    window.addEventListener("chat:logout", logout);
+
+    await expect(auth.me()).rejects.toMatchObject({ status: 401 });
+    expect(localStorage.getItem("chat_refresh")).toBeNull();
+    expect(localStorage.getItem("chat_access")).toBeNull();
+    expect(logout).toHaveBeenCalledTimes(1);
   });
 });

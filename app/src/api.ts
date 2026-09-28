@@ -105,6 +105,39 @@ function requireSession(gen: number) {
   if (gen !== session()) throw new ApiError(0, "session changed");
 }
 
+// Web Locks 锁名：跨标签页串行化刷新，避免并发轮换互相消费掉对方的刷新令牌
+const REFRESH_LOCK = "chat_token_refresh";
+
+// 单次刷新（在 Web Locks 内执行）：localStorage 是所有标签页共享的，
+// 刷新令牌已被换成别的值 = 别的标签页刚刷新成功（或新登录），直接当作成功、
+// 用存储里的新访问令牌重试即可，不再请求服务端也不清空会话
+async function refreshOnce(gen: number, srv: string, rt: string): Promise<boolean> {
+  const swapped = () => {
+    const cur = localStorage.getItem(LS_REFRESH);
+    return cur !== null && cur !== rt;
+  };
+  if (swapped()) return true;
+  let r: AuthResponse;
+  try {
+    const res = await fetch(`${srv}/v1/auth/refresh`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refresh_token: rt }),
+    });
+    if (!res.ok) return swapped();
+    r = await res.json();
+  } catch {
+    return swapped();
+  }
+  // 期间发生了登录/登出/换服务器：不能把旧凭据写回新会话
+  if (gen !== session() || getServer() !== srv) return false;
+  if (localStorage.getItem(LS_REFRESH) !== rt) return swapped();
+  localStorage.setItem(LS_ACCESS, r.access_token);
+  localStorage.setItem(LS_REFRESH, r.refresh_token);
+  localStorage.setItem(LS_USER, JSON.stringify(r.user));
+  return true;
+}
+
 async function tryRefresh(gen: number, srv: string): Promise<boolean> {
   requireSession(gen);
   if (refreshing?.gen === gen) return refreshing.promise;
@@ -112,21 +145,18 @@ async function tryRefresh(gen: number, srv: string): Promise<boolean> {
   if (!rt) return false;
   const owner = { gen, promise: Promise.resolve(false) };
   refreshing = owner;
+  const run = () => refreshOnce(gen, srv, rt);
   owner.promise = (async () => {
     try {
-      const res = await fetch(`${srv}/v1/auth/refresh`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ refresh_token: rt }),
-      });
-      if (!res.ok) return false;
-      const r: AuthResponse = await res.json();
-      // 期间发生了登录/登出/换服务器：不能把旧凭据写回新会话
-      if (gen !== session() || localStorage.getItem(LS_REFRESH) !== rt || getServer() !== srv) return false;
-      localStorage.setItem(LS_ACCESS, r.access_token);
-      localStorage.setItem(LS_REFRESH, r.refresh_token);
-      localStorage.setItem(LS_USER, JSON.stringify(r.user));
-      return true;
+      const locks = typeof navigator !== "undefined" ? navigator.locks : undefined;
+      if (locks) {
+        try {
+          return await locks.request(REFRESH_LOCK, run);
+        } catch {
+          // 锁服务本身异常：退化为无锁刷新
+        }
+      }
+      return await run();
     } catch {
       return false;
     } finally {
