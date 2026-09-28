@@ -80,24 +80,84 @@ node scripts/e2e.mjs phase2   # phase2：验证数据持久化（含头像、文
 
 ## 客户端打包
 
+桌面安装包只能在对应系统上编：Windows 包在 Windows 上编，macOS 包在 Mac 上编，Linux 包在 Linux 上编。Android 包在任一台桌面系统上都能编。
+
+所有平台都要先准备：
+
+- Node.js 20 以上、pnpm、Rust stable（用 [rustup](https://rustup.rs) 安装）。
+- 仓库根目录执行一次 `pnpm install`。
+- 版本号改 `app/src-tauri/tauri.conf.json` 的 `version`，安装包文件名和 Android 的 versionName 都跟着它变。
+- 图标已生成在 `app/src-tauri/icons/`。换图标后在 `app/` 下执行 `node gen-icon.cjs`。
+
+下面的打包命令都在 `app/` 目录执行。装好后在客户端登录页填服务器地址（如 `http://192.168.1.5:28080`）。
+
+### Windows
+
+准备：Visual Studio 2022 生成工具，勾选「使用 C++ 的桌面开发」；Rust 用默认的 MSVC 工具链。WebView2 在 Windows 10 / 11 上已自带。
+
 ```bash
 cd app
-node gen-icon.cjs                              # 已生成，可跳过
-./node_modules/.bin/tauri build                # Windows → src-tauri/target/release/bundle/nsis/Chat_0.1.0_x64-setup.exe
-./node_modules/.bin/tauri android init         # 首次生成 Android 工程
-./node_modules/.bin/tauri android build --apk  # 需 Android SDK + NDK + rust android targets
+pnpm tauri build
 ```
 
-macOS 要在 Mac 上编（仓库根目录先 `pnpm install`，另需 Rust 和 Xcode 命令行工具）：
+产物：`src-tauri/target/release/bundle/nsis/Chat_<版本>_x64-setup.exe`。
+
+- 第一次打包会自动下载 NSIS，需要联网。release 编译第一次约 5–10 分钟，之后是增量编译。
+- 安装包没有代码签名，从网上下载后运行时 SmartScreen 可能提示「未知发布者」，点「更多信息 → 仍要运行」。
+
+### macOS
+
+准备：Xcode 命令行工具（`xcode-select --install`）。
 
 ```bash
 cd app
-pnpm tauri build --bundles app   # → src-tauri/target/release/bundle/macos/Chat.app
+pnpm tauri build --bundles app
 ```
 
-把 `Chat.app` 拖进「应用程序」即可。加上 `dmg`（`--bundles app,dmg`）会多打一个 DMG，但这一步要用 AppleScript 控制 Finder，失败时 `Chat.app` 已经生成，直接拖即可。
+产物：`src-tauri/target/release/bundle/macos/Chat.app`，拖进「应用程序」即可。
 
-Tauri 端登录页填写服务器地址（如 `http://192.168.1.5:28080`）。
+- 打出来的包只适配编译它的那台 Mac 的芯片（Apple 芯片或 Intel）。
+- 加上 `dmg`（`--bundles app,dmg`）会多打一个 DMG。这一步要用 AppleScript 控制 Finder，可能失败；失败时 `Chat.app` 已经生成，直接拖即可。
+- 包没有签名。拷到别的 Mac 上，第一次打开如果提示「已损坏」或「无法验证开发者」，执行 `xattr -cr /Applications/Chat.app` 后再打开。
+- 同时适配两种芯片的通用包（未实测）：先 `rustup target add aarch64-apple-darwin x86_64-apple-darwin`，再 `pnpm tauri build --bundles app --target universal-apple-darwin`，产物在 `src-tauri/target/universal-apple-darwin/release/bundle/macos/Chat.app`。
+
+### Linux（未实测）
+
+以 Debian / Ubuntu 为例先装系统依赖（其他发行版见 [Tauri 前置要求](https://v2.tauri.app/start/prerequisites/)）：
+
+```bash
+sudo apt update
+sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+```
+
+```bash
+cd app
+pnpm tauri build --bundles deb,appimage
+```
+
+产物：
+
+- `src-tauri/target/release/bundle/deb/Chat_<版本>_amd64.deb`，用 `sudo apt install ./Chat_<版本>_amd64.deb` 安装。
+- `src-tauri/target/release/bundle/appimage/Chat_<版本>_amd64.AppImage`，`chmod +x` 后直接运行。
+- 要 RPM 包就在 `--bundles` 里加上 `rpm`。
+
+### Android
+
+准备：
+
+- Android Studio，并在 SDK Manager 里装上 NDK。
+- 环境变量：`JAVA_HOME` 指向 Android Studio 自带的 JBR，`ANDROID_HOME` 指向 SDK 目录，`NDK_HOME` 指向 NDK 目录。
+- Rust 目标：`rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android`。
+- Android 工程已经提交在 `app/src-tauri/gen/android`，不用再执行 `tauri android init`。
+
+```bash
+cd app
+pnpm tauri android build --apk --debug --target aarch64
+```
+
+- APK 在 `src-tauri/gen/android/app/build/outputs/apk/` 下，命令结束时会打印完整路径。用 `adb install -r <apk 路径>` 安装，或者拷到手机上点开安装。
+- `--target aarch64` 只编 arm64，现在的手机基本都是这个架构，编得也快。去掉它会把四种架构都编进去。
+- 用 debug 包的原因：release 包禁止明文 HTTP（`usesCleartextTraffic=false`），连不上局域网的 `http://` 服务器；而且 release 包没有签名，不能直接安装。只有服务器走 HTTPS、又配好了签名，才用 release 包（去掉 `--debug`）。
 
 ### Android 在 Windows 上的已知坑
 
