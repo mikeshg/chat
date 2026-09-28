@@ -190,7 +190,7 @@ pub struct ApprovalLink {
 }
 
 /// 宿主上报给服务端的一个模型或模式选项。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AgentOption {
     pub id: String,
     pub name: String,

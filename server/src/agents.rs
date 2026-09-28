@@ -14,8 +14,7 @@ use crate::domain::{self, PostError};
 use crate::error::{AppError, AppResult};
 use crate::model::{
     AgentHostView, AgentRuntimeReq, AgentStepView, AgentUserSettings, AgentView, CreateAgentReq,
-    InvocationView, PatchAgentReq, ProbeRuntimeReq, StreamStepView, UpdateAgentUserSettingsReq,
-    WsOut,
+    InvocationView, PatchAgentReq, StreamStepView, UpdateAgentUserSettingsReq, WsOut,
 };
 use crate::state::{InvRun, SharedState};
 use axum::{
@@ -729,18 +728,31 @@ pub async fn delete_agent(
 /// 试读可能要冷启动 npx 包，给足时间。
 const PROBE_WAIT: Duration = Duration::from_secs(60);
 
-/// 下发 agent_probe 并等宿主回 probe_result：{modes, models, error}。离线 409，超时 504。
-/// 已有 Agent 的结果由宿主另发的 agent_options 落库，这里只转给调用方。
-async fn probe_wait(st: &SharedState, host_id: Uuid, agent: Value) -> AppResult<Json<Value>> {
-    if !st.host_online(host_id) {
+/// POST /v1/agents/{id}/probe：让宿主重新读一次可选模型 / 模式，等宿主回 probe_result
+/// 再返回 {modes, models, error}。离线 409，超时 504。结果由宿主另发的 agent_options 落库。
+pub async fn probe_agent(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Value>> {
+    let uid = uid(&headers, &st).await?;
+    let cfg = load_cfg(&st.pool, id)
+        .await?
+        .filter(|a| a.owner == uid && a.deleted_at.is_none())
+        .ok_or_else(|| AppError::not_found("agent not found"))?;
+    if !st.host_online(cfg.host_id) {
         return Err(AppError::conflict("host_offline"));
     }
     let request_id = Uuid::new_v4();
     let (tx, rx) = tokio::sync::oneshot::channel();
     st.registry_wait.insert(request_id, tx);
-    let payload =
-        json!({"type": "agent_probe", "request_id": request_id, "agent": agent}).to_string();
-    if !st.send_to_host(host_id, &payload) {
+    let payload = json!({
+        "type": "agent_probe",
+        "request_id": request_id,
+        "agent": agent_snapshot(&cfg),
+    })
+    .to_string();
+    if !st.send_to_host(cfg.host_id, &payload) {
         st.registry_wait.remove(&request_id);
         return Err(AppError::conflict("host_offline"));
     }
@@ -757,41 +769,6 @@ async fn probe_wait(st: &SharedState, host_id: Uuid, agent: Value) -> AppResult<
         None => Value::Null,
     };
     Ok(Json(out))
-}
-
-/// POST /v1/agents/{id}/probe：让宿主重新读一次可选模型 / 模式，等到结果再返回。
-pub async fn probe_agent(
-    State(st): State<SharedState>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-) -> AppResult<Json<Value>> {
-    let uid = uid(&headers, &st).await?;
-    let cfg = load_cfg(&st.pool, id)
-        .await?
-        .filter(|a| a.owner == uid && a.deleted_at.is_none())
-        .ok_or_else(|| AppError::not_found("agent not found"))?;
-    probe_wait(&st, cfg.host_id, agent_snapshot(&cfg)).await
-}
-
-/// POST /v1/agent-hosts/{id}/probe：添加前试读一个程序的可选项，不落库。
-/// 和添加一样只允许本次登录正在跑桌面端的那台电脑（会在那台电脑上起进程）。
-pub async fn probe_runtime(
-    State(st): State<SharedState>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-    Json(req): Json<ProbeRuntimeReq>,
-) -> AppResult<Json<Value>> {
-    let ctx = auth::require_auth(&st, &headers).await?;
-    if !crate::agent_access::user_allows(&st.pool, ctx.user.id).await? {
-        return Err(AppError::forbidden("agent_access_denied"));
-    }
-    require_own_host(&st, ctx.user.id, id).await?;
-    if !st.host_is_local_session(id, ctx.sid) {
-        return Err(AppError::forbidden("host_not_local"));
-    }
-    let (runtime, cwd) = normalize_runtime(&req.runtime, &req.cwd)?;
-    let agent = json!({"id": Uuid::nil(), "name": "", "runtime": runtime, "cwd": cwd});
-    probe_wait(&st, id, agent).await
 }
 
 /// 宿主上报 agent_options：写入 reported_options，并让主人重拉 Agent 列表。

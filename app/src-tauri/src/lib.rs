@@ -59,6 +59,7 @@ pub fn run() {
             agent_host::agent_host_start,
             agent_host::agent_host_stop,
             agent_host::agent_host_ticket,
+            agent_host::agent_host_probe,
         ])
         .setup(|app| {
             tray::install(app.handle())?;

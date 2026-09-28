@@ -356,9 +356,22 @@ fn start_invocation(s: &Arc<Shared>, v: &Value) {
     s.running.lock().unwrap().insert(inv_id, task);
 }
 
-/// agent_probe：只握手并新建会话，把可选项报回去，不起调用。
-/// 已有 Agent（id 非空）成功时照旧发 agent_options；帧里带 request_id 时另回
-/// probe_result（含失败原因），服务端据此同步应答。添加前的试读 id 为全零。
+/// 只握手并新建会话，读程序提供的模型 / 模式，不发 prompt。
+/// 桌面端添加 Agent 前直接调它（不经过服务端）。
+pub async fn probe(
+    spec: AgentSpec,
+    data_dir: std::path::PathBuf,
+    registry_url: &str,
+) -> Result<RunOutput, String> {
+    let spec = materialize(spec, &data_dir, registry_url).await?;
+    let rt = runtime::runtime_for(&spec);
+    let (events, _) = tokio::sync::mpsc::unbounded_channel();
+    rt.run(runtime::RunRequest::for_probe(spec, data_dir), events)
+        .await
+}
+
+/// agent_probe：成功时照旧发 agent_options；帧里带 request_id 时另回
+/// probe_result（含失败原因），服务端据此同步应答。
 fn start_probe(s: &Arc<Shared>, v: &Value) {
     let request_id = v.get("request_id").cloned().filter(|r| !r.is_null());
     let lane = s.lane.clone();
@@ -374,18 +387,9 @@ fn start_probe(s: &Arc<Shared>, v: &Value) {
     let registry_url = s.cfg.registry_url.clone();
     let key = Uuid::new_v4();
     let task = tokio::spawn(async move {
-        let got = match materialize(spec, &dir, &registry_url).await {
-            Ok(spec) => {
-                let rt = runtime::runtime_for(&spec);
-                let (events, _) = tokio::sync::mpsc::unbounded_channel();
-                rt.run(runtime::RunRequest::for_probe(spec, dir), events)
-                    .await
-            }
-            Err(e) => Err(e),
-        };
+        let got = probe(spec, dir, &registry_url).await;
         match &got {
-            Ok(out) if !agent_id.is_nil() => send_options(&lane, agent_id, out, true),
-            Ok(_) => {}
+            Ok(out) => send_options(&lane, agent_id, out, true),
             Err(e) => warn!("probe 失败: {e}"),
         }
         if let Some(rid) = request_id {

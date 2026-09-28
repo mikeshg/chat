@@ -8,6 +8,7 @@
 import { canUseAgent } from "./agentAccess";
 import { convs, deviceLabel, getServer } from "./api";
 import { setState } from "./store";
+import type { AgentRuntime, ReportedOptions } from "./types";
 
 /** 仅 Tauri 桌面壳：浏览器与 Android WebView 都不启动宿主 */
 export function isDesktopShell(): boolean {
@@ -98,6 +99,12 @@ export async function syncAgentHost(
     return;
   }
   await startAgentHost();
+}
+
+/** 添加前在本机读程序提供的模型 / 模式（仅桌面端，不经过服务端）。失败时 reject 原因文字 */
+export async function probeLocal(runtime: AgentRuntime, cwd: string): Promise<ReportedOptions> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<ReportedOptions>("agent_host_probe", { runtime, cwd });
 }
 
 /** 退出登录时调用：停掉本机宿主（Web/Android 为 no-op） */

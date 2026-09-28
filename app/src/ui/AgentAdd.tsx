@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { probeLocal } from "../agentHost";
 import { agents } from "../api";
 import type { AgentHostView, AgentRuntime, AgentView, RegistryEntry, ReportedOptions } from "../types";
 import { hostDisplayName } from "./agentHosts";
@@ -75,12 +76,10 @@ export default function AgentAdd({
     const seq = probeSeq.current;
     setProbing(true);
     try {
-      const res = await agents.probeRuntime(host.id, { runtime: runtimeOf(p), cwd: cwd.trim() });
-      if (seq !== probeSeq.current) return;
-      if (res.error) setProbeErr(res.error);
-      else setOptions({ modes: res.modes, models: res.models });
+      const res = await probeLocal(runtimeOf(p), cwd.trim());
+      if (seq === probeSeq.current) setOptions(res);
     } catch (e) {
-      if (seq === probeSeq.current) setProbeErr(agentErrText(e));
+      if (seq === probeSeq.current) setProbeErr(e instanceof Error ? e.message : String(e));
     } finally {
       if (seq === probeSeq.current) setProbing(false);
     }
@@ -88,7 +87,7 @@ export default function AgentAdd({
 
   // 选中已安装的登记表程序就自动读；自定义命令填好后点「重新读取」
   useEffect(() => {
-    if (pick?.kind === "reg" && pick.entry.status === "ready" && host.online) void probe(pick);
+    if (pick?.kind === "reg" && pick.entry.status === "ready") void probe(pick);
     else resetOptions();
   }, [pick]);
 

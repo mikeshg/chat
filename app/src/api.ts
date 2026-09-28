@@ -3,7 +3,6 @@ import type {
   AdminSettings,
   AdminUserView,
   AgentHostView,
-  AgentRuntime,
   AgentUserSettings,
   AgentView,
   RegistryList,
@@ -382,11 +381,7 @@ export const agents = {
   /** 软删除。进行中的调用会被取消 */
   remove: (id: string) => del<void>(`/agents/${id}`),
   /** 让在线宿主重新读可选模型 / 模式，等到结果；离线 409 host_offline，60 秒无响应 504 */
-  probe: (id: string) => post<ProbeResult>(`/agents/${id}/probe`),
-  /** 添加前在本机试读一个程序的可选项（不落库）；403 host_not_local */
-  probeRuntime: (hostId: string, body: { runtime: AgentRuntime; cwd?: string }) =>
-    post<ProbeResult>(`/agent-hosts/${hostId}/probe`, body),
-  /** 上传头像（PNG / JPEG / WebP），返回更新后的 Agent */
+  probe: (id: string) => post<ProbeResult>(`/agents/${id}/probe`),  /** 上传头像（PNG / JPEG / WebP），返回更新后的 Agent */
   uploadAvatar: (id: string, file: Blob) => {
     const fd = new FormData();
     const ext = file.type === "image/png" ? "png" : file.type === "image/webp" ? "webp" : "jpg";

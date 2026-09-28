@@ -209,6 +209,27 @@ pub async fn agent_host_stop(
     Ok(())
 }
 
+/// 添加 Agent 前在本机读程序提供的模型 / 模式，不经过服务端。
+/// runtime 与创建时同形：{command,args} 或 {registry:{id,version}}；失败返回原因。
+#[tauri::command]
+pub async fn agent_host_probe(
+    runtime: serde_json::Value,
+    cwd: String,
+) -> Result<serde_json::Value, String> {
+    let agent = serde_json::json!({"id": Uuid::nil(), "name": "", "runtime": runtime, "cwd": cwd});
+    let spec = agent_host::runtime::AgentSpec::from_json(&agent).ok_or("运行时描述不完整")?;
+    let out = agent_host::probe(
+        spec,
+        agent_host::default_data_dir(),
+        agent_host::DEFAULT_REGISTRY_URL,
+    )
+    .await?;
+    Ok(serde_json::json!({
+        "modes": out.modes.unwrap_or_default(),
+        "models": out.models.unwrap_or_default(),
+    }))
+}
+
 /// 前端回填取票结果：ticket 或 error 二选一。
 #[tauri::command]
 pub fn agent_host_ticket(

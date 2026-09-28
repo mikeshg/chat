@@ -125,6 +125,21 @@ async fn acp_probe_reports_options_without_prompt() {
     assert_eq!(out.models.unwrap().len(), 2);
 }
 
+/// 桌面端添加前直接调的 probe：读到可选项；命令起不来时返回原因。
+#[tokio::test]
+async fn host_probe_reads_options_and_reports_failure() {
+    let out = agent_host::probe(fake(), std::env::temp_dir(), "")
+        .await
+        .expect("probe 应成功");
+    assert_eq!(out.models.unwrap()[1].id, "smart");
+    let mut bad = fake();
+    bad.command = "chat-no-such-cmd-probe".into();
+    let err = agent_host::probe(bad, std::env::temp_dir(), "")
+        .await
+        .unwrap_err();
+    assert!(!err.is_empty());
+}
+
 #[tokio::test]
 async fn acp_ignores_mode_outside_options() {
     let mut spec = fake();

@@ -702,14 +702,6 @@ pub struct CreateAgentReq {
     pub mode: String,
 }
 
-/// POST /v1/agent-hosts/{id}/probe 请求体：添加前试读这个程序的可选模型 / 模式
-#[derive(Debug, Deserialize)]
-pub struct ProbeRuntimeReq {
-    pub runtime: AgentRuntimeReq,
-    #[serde(default)]
-    pub cwd: String,
-}
-
 /// 两种运行时：自定义命令，或登记表条目（只校验字段，不联网）。
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]

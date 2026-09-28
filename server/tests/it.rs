@@ -10288,39 +10288,12 @@ async fn a06_probe_online_then_offline() {
     assert_eq!(body["error"], "host_offline");
 }
 
-/// 添加前试读：本机宿主回可选项；启动失败带原因；创建时可直接带上模型和模式。
+/// 创建时可直接带上模型和模式（添加页在本机读好可选项后一起提交）。
 #[tokio::test]
-async fn a06_probe_runtime_before_create() {
+async fn a06_create_with_model_and_mode() {
     let base = spawn_named_db(&format!("chat_t_a06p_{}", uniq())).await;
     let a = register(&base, &format!("a06p_{}", uniq())).await;
     let (h, host_id) = spawn_host(&base, &a, uuid::Uuid::new_v4()).await;
-    let probe = |runtime: Value| {
-        http()
-            .post(format!("{base}/v1/agent-hosts/{host_id}/probe"))
-            .header("authorization", authz(&a.access))
-            .json(&json!({"runtime": runtime}))
-            .send()
-    };
-
-    let r = probe(json!({"command": "node", "args": fake_acp_args()}))
-        .await
-        .unwrap();
-    assert_eq!(r.status().as_u16(), 200);
-    let body: Value = r.json().await.unwrap();
-    assert_eq!(body["models"][1]["id"], "smart", "{body}");
-    assert_eq!(body["modes"].as_array().map(|a| a.len()), Some(2), "{body}");
-    assert!(body["error"].is_null(), "{body}");
-
-    let r = probe(json!({"command": "chat-no-such-cmd-a06p", "args": []}))
-        .await
-        .unwrap();
-    assert_eq!(r.status().as_u16(), 200);
-    let body: Value = r.json().await.unwrap();
-    assert!(
-        body["error"].as_str().is_some_and(|e| !e.is_empty()),
-        "{body}"
-    );
-
     let r = http()
         .post(format!("{base}/v1/agents"))
         .header("authorization", authz(&a.access))

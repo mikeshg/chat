@@ -7,6 +7,7 @@
 pub mod acp;
 pub mod command;
 mod conn;
+pub use conn::probe;
 pub mod files;
 pub mod mcp;
 pub mod mcp_bridge;

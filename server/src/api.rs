@@ -116,10 +116,6 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
             post(crate::agents::registry_install),
         )
         .route(
-            "/agent-hosts/{id}/probe",
-            post(crate::agents::probe_runtime),
-        )
-        .route(
             "/agents",
             get(crate::agents::list_agents).post(crate::agents::create_agent),
         )
