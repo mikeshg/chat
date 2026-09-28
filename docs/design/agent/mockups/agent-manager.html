@@ -1,0 +1,579 @@
+<title>Agent 管理草图</title>
+<style>
+  :root {
+    --bg: #f7f7f7;
+    --panel: #ffffff;
+    --rail: #2e2e2e;
+    --rail-fg: #999999;
+    --rail-on: rgba(255, 255, 255, 0.12);
+    --line: #e5e5e5;
+    --text: #1a1a1a;
+    --muted: #8a8a8a;
+    --green: #07c160;
+    --green-dk: #06ad56;
+    --green-soft: #e8f5ec;
+    --danger: #fa5151;
+    --danger-soft: #fdecec;
+    --warn-bg: #fef0d5;
+    --warn-fg: #b8811f;
+    --hover: #f0f0f0;
+    --selected: #e9e9e9;
+    --input-bg: #ffffff;
+    --avatar-bg: #d5e8d4;
+    --avatar-fg: #4a7c59;
+    --dot-off: #b5b5b5;
+    --page: #ececec;
+    --shadow: rgba(0, 0, 0, 0.12);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #161616; --panel: #1e1e1e; --rail: #1a1a1a; --rail-fg: #8f8f8f;
+      --line: #343434; --text: #e8e8e8; --muted: #909090; --green-dk: #2bc56e;
+      --green-soft: #1e3626; --danger-soft: #3a1f1f; --warn-bg: #3a2f16; --warn-fg: #d9a441;
+      --hover: #2c2c2c; --selected: #373737; --input-bg: #262626;
+      --avatar-bg: #274631; --avatar-fg: #a4d3b2; --dot-off: #555555; --page: #0f0f0f;
+      --shadow: rgba(0, 0, 0, 0.5);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #161616; --panel: #1e1e1e; --rail: #1a1a1a; --rail-fg: #8f8f8f;
+    --line: #343434; --text: #e8e8e8; --muted: #909090; --green-dk: #2bc56e;
+    --green-soft: #1e3626; --danger-soft: #3a1f1f; --warn-bg: #3a2f16; --warn-fg: #d9a441;
+    --hover: #2c2c2c; --selected: #373737; --input-bg: #262626;
+    --avatar-bg: #274631; --avatar-fg: #a4d3b2; --dot-off: #555555; --page: #0f0f0f;
+    --shadow: rgba(0, 0, 0, 0.5);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--page); color: var(--text);
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 14px; padding-inline: 16px; padding-block: 16px 32px;
+  }
+  button {
+    border: 1px solid var(--line); background: var(--panel); color: var(--text);
+    border-radius: 4px; padding: 6px 14px; font: inherit; font-size: 13px; cursor: pointer;
+  }
+  button:hover { background: var(--hover); }
+  button.primary { background: var(--green); border-color: var(--green); color: #fff; }
+  button.primary:hover { background: var(--green-dk); }
+  button.danger { color: var(--danger); }
+  button.ghost { border-color: transparent; background: transparent; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, .pick:focus-visible {
+    outline: 2px solid var(--green); outline-offset: 1px;
+  }
+  input, textarea, select {
+    border: 1px solid var(--line); border-radius: 4px; padding: 8px 10px; font: inherit;
+    background: var(--input-bg); color: var(--text); width: 100%;
+  }
+  textarea { resize: vertical; }
+
+  /* 草图外框 */
+  .bar { max-width: 1180px; margin: 0 auto 12px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; }
+  .bar h1 { font-size: 18px; margin: 0; text-wrap: balance; }
+  .bar .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: var(--panel); }
+  .seg button { border: none; border-radius: 0; padding: 6px 12px; }
+  .seg button[aria-pressed="true"] { background: var(--green); color: #fff; }
+
+  .frame {
+    max-width: 1180px; margin: 0 auto; height: 720px; display: flex;
+    background: var(--bg); border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+    box-shadow: 0 6px 24px var(--shadow);
+  }
+  .frame.phone { max-width: 390px; height: 760px; flex-direction: column-reverse; }
+
+  /* 左侧导航 */
+  .rail { width: 64px; background: var(--rail); display: flex; flex-direction: column; align-items: center; padding: 14px 0; gap: 6px; flex-shrink: 0; }
+  .rail .me { width: 38px; height: 38px; border-radius: 6px; background: var(--green); color: #fff; display: grid; place-items: center; font-weight: 600; margin-bottom: 12px; }
+  .rail button { width: 52px; padding: 8px 0; border: none; background: transparent; color: var(--rail-fg); font-size: 12px; border-radius: 6px; }
+  .rail button.on { color: #fff; background: var(--rail-on); }
+  .frame.phone .rail { width: 100%; height: 56px; flex-direction: row; justify-content: space-around; padding: 0 8px; }
+  .frame.phone .rail .me { display: none; }
+
+  /* 列表栏 */
+  .list { width: 290px; flex-shrink: 0; border-right: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; min-height: 0; }
+  .list-head { display: flex; align-items: center; justify-content: space-between; padding: 16px 14px 10px; }
+  .list-head h2 { font-size: 17px; margin: 0; }
+  .list-body { overflow-y: auto; flex: 1; padding-bottom: 8px; }
+  .pc { margin-top: 6px; }
+  .pc-head { display: flex; align-items: center; gap: 8px; padding: 8px 14px 4px; color: var(--muted); font-size: 12px; }
+  .pc-head b { color: var(--text); font-size: 13px; font-weight: 600; }
+  .pc-head .grow { flex: 1; min-width: 0; display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
+  .tag { font-size: 11px; padding: 1px 6px; border-radius: 3px; background: var(--green-soft); color: var(--green-dk); font-weight: 500; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); flex-shrink: 0; }
+  .dot.off { background: var(--dot-off); }
+  .more { border: none; background: transparent; padding: 2px 6px; color: var(--muted); font-size: 16px; line-height: 1; }
+  .menu { position: relative; }
+  .menu-pop { position: absolute; right: 0; top: 24px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 4px 14px var(--shadow); z-index: 5; min-width: 120px; padding: 4px; }
+  .menu-pop button { display: block; width: 100%; text-align: left; border: none; }
+  .agent-row { display: flex; align-items: center; gap: 10px; padding: 8px 14px 8px 28px; cursor: pointer; border: none; background: transparent; width: 100%; text-align: left; border-radius: 0; }
+  .agent-row:hover { background: var(--hover); }
+  .agent-row.on { background: var(--selected); }
+  .agent-row .meta { flex: 1; min-width: 0; }
+  .agent-row .meta b { display: block; font-size: 14px; }
+  .agent-row .meta span { display: block; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .empty { padding: 4px 14px 8px 28px; color: var(--muted); font-size: 12px; }
+  .list-foot { border-top: 1px solid var(--line); padding: 6px; }
+  .list-foot button { width: 100%; text-align: left; border: none; background: transparent; }
+  .list-foot button.on { background: var(--selected); }
+  .rename { display: flex; gap: 6px; padding: 4px 14px 8px 28px; }
+  .rename input { padding: 5px 8px; }
+
+  .av { width: 34px; height: 34px; border-radius: 6px; background: var(--avatar-bg); color: var(--avatar-fg); display: grid; place-items: center; font-weight: 700; flex-shrink: 0; font-size: 14px; }
+  .av.lg { width: 56px; height: 56px; font-size: 22px; border-radius: 8px; }
+
+  /* 详情栏 */
+  .detail { flex: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; }
+  .d-head { display: flex; gap: 12px; align-items: center; padding: 18px 24px 12px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+  .d-head .t { flex: 1; min-width: 160px; }
+  .d-head h2 { margin: 0; font-size: 18px; }
+  .d-head .s { color: var(--muted); font-size: 12px; margin-top: 3px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .back { display: none; }
+  .tabs { display: flex; gap: 2px; padding: 0 20px; background: var(--panel); border-bottom: 1px solid var(--line); overflow-x: auto; }
+  .tabs button { border: none; border-bottom: 2px solid transparent; border-radius: 0; background: transparent; padding: 10px 12px; color: var(--muted); white-space: nowrap; }
+  .tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--green); font-weight: 600; }
+  .d-body { flex: 1; overflow-y: auto; padding: 20px 24px 24px; }
+  .form { max-width: 560px; display: flex; flex-direction: column; gap: 18px; }
+  .field { display: flex; flex-direction: column; gap: 6px; }
+  .field > label, .field > .lb { font-weight: 600; font-size: 13px; }
+  .hint { color: var(--muted); font-size: 12px; line-height: 1.5; }
+  .ro { padding: 8px 10px; border: 1px dashed var(--line); border-radius: 4px; color: var(--muted); }
+  .inline { display: flex; gap: 8px; align-items: center; }
+  .inline > input, .inline > select { flex: 1; }
+  .choices { display: grid; gap: 8px; }
+  .choice { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); cursor: pointer; text-align: left; width: 100%; }
+  .choice:hover { background: var(--hover); }
+  .choice.on { border-color: var(--green); background: var(--green-soft); }
+  .choice .r { width: 16px; height: 16px; border-radius: 50%; border: 2px solid var(--line); margin-top: 2px; flex-shrink: 0; }
+  .choice.on .r { border-color: var(--green); background: radial-gradient(var(--green) 45%, transparent 50%); }
+  .choice b { display: block; font-size: 13px; }
+  .choice span { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; line-height: 1.5; }
+  .sec-title { font-size: 12px; color: var(--muted); letter-spacing: 0.04em; margin: 4px 0 -6px; }
+  details.adv { border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+  details.adv summary { padding: 10px 12px; cursor: pointer; font-weight: 600; font-size: 13px; }
+  details.adv .in { padding: 0 12px 12px; display: flex; flex-direction: column; gap: 8px; }
+  .kv { display: grid; grid-template-columns: 1fr 1.4fr auto; gap: 6px; }
+  .danger-zone { border: 1px solid var(--danger-soft); background: var(--danger-soft); border-radius: 6px; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+  .savebar { display: flex; align-items: center; gap: 8px; padding: 10px 24px; border-top: 1px solid var(--line); background: var(--panel); }
+  .savebar .grow { flex: 1; color: var(--warn-fg); font-size: 12px; }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px; }
+  .pick { border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: var(--panel); text-align: left; cursor: pointer; display: flex; flex-direction: column; gap: 6px; min-height: 104px; }
+  .pick:hover { background: var(--hover); }
+  .pick.on { border-color: var(--green); background: var(--green-soft); }
+  .pick.dis { opacity: 0.55; cursor: not-allowed; }
+  .pick b { font-size: 14px; }
+  .pick .st { font-size: 11px; font-weight: 500; }
+  .st.ok { color: var(--green-dk); }
+  .st.need { color: var(--warn-fg); }
+  .st.no { color: var(--muted); }
+  .pick .ds { color: var(--muted); font-size: 12px; line-height: 1.45; }
+  .note { background: var(--warn-bg); color: var(--warn-fg); border-radius: 6px; padding: 10px 12px; font-size: 12px; line-height: 1.5; }
+  .ok-note { background: var(--green-soft); color: var(--green-dk); border-radius: 6px; padding: 10px 12px; font-size: 13px; }
+  .blank { display: grid; place-items: center; height: 100%; color: var(--muted); text-align: center; padding: 24px; line-height: 1.7; }
+
+  .sched { border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+  .sched-row { display: flex; gap: 10px; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+  .sched-row:last-child { border-bottom: none; }
+  .sched-row .grow { flex: 1; min-width: 0; }
+  .sched-row b { display: block; font-size: 13px; }
+  .sched-row span { color: var(--muted); font-size: 12px; }
+  .switch { width: 34px; height: 20px; border-radius: 10px; background: var(--dot-off); position: relative; border: none; padding: 0; flex-shrink: 0; }
+  .switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: left .15s; }
+  .switch[aria-checked="true"] { background: var(--green); }
+  .switch[aria-checked="true"]::after { left: 16px; }
+  .days { display: flex; flex-wrap: wrap; gap: 6px; }
+  .days button { padding: 4px 9px; }
+  .days button[aria-pressed="true"] { background: var(--green-soft); border-color: var(--green); color: var(--green-dk); }
+
+  .toast { position: absolute; left: 50%; transform: translateX(-50%); bottom: 18px; background: var(--text); color: var(--panel); padding: 8px 14px; border-radius: 6px; font-size: 13px; z-index: 10; }
+  .frame { position: relative; }
+
+  /* 手机：列表 → 详情两级 */
+  .frame.phone .list { width: 100%; border-right: none; }
+  .frame.phone .detail { display: none; }
+  .frame.phone.in-detail .list { display: none; }
+  .frame.phone.in-detail .detail { display: flex; }
+  .frame.phone .back { display: inline-block; }
+  .frame.phone .d-head { padding: 12px 14px; }
+  .frame.phone .d-body { padding: 16px 14px; }
+  .frame.phone .tabs { padding: 0 8px; }
+  .frame.phone .savebar { padding: 10px 14px; }
+
+  .notes { max-width: 1180px; margin: 16px auto 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+  .notes section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+  .notes h3 { margin: 0 0 6px; font-size: 13px; }
+  .notes ul { margin: 0; padding-left: 18px; color: var(--muted); font-size: 12px; line-height: 1.7; }
+
+  @media (max-width: 720px) {
+    .frame { max-width: 100%; height: 760px; flex-direction: column-reverse; }
+    .rail { width: 100%; height: 56px; flex-direction: row; justify-content: space-around; padding: 0 8px; }
+    .rail .me { display: none; }
+    .list { width: 100%; border-right: none; }
+    .detail { display: none; }
+    .frame.in-detail .list { display: none; }
+    .frame.in-detail .detail { display: flex; }
+    .back { display: inline-block; }
+    .d-head, .d-body { padding-inline: 14px; }
+  }
+  @media (prefers-reduced-motion: reduce) { .switch::after { transition: none; } }
+</style>
+
+<div class="bar">
+  <div>
+    <h1>Agent 管理草图</h1>
+    <div class="sub">可点击的静态草图，数据是示例（14X 和「桌面端」是你现有的两台电脑）。改动不会保存。</div>
+  </div>
+  <div class="seg" role="group" aria-label="预览设备">
+    <button id="dev-desktop" aria-pressed="true">桌面端（本机 14X）</button>
+    <button id="dev-phone" aria-pressed="false">手机</button>
+  </div>
+</div>
+
+<div class="frame" id="frame">
+  <nav class="rail" aria-label="主导航">
+    <div class="me">X</div>
+    <button>会话</button>
+    <button>联系人</button>
+    <button class="on">Agent</button>
+    <button>我</button>
+    <button>管理</button>
+  </nav>
+  <aside class="list" id="list"></aside>
+  <main class="detail" id="detail"></main>
+</div>
+
+<div class="notes">
+  <section>
+    <h3>已定下的</h3>
+    <ul>
+      <li>左侧导航新增「Agent」，与会话、联系人平级；「我」页的 Agent 入口去掉。</li>
+      <li>「宿主」在界面上改叫「电脑」。只能在桌面端添加，且只加到本机。</li>
+      <li>手机 / 网页只管理和调用已有 Agent：列表 → 详情两级。</li>
+    </ul>
+  </section>
+  <section>
+    <h3>请重点看</h3>
+    <ul>
+      <li>详情分 5 个标签：基本 / 程序 / 权限 / 回复 / 定时任务。字段归组是否顺手？</li>
+      <li>编辑后底部出现「保存」条，一次保存所有标签的改动。</li>
+      <li>添加：先选程序（上方可搜索），选好后下面才出现名字、工作目录、权限。</li>
+    </ul>
+  </section>
+  <section>
+    <h3>细节</h3>
+    <ul>
+      <li>电脑改名在电脑名右边的「⋯」菜单里。</li>
+      <li>在线的电脑不再显示「最后在线」，离线时才显示。</li>
+      <li>输出方式、离线排队在单个 Agent 里默认「跟随默认设置」，并写明当前默认值。</li>
+    </ul>
+  </section>
+</div>
+
+<script>
+(function () {
+  const PCS = [
+    { id: "c1", name: "14X", os: "Windows", online: true, local: true, seen: "" },
+    { id: "c2", name: "桌面端", os: "macOS", online: true, local: false, seen: "" },
+    { id: "c3", name: "家里台式机", os: "Windows", online: false, local: false, seen: "9/25 22:40" },
+  ];
+  const TIERS = [
+    { id: "read_only", label: "只读", hint: "读取、搜索、思考和抓取自动放行，其他操作需要你批准" },
+    { id: "workspace", label: "可改工作目录", hint: "在只读基础上，工作目录和额外目录里的修改自动放行；执行命令和目录外的写入需要批准" },
+    { id: "full", label: "完全放开", hint: "全部操作自动放行，不再询问" },
+  ];
+  const OUTPUTS = [
+    { id: "stream", label: "实时流式", hint: "边生成边显示文字和正在做的步骤" },
+    { id: "status", label: "状态 + 最终结果", hint: "只显示当前在做哪一步，完成后发一条回复" },
+    { id: "steps", label: "每步一条消息", hint: "每完成一步就在会话里发一条消息" },
+  ];
+  const QUEUES = ["10 分钟", "1 小时", "6 小时", "1 天", "7 天", "永不"];
+  const REGISTRY = [
+    { id: "claude", name: "Claude Code", ver: "2.0.14", st: "ok", ds: "Anthropic 的编程 Agent" },
+    { id: "codex", name: "Codex", ver: "0.46.0", st: "need", ds: "要先装一次它的 ACP 适配器（装在 Chat 自己的目录里，沿用本机的登录）" },
+    { id: "gemini", name: "Gemini CLI", ver: "0.9.0", st: "ok", ds: "Google 的命令行 Agent" },
+    { id: "goose", name: "Goose", ver: "1.8.0", st: "no", ds: "当前环境不支持" },
+  ];
+  const defaults = { output: "stream", queue: "1 天", depth: 3 };
+  let agents = [
+    { id: "a1", name: "test1", pc: "c1", prog: { kind: "reg", id: "claude" }, tier: "read_only", cwd: "D:\\work\\chat", dirs: [], model: "", mode: "", instr: "", env: [], output: "", queue: "",
+      scheds: [{ name: "每日站会摘要", when: "每天 09:00", target: "专属会话", on: true }] },
+    { id: "a2", name: "reviewer", pc: "c1", prog: { kind: "reg", id: "codex" }, tier: "workspace", cwd: "D:\\work\\chat", dirs: ["D:\\work\\shared-libs"], model: "gpt-5-codex", mode: "", instr: "回答用中文，代码注释跟随仓库风格。", env: [{ k: "HTTPS_PROXY", v: "http://127.0.0.1:7890" }], output: "status", queue: "", scheds: [] },
+    { id: "a3", name: "nightly", pc: "c3", prog: { kind: "cmd", command: "node", args: ["agent.js", "--acp"] }, tier: "full", cwd: "C:\\builds", dirs: [], model: "", mode: "", instr: "", env: [], output: "", queue: "7 天", scheds: [{ name: "夜间构建", when: "每天 02:00", target: "专属会话", on: false }] },
+  ];
+
+  const st = { device: "desktop", view: { kind: "agent", id: "a1" }, tab: "basic", draft: null, dirty: false, menu: null, renaming: null, confirmDel: false, add: null, toast: "" };
+  const frame = document.getElementById("frame");
+  const listEl = document.getElementById("list");
+  const detailEl = document.getElementById("detail");
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const pc = (id) => PCS.find((p) => p.id === id);
+  const reg = (id) => REGISTRY.find((r) => r.id === id);
+  const progLabel = (a) => a.prog.kind === "reg" ? reg(a.prog.id).name : "自定义命令 · " + a.prog.command;
+  const tierLabel = (id) => TIERS.find((t) => t.id === id).label;
+  const isPhone = () => st.device === "phone" || window.matchMedia("(max-width: 720px)").matches;
+
+  function renderList() {
+    const canAdd = st.device === "desktop";
+    let h = `<div class="list-head"><h2>Agent</h2>${canAdd ? `<button class="primary" data-act="add">＋ 添加</button>` : ""}</div><div class="list-body">`;
+    for (const p of PCS) {
+      const mine = agents.filter((a) => a.pc === p.id);
+      h += `<div class="pc"><div class="pc-head"><i class="dot ${p.online ? "" : "off"}"></i><span class="grow"><b>${esc(p.name)}</b>${p.local && st.device === "desktop" ? `<span class="tag">本机</span>` : ""}<span>${esc(p.os)} · ${p.online ? "在线" : "离线，最后在线 " + p.seen}</span></span>
+        <span class="menu"><button class="more" aria-label="${esc(p.name)} 的更多操作" data-act="menu" data-id="${p.id}">⋯</button>${st.menu === p.id ? `<div class="menu-pop"><button data-act="rename" data-id="${p.id}">改名</button></div>` : ""}</span></div>`;
+      if (st.renaming === p.id) {
+        h += `<form class="rename" data-act="rename-save" data-id="${p.id}"><input id="rename-${p.id}" value="${esc(p.name)}" maxlength="60" aria-label="电脑名称"><button class="primary">保存</button><button type="button" data-act="rename-cancel">取消</button></form>`;
+      }
+      if (!mine.length) h += `<div class="empty">这台电脑上还没有 Agent${p.local && canAdd ? "，点右上角「添加」" : ""}</div>`;
+      for (const a of mine) {
+        const on = st.view.kind === "agent" && st.view.id === a.id;
+        h += `<button class="agent-row ${on ? "on" : ""}" data-act="open" data-id="${a.id}"><span class="av">${esc(a.name[0].toUpperCase())}</span><span class="meta"><b>${esc(a.name)}</b><span>${esc(progLabel(a))} · ${tierLabel(a.tier)}</span></span><i class="dot ${p.online ? "" : "off"}" title="${p.online ? "电脑在线" : "电脑离线，调用会排队"}"></i></button>`;
+      }
+      h += `</div>`;
+    }
+    h += `</div><div class="list-foot"><button class="${st.view.kind === "defaults" ? "on" : ""}" data-act="defaults">⚙ 默认设置</button>`;
+    if (!canAdd) h += `<div class="hint" style="padding:6px 8px">要添加 Agent，在想让它运行的那台电脑上打开 Chat 桌面端。</div>`;
+    h += `</div>`;
+    listEl.innerHTML = h;
+  }
+
+  function head(a) {
+    const p = pc(a.pc);
+    return `<div class="d-head"><button class="ghost back" data-act="back">← 返回</button>
+      <span class="av lg">${esc(a.name[0].toUpperCase())}</span>
+      <div class="t"><h2>${esc(a.name)}</h2><div class="s"><i class="dot ${p.online ? "" : "off"}"></i>运行在 ${esc(p.name)}${p.local && st.device === "desktop" ? "（本机）" : ""} · ${p.online ? "在线" : "离线，新调用会排队"}</div></div>
+      <button class="primary" data-act="conv">进入会话 →</button></div>`;
+  }
+
+  const TABS = [["basic", "基本"], ["prog", "程序"], ["perm", "权限"], ["reply", "回复"], ["sched", "定时任务"]];
+
+  function renderAgent() {
+    const a = st.draft;
+    let h = head(a) + `<div class="tabs" role="tablist">` + TABS.map(([id, t]) => `<button role="tab" aria-selected="${st.tab === id}" data-act="tab" data-id="${id}">${t}${id === "sched" && a.scheds.length ? " (" + a.scheds.length + ")" : ""}</button>`).join("") + `</div><div class="d-body"><div class="form">`;
+    if (st.tab === "basic") {
+      h += `<div class="field"><span class="lb">头像</span><div class="inline"><span class="av lg">${esc(a.name[0] ? a.name[0].toUpperCase() : "?")}</span><button>更换头像</button><span class="hint">PNG / JPEG / WebP</span></div></div>
+        <div class="field"><label for="f-name">名字</label><input id="f-name" data-bind="name" value="${esc(a.name)}"><span class="hint">在会话里用 @${esc(a.name || "名字")} 调用它。1–32 位字母、数字、_ 或 -，不区分大小写。</span></div>
+        <div class="field"><span class="lb">运行在</span><div class="ro">${esc(pc(a.pc).name)}（${esc(pc(a.pc).os)}）· 不能更换。要换电脑，在那台电脑上重新添加。</div></div>
+        <div class="danger-zone"><b>删除 Agent</b><span class="hint">专属会话会保留，但不能再发言。</span>
+          ${st.confirmDel ? `<div class="inline"><span class="hint" style="flex:1">确定删除 ${esc(a.name)}？</span><button data-act="del-cancel">取消</button><button class="danger" data-act="del-ok">确认删除</button></div>` : `<div><button class="danger" data-act="del">删除…</button></div>`}</div>`;
+    } else if (st.tab === "prog") {
+      if (a.prog.kind === "reg") {
+        const r = reg(a.prog.id);
+        h += `<div class="field"><span class="lb">程序</span><div class="ro">${esc(r.name)} ${esc(r.ver)} · 来自登记表</div></div>`;
+      } else {
+        h += `<div class="field"><label for="f-cmd">启动命令</label><input id="f-cmd" value="${esc(a.prog.command)}" data-bind="cmd"></div>
+          <div class="field"><label for="f-args">参数</label><textarea id="f-args" rows="3" data-bind="args">${esc(a.prog.args.join("\n"))}</textarea><span class="hint">每行一个参数。</span></div>`;
+      }
+      h += `<div class="field"><span class="lb">模型和模式</span><div class="inline"><select id="f-model" aria-label="模型" data-bind="model"><option value="">模型：默认</option><option ${a.model === "gpt-5-codex" ? "selected" : ""}>gpt-5-codex</option><option>gpt-5</option></select><select id="f-mode" aria-label="模式" data-bind="mode"><option value="">模式：默认</option><option>ask</option><option>code</option></select></div><span class="hint">可选项来自程序自己上报；列表不全时点 <button class="ghost" style="padding:0;color:var(--green-dk)">重新读取</button>（电脑需在线）。</span></div>
+        <div class="field"><label for="f-instr">附加指令</label><textarea id="f-instr" rows="4" data-bind="instr" placeholder="例如：回答用中文。">${esc(a.instr)}</textarea><span class="hint">每次开新话题时，放在你第一条消息前面。</span></div>
+        <details class="adv"><summary>环境变量（${a.env.length}）</summary><div class="in">
+          ${a.env.map((e, i) => `<div class="kv"><input aria-label="变量名 ${i + 1}" value="${esc(e.k)}"><input aria-label="变量值 ${i + 1}" value="${esc(e.v)}"><button class="ghost" aria-label="删除变量 ${i + 1}" data-act="env-del" data-id="${i}">✕</button></div>`).join("")}
+          <div><button data-act="env-add">＋ 添加变量</button></div><span class="hint">明文保存在服务器上，管理员和备份都能看到。</span></div></details>`;
+    } else if (st.tab === "perm") {
+      h += `<div class="field"><label for="f-cwd">工作目录</label><input id="f-cwd" data-bind="cwd" value="${esc(a.cwd)}" placeholder="例如 D:\\work\\project"><span class="hint">${esc(pc(a.pc).name)} 上的绝对路径。留空则用 Chat 自己的数据目录。</span></div>
+        <div class="field"><span class="lb">额外目录</span>${a.dirs.map((d, i) => `<div class="inline"><input aria-label="额外目录 ${i + 1}" value="${esc(d)}"><button class="ghost" aria-label="删除额外目录 ${i + 1}" data-act="dir-del" data-id="${i}">✕</button></div>`).join("")}<div><button data-act="dir-add">＋ 添加目录</button></div><span class="hint">「可改工作目录」档位下，这些目录里的修改同样自动放行。</span></div>
+        <div class="field"><span class="lb">权限档位</span><div class="choices">${TIERS.map((t) => `<button class="choice ${a.tier === t.id ? "on" : ""}" data-act="tier" data-id="${t.id}"><i class="r"></i><span><b>${t.label}</b><span>${t.hint}</span></span></button>`).join("")}</div><span class="hint">超出档位的操作，会在专属会话里发审批卡片给你。</span></div>`;
+    } else if (st.tab === "reply") {
+      const curOut = OUTPUTS.find((o) => o.id === defaults.output).label;
+      h += `<div class="field"><span class="lb">输出方式</span><div class="choices">
+          <button class="choice ${a.output === "" ? "on" : ""}" data-act="out" data-id=""><i class="r"></i><span><b>跟随默认设置</b><span>现在是「${curOut}」</span></span></button>
+          ${OUTPUTS.map((o) => `<button class="choice ${a.output === o.id ? "on" : ""}" data-act="out" data-id="${o.id}"><i class="r"></i><span><b>${o.label}</b><span>${o.hint}</span></span></button>`).join("")}</div></div>
+        <div class="field"><label for="f-queue">电脑离线时，排队多久后取消</label><select id="f-queue" data-bind="queue"><option value="" ${a.queue === "" ? "selected" : ""}>跟随默认设置（现在是 ${defaults.queue}）</option>${QUEUES.map((q) => `<option ${a.queue === q ? "selected" : ""}>${q}</option>`).join("")}</select><span class="hint">电脑离线时发起的调用先排队，电脑上线后按顺序执行。</span></div>`;
+    } else {
+      h += `<div class="field"><span class="lb">定时任务</span>${a.scheds.length ? `<div class="sched">${a.scheds.map((s, i) => `<div class="sched-row"><div class="grow"><b>${esc(s.name)}</b><span>${esc(s.when)} · 发到${esc(s.target)}</span></div><button class="switch" role="switch" aria-checked="${s.on}" aria-label="启用 ${esc(s.name)}" data-act="sched-toggle" data-id="${i}"></button><button class="ghost" aria-label="删除 ${esc(s.name)}" data-act="sched-del" data-id="${i}">✕</button></div>`).join("")}</div>` : `<div class="hint">还没有定时任务。</div>`}</div>
+        <details class="adv" open><summary>新建定时任务</summary><div class="in">
+          <input aria-label="名称" id="s-name" placeholder="名称，例如：每日站会摘要">
+          <textarea aria-label="到点执行的指令" id="s-instr" rows="3" placeholder="到点让它做什么，例如：总结昨天合并的提交"></textarea>
+          <div class="inline"><select aria-label="发到哪个会话" id="s-target"><option>发到专属会话</option><option>发到「开发群」</option></select></div>
+          <div class="inline"><select aria-label="重复" id="s-kind"><option>每天</option><option>每周</option><option>一次</option><option>每隔</option></select><input type="time" aria-label="时刻" id="s-time" value="09:00"></div>
+          <div><button class="primary" data-act="sched-add">添加</button></div></div></details>`;
+    }
+    h += `</div></div>`;
+    if (st.dirty) h += `<div class="savebar"><span class="grow">有未保存的修改</span><button data-act="discard">放弃</button><button class="primary" data-act="save">保存</button></div>`;
+    detailEl.innerHTML = h;
+  }
+
+  function renderDefaults() {
+    detailEl.innerHTML = `<div class="d-head"><button class="ghost back" data-act="back">← 返回</button><div class="t"><h2>默认设置</h2><div class="s">对你所有的 Agent 生效；单个 Agent 可在「回复」标签里改成别的。</div></div></div>
+      <div class="d-body"><div class="form">
+        <div class="field"><span class="lb">输出方式</span><div class="choices">${OUTPUTS.map((o) => `<button class="choice ${defaults.output === o.id ? "on" : ""}" data-act="def-out" data-id="${o.id}"><i class="r"></i><span><b>${o.label}</b><span>${o.hint}</span></span></button>`).join("")}</div></div>
+        <div class="field"><label for="d-queue">电脑离线时，排队多久后取消</label><select id="d-queue" data-act-change="def-queue">${QUEUES.map((q) => `<option ${defaults.queue === q ? "selected" : ""}>${q}</option>`).join("")}</select></div>
+        <div class="field"><label for="d-depth">Agent 互相调用最多几层</label><select id="d-depth" data-act-change="def-depth">${Array.from({ length: 10 }, (_, i) => `<option ${defaults.depth === i + 1 ? "selected" : ""}>${i + 1}</option>`).join("")}</select><span class="hint">A 调用 B、B 再调用 C 算两层。超过层数的调用会被拒绝，防止互相无限调用。</span></div>
+        <div class="hint">改动立即生效，不需要保存。</div>
+      </div></div>`;
+  }
+
+  function renderAdd() {
+    const ad = st.add;
+    const here = PCS.find((p) => p.local);
+    let h = `<div class="d-head"><button class="ghost back" data-act="back">← 返回</button><div class="t"><h2>添加 Agent</h2><div class="s"><i class="dot"></i>运行在这台电脑：${esc(here.name)}（${esc(here.os)}）</div></div></div><div class="d-body"><div class="form" style="max-width:720px">`;
+    h += `<div class="field"><span class="lb">1. 选择要运行的程序</span><input id="n-search" type="search" placeholder="搜索程序，例如 claude" value="${esc(ad.q)}" data-add="q" aria-label="搜索程序"><div class="cards">`;
+    const q = ad.q.trim().toLowerCase();
+    const shown = REGISTRY.filter((r) => !q || r.name.toLowerCase().includes(q) || r.id.includes(q));
+    if (!shown.length) h += `<div class="hint">登记表里没有「${esc(ad.q)}」。可以用下面的自定义命令。</div>`;
+    for (const r of shown) {
+      const on = ad.pick === r.id;
+      const lab = r.st === "ok" ? "可用" : r.st === "need" ? "需安装" : "不可用";
+      h += `<button class="pick ${on ? "on" : ""} ${r.st === "no" ? "dis" : ""}" ${r.st === "no" ? 'aria-disabled="true"' : ""} data-act="pick" data-id="${r.id}"><b>${esc(r.name)}</b><span class="st ${r.st}">${lab}${r.st !== "no" ? " · " + r.ver : ""}</span><span class="ds">${esc(r.ds)}</span></button>`;
+    }
+    h += `<button class="pick ${ad.pick === "cmd" ? "on" : ""}" data-act="pick" data-id="cmd"><b>自定义命令</b><span class="st no">手动填写</span><span class="ds">登记表里没有的 ACP 程序</span></button></div></div>`;
+    if (ad.pick === "codex" && !ad.installed) {
+      h += `<div class="note">Codex 要先装一次 ACP 适配器（约 30 MB，装在 Chat 自己的目录里，不动本机已装的 CLI，沿用本机的登录和配置）。<div style="margin-top:8px">${ad.installing ? "正在安装… 下载中 62%" : `<button class="primary" data-act="install">安装</button>`}</div></div>`;
+    }
+    const ready = ad.pick && (ad.pick === "cmd" || reg(ad.pick).st === "ok" || ad.installed);
+    if (ready) {
+      h += `<div class="sec-title">2. 设置</div>`;
+      if (ad.pick === "cmd") {
+        h += `<div class="field"><label for="n-cmd">启动命令</label><input id="n-cmd" placeholder="例如 node" value="${esc(ad.cmd)}" data-add="cmd"></div><div class="field"><label for="n-args">参数</label><textarea id="n-args" rows="2" placeholder="每行一个，例如 agent.js">${esc(ad.args)}</textarea></div>`;
+      }
+      h += `<div class="field"><label for="n-name">名字</label><input id="n-name" value="${esc(ad.name)}" data-add="name"><span class="hint">在会话里用 @${esc(ad.name || "名字")} 调用它。</span></div>
+        <div class="field"><label for="n-cwd">工作目录</label><input id="n-cwd" value="${esc(ad.cwd)}" data-add="cwd" placeholder="例如 D:\\work\\project"><span class="hint">它读写文件的地方。可以留空，之后再改。</span></div>
+        <div class="field"><span class="lb">权限档位</span><div class="choices">${TIERS.map((t) => `<button class="choice ${ad.tier === t.id ? "on" : ""}" data-act="add-tier" data-id="${t.id}"><i class="r"></i><span><b>${t.label}${t.id === "read_only" ? "（推荐先用这个）" : ""}</b><span>${t.hint}</span></span></button>`).join("")}</div></div>
+        <div class="inline" style="justify-content:flex-end"><button data-act="back-list">取消</button><button class="primary" data-act="create" ${ad.name.trim() && (ad.pick !== "cmd" || ad.cmd.trim()) ? "" : "disabled"}>创建 Agent</button></div>`;
+    }
+    h += `</div></div>`;
+    detailEl.innerHTML = h;
+  }
+
+  function renderBlank() {
+    detailEl.innerHTML = `<div class="blank">从左边选一个 Agent 查看和修改设置。</div>`;
+  }
+
+  function render() {
+    frame.classList.toggle("phone", st.device === "phone");
+    document.getElementById("dev-desktop").setAttribute("aria-pressed", st.device === "desktop");
+    document.getElementById("dev-phone").setAttribute("aria-pressed", st.device === "phone");
+    frame.classList.toggle("in-detail", st.view.kind !== "none");
+    renderList();
+    if (st.view.kind === "agent") renderAgent();
+    else if (st.view.kind === "defaults") renderDefaults();
+    else if (st.view.kind === "add") renderAdd();
+    else renderBlank();
+    const old = frame.querySelector(".toast");
+    if (old) old.remove();
+    if (st.toast) {
+      const t = document.createElement("div");
+      t.className = "toast"; t.textContent = st.toast; frame.appendChild(t);
+      const msg = st.toast;
+      setTimeout(() => { if (st.toast === msg) { st.toast = ""; t.remove(); } }, 2600);
+    }
+  }
+
+  function openAgent(id) {
+    const a = agents.find((x) => x.id === id);
+    st.view = { kind: "agent", id }; st.draft = JSON.parse(JSON.stringify(a)); st.dirty = false; st.confirmDel = false; st.tab = "basic";
+  }
+  // 输入时不整块重绘（会丢焦点），只在第一次改动时补上保存条
+  function markDirty() {
+    if (st.dirty) return;
+    st.dirty = true;
+    detailEl.insertAdjacentHTML("beforeend", `<div class="savebar"><span class="grow">有未保存的修改</span><button data-act="discard">放弃</button><button class="primary" data-act="save">保存</button></div>`);
+  }
+
+  document.getElementById("dev-desktop").onclick = () => { st.device = "desktop"; render(); };
+  document.getElementById("dev-phone").onclick = () => {
+    st.device = "phone";
+    if (st.view.kind === "add") st.view = { kind: "none" };
+    render();
+  };
+
+  frame.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-act]");
+    if (!b || b.tagName === "FORM") return;
+    const act = b.dataset.act, id = b.dataset.id;
+    if (act !== "menu") st.menu = null;
+    switch (act) {
+      case "open": openAgent(id); break;
+      case "tab": st.tab = id; st.confirmDel = false; break;
+      case "add": st.view = { kind: "add" }; st.add = { q: "", pick: "", name: "", cwd: "", tier: "read_only", cmd: "", args: "", installed: false, installing: false }; break;
+      case "defaults": st.view = { kind: "defaults" }; break;
+      case "back": st.view = { kind: "none" }; break;
+      case "back-list": st.view = { kind: "none" }; break;
+      case "menu": st.menu = st.menu === id ? null : id; break;
+      case "rename": st.renaming = id; break;
+      case "rename-cancel": st.renaming = null; break;
+      case "conv": st.toast = "打开 " + st.draft.name + " 的专属会话"; break;
+      case "tier": st.draft.tier = id; st.dirty = true; break;
+      case "out": st.draft.output = id; st.dirty = true; break;
+      case "dir-add": st.draft.dirs.push(""); st.dirty = true; break;
+      case "dir-del": st.draft.dirs.splice(+id, 1); st.dirty = true; break;
+      case "env-add": st.draft.env.push({ k: "", v: "" }); st.dirty = true; break;
+      case "env-del": st.draft.env.splice(+id, 1); st.dirty = true; break;
+      case "sched-toggle": st.draft.scheds[+id].on = !st.draft.scheds[+id].on; st.toast = "已" + (st.draft.scheds[+id].on ? "启用" : "停用"); agents = agents.map((a) => a.id === st.draft.id ? { ...a, scheds: JSON.parse(JSON.stringify(st.draft.scheds)) } : a); break;
+      case "sched-del": st.draft.scheds.splice(+id, 1); agents = agents.map((a) => a.id === st.draft.id ? { ...a, scheds: JSON.parse(JSON.stringify(st.draft.scheds)) } : a); st.toast = "已删除定时任务"; break;
+      case "sched-add": {
+        const name = document.getElementById("s-name").value.trim() || "新的定时任务";
+        const when = document.getElementById("s-kind").value + " " + document.getElementById("s-time").value;
+        st.draft.scheds.push({ name, when, target: document.getElementById("s-target").value.replace("发到", ""), on: true });
+        agents = agents.map((a) => a.id === st.draft.id ? { ...a, scheds: JSON.parse(JSON.stringify(st.draft.scheds)) } : a);
+        st.toast = "已添加定时任务"; break;
+      }
+      case "save": agents = agents.map((a) => (a.id === st.draft.id ? JSON.parse(JSON.stringify(st.draft)) : a)); st.dirty = false; st.toast = "已保存"; break;
+      case "discard": openAgent(st.draft.id); st.tab = st.tab; break;
+      case "del": st.confirmDel = true; break;
+      case "del-cancel": st.confirmDel = false; break;
+      case "del-ok": agents = agents.filter((a) => a.id !== st.draft.id); st.view = { kind: "none" }; st.toast = "已删除"; break;
+      case "def-out": defaults.output = id; st.toast = "已保存"; break;
+      case "pick": {
+        const r = reg(id);
+        if (r && r.st === "no") return;
+        st.add.pick = id;
+        if (!st.add.name) st.add.name = id === "cmd" ? "" : id;
+        break;
+      }
+      case "install": st.add.installing = true; render(); setTimeout(() => { st.add.installing = false; st.add.installed = true; render(); }, 1200); return;
+      case "add-tier": st.add.tier = id; break;
+      case "create": {
+        const idn = "a" + Date.now();
+        agents.push({ id: idn, name: st.add.name.trim(), pc: "c1", prog: st.add.pick === "cmd" ? { kind: "cmd", command: st.add.cmd, args: st.add.args.split("\n").filter(Boolean) } : { kind: "reg", id: st.add.pick }, tier: st.add.tier, cwd: st.add.cwd, dirs: [], model: "", mode: "", instr: "", env: [], output: "", queue: "", scheds: [] });
+        openAgent(idn); st.toast = "已创建。去专属会话发条消息试试"; break;
+      }
+      default: return;
+    }
+    render();
+  });
+
+  frame.addEventListener("input", (e) => {
+    const t = e.target;
+    if (t.dataset.bind && st.view.kind === "agent") {
+      const k = t.dataset.bind;
+      if (k === "cmd") st.draft.prog.command = t.value;
+      else if (k === "args") st.draft.prog.args = t.value.split("\n");
+      else st.draft[k] = t.value;
+      markDirty();
+    }
+    if (t.dataset.add === "q" && st.add) {
+      st.add.q = t.value; const pos = t.selectionStart; renderAdd();
+      const n = document.getElementById("n-search"); n.focus(); n.setSelectionRange(pos, pos);
+      return;
+    }
+    if (t.dataset.add && st.add) {
+      st.add[t.dataset.add] = t.value;
+      const btn = frame.querySelector('[data-act="create"]');
+      if (btn) btn.disabled = !(st.add.name.trim() && (st.add.pick !== "cmd" || st.add.cmd.trim()));
+    }
+  });
+  frame.addEventListener("change", (e) => {
+    const t = e.target;
+    if (t.dataset.actChange === "def-queue") { defaults.queue = t.value; st.toast = "已保存"; render(); }
+    if (t.dataset.actChange === "def-depth") { defaults.depth = +t.value; st.toast = "已保存"; render(); }
+    if (t.dataset.bind && t.tagName === "SELECT" && st.view.kind === "agent") { st.draft[t.dataset.bind] = t.value; markDirty(); }
+  });
+  frame.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const f = e.target;
+    if (f.dataset.act === "rename-save") {
+      const p = pc(f.dataset.id);
+      const v = f.querySelector("input").value.trim();
+      if (v) p.name = v;
+      st.renaming = null; st.toast = "已改名"; render();
+    }
+  });
+
+  openAgent("a1");
+  render();
+})();
+</script>
