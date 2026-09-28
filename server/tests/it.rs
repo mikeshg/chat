@@ -18398,3 +18398,140 @@ async fn a23_cancel_races_queue_flush() {
         );
     }
 }
+
+// ===== Agent A24 =====
+// 宿主连接复核登录会话：register_host 后立刻复核一次，堵住「升级后、hello 前」
+// 撤销/禁用/改密的缝隙；登记后读循环每个 ping 周期复核一次，失效按正常断开收尾。
+
+/// 升级后暂不 hello 的裸宿主连接（票据用 dev 的 access 换，绑定 dev 的登录会话）。
+async fn a24_pending_host(base: &str, dev: &TestUser) -> RawHostWs {
+    let url = format!("{}&role=host", ws_url(base, dev).await);
+    tokio_tungstenite::connect_async(&url).await.unwrap().0
+}
+
+/// 读宿主连接直到关闭（最多 dur）；返回期间收到的文本帧。
+/// 未关闭返回 None。
+async fn a24_until_close(sock: &mut RawHostWs, dur: A01Dur) -> Option<Vec<Value>> {
+    let mut frames = Vec::new();
+    let done = tokio::time::timeout(dur, async {
+        loop {
+            match sock.next().await {
+                Some(Ok(WsMsg::Text(t))) => {
+                    if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                        frames.push(v);
+                    }
+                }
+                // Ping/Pong 等控制帧不算应用帧
+                Some(Ok(_)) => {}
+                _ => break,
+            }
+        }
+    })
+    .await
+    .is_ok();
+    done.then_some(frames)
+}
+
+/// hello 前撤销会话：kick_session 只断开已登记宿主，漏掉这条挂起连接；
+/// 它随后 hello → 登记后复核不过 → 关闭，没有 host_ready，宿主不在线。
+#[tokio::test]
+async fn a24_host_revoked_before_hello_never_registers() {
+    let base = spawn().await;
+    let u = register(&base, &format!("a24a_{}", uniq())).await;
+    let dev = login_device(&base, &u.username, "secret123", "hostdev").await;
+
+    // 宿主角色升级成功但暂不 hello（改过的客户端可把 hello 拖近 10 秒上限）
+    let mut host = a24_pending_host(&base, &dev).await;
+
+    // 另一台设备把宿主所在登录会话移出：disconnect_hosts 找不到未登记的它
+    let list = sessions_of(&base, &u.access).await;
+    let sid = list
+        .iter()
+        .find(|s| s["device_label"] == "hostdev")
+        .expect("找不到 hostdev 的登录会话")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        rest_status(
+            &base,
+            "DELETE",
+            &format!("/users/me/sessions/{sid}"),
+            &u.access
+        )
+        .await,
+        204
+    );
+
+    // 现在才 hello：登记后复核发现会话已撤销 → 关连接，不发 host_ready
+    host.send(WsMsg::Text(
+        json!({"type":"host_hello","install_id":uuid::Uuid::new_v4(),
+               "label":"stolen","platform":"test"})
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let frames = a24_until_close(&mut host, A01Dur::from_secs(3))
+        .await
+        .expect("已撤销会话的宿主连接应被关闭");
+    assert!(
+        frames.iter().all(|f| f["type"] != "host_ready"),
+        "不应收到 host_ready: {frames:?}"
+    );
+
+    // 宿主行落库（install_id 先 upsert）但登记已被摘掉 → 不在线
+    let hosts: Value = http()
+        .get(format!("{base}/v1/agent-hosts"))
+        .header("authorization", authz(&u.access))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let stolen = hosts
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["label"] == "stolen")
+        .expect("宿主行应已落库");
+    assert_eq!(stolen["online"], false, "{hosts}");
+}
+
+/// 已登记宿主的读循环复核：直接在库里撤会话（绕开 kick_session，模拟漏网），
+/// ping 周期调小 → 下一次 ping 复核失败 → 正常断开、宿主离线。
+#[tokio::test]
+async fn a24_registered_host_disconnects_on_ping_after_revoke() {
+    let (base, st) = spawn_named_state(&format!("chat_it_a24_{}", uniq())).await;
+    st.ws_ping_interval_ms
+        .store(60, std::sync::atomic::Ordering::Relaxed);
+    let u = register(&base, &format!("a24b_{}", uniq())).await;
+    let (mut host, host_id) = spawn_raw_host(&base, &u).await;
+    let hid = uuid::Uuid::parse_str(&host_id).unwrap();
+    assert!(st.host_online(hid));
+
+    // 绕开 kick_session 直接在库里撤销该登录会话（模拟踢设备漏掉这条宿主）
+    let uid = uuid::Uuid::parse_str(&u.id).unwrap();
+    sqlx::query("UPDATE sessions SET revoked_at = now() WHERE user_id = $1")
+        .bind(uid)
+        .execute(&st.pool)
+        .await
+        .unwrap();
+
+    // 下一次 ping 复核发现失效 → 正常断开：关连接、走离线收尾
+    let frames = a24_until_close(&mut host, A01Dur::from_secs(5))
+        .await
+        .expect("被撤销会话的已登记宿主应在下一次 ping 后断开");
+    assert!(
+        frames.iter().all(|f| f["type"] != "host_ready"),
+        "{frames:?}"
+    );
+
+    // 离线收尾已跑：宿主不再在线
+    let deadline = std::time::Instant::now() + A01Dur::from_secs(3);
+    while st.host_online(hid) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(A01Dur::from_millis(20)).await;
+    }
+    assert!(!st.host_online(hid), "断开后宿主应离线");
+}

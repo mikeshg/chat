@@ -203,6 +203,29 @@ pub struct AuthCtx {
     pub sid: Option<Uuid>,
 }
 
+/// WS 连接级复核（升级前、登记后、每帧、宿主 ping 共用这一条 SQL）：
+/// 账号未禁用、凭据版本未变、sid 对应的登录会话未撤销；sid 为 None 的老连接不查会话。
+pub async fn grant_valid(
+    pool: &sqlx::PgPool,
+    uid: Uuid,
+    session_version: i64,
+    sid: Option<Uuid>,
+) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT disabled_at IS NULL AND session_version = $2
+            AND ($3::uuid IS NULL OR EXISTS(
+                 SELECT 1 FROM sessions s
+                  WHERE s.id = $3 AND s.user_id = users.id AND s.revoked_at IS NULL))
+           FROM users WHERE id = $1",
+    )
+    .bind(uid)
+    .bind(session_version)
+    .bind(sid)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false)
+}
+
 /// 解析 token 并取出用户行；账号被禁用、会话版本落后（改密/禁用后签发的旧 token）
 /// 或所属登录会话已撤销（sid 存在时一次查询带出）都立即拒绝。
 /// sid 为 None 的老 token 不做 session 校验（向后兼容，由 session_version 兜底）。
