@@ -451,13 +451,15 @@ button.ctx-item:hover { background: var(--bg); }
 
 /* ---------- 消息生命周期 ---------- */
 .bubble-wrap { position: relative; display: inline-block; max-width: 100%; }
+/* 操作栏朝会话中间展开：别人的消息从气泡左边向右，自己的从右边向左。
+   反过来的话短气泡的操作栏会伸出列表边缘，自己的消息那侧还会撑出横向滚动条 */
 .msg-actions {
-  position: absolute; top: -15px; right: 6px; z-index: 20;
+  position: absolute; top: -15px; left: 6px; z-index: 20;
   display: none; align-items: center; gap: 1px; padding: 2px;
   background: var(--panel); border: 1px solid var(--line);
   border-radius: 6px; box-shadow: 0 2px 8px var(--shadow);
 }
-.msg-row.mine .msg-actions { right: auto; left: 6px; }
+.msg-row.mine .msg-actions { left: auto; right: 6px; }
 .msg-row:hover .msg-actions,
 .msg-actions:focus-within,
 .msg-actions.open { display: flex; }
