@@ -7,9 +7,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn scratch() -> PathBuf {
+    // 并行测试可能拿到同一个时间戳（Windows 时钟 100ns 粒度），加计数保证各用各的目录
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "a07-cache-{}-{}",
+        "a07-cache-{}-{}-{}",
         std::process::id(),
+        SEQ.fetch_add(1, Ordering::SeqCst),
         std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
