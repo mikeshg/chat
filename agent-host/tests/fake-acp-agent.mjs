@@ -36,6 +36,9 @@
 // 指令取 prompt 的最后一个文本块（附加指令放在前面的块里）。
 // session/new 报告两个 mode、两个 model；支持 session/set_mode / session/set_model。
 // session/cancel（通知）：进行中的 sleep 立刻以 stopReason "cancelled" 返回。
+// 启动参数 --banner=before：session/new 响应之前先发一段 BANNER 消息（启动信息不算回复）。
+// 启动参数 --banner=pi：像 pi-acp 那样把启动信息放进 _meta.fakeAcp.startupInfo，
+//   并在下一个 session/prompt 开头才补发同一段文字（模拟定时器晚于 prompt 到达）。
 // 启动参数 --ignore-cancel：忽略取消，用来测宿主 5 秒后强制结束子进程。
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -49,6 +52,10 @@ const caps = capArg ? capArg.slice("--caps=".length) : "resume";
 const dir = path.join(os.tmpdir(), "chat-fake-acp");
 const ignoreCancel = process.argv.includes("--ignore-cancel");
 const noImage = process.argv.includes("--no-image");
+const bannerArg = process.argv.find((a) => a.startsWith("--banner="));
+const banner = bannerArg ? bannerArg.slice("--banner=".length) : "";
+const STARTUP = "## Extensions\n- [object Object]\n- npm:pi-btw\n  - index.ts\n";
+let startupPending = false;
 // 宿主在 prompt 末尾追加的 outbox 提示块（固定前缀），不是用户指令
 const HINT = "如需把文件发给用户";
 
@@ -333,10 +340,13 @@ rl.on("line", (line) => {
     currentMode = "ask";
     currentModel = "fast";
     additionalDirs = Array.isArray(params?.additionalDirectories) ? params.additionalDirectories : [];
+    if (banner === "before") chunk(sessionId, "BANNER-BEFORE\n");
+    startupPending = banner === "pi";
     return result(id, {
       sessionId,
       modes: { currentModeId: currentMode, availableModes: MODES },
       models: { currentModelId: currentModel, availableModels: MODELS },
+      ...(banner === "pi" ? { _meta: { fakeAcp: { startupInfo: STARTUP } } } : {}),
     });
   }
   if (method === "session/set_mode") {
@@ -364,6 +374,10 @@ rl.on("line", (line) => {
     return result(id, { sessionId });
   }
   if (method === "session/prompt") {
+    if (startupPending) {
+      startupPending = false;
+      chunk(sessionId, STARTUP);
+    }
     const raw = params?.prompt ?? [];
     const blocks = raw.map((p) => (typeof p?.text === "string" ? p.text : ""));
     // 最后一个文本块可能是宿主的 outbox 提示，不是指令——去掉再取

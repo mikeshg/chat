@@ -528,3 +528,25 @@ async fn a05_resume_carries_attachments() {
     assert!(out.text.contains("link:r.txt:true"), "{}", out.text);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// 启动信息不算回复：建会话时 agent 自己发的消息，以及 pi-acp 在 _meta 里声明、晚于 prompt 才补发的同一段文字
+async fn run_with_banner(mode: &str, prompt: &str) -> RunOutput {
+    let mut spec = fake();
+    spec.args.push(format!("--banner={mode}"));
+    let (events, _) = mpsc::unbounded_channel();
+    run_invocation(runtime_req(spec, prompt), events)
+        .await
+        .expect("应成功")
+}
+
+#[tokio::test]
+async fn acp_drops_message_sent_before_prompt() {
+    let out = run_with_banner("before", "echo:hello").await;
+    assert_eq!(out.text, "hello");
+}
+
+#[tokio::test]
+async fn acp_drops_declared_startup_info_even_after_prompt() {
+    let out = run_with_banner("pi", "echo:hello").await;
+    assert_eq!(out.text, "hello");
+}

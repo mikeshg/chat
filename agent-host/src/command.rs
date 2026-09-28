@@ -38,7 +38,7 @@ pub fn prepare(command: &str, args: &[String]) -> Command {
 
 /// 同 `prepare`，但 PATH / PATHEXT 由调用方给定（测试用）。
 pub fn prepare_in(command: &str, args: &[String], path_env: &str, pathext: &str) -> Command {
-    match resolve_in(command, path_env, pathext) {
+    let mut cmd = match resolve_in(command, path_env, pathext) {
         Some(path) if is_batch(&path) => batch_command(&path, args),
         Some(path) => {
             let mut cmd = Command::new(path);
@@ -50,8 +50,16 @@ pub fn prepare_in(command: &str, args: &[String], path_env: &str, pathext: &str)
             cmd.args(args);
             cmd
         }
-    }
+    };
+    // 桌面端是图形程序，没有控制台：不加这个标志，每个 Agent 进程都会弹出一个终端窗口。
+    // 子进程拿到的是隐藏控制台，它再起的子进程也沿用，不会各自弹窗。
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
 }
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 fn default_pathext() -> String {
     if cfg!(windows) {

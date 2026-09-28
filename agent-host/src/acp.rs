@@ -57,8 +57,12 @@ struct Pipe {
     events: Events,
     /// 本次拒绝的权限请求次数
     permissions_rejected: u32,
-    /// session/load 响应返回前的历史回放，不能算进本次回复
+    /// session/prompt 发出前收到的 session/update 不算本次回复：
+    /// session/load 的历史回放、agent 建会话时自己发的启动信息都在这段时间里
     suppress_chunks: bool,
+    /// session/new 响应 `_meta.*.startupInfo` 声明的启动信息。pi-acp 会在响应之后
+    /// 用定时器把同一段文字当消息补发，可能晚于 prompt 到达：原样相同的那一段丢掉一次
+    startup_text: Option<String>,
     /// 进行中的 tool_call：id → (title, kind)
     open_steps: HashMap<String, (String, String)>,
     /// 已完成步骤（按收尾顺序）
@@ -154,7 +158,8 @@ pub async fn run_invocation(req: RunRequest, events: Events) -> Result<RunOutput
         err,
         events,
         permissions_rejected: 0,
-        suppress_chunks: false,
+        suppress_chunks: true,
+        startup_text: None,
         open_steps: HashMap::new(),
         steps: Vec::new(),
         tier: if req.permission_tier.is_empty() {
@@ -306,6 +311,16 @@ fn ask_first_mode(modes: Option<&Value>) -> Option<String> {
     (modes["currentModeId"].as_str() != Some(id)).then(|| id.to_string())
 }
 
+/// session/new 响应里 `_meta.<适配器>.startupInfo`（pi-acp 是 `_meta.piAcp`）。
+fn startup_info(new: &Value) -> Option<String> {
+    new.get("_meta")?
+        .as_object()?
+        .values()
+        .find_map(|v| v.get("startupInfo")?.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 fn in_options(id: &str, list: &Option<Vec<AgentOption>>) -> bool {
     list.as_ref()
         .is_some_and(|xs| xs.iter().any(|o| o.id == id))
@@ -382,6 +397,7 @@ async fn drive(
         params["additionalDirectories"] = json!(req.extra_dirs);
     }
     let new = pipe.call("session/new", params).await?;
+    pipe.startup_text = startup_info(&new);
     let modes = option_list(new.pointer("/modes/availableModes"), &["id"]);
     // ACP 模型 id 字段是 modelId；也认 id，方便假 agent 两种写法
     let models = option_list(new.pointer("/models/availableModels"), &["modelId", "id"]);
@@ -441,6 +457,7 @@ async fn prompt_or_cancel(
     prompt: Value,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<(), String> {
+    pipe.suppress_chunks = false;
     let id = pipe
         .send_req(
             "session/prompt",
@@ -471,10 +488,8 @@ async fn resume_session(
             return session_id_of(&r, Some(sid)).ok();
         }
     } else if cap_load(caps) {
-        // load 会先回放历史：响应返回前的 agent_message_chunk 不算本次回复
-        pipe.suppress_chunks = true;
+        // load 会先回放历史；prompt 发出前一直是 suppress_chunks，回放不算本次回复
         let loaded = pipe.call("session/load", params).await;
-        pipe.suppress_chunks = false;
         if let Ok(r) = loaded {
             return session_id_of(&r, Some(sid)).ok();
         }
@@ -673,6 +688,10 @@ impl Pipe {
         match upd["sessionUpdate"].as_str() {
             Some("agent_message_chunk") => {
                 if let Some(t) = upd.pointer("/content/text").and_then(Value::as_str) {
+                    if self.startup_text.as_deref() == Some(t) {
+                        self.startup_text = None;
+                        return;
+                    }
                     self.text.push_str(t);
                     let _ = self.events.send(RunEvent::Text(t.to_string()));
                 }
