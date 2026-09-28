@@ -664,6 +664,21 @@ pub async fn post_message(pool: &PgPool, msg: PostMessage<'_>) -> Result<Posted,
     }
 }
 
+/// 在调用方已经开始的事务里写消息，不提交。
+/// 审批卡片必须和调用行锁落在同一个事务里，不能走自己开事务的 `post_message`。
+pub async fn post_message_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    msg: PostMessage<'_>,
+) -> Result<Posted, PostError> {
+    let client_msg_id = normalize_client_msg_id(msg.client_msg_id)?;
+    match write_message(tx, &msg, client_msg_id.as_deref()).await {
+        Ok(posted) => Ok(posted),
+        // 语句失败后事务已中止，调用方回滚。审批不带 client_msg_id，走不到幂等分支。
+        Err(WriteError::IdempotentHit) => Err(PostError::deny("internal", "db error")),
+        Err(WriteError::Fail(e)) => Err(e),
+    }
+}
+
 fn normalize_client_msg_id(raw: Option<&str>) -> Result<Option<String>, PostError> {
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);

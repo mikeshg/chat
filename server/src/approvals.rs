@@ -1,6 +1,7 @@
 // Agent A12：审批。宿主上报超档操作 → 调用改成 awaiting_approval，
 // 在 Agent 专属会话里以 Agent 身份发一张卡片。主人决定后把选项交回宿主。
-// 调用取消 / 失败 / 宿主断开时，未决审批改为 expired。
+// 同一次调用可以同时有多张 pending 卡（A22）。
+// 调用取消 / 失败 / 宿主断开时，未决审批全部改为 expired。
 
 use crate::auth;
 use crate::domain::{self, PostError};
@@ -37,7 +38,13 @@ struct DecideRow {
     conversation_id: Uuid,
 }
 
-/// 宿主 → approval_request。调用必须属于这条宿主连接且仍是 running，否则忽略。
+/// 宿主 → approval_request。调用必须属于这条宿主连接，且仍是 running 或
+/// awaiting_approval，否则忽略。同一调用可以叠多张卡。
+///
+/// 加锁：先 `FOR UPDATE OF i` 锁调用行，再在同一事务里插入卡片并把状态写成
+/// awaiting_approval。`decide` 是 `FOR UPDATE OF ap, i`（先被决定的那张审批行，
+/// 再调用行）。插入新卡不锁已有审批行，所以和 decide 不会成环。必须先锁调用行
+/// 再插 `agent_approvals`，否则外键的 KEY SHARE 再升级成 FOR UPDATE 会和 decide 死锁。
 pub async fn handle_request(st: &SharedState, host_id: Uuid, v: &Value) {
     let Some(inv_id) = v["invocation_id"]
         .as_str()
@@ -58,42 +65,36 @@ pub async fn handle_request(st: &SharedState, host_id: Uuid, v: &Value) {
         return;
     };
     let request = sanitize_request(&v["tool_call"], &request_id, inv_id);
+    let mut tx = match st.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!(error = %e, "审批开事务失败");
+            return;
+        }
+    };
+    // 调用行锁盖住「插卡 + 改状态」，和 decide 改回 running 互斥。
     let row = sqlx::query_as::<_, (Uuid, Uuid, Uuid, String)>(
         "SELECT i.conversation_id, a.id, a.owner_id, i.status
            FROM agent_invocations i
            JOIN agents a ON a.id = i.agent_id
-          WHERE i.id = $1 AND a.host_id = $2",
+          WHERE i.id = $1 AND a.host_id = $2
+          FOR UPDATE OF i",
     )
     .bind(inv_id)
     .bind(host_id)
-    .fetch_optional(&st.pool)
+    .fetch_optional(&mut *tx)
     .await;
-    let Ok(Some((conv, agent_id, owner, status))) = row else {
+    let Ok(Some((origin_conv, agent_id, owner, status))) = row else {
         return;
     };
-    if status != "running" {
+    if !matches!(status.as_str(), "running" | "awaiting_approval") {
         return;
     }
-    let updated = sqlx::query_as::<_, InvocationView>(&format!(
-        "UPDATE agent_invocations SET status = 'awaiting_approval'
-          WHERE id = $1 AND status = 'running' AND finished_at IS NULL
-          {INV_RETURNING}"
-    ))
-    .bind(inv_id)
-    .fetch_optional(&st.pool)
-    .await;
-    let Ok(Some(inv)) = updated else {
-        return;
-    };
-    let members = domain::member_ids(&st.pool, conv).await.unwrap_or_default();
-    let members = crate::agents::with_root_members(st, &members, &inv).await;
-    push_invocation(st, &members, &inv);
-
     let agent_conv = sqlx::query_scalar::<_, Uuid>(
         "SELECT id FROM conversations WHERE agent_id = $1 AND type = 'agent'",
     )
     .bind(agent_id)
-    .fetch_optional(&st.pool)
+    .fetch_optional(&mut *tx)
     .await
     .ok()
     .flatten();
@@ -103,8 +104,8 @@ pub async fn handle_request(st: &SharedState, host_id: Uuid, v: &Value) {
     };
     let text = approval_text(&request);
     let options_value = Value::Array(options);
-    let posted = domain::post_message(
-        &st.pool,
+    let posted = domain::post_message_in_tx(
+        &mut tx,
         domain::PostMessage {
             conversation_id: agent_conv,
             sender_id: owner,
@@ -125,13 +126,42 @@ pub async fn handle_request(st: &SharedState, host_id: Uuid, v: &Value) {
         },
     )
     .await;
-    match posted {
-        Ok(p) => crate::ws::broadcast_posted(st, agent_conv, &p).await,
+    let posted = match posted {
+        Ok(p) => p,
         Err(PostError::Deny { code, message }) => {
             tracing::warn!(code, message, "审批卡片被拒绝");
+            return;
         }
-        Err(PostError::Db(e)) => tracing::error!(error = %e, "审批卡片写入失败"),
+        Err(PostError::Db(e)) => {
+            tracing::error!(error = %e, "审批卡片写入失败");
+            return;
+        }
+    };
+    let updated = sqlx::query_as::<_, InvocationView>(&format!(
+        "UPDATE agent_invocations SET status = 'awaiting_approval'
+          WHERE id = $1
+            AND status IN ('running', 'awaiting_approval')
+            AND finished_at IS NULL
+          {INV_RETURNING}"
+    ))
+    .bind(inv_id)
+    .fetch_optional(&mut *tx)
+    .await;
+    let Ok(Some(inv)) = updated else {
+        tracing::error!("审批写卡后无法把调用改成 awaiting_approval");
+        return;
+    };
+    if let Err(e) = tx.commit().await {
+        tracing::error!(error = %e, "审批提交失败");
+        return;
     }
+
+    let members = domain::member_ids(&st.pool, origin_conv)
+        .await
+        .unwrap_or_default();
+    let members = crate::agents::with_root_members(st, &members, &inv).await;
+    push_invocation(st, &members, &inv);
+    crate::ws::broadcast_posted(st, agent_conv, &posted).await;
 }
 
 /// POST /v1/agent-approvals/{id}/decide。不是主人 → 404；不是 pending → 409；
@@ -186,12 +216,27 @@ pub async fn decide(
     .bind(&option_id)
     .execute(&mut *tx)
     .await?;
+    // 还持有调用行锁（上面 FOR UPDATE OF ap, i）。此时数得到的 pending
+    // 不含正在等这把锁的新卡，也不含刚决定的这一张。
+    let pending_left: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent_approvals
+          WHERE invocation_id = $1 AND status = 'pending'",
+    )
+    .bind(row.invocation_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let next = if pending_left > 0 {
+        "awaiting_approval"
+    } else {
+        "running"
+    };
     let inv = sqlx::query_as::<_, InvocationView>(&format!(
-        "UPDATE agent_invocations SET status = 'running'
+        "UPDATE agent_invocations SET status = $2
           WHERE id = $1 AND status = 'awaiting_approval' AND finished_at IS NULL
           {INV_RETURNING}"
     ))
     .bind(row.invocation_id)
+    .bind(next)
     .fetch_optional(&mut *tx)
     .await?;
     let Some(inv) = inv else {
@@ -243,7 +288,8 @@ pub async fn decide(
     Ok(Json(view_row.into_view(uid)))
 }
 
-/// 调用离开「还能被决定」的状态时，把它剩下的 pending 审批标成 expired 并刷新卡片。
+/// 调用离开「还能被决定」的状态时，把它剩下的全部 pending 审批标成 expired 并刷新卡片。
+/// 不假设一个调用只有一张卡。取消、调用结束和宿主断开都走这里。
 pub async fn expire_invocation(st: &SharedState, inv_id: Uuid) {
     let ids = sqlx::query_scalar::<_, Uuid>(
         "UPDATE agent_approvals
