@@ -61,7 +61,8 @@ pub struct InvRun {
     /// 该调用派给的宿主
     pub host_id: Uuid,
     pub conversation_id: Uuid,
-    /// 会话成员（普通连接推送目标；A03 场景 = 主人）
+    /// 流式 / 步骤帧的接收者。派发时是「调用会话成员 ∪ 根会话成员」，
+    /// 成员变更提交后按当时的成员重算（不在推流路径上查库）。
     pub member_ids: Vec<Uuid>,
     /// 主人 / Agent id（步骤消息与定稿消息的回写需要）
     pub owner: Uuid,
