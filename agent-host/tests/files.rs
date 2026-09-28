@@ -241,3 +241,73 @@ fn parse_attachments_keeps_ids() {
     assert_eq!(got[0].id, id);
     let _ = Value::Null;
 }
+
+// ===== Agent A19 =====
+
+/// 附件名清洗：盘符相对路径 / 路径穿越 / 保留设备名 / ADS 写法都不能逃出 in/<id>/
+#[tokio::test]
+async fn download_inputs_sanitizes_hostile_names() {
+    let (base, _st) = stub().await;
+    let root = std::env::temp_dir().join(format!("a19-dl-{}", Uuid::new_v4().simple()));
+    let in_dir = root.join("in");
+    tokio::fs::create_dir_all(&in_dir).await.unwrap();
+    let ms = metas(&[
+        "C:foo.txt", // 盘符相对路径：join 会被「有前缀无根」整段替换，逃出 in/
+        "..\\..\\x", // 路径穿越
+        "a/b/c.txt", // 正斜杠路径
+        "nul.txt",   // Windows 保留设备名（含扩展名也算）
+        "a:stream",  // NTFS 备用数据流写法
+        "",          // 空名 → 退回附件 id
+    ]);
+    let http = reqwest::Client::new();
+    let got = files::download_inputs(&http, &base, &in_dir, &ms).await;
+    assert_eq!(got.len(), ms.len(), "全都应落盘: {got:?}");
+    for (m, f) in ms.iter().zip(&got) {
+        // 落在 in/<附件 id>/ 下且是该目录的直接孩子
+        assert_eq!(
+            f.path.parent().unwrap(),
+            in_dir.join(m.id.to_string()),
+            "{} 不在自己的目录里",
+            f.path.display()
+        );
+        assert!(f.path.starts_with(&in_dir), "{:?} 逃出 in/", f.path);
+        // 清洗后的名字是单个普通文件名：无分隔、无冒号、无非法字符
+        assert!(!f.name.is_empty());
+        assert!(
+            !f.name
+                .contains(['/', '\\', ':', '<', '>', '"', '|', '?', '*']),
+            "{}",
+            f.name
+        );
+        let data = std::fs::read(&f.path).unwrap();
+        assert_eq!(data, format!("bytes-of-{}", m.id).into_bytes());
+    }
+    assert_eq!(got[0].name, "foo.txt"); // C:foo.txt → 剥盘符
+    assert_eq!(got[1].name, "x"); // ..\..\x → basename
+    assert_eq!(got[2].name, "c.txt"); // a/b/c.txt → basename
+    assert_ne!(got[3].name, "nul.txt"); // 保留设备名必须改掉
+    assert_eq!(got[5].name, ms[5].id.to_string()); // 空名 → id
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// 同名附件各落各的目录，内容互不覆盖
+#[tokio::test]
+async fn download_inputs_same_names_do_not_clobber() {
+    let (base, _st) = stub().await;
+    let root = std::env::temp_dir().join(format!("a19-dup-{}", Uuid::new_v4().simple()));
+    let in_dir = root.join("in");
+    tokio::fs::create_dir_all(&in_dir).await.unwrap();
+    let ms = metas(&["report.txt", "report.txt"]);
+    let http = reqwest::Client::new();
+    let got = files::download_inputs(&http, &base, &in_dir, &ms).await;
+    assert_eq!(got.len(), 2);
+    assert_ne!(got[0].path, got[1].path, "同名附件必须落不同路径");
+    // Agent 看到的仍是可读原名
+    assert_eq!(got[0].name, "report.txt");
+    assert_eq!(got[1].name, "report.txt");
+    for (m, f) in ms.iter().zip(&got) {
+        let data = std::fs::read(&f.path).unwrap();
+        assert_eq!(data, format!("bytes-of-{}", m.id).into_bytes());
+    }
+    std::fs::remove_dir_all(&root).unwrap();
+}

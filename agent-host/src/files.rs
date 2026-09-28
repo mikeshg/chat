@@ -1,7 +1,7 @@
 // Agent A05：调用附件工作目录。
 //
 // 每次调用一个临时目录 <data_dir>/inv-<id>/：
-//   in/   服务端附件经能力 URL（GET /v1/files/{id}，无需鉴权）下载到这里
+//   in/   服务端附件经能力 URL（GET /v1/files/{id}，无需鉴权）下载到 in/<附件 id>/
 //   out/  Agent 产出文件（CHAT_AGENT_OUTBOX 指到这里）
 // 调用结束 WorkDir drop 整树删除。
 // 产出文件按文件名排序、最多 10 个，逐个用 Invocation 凭据 POST 到
@@ -67,23 +67,76 @@ impl Drop for WorkDir {
     }
 }
 
-/// 附件名剥成 basename（剥掉 `../`、`sub/x`、盘符前缀）；剥空退回附件 id。
+/// 附件名清洗成单个普通文件名：剥掉路径分隔与开头盘符前缀、冒号（含 NTFS
+/// 备用数据流写法）、Windows 非法字符与控制字符、结尾的点和空格；保留设备名
+/// （CON/NUL/COM1 等，含 `nul.txt` 这类带扩展名的）改掉；剥空退回附件 id。
+/// A19：服务端不清洗 multipart 文件名，转发附件名原样来自群友，必须防住
+/// `C:foo.txt` 这类「有前缀无根」路径——join 会整个替换，写出 in/ 外。
 fn safe_name(name: &str, id: Uuid) -> String {
-    let base = name
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or("")
-        .trim_start_matches(':')
-        .trim();
-    if base.is_empty() || base == "." || base == ".." {
-        id.to_string()
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let base = strip_drive_prefix(base);
+    let mut out: String = base.chars().filter(|c| !is_bad_char(*c)).collect();
+    while out.ends_with(['.', ' ']) {
+        out.pop();
+    }
+    if out.is_empty() {
+        return id.to_string();
+    }
+    if is_reserved_name(&out) {
+        out.insert(0, '_');
+    }
+    out
+}
+
+/// 剥掉开头的 `X:` 盘符前缀（盘符相对路径 `C:foo` 的 `C:`）。
+fn strip_drive_prefix(s: &str) -> &str {
+    let b = s.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        &s[2..]
     } else {
-        base.to_string()
+        s
     }
 }
 
-/// 按附件清单逐个 GET 能力 URL 写进 in/；非 2xx / IO 失败的条目跳过。
-/// 返回给运行时的 LocalFile：path 指向 in/<basename>。
+/// Windows 文件名非法字符 + 控制字符；冒号含 NTFS 备用数据流写法。
+fn is_bad_char(c: char) -> bool {
+    c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*' | '/' | '\\')
+}
+
+/// Windows 保留设备名：看首个 `.` 前的词干（大小写不敏感）。
+fn is_reserved_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("").trim_end();
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+/// 按附件清单逐个 GET 能力 URL 写进 in/<附件 id>/（每附件一个子目录，同名附件
+/// 不互相覆盖）；非 2xx / IO 失败 / 清洗后仍不安全的条目跳过。
+/// 返回给运行时的 LocalFile：path 指向 in/<id>/<清洗后文件名>，name 是清洗后的
+/// 可读名（ACP resource_link.name 用它）。
 pub async fn download_inputs(
     http: &reqwest::Client,
     base: &str,
@@ -93,6 +146,13 @@ pub async fn download_inputs(
     let mut out = Vec::with_capacity(metas.len());
     for m in metas {
         let name = safe_name(&m.name, m.id);
+        let dir = in_dir.join(m.id.to_string());
+        let path = dir.join(&name);
+        // 兜底断言：落盘路径必须是 in/<附件 id>/ 的直接孩子
+        if path.parent() != Some(dir.as_path()) {
+            tracing::warn!(att = %m.id, name = %m.name, "附件名清洗后仍不安全，跳过");
+            continue;
+        }
         let url = format!("{base}/v1/files/{}", m.id);
         let bytes = match http.get(&url).send().await {
             Ok(r) if r.status().is_success() => match r.bytes().await {
@@ -111,7 +171,10 @@ pub async fn download_inputs(
                 continue;
             }
         };
-        let path = in_dir.join(&name);
+        if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+            tracing::warn!(error = %e, att = %m.id, "附件目录创建失败，跳过");
+            continue;
+        }
         if let Err(e) = tokio::fs::write(&path, &bytes).await {
             tracing::warn!(error = %e, att = %m.id, "附件落盘失败，跳过");
             continue;
