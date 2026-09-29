@@ -130,7 +130,8 @@ export function convTitle(c: ConversationView, meId?: string): string {
   // V2 P2-4：self 会话 name 恒 NULL、peer 恒空，标题固定
   if (c.kind === "self") return "文件传输助手";
   // Agent A01：专属会话 name 恒 NULL，标题是 Agent 名
-  if (c.kind === "agent") return c.agent?.name ?? "Agent";
+  // A27：工作区对话有自己的名字，没起名时同样显示 Agent 名
+  if (c.kind === "agent") return c.name ?? c.agent?.name ?? "Agent";
   return c.peer?.display_name ?? c.name ?? "会话";
 }
 
@@ -330,13 +331,27 @@ export function applyPrefUpdate(
   };
 }
 
+/** A27：工作区对话只在 Agent 页打开，其余会话在会话页 */
+export function isWorkspaceConv(c: ConversationView | undefined): boolean {
+  return !!c?.agent?.workspace_id;
+}
+
+export function convTab(s: AppState, id: string): "chats" | "agents" {
+  return isWorkspaceConv(s.conversations.find((c) => c.id === id)) ? "agents" : "chats";
+}
+
+/** 这个会话此刻是否正打开在它所在的页上 */
+export function isViewing(s: AppState, id: string): boolean {
+  return s.activeConv === id && s.tab === convTab(s, id);
+}
+
 /**
  * 新消息是否触发应用内提示：非本人所发、非当前打开的会话；
  * 静音会话抑制提示，但 @本人 可突破静音（§8.3）。
  */
 export function shouldNotify(s: AppState, m: MessageView): boolean {
   if (s.me == null || isOwnMessage(m, s.me.id)) return false;
-  if (s.activeConv === m.conversation_id && s.tab === "chats") return false;
+  if (isViewing(s, m.conversation_id)) return false;
   const conv = s.conversations.find((c) => c.id === m.conversation_id);
   if (conv && isMuted(conv) && !m.mentions.includes(s.me.id)) return false;
   return true;
@@ -426,7 +441,7 @@ export function applyLiveMessage(s: AppState, m: MessageView, foreground = true)
   const list = s.messages[m.conversation_id] ?? [];
   const exists = list.some((x) => x.id === m.id) || s.conversations.some((c) => c.last_message?.id === m.id);
   const refreshed = applyRefreshed(s, m.conversation_id, [m]);
-  const isActive = s.activeConv === m.conversation_id && s.tab === "chats" && foreground;
+  const isActive = isViewing(s, m.conversation_id) && foreground;
   // Agent 消息对主人按「别人发来的」计未读（sender_id 仍是主人，由 m.agent 区分）
   const mine = isOwnMessage(m, s.me?.id);
   const { [m.conversation_id]: _typing, ...typing } = s.typing;

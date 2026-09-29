@@ -21,11 +21,13 @@ import {
   applyRefreshed,
   applySyncMessages,
   applyUpdatedMessage,
+  convTab,
   convTitle,
   dropConversationCache,
   dropOptimistic,
   getState,
   isOwnMessage,
+  isViewing,
   mergeConversationLists,
   pushToast,
   replyPreview,
@@ -483,7 +485,7 @@ function inForeground(): boolean {
 // 回到前台：补报当前打开会话的已读（后台期间不自动已读，未读数与标题才准确）
 function readActiveOnReturn() {
   const s = getState();
-  if (s.activeConv && s.tab === "chats" && inForeground()) openConversation(s.activeConv);
+  if (s.activeConv && isViewing(s, s.activeConv) && inForeground()) openConversation(s.activeConv);
 }
 if (typeof window !== "undefined") {
   window.addEventListener("focus", readActiveOnReturn);
@@ -498,7 +500,7 @@ function onMessage(m: MessageView) {
   const known = getState().conversations.some((c) => c.id === m.conversation_id);
   const s = getState();
   const fg = inForeground();
-  const isActive = s.activeConv === m.conversation_id && s.tab === "chats" && fg;
+  const isActive = isViewing(s, m.conversation_id) && fg;
   const mine = isOwnMessage(m, s.me?.id);
   setState((cur) => applyLiveMessage(cur, m, fg));
   if (!known) void refreshCatalogs().catch((e) => console.warn("refresh failed", e));
@@ -533,6 +535,8 @@ async function refreshByWhat(what: string) {
   try {
     if (what === "conversations" || what === "friends" || what === "requests") {
       await refreshCatalogs();
+    } else if (what === "agent_workspaces") {
+      window.dispatchEvent(new Event("chat:workspaces"));
     } else if (what === "agents") {
       // Agent 面板自己重拉列表（可选项 / 删除）
       window.dispatchEvent(new Event("chat:agents"));
@@ -651,7 +655,7 @@ export function sendRead(convId: string, seq: number) {
 export function openConversation(id: string) {
   const s = getState();
   const c = s.conversations.find((x) => x.id === id);
-  setState({ activeConv: id, tab: "chats" });
+  setState({ activeConv: id, tab: convTab(s, id) });
   if (c && c.unread_count > 0 && c.last_seq > 0) {
     sendRead(id, c.last_seq);
     setState((cur) => ({

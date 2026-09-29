@@ -168,3 +168,64 @@ describe("readInjectedLocalHostId", () => {
     g.__CHAT_LOCAL_HOST__ = prev;
   });
 });
+
+// ===== Agent A27 =====
+import type { AgentHostView, ConversationView } from "../types";
+import { folderName, optionName, pickHost, sessionName, workspaceSessions } from "./agentPage";
+
+describe("A27 工作区与对话", () => {
+  const host = (id: string, online: boolean): AgentHostView => ({
+    id,
+    label: id,
+    platform: "windows",
+    online,
+    last_seen_at: "2026-09-29T00:00:00Z",
+  });
+  const conv = (id: string, ws: string | null, at: string): ConversationView =>
+    ({
+      id,
+      kind: "agent",
+      name: null,
+      owner_id: "u",
+      peer: null,
+      member_count: 1,
+      last_seq: 0,
+      unread_count: 0,
+      has_mention: false,
+      last_message: null,
+      agent: { id: "a", name: "bot", host_id: "h", host_online: true, workspace_id: ws },
+      created_at: at,
+    }) as ConversationView;
+
+  it("工作区名取路径最后一段，Windows / Unix 都认", () => {
+    expect(folderName("D:\\projects\\chat\\")).toBe("chat");
+    expect(folderName("/home/me/app")).toBe("app");
+    expect(folderName("C:")).toBe("C:");
+  });
+
+  it("选电脑：保持当前 → 本机 → 在线 → 第一台", () => {
+    const hs = [host("a", false), host("b", true), host("c", true)];
+    expect(pickHost(hs, "c", "a")).toBe("a");
+    expect(pickHost(hs, "c", "gone")).toBe("c");
+    expect(pickHost(hs, null, null)).toBe("b");
+    expect(pickHost([host("a", false)], null, null)).toBe("a");
+    expect(pickHost([], null, null)).toBeNull();
+  });
+
+  it("工作区对话只取本工作区的，最近的在前；专属会话不算", () => {
+    const list = [
+      conv("old", "w1", "2026-09-01T00:00:00Z"),
+      conv("home", null, "2026-09-30T00:00:00Z"),
+      conv("new", "w1", "2026-09-20T00:00:00Z"),
+      conv("other", "w2", "2026-09-25T00:00:00Z"),
+    ];
+    expect(workspaceSessions(list, "w1").map((c) => c.id)).toEqual(["new", "old"]);
+  });
+
+  it("对话名取第一行、最多 30 字；可选项名找不到时显示 id", () => {
+    expect(sessionName("  修一下测试\n细节如下")).toBe("修一下测试");
+    expect([...sessionName("字".repeat(40))].length).toBe(30);
+    expect(optionName("smart", [{ id: "smart", name: "Smart" }])).toBe("Smart");
+    expect(optionName("x", undefined)).toBe("x");
+  });
+});

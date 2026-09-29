@@ -130,6 +130,23 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
                 .layer(DefaultBodyLimit::max(AVATAR_MAX_BYTES + UPLOAD_BODY_MARGIN)),
         )
         .route("/agents/{id}/probe", post(crate::agents::probe_agent))
+        // ---------- Agent A27：工作区与工作区对话 ----------
+        .route(
+            "/agent-hosts/{id}/workspaces",
+            get(crate::workspaces::list_workspaces).post(crate::workspaces::add_workspace),
+        )
+        .route(
+            "/agent-workspaces/{id}",
+            delete(crate::workspaces::remove_workspace),
+        )
+        .route(
+            "/agent-workspaces/{id}/sessions",
+            post(crate::workspaces::create_session),
+        )
+        .route(
+            "/agent-sessions/{id}",
+            patch(crate::workspaces::patch_session).delete(crate::workspaces::delete_session),
+        )
         .route(
             "/agents/{id}/schedules",
             get(crate::schedules::list_schedules).post(crate::schedules::create_schedule),
@@ -1045,6 +1062,10 @@ struct ConvRow {
     c_agent_host_id: Option<Uuid>,
     c_agent_avatar_version: Option<i32>,
     c_agent_deleted: Option<bool>,
+    // Agent A27：工作区对话所属工作区与对话里选的模型 / 模式
+    c_workspace_id: Option<Uuid>,
+    c_agent_model: String,
+    c_agent_mode: String,
     // 本人偏好（conversation_preferences 左连接，无行则全 NULL/false）
     p_pinned_at: Option<DateTime<Utc>>,
     p_archived_at: Option<DateTime<Utc>>,
@@ -1090,6 +1111,8 @@ async fn list_conversations(
                 ag.id AS c_agent_id, ag.name AS c_agent_name, ag.host_id AS c_agent_host_id,
                 ag.avatar_version AS c_agent_avatar_version,
                 (ag.deleted_at IS NOT NULL) AS c_agent_deleted,
+                c.workspace_id AS c_workspace_id, c.agent_model AS c_agent_model,
+                c.agent_mode AS c_agent_mode,
                 cp.pinned_at AS p_pinned_at, cp.archived_at AS p_archived_at,
                 cp.muted_until AS p_muted_until, cp.mute_forever AS p_mute_forever,
                 cp.updated_at AS p_updated_at,
@@ -1097,6 +1120,7 @@ async fn list_conversations(
            FROM memberships m
            JOIN conversations c ON c.id = m.conversation_id
            LEFT JOIN agents ag ON ag.id = c.agent_id
+           LEFT JOIN agent_workspaces ws ON ws.id = c.workspace_id
            LEFT JOIN users au ON au.id = c.announcement_by
            LEFT JOIN conversation_preferences cp
                   ON cp.conversation_id = c.id AND cp.user_id = m.user_id
@@ -1131,6 +1155,8 @@ async fn list_conversations(
                 LIMIT 1
            ) lm ON true
           WHERE m.user_id = $1
+            -- 移除了的工作区连同对话一起隐藏
+            AND (c.workspace_id IS NULL OR ws.deleted_at IS NULL)
           -- 置顶块在前按 pinned_at DESC，块内与未置顶均按原活动时间 DESC、id 兜底
           ORDER BY (cp.pinned_at IS NOT NULL) DESC, cp.pinned_at DESC,
                    COALESCE(lm.created_at, c.created_at) DESC, c.id",
@@ -1236,6 +1262,9 @@ async fn list_conversations(
                         .unwrap_or(false),
                     avatar_version: r.c_agent_avatar_version.unwrap_or(0),
                     deleted: r.c_agent_deleted.unwrap_or(false),
+                    workspace_id: r.c_workspace_id,
+                    model: r.c_agent_model.clone(),
+                    mode: r.c_agent_mode.clone(),
                 }),
                 created_at: r.created_at,
             }

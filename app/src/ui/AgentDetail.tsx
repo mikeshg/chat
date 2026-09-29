@@ -413,7 +413,9 @@ export default function AgentDetail({
                   placeholder="例如 D:\work\project"
                   onChange={(e) => patchDraft({ cwd: e.target.value })}
                 />
-                <span className="am-hint">{computer} 上的绝对路径。留空则用 Chat 自己的数据目录。</span>
+                <span className="am-hint">
+                  {computer} 上的绝对路径，专属会话、群里 @、互调和定时任务在这里干活；工作区对话用工作区的目录。留空则用 Chat 自己的数据目录。
+                </span>
               </div>
               <div className="am-field">
                 <span className="am-lb">额外目录</span>

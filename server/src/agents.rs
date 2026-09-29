@@ -31,7 +31,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-async fn uid(headers: &HeaderMap, st: &SharedState) -> AppResult<Uuid> {
+pub(crate) async fn uid(headers: &HeaderMap, st: &SharedState) -> AppResult<Uuid> {
     let id = auth::require_user(st, headers).await?.id;
     // 头像 GET 不走这里。其余 Agent REST 无权一律 403。
     if !crate::agent_access::user_allows(&st.pool, id).await? {
@@ -120,7 +120,7 @@ pub async fn patch_host(
 /// AgentView 的查询列（list / patch 共用）
 const AGENT_SELECT: &str = "SELECT a.id, a.name, a.host_id, a.runtime, a.cwd, a.created_at,
         (SELECT c.id FROM conversations c
-          WHERE c.agent_id = a.id AND c.type = 'agent') AS conversation_id,
+          WHERE c.agent_id = a.id AND c.type = 'agent' AND c.workspace_id IS NULL) AS conversation_id,
         a.output_mode, a.queue_timeout_secs,
         a.extra_dirs, a.model, a.mode, a.instructions, a.env,
         a.avatar_version, a.reported_options,
@@ -358,7 +358,7 @@ fn check_instructions(s: &str) -> AppResult<()> {
 }
 
 /// 空串 = 用 agent 默认。过长拒绝。
-fn check_token(s: &str, code: &'static str) -> AppResult<String> {
+pub(crate) fn check_token(s: &str, code: &'static str) -> AppResult<String> {
     let t = s.trim();
     if t.chars().count() > 200 {
         return Err(AppError::bad_request(code));
@@ -1999,10 +1999,38 @@ async fn invocation_start_payload(
     .map_err(|e| tracing::error!(error = ?e, "tools_token mint failed"))
     .ok();
     let attachments = attachment_meta(&st.pool, &inv.attachment_ids).await;
+    let mut snapshot = agent_snapshot(agent);
+    // A27：在 Agent 自己的对话里直接发的消息，用这条对话选的模型 / 模式，
+    // 工作区对话再用工作区目录。定时、互调的上下文键不是会话 id，不走这里。
+    if context_key == inv.conversation_id.to_string() {
+        let conv = sqlx::query_as::<_, (Option<String>, String, String)>(
+            "SELECT w.path, c.agent_model, c.agent_mode
+               FROM conversations c
+               LEFT JOIN agent_workspaces w ON w.id = c.workspace_id
+              WHERE c.id = $1 AND c.agent_id = $2",
+        )
+        .bind(inv.conversation_id)
+        .bind(agent.id)
+        .fetch_optional(&st.pool)
+        .await
+        .ok()
+        .flatten();
+        if let Some((path, model, mode)) = conv {
+            if let Some(path) = path {
+                snapshot["cwd"] = json!(path);
+            }
+            if !model.is_empty() {
+                snapshot["model"] = json!(model);
+            }
+            if !mode.is_empty() {
+                snapshot["mode"] = json!(mode);
+            }
+        }
+    }
     json!({
         "type": "invocation_start",
         "invocation_id": inv.id,
-        "agent": agent_snapshot(agent),
+        "agent": snapshot,
         "prompt": prompt,
         "context": {"key": context_key, "session_id": session_id},
         "tools_token": tools_token,
@@ -2640,7 +2668,8 @@ pub(crate) async fn start_child_call(st: &SharedState, req: ChildReq) -> AppResu
     let found = sqlx::query_as::<_, (Uuid, Uuid)>(
         "SELECT a.id, c.id
            FROM agents a
-           JOIN conversations c ON c.agent_id = a.id AND c.type = 'agent'
+           JOIN conversations c
+             ON c.agent_id = a.id AND c.type = 'agent' AND c.workspace_id IS NULL
           WHERE a.owner_id = $1 AND a.deleted_at IS NULL AND lower(a.name) = lower($2)",
     )
     .bind(req.owner)

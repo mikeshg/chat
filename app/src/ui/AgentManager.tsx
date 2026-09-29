@@ -1,27 +1,38 @@
 import { useEffect, useState } from "react";
 import { isDesktopShell } from "../agentHost";
 import { agents, convs } from "../api";
-import { setState, useApp } from "../store";
-import type { AgentUserSettings, AgentView } from "../types";
+import { convTitle, isWorkspaceConv, setState, useApp } from "../store";
+import type { AgentUserSettings, AgentView, AgentWorkspace, ConversationView } from "../types";
 import { openConversation } from "../ws";
-import { groupAgentsByHost, hostDisplayName } from "./agentHosts";
+import { hostDisplayName } from "./agentHosts";
 import {
   ADD_ON_DESKTOP_HINT,
   NO_AGENTS_ON_COMPUTER,
   agentErrText,
   agentRowMeta,
   canAddAgent,
+  folderName,
   hostGroupStatus,
+  pickHost,
   readInjectedLocalHostId,
   resolveLocalComputer,
   showLocalTag,
+  workspaceSessions,
 } from "./agentPage";
 import AgentAdd from "./AgentAdd";
 import AgentAvatar from "./AgentAvatar";
 import AgentDetail from "./AgentDetail";
+import AgentSessionNew from "./AgentSessionNew";
 import AgentSettings from "./AgentSettings";
+import ChatView from "./ChatView";
 
-type Pane = { kind: "blank" } | { kind: "agent"; id: string } | { kind: "add" } | { kind: "defaults" };
+type Pane =
+  | { kind: "blank" }
+  | { kind: "agent"; id: string }
+  | { kind: "add" }
+  | { kind: "defaults" }
+  | { kind: "new"; wsId: string }
+  | { kind: "session"; id: string };
 
 function fmtSeen(iso: string): string {
   const d = new Date(iso);
@@ -33,7 +44,7 @@ function fmtSeen(iso: string): string {
   return `${m}/${day} ${hh}:${mm}`;
 }
 
-/** Agent 管理页：左栏按电脑分组，右栏是详情、添加或默认设置。 */
+/** Agent 页：先选电脑，再看它的工作区和对话；下方是这台电脑上的 Agent 配置。 */
 export default function AgentManager() {
   const s = useApp();
   const [list, setList] = useState<AgentView[]>([]);
@@ -43,12 +54,17 @@ export default function AgentManager() {
   const [dirty, setDirty] = useState(false);
   const [menu, setMenu] = useState<string | null>(null);
   const [renaming, setRenaming] = useState<string | null>(null);
-  const [hostDraft, setHostDraft] = useState("");
-  const [hostErr, setHostErr] = useState("");
-  const [hostBusy, setHostBusy] = useState(false);
+  const [nameDraft, setNameDraft] = useState("");
+  const [rowErr, setRowErr] = useState("");
+  const [rowBusy, setRowBusy] = useState(false);
+  const [confirmDel, setConfirmDel] = useState<string | null>(null);
   const [settings, setSettings] = useState<AgentUserSettings | null>(null);
   const [names, setNames] = useState<Record<string, string>>({});
   const [banner, setBanner] = useState<{ id: string; text: string } | null>(null);
+  const [hostSel, setHostSel] = useState<string | null>(null);
+  const [workspaces, setWorkspaces] = useState<AgentWorkspace[]>([]);
+  const [addingWs, setAddingWs] = useState(false);
+  const [wsPath, setWsPath] = useState("");
 
   const local = resolveLocalComputer({
     desktopShell: isDesktopShell(),
@@ -56,10 +72,16 @@ export default function AgentManager() {
     injectedHostId: readInjectedLocalHostId(),
   });
   const hosts = s.agentHosts;
-  const groups = groupAgentsByHost(hosts, list);
+  const hostId = pickHost(hosts, local.localHostId, hostSel);
+  const host = hosts.find((h) => h.id === hostId) ?? null;
+  const hostAgents = list.filter((a) => a.host_id === hostId);
   const allowAdd = canAddAgent(local, hosts);
   const localHost = hosts.find((h) => h.id === local.localHostId) ?? null;
   const hostKey = hosts.map((h) => `${h.id}:${h.online}`).join("|");
+  const regNames: Record<string, string> = {};
+  for (const [k, v] of Object.entries(names)) {
+    if (k.startsWith(`${hostId}:`)) regNames[k.slice(`${hostId}:`.length)] = v;
+  }
 
   useEffect(() => {
     let alive = true;
@@ -89,6 +111,25 @@ export default function AgentManager() {
   }, []);
 
   useEffect(() => {
+    if (!hostId) {
+      setWorkspaces([]);
+      return;
+    }
+    let alive = true;
+    const load = () =>
+      agents
+        .workspaces(hostId)
+        .then((ws) => alive && setWorkspaces(ws))
+        .catch(() => alive && setWorkspaces([]));
+    load();
+    window.addEventListener("chat:workspaces", load);
+    return () => {
+      alive = false;
+      window.removeEventListener("chat:workspaces", load);
+    };
+  }, [hostId]);
+
+  useEffect(() => {
     let alive = true;
     for (const h of hosts) {
       if (!h.online) continue;
@@ -116,27 +157,49 @@ export default function AgentManager() {
     return () => window.removeEventListener("click", close);
   }, [menu]);
 
+  // 通知、提示点进来的工作区对话：切到它的电脑并打开
+  const activeConv = s.conversations.find((c) => c.id === s.activeConv);
+  useEffect(() => {
+    if (!activeConv || !isWorkspaceConv(activeConv)) return;
+    if (view.kind === "session" && view.id === activeConv.id) return;
+    setHostSel(activeConv.agent!.host_id);
+    setView({ kind: "session", id: activeConv.id });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeConv?.id]);
+
+  const go = (next: Pane) => {
+    setPending(null);
+    setMenu(null);
+    setView(next);
+    if (next.kind === "session") openConversation(next.id);
+    else if (isWorkspaceConv(activeConv)) setState({ activeConv: null });
+  };
+
   const requestNav = (next: Pane) => {
-    const leaving =
-      view.kind === "agent" && !(next.kind === "agent" && next.id === view.id);
+    const leaving = view.kind === "agent" && !(next.kind === "agent" && next.id === view.id);
     if (dirty && leaving) {
       setPending(next);
       return;
     }
-    setPending(null);
-    setView(next);
+    go(next);
+  };
+
+  const startRename = (id: string, current: string) => {
+    setRenaming(id);
+    setNameDraft(current);
+    setRowErr("");
     setMenu(null);
   };
 
   const saveHost = async (id: string) => {
-    if (hostBusy) return;
-    const label = hostDraft.trim();
+    if (rowBusy) return;
+    const label = nameDraft.trim();
     if (!label || [...label].length > 60) {
-      setHostErr("名称需要 1–60 个字符");
+      setRowErr("名称需要 1–60 个字符");
       return;
     }
-    setHostBusy(true);
-    setHostErr("");
+    setRowBusy(true);
+    setRowErr("");
     try {
       const updated = await agents.patchHost(id, label);
       setState((cur) => ({
@@ -144,9 +207,73 @@ export default function AgentManager() {
       }));
       setRenaming(null);
     } catch (e) {
-      setHostErr(agentErrText(e));
+      setRowErr(agentErrText(e));
     } finally {
-      setHostBusy(false);
+      setRowBusy(false);
+    }
+  };
+
+  const saveSessionName = async (id: string) => {
+    if (rowBusy) return;
+    setRowBusy(true);
+    setRowErr("");
+    try {
+      await agents.patchSession(id, { name: nameDraft.trim() });
+      const name = nameDraft.trim() || null;
+      setState((cur) => ({
+        conversations: cur.conversations.map((c) => (c.id === id ? { ...c, name } : c)),
+      }));
+      setRenaming(null);
+    } catch (e) {
+      setRowErr(agentErrText(e));
+    } finally {
+      setRowBusy(false);
+    }
+  };
+
+  const deleteSession = async (id: string) => {
+    setRowBusy(true);
+    setRowErr("");
+    try {
+      await agents.removeSession(id);
+      setConfirmDel(null);
+      if (view.kind === "session" && view.id === id) go({ kind: "blank" });
+      setState((cur) => ({ conversations: cur.conversations.filter((c) => c.id !== id) }));
+    } catch (e) {
+      setRowErr(agentErrText(e));
+    } finally {
+      setRowBusy(false);
+    }
+  };
+
+  const addWorkspace = async () => {
+    if (!hostId || rowBusy) return;
+    setRowBusy(true);
+    setRowErr("");
+    try {
+      const ws = await agents.addWorkspace(hostId, wsPath);
+      setWorkspaces((cur) => (cur.some((w) => w.id === ws.id) ? cur : [...cur, ws]));
+      setAddingWs(false);
+      setWsPath("");
+    } catch (e) {
+      setRowErr(agentErrText(e));
+    } finally {
+      setRowBusy(false);
+    }
+  };
+
+  const removeWorkspace = async (ws: AgentWorkspace) => {
+    setMenu(null);
+    try {
+      await agents.removeWorkspace(ws.id);
+      setWorkspaces((cur) => cur.filter((w) => w.id !== ws.id));
+      const open = view.kind === "session" ? s.conversations.find((c) => c.id === view.id) : null;
+      if ((view.kind === "new" && view.wsId === ws.id) || open?.agent?.workspace_id === ws.id) {
+        go({ kind: "blank" });
+      }
+      setBanner({ id: "", text: `已移除「${folderName(ws.path)}」，再加同一路径可以找回它的对话` });
+    } catch (e) {
+      setRowErr(agentErrText(e));
     }
   };
 
@@ -162,136 +289,252 @@ export default function AgentManager() {
     openConversation(a.conversation_id);
   };
 
+  const menuButton = (id: string, label: string, items: { text: string; run: () => void }[]) => (
+    <span className="am-menu">
+      <button
+        type="button"
+        className="am-more"
+        aria-label={`${label} 的更多操作`}
+        aria-expanded={menu === id}
+        onClick={(e) => {
+          e.stopPropagation();
+          setMenu(menu === id ? null : id);
+        }}
+      >
+        ⋯
+      </button>
+      {menu === id && (
+        <div className="am-menu-pop">
+          {items.map((it) => (
+            <button
+              key={it.text}
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                it.run();
+              }}
+            >
+              {it.text}
+            </button>
+          ))}
+        </div>
+      )}
+    </span>
+  );
+
+  const renameForm = (id: string, label: string, save: () => void) => (
+    <form
+      className="am-rename"
+      onSubmit={(e) => {
+        e.preventDefault();
+        save();
+      }}
+    >
+      <input
+        aria-label={label}
+        value={nameDraft}
+        maxLength={60}
+        autoFocus
+        onChange={(e) => setNameDraft(e.target.value)}
+      />
+      <button type="submit" className="primary" disabled={rowBusy}>
+        {rowBusy ? "保存中…" : "保存"}
+      </button>
+      <button type="button" disabled={rowBusy} onClick={() => setRenaming(null)}>
+        取消
+      </button>
+    </form>
+  );
+
+  const sessionRow = (c: ConversationView) => {
+    const on = view.kind === "session" && view.id === c.id;
+    return (
+      <div key={c.id}>
+        <div className={`am-session${on ? " on" : ""}`}>
+          <button type="button" className="am-session-main" onClick={() => requestNav({ kind: "session", id: c.id })}>
+            <span className="am-session-title">{convTitle(c)}</span>
+            <span className="am-session-meta">{c.agent?.name}</span>
+          </button>
+          {c.unread_count > 0 && <i className="badge am-badge">{c.unread_count > 99 ? "99+" : c.unread_count}</i>}
+          {menuButton(c.id, convTitle(c), [
+            { text: "改名", run: () => startRename(c.id, c.name ?? "") },
+            {
+              text: "删除",
+              run: () => {
+                setConfirmDel(c.id);
+                setRowErr("");
+                setMenu(null);
+              },
+            },
+          ])}
+        </div>
+        {renaming === c.id && renameForm(c.id, "对话名称", () => void saveSessionName(c.id))}
+        {confirmDel === c.id && (
+          <div className="am-rename">
+            <span className="am-hint">删除这条对话和它的全部消息？</span>
+            <button type="button" disabled={rowBusy} onClick={() => setConfirmDel(null)}>
+              取消
+            </button>
+            <button type="button" className="danger" disabled={rowBusy} onClick={() => void deleteSession(c.id)}>
+              删除
+            </button>
+          </div>
+        )}
+        {(renaming === c.id || confirmDel === c.id) && rowErr && <div className="auth-err am-pad">{rowErr}</div>}
+      </div>
+    );
+  };
+
   const current = view.kind === "agent" ? list.find((a) => a.id === view.id) ?? null : null;
+  const newWs = view.kind === "new" ? workspaces.find((w) => w.id === view.wsId) ?? null : null;
   const inDetail = view.kind !== "blank";
+  const isLocal = !!host && showLocalTag(local, host.id);
 
   return (
     <div className={`agent-page${inDetail ? " in-detail" : ""}`}>
       <aside className="am-list">
         <div className="am-list-head">
           <h2>Agent</h2>
-          {allowAdd && (
-            <button type="button" className="primary" onClick={() => requestNav({ kind: "add" })}>
-              ＋ 添加
-            </button>
-          )}
         </div>
+        {!loaded && <div className="am-hint am-pad">加载中…</div>}
+        {loaded && hosts.length === 0 && (
+          <div className="am-hint am-pad">还没有电脑。在桌面端登录后，这台电脑会自动出现。</div>
+        )}
+        {host && (
+          <div className="am-host">
+            <div className="am-row">
+              <i className={`am-dot${host.online ? " on" : ""}`} />
+              <select
+                aria-label="电脑"
+                value={host.id}
+                onChange={(e) => {
+                  setHostSel(e.target.value);
+                  requestNav({ kind: "blank" });
+                }}
+              >
+                {hosts.map((h) => (
+                  <option key={h.id} value={h.id}>
+                    {hostDisplayName(h)}
+                    {showLocalTag(local, h.id) ? "（本机）" : ""}
+                    {h.online ? "" : " · 离线"}
+                  </option>
+                ))}
+              </select>
+              {menuButton(`host:${host.id}`, hostDisplayName(host), [
+                { text: "改名", run: () => startRename(`host:${host.id}`, host.label) },
+              ])}
+            </div>
+            <div className="am-hint">
+              {isLocal && <span className="am-tag">本机</span>}{" "}
+              {hostGroupStatus(host.platform, host.online, fmtSeen(host.last_seen_at))}
+            </div>
+            {renaming === `host:${host.id}` && renameForm(host.id, "电脑名称", () => void saveHost(host.id))}
+            {renaming === `host:${host.id}` && rowErr && <div className="auth-err am-pad">{rowErr}</div>}
+          </div>
+        )}
         <div className="am-list-body">
-          {!loaded && <div className="am-hint am-pad">加载中…</div>}
-          {loaded && groups.length === 0 && (
-            <div className="am-hint am-pad">还没有电脑。在桌面端登录后，这台电脑会自动出现。</div>
-          )}
-          {groups.map((g) => {
-            const host = g.host;
-            const id = host?.id ?? "unknown";
-            const title = host ? hostDisplayName(host) : "未知电脑";
-            return (
-              <div className="am-pc" key={id}>
-                <div className="am-pc-head">
-                  <i className={`am-dot${host?.online ? " on" : ""}`} />
-                  <span className="am-pc-name">
-                    <b>{title}</b>
-                    {host && showLocalTag(local, host.id) && <span className="am-tag">本机</span>}
-                    {host && (
-                      <span>{hostGroupStatus(host.platform, host.online, fmtSeen(host.last_seen_at))}</span>
-                    )}
-                  </span>
-                  {host && (
-                    <span className="am-menu">
+          {host && (
+            <>
+              <div className="am-sec">
+                <span>工作区</span>
+                <button
+                  type="button"
+                  className="am-more"
+                  title="添加工作区"
+                  aria-label="添加工作区"
+                  onClick={() => {
+                    setAddingWs(!addingWs);
+                    setRowErr("");
+                  }}
+                >
+                  ＋
+                </button>
+              </div>
+              {addingWs && (
+                <form
+                  className="am-rename"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    void addWorkspace();
+                  }}
+                >
+                  <input
+                    aria-label="工作区路径"
+                    placeholder={host.platform === "windows" ? "D:\\projects\\app" : "/home/me/app"}
+                    value={wsPath}
+                    maxLength={500}
+                    autoFocus
+                    onChange={(e) => setWsPath(e.target.value)}
+                  />
+                  <button type="submit" className="primary" disabled={rowBusy || !wsPath.trim()}>
+                    添加
+                  </button>
+                </form>
+              )}
+              {addingWs && rowErr && <div className="auth-err am-pad">{rowErr}</div>}
+              {workspaces.length === 0 && !addingWs && (
+                <div className="am-empty">还没有工作区。点「＋」填这台电脑上的一个目录。</div>
+              )}
+              {workspaces.map((ws) => {
+                const sessions = workspaceSessions(s.conversations, ws.id);
+                return (
+                  <div className="am-ws" key={ws.id}>
+                    <div className="am-ws-head" title={ws.path}>
+                      <span className="am-ws-name">📁 {folderName(ws.path)}</span>
                       <button
                         type="button"
-                        className="am-more"
-                        aria-label={`${title} 的更多操作`}
-                        aria-expanded={menu === host.id}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setMenu(menu === host.id ? null : host.id);
-                        }}
+                        className={`am-more${view.kind === "new" && view.wsId === ws.id ? " on" : ""}`}
+                        title="新对话"
+                        aria-label={`在 ${folderName(ws.path)} 新开对话`}
+                        onClick={() => requestNav({ kind: "new", wsId: ws.id })}
                       >
-                        ⋯
+                        ＋
                       </button>
-                      {menu === host.id && (
-                        <div className="am-menu-pop">
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setRenaming(host.id);
-                              setHostDraft(host.label);
-                              setHostErr("");
-                              setMenu(null);
-                            }}
-                          >
-                            改名
-                          </button>
-                        </div>
-                      )}
-                    </span>
-                  )}
-                </div>
-                {host && renaming === host.id && (
-                  <form
-                    className="am-rename"
-                    onSubmit={(e) => {
-                      e.preventDefault();
-                      void saveHost(host.id);
-                    }}
-                  >
-                    <input
-                      aria-label="电脑名称"
-                      value={hostDraft}
-                      maxLength={60}
-                      autoFocus
-                      onChange={(e) => setHostDraft(e.target.value)}
-                    />
-                    <button type="submit" className="primary" disabled={hostBusy}>
-                      {hostBusy ? "保存中…" : "保存"}
-                    </button>
-                    <button
-                      type="button"
-                      disabled={hostBusy}
-                      onClick={() => {
-                        setRenaming(null);
-                        setHostErr("");
-                      }}
-                    >
-                      取消
-                    </button>
-                  </form>
-                )}
-                {host && renaming === host.id && hostErr && <div className="auth-err am-pad">{hostErr}</div>}
-                {g.agents.length === 0 && (
-                  <div className="am-empty">
-                    {NO_AGENTS_ON_COMPUTER}
-                    {host && showLocalTag(local, host.id) && allowAdd ? "，点右上角「添加」" : ""}
+                      {menuButton(`ws:${ws.id}`, folderName(ws.path), [
+                        { text: "移除", run: () => void removeWorkspace(ws) },
+                      ])}
+                    </div>
+                    {sessions.length === 0 && <div className="am-empty">还没有对话</div>}
+                    {sessions.map(sessionRow)}
                   </div>
+                );
+              })}
+
+              <div className="am-sec">
+                <span>Agent</span>
+                {allowAdd && isLocal && (
+                  <button
+                    type="button"
+                    className="am-more"
+                    title="添加 Agent"
+                    aria-label="添加 Agent"
+                    onClick={() => requestNav({ kind: "add" })}
+                  >
+                    ＋
+                  </button>
                 )}
-                {g.agents.map((a) => {
-                  const on = view.kind === "agent" && view.id === a.id;
-                  const regId = a.runtime?.registry?.id;
-                  const regName = regId ? names[`${a.host_id}:${regId}`] : undefined;
-                  return (
-                    <button
-                      key={a.id}
-                      type="button"
-                      className={`am-agent${on ? " on" : ""}`}
-                      onClick={() => requestNav({ kind: "agent", id: a.id })}
-                    >
-                      <AgentAvatar agentId={a.id} name={a.name} version={a.avatar_version} size="sm" />
-                      <span className="am-agent-meta">
-                        <b>{a.name}</b>
-                        <span>{agentRowMeta(a.runtime, a.permission_tier, regName)}</span>
-                      </span>
-                      <i
-                        className={`am-dot${host?.online ? " on" : ""}`}
-                        title={host?.online ? "电脑在线" : "电脑离线，调用会排队"}
-                      />
-                    </button>
-                  );
-                })}
               </div>
-            );
-          })}
+              {hostAgents.length === 0 && <div className="am-empty">{NO_AGENTS_ON_COMPUTER}</div>}
+              {hostAgents.map((a) => {
+                const on = view.kind === "agent" && view.id === a.id;
+                const regId = a.runtime?.registry?.id;
+                return (
+                  <button
+                    key={a.id}
+                    type="button"
+                    className={`am-agent${on ? " on" : ""}`}
+                    onClick={() => requestNav({ kind: "agent", id: a.id })}
+                  >
+                    <AgentAvatar agentId={a.id} name={a.name} version={a.avatar_version} size="sm" />
+                    <span className="am-agent-meta">
+                      <b>{a.name}</b>
+                      <span>{agentRowMeta(a.runtime, a.permission_tier, regId ? regNames[regId] : undefined)}</span>
+                    </span>
+                  </button>
+                );
+              })}
+            </>
+          )}
         </div>
         <div className="am-list-foot">
           <button
@@ -319,8 +562,7 @@ export default function AgentManager() {
                   className="primary"
                   onClick={() => {
                     setDirty(false);
-                    setView(pending);
-                    setPending(null);
+                    go(pending);
                   }}
                 >
                   放弃
@@ -328,6 +570,23 @@ export default function AgentManager() {
               </div>
             </div>
           </div>
+        )}
+        {view.kind === "session" && s.activeConv === view.id && (
+          <section className="am-pane am-chat">
+            <button type="button" className="am-back am-chat-back" onClick={() => requestNav({ kind: "blank" })}>
+              ← 返回
+            </button>
+            <ChatView />
+          </section>
+        )}
+        {view.kind === "new" && newWs && (
+          <AgentSessionNew
+            key={newWs.id}
+            workspace={newWs}
+            agents={hostAgents.filter((a) => !a.deleted)}
+            regNames={regNames}
+            onBack={() => requestNav({ kind: "blank" })}
+          />
         )}
         {view.kind === "agent" && current && (
           <AgentDetail
@@ -359,7 +618,7 @@ export default function AgentManager() {
             onCancel={() => requestNav({ kind: "blank" })}
             onCreated={(a) => {
               setList((cur) => [...cur, a]);
-              setBanner({ id: a.id, text: "已创建，去专属会话发条消息试试" });
+              setBanner({ id: a.id, text: "已创建，在工作区里点「＋」开个对话试试" });
               setDirty(false);
               setView({ kind: "agent", id: a.id });
             }}
@@ -381,7 +640,11 @@ export default function AgentManager() {
             </div>
           </section>
         )}
-        {view.kind === "blank" && <div className="am-blank">从左边选一个 Agent 查看和修改设置。</div>}
+        {view.kind === "blank" && (
+          <div className="am-blank">
+            {banner && !banner.id ? banner.text : "选一个工作区开始对话，或者点它右边的「＋」新开一个。"}
+          </div>
+        )}
       </main>
     </div>
   );

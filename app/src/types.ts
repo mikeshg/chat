@@ -208,6 +208,19 @@ export interface ConvAgentRef {
   avatar_version?: number;
   /** 软删除后专属会话只读 */
   deleted?: boolean;
+  /** A27：非空 = 工作区对话（只在 Agent 页显示）；空 = 专属会话 */
+  workspace_id?: string | null;
+  /** A27：对话里选的模型 / 模式，空串 = 跟随 Agent 配置 */
+  model?: string;
+  mode?: string;
+}
+
+/** A27：工作区 = 某台电脑上的一个目录 */
+export interface AgentWorkspace {
+  id: string;
+  host_id: string;
+  path: string;
+  created_at: string;
 }
 
 /** GET /agent-hosts 单条宿主视图（A01） */

@@ -90,10 +90,16 @@ pub async fn handle_request(st: &SharedState, host_id: Uuid, v: &Value) {
     if !matches!(status.as_str(), "running" | "awaiting_approval") {
         return;
     }
+    // 调用发自这个 Agent 自己的对话（专属会话或工作区对话）→ 卡片就在那里；
+    // 私聊 / 群 / 互调 / 定时 → 专属会话。
     let agent_conv = sqlx::query_scalar::<_, Uuid>(
-        "SELECT id FROM conversations WHERE agent_id = $1 AND type = 'agent'",
+        "SELECT id FROM conversations
+          WHERE agent_id = $1 AND type = 'agent' AND (id = $2 OR workspace_id IS NULL)
+          ORDER BY (id = $2) DESC
+          LIMIT 1",
     )
     .bind(agent_id)
+    .bind(origin_conv)
     .fetch_optional(&mut *tx)
     .await
     .ok()

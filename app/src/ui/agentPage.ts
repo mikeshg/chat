@@ -1,5 +1,5 @@
 import { ApiError } from "../api";
-import type { AgentOutputMode, AgentRuntime, AgentView } from "../types";
+import type { AgentHostView, AgentOptionItem, AgentOutputMode, AgentRuntime, AgentView, ConversationView } from "../types";
 import { tierChoice } from "./approval";
 
 /** 输出方式。hint 是单选卡片上的说明。 */
@@ -207,10 +207,47 @@ export function agentErrText(e: unknown): string {
     host_not_local: "只能添加到正在运行 Chat 桌面端的这台电脑",
     bad_label: "名称需要 1–60 个字符",
     probe_timeout: "读取超时，程序可能卡在启动或登录",
+    bad_path: "路径不合法（1–500 字，不能有控制字符）",
+    agent_on_other_host: "这个 Agent 不在这台电脑上",
+    invocation_running: "还有没结束的调用，先取消或等它结束",
   };
   if (known[e.message]) return known[e.message];
   if (e.status === 409) return known.name_taken;
   if (e.status === 400) return `参数不合法：${e.message}`;
   if (e.status === 404) return "找不到这台电脑或这个 Agent";
   return e.message || "保存失败";
+}
+
+// ===== Agent A27：工作区与对话 =====
+
+/** 可选项 id → 名字；列表里没有就显示 id */
+export function optionName(id: string, items: AgentOptionItem[] | undefined): string {
+  return items?.find((o) => o.id === id)?.name ?? id;
+}
+
+/** 路径最后一段当工作区名（兼容 / 和 \） */
+export function folderName(path: string): string {
+  const parts = path.split(/[\\/]+/).filter(Boolean);
+  return parts[parts.length - 1] ?? path;
+}
+
+/** Agent 页选哪台电脑：保持当前 → 本机 → 第一台在线 → 第一台 */
+export function pickHost(hosts: AgentHostView[], localId: string | null, current: string | null): string | null {
+  if (current && hosts.some((h) => h.id === current)) return current;
+  if (localId && hosts.some((h) => h.id === localId)) return localId;
+  return (hosts.find((h) => h.online) ?? hosts[0])?.id ?? null;
+}
+
+/** 工作区下的对话，最近活动在前 */
+export function workspaceSessions(convs: ConversationView[], wsId: string): ConversationView[] {
+  const at = (c: ConversationView) => c.last_message?.created_at ?? c.created_at;
+  return convs
+    .filter((c) => c.agent?.workspace_id === wsId)
+    .sort((a, b) => (at(a) < at(b) ? 1 : at(a) > at(b) ? -1 : 0));
+}
+
+/** 新对话的名字：第一条消息的第一行，最多 30 字 */
+export function sessionName(text: string): string {
+  const line = text.trim().split("\n")[0].trim();
+  return [...line].slice(0, 30).join("");
 }

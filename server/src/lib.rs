@@ -18,6 +18,7 @@ pub mod schedules;
 pub mod sessions;
 pub mod settings;
 pub mod state;
+pub mod workspaces;
 pub mod ws;
 
 use axum::Router;

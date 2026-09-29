@@ -1,19 +1,24 @@
 import type { AgentOptionItem, ReportedOptions } from "../types";
 
-function OptionSelect({
+export function OptionSelect({
   label,
   value,
   items,
   onChange,
+  defaultText = "默认",
+  disabled,
 }: {
   label: string;
   value: string;
   items: AgentOptionItem[];
   onChange: (v: string) => void;
+  /** 空值那一项的说明，如「跟随 Agent（Smart）」 */
+  defaultText?: string;
+  disabled?: boolean;
 }) {
   return (
-    <select aria-label={label} value={value} onChange={(e) => onChange(e.target.value)}>
-      <option value="">{label}：默认</option>
+    <select aria-label={label} value={value} disabled={disabled} onChange={(e) => onChange(e.target.value)}>
+      <option value="">{label}：{defaultText}</option>
       {value && !items.some((m) => m.id === value) && <option value={value}>{value}</option>}
       {items.map((m) => (
         <option key={m.id} value={m.id}>
@@ -48,13 +53,13 @@ export default function ModelModeFields({
 }) {
   return (
     <div className="am-field">
-      <span className="am-lb">模型和模式</span>
+      <span className="am-lb">默认模型和模式</span>
       <div className="am-row">
         <OptionSelect label="模型" value={model} items={options.models ?? []} onChange={onModel} />
         <OptionSelect label="模式" value={mode} items={options.modes ?? []} onChange={onMode} />
       </div>
       <span className="am-hint">
-        可选项由程序自己提供；列表不全时点
+        每条对话可以另选。可选项由程序自己提供；列表不全时点
         <button type="button" className="am-link" disabled={probing || disabled} onClick={onReload}>
           {probing ? "读取中…" : "重新读取"}
         </button>

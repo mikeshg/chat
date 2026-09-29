@@ -47,6 +47,7 @@ import VoiceRecorder from "./VoiceRecorder";
 import InvocationStatus from "./InvocationStatus";
 import { NestedInvocations } from "./NestedInvocation";
 import { LiveRunBubble, StepRecord } from "./AgentRun";
+import AgentSessionBar from "./AgentSessionBar";
 
 function fmtSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -953,7 +954,7 @@ export default function ChatView() {
             {conv.kind === "self"
               ? "在你的设备间同步消息与文件"
               : conv.kind === "agent"
-                ? `${agentHost ? computerTitle(agentHost.label, agentHost.platform) : "电脑"} · ${agentDeleted ? "已删除" : conv.agent?.host_online ? "在线" : "离线"}`
+                ? `${conv.agent?.workspace_id ? `${conv.agent.name} · ` : ""}${agentHost ? computerTitle(agentHost.label, agentHost.platform) : "电脑"} · ${agentDeleted ? "已删除" : conv.agent?.host_online ? "在线" : "离线"}`
                 : conv.kind === "dm"
                   ? peerOnline
                     ? "在线"
@@ -1360,6 +1361,7 @@ export default function ChatView() {
               <div className="readonly-hint">管理员已关闭你的 Agent 功能</div>
             )}
             {agentDeleted && !agentClosed && <div className="readonly-hint">该 Agent 已删除</div>}
+            {conv.kind === "agent" && conv.agent && !composerLocked && <AgentSessionBar conv={conv} />}
             <input ref={fileInput} type="file" hidden multiple onChange={onFile} />
             {s.replyingTo && (
               <div className="composer-banner">

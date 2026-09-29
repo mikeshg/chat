@@ -5,6 +5,7 @@ import type {
   AgentHostView,
   AgentUserSettings,
   AgentView,
+  AgentWorkspace,
   RegistryList,
   AttachmentView,
   AuthResponse,
@@ -410,6 +411,21 @@ export const agents = {
   /** 主人决定一张审批卡片。404 不是主人，409 已不是 pending，400 选项不对 */
   decideApproval: (id: string, optionId: string) =>
     post<MessageView>(`/agent-approvals/${id}/decide`, { option_id: optionId }),
+  /** A27：这台电脑上的工作区。别人的电脑 404 */
+  workspaces: (hostId: string) => get<AgentWorkspace[]>(`/agent-hosts/${hostId}/workspaces`),
+  /** 加工作区；同一路径移除过就恢复（连同对话）。400 bad_path */
+  addWorkspace: (hostId: string, path: string) =>
+    post<AgentWorkspace>(`/agent-hosts/${hostId}/workspaces`, { path }),
+  /** 移除工作区（对话跟着隐藏，再加同一路径会回来） */
+  removeWorkspace: (id: string) => del<void>(`/agent-workspaces/${id}`),
+  /** 新对话：Agent 必须和工作区在同一台电脑上（否则 400 agent_on_other_host） */
+  createSession: (wsId: string, body: { agent_id: string; name?: string; model?: string; mode?: string }) =>
+    post<{ conversation_id: string }>(`/agent-workspaces/${wsId}/sessions`, body),
+  /** 改对话名（只限工作区对话）/ 模型 / 模式；空串 = 跟随 Agent */
+  patchSession: (id: string, body: { name?: string; model?: string; mode?: string }) =>
+    patch<void>(`/agent-sessions/${id}`, body),
+  /** 删工作区对话；进行中的调用未结束 409 invocation_running */
+  removeSession: (id: string) => del<void>(`/agent-sessions/${id}`),
 };
 
 // ---------- 消息生命周期 ----------

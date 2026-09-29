@@ -348,6 +348,11 @@ pub struct ConvAgentRef {
     pub avatar_version: i32,
     /// 软删除后专属会话仍在，输入只读
     pub deleted: bool,
+    /// A27：非空 = 工作区对话（只在 Agent 页显示）；空 = 专属会话
+    pub workspace_id: Option<Uuid>,
+    /// A27：对话里选的模型 / 模式，空串 = 跟随 Agent 配置
+    pub model: String,
+    pub mode: String,
 }
 
 /// GET /conversations/preferences 的条目：{conversation_id, preference}

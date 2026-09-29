@@ -208,7 +208,7 @@ export default function AgentAdd({
                   placeholder="例如 D:\work\project"
                   onChange={(e) => setCwd(e.target.value)}
                 />
-                <span className="am-hint">它读写文件的地方。可以留空，之后再改。</span>
+                <span className="am-hint">专属会话和群里 @ 时它读写文件的地方；工作区对话用工作区的目录。可以留空，之后再改。</span>
               </div>
               <div className="am-field">
                 <span className="am-lb">权限档位</span>

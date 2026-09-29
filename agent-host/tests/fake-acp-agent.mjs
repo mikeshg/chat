@@ -134,6 +134,7 @@ let state = { prompts: [], replies: [] };
 let currentMode = "ask";
 let currentModel = "fast";
 let additionalDirs = [];
+let sessionCwd = "";
 
 const MODES = [
   { id: "ask", name: "Ask" },
@@ -340,6 +341,7 @@ rl.on("line", (line) => {
     currentMode = "ask";
     currentModel = "fast";
     additionalDirs = Array.isArray(params?.additionalDirectories) ? params.additionalDirectories : [];
+    sessionCwd = params?.cwd ?? "";
     if (banner === "before") chunk(sessionId, "BANNER-BEFORE\n");
     startupPending = banner === "pi";
     return result(id, {
@@ -360,12 +362,14 @@ rl.on("line", (line) => {
   if (method === "session/resume") {
     if (caps !== "resume") return rpcErr(id, "resume unsupported");
     if (!openSaved(params?.sessionId)) return rpcErr(id, "unknown session");
+    sessionCwd = params?.cwd ?? "";
     mcpServers = params?.mcpServers ?? [];
     return result(id, { sessionId });
   }
   if (method === "session/load") {
     if (caps !== "load") return rpcErr(id, "load unsupported");
     if (!openSaved(params?.sessionId)) return rpcErr(id, "unknown session");
+    sessionCwd = params?.cwd ?? "";
     mcpServers = params?.mcpServers ?? [];
     // 回放必须发生在 session/load 的响应之前，宿主用这一点把历史和本次回复分开
     for (const reply of state.replies) {
@@ -390,6 +394,7 @@ rl.on("line", (line) => {
         `FAKE_ECHO=${process.env.FAKE_ECHO ?? ""}`,
         `first=${blocks[0] ?? ""}`,
         `dirs=${additionalDirs.join(",")}`,
+        `cwd=${sessionCwd}`,
       ].join("\n");
       remember(text, out);
       chunk(sessionId, out);

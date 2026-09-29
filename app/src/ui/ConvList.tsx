@@ -7,6 +7,7 @@ import {
   isArchived,
   isMuted,
   isPinned,
+  isWorkspaceConv,
   setState,
   useApp,
 } from "../store";
@@ -48,10 +49,12 @@ export default function ConvList() {
   const [menuBusy, setMenuBusy] = useState(false);
   const [menuErr, setMenuErr] = useState<string | null>(null);
 
-  const archivedCount = s.conversations.filter(isArchived).length;
+  // A27：工作区对话只在 Agent 页显示
+  const chats = s.conversations.filter((c) => !isWorkspaceConv(c));
+  const archivedCount = chats.filter(isArchived).length;
 
   const list = useMemo(() => {
-    const inTab = s.conversations.filter((c) =>
+    const inTab = chats.filter((c) =>
       tab === "archived" ? isArchived(c) : !isArchived(c),
     );
     const kw = q.trim().toLowerCase();

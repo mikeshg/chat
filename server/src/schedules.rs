@@ -123,7 +123,9 @@ async fn owned_live_agent(pool: &PgPool, owner: Uuid, agent_id: Uuid) -> AppResu
 }
 
 async fn agent_conversation(pool: &PgPool, agent_id: Uuid) -> AppResult<Uuid> {
-    sqlx::query_scalar("SELECT id FROM conversations WHERE agent_id = $1 AND type = 'agent'")
+    sqlx::query_scalar(
+        "SELECT id FROM conversations WHERE agent_id = $1 AND type = 'agent' AND workspace_id IS NULL",
+    )
         .bind(agent_id)
         .fetch_optional(pool)
         .await?

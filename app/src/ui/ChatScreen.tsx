@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { canUseAgent } from "../agentAccess";
-import { dismissToast, setState, useApp } from "../store";
+import { dismissToast, isWorkspaceConv, setState, useApp } from "../store";
 import { openConversation, refreshCatalogs } from "../ws";
 import ConvList from "./ConvList";
 import ChatView from "./ChatView";
@@ -18,7 +18,10 @@ export default function ChatScreen() {
   }, []);
 
   const pendingCount = s.requests.incoming.length;
-  const totalUnread = s.conversations.reduce((a, c) => a + c.unread_count, 0);
+  // A27：工作区对话的未读算在 Agent 按钮上
+  const totalUnread = s.conversations.reduce((a, c) => a + (isWorkspaceConv(c) ? 0 : c.unread_count), 0);
+  const agentUnread = s.conversations.reduce((a, c) => a + (isWorkspaceConv(c) ? c.unread_count : 0), 0);
+  const activeInAgents = isWorkspaceConv(s.conversations.find((c) => c.id === s.activeConv));
 
   return (
     <div className="shell">
@@ -33,7 +36,7 @@ export default function ChatScreen() {
         />
         <button
           className={`rail-btn ${s.tab === "chats" ? "on" : ""}`}
-          onClick={() => setState({ tab: "chats" })}
+          onClick={() => setState(activeInAgents ? { tab: "chats", activeConv: null } : { tab: "chats" })}
           title="聊天"
         >
           会话
@@ -54,6 +57,7 @@ export default function ChatScreen() {
             title="Agent"
           >
             Agent
+            {agentUnread > 0 && <i className="badge">{agentUnread > 99 ? "99+" : agentUnread}</i>}
           </button>
         )}
         <button

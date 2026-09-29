@@ -376,11 +376,26 @@ async fn drive(
     let image_ok = cap_image(&init);
     // 注入的工具（A13）：新建和恢复会话都要带上
     let mcp = json!(mcp_entries(&init, &req.mcp_servers));
-    // 能续上已有会话就续上（probe 不续）：模式、模型、额外目录、附加指令都沿用那个会话，不再设置
+    // 能续上已有会话就续上（probe 不续）：额外目录、附加指令沿用那个会话；模式、模型按这次的值再设
     if !req.probe {
         if let Some(sid) =
             resume_session(pipe, dir, req.resume_session.as_deref(), &caps, &mcp).await
         {
+            // A27：对话里可以换模型 / 模式，续上的会话也按这次的值设一遍。
+            // 程序不支持或不认这个值就沿用会话原来的。
+            let session_id = json!(sid);
+            for (method, key, value) in [
+                ("session/set_mode", "modeId", &req.mode),
+                ("session/set_model", "modelId", &req.model),
+            ] {
+                if value.is_empty() {
+                    continue;
+                }
+                let params = json!({"sessionId": session_id, key: value});
+                if let Err(e) = pipe.call(method, params).await {
+                    tracing::warn!(method, error = %e, "续上的会话设置失败，沿用原值");
+                }
+            }
             // A05：恢复路径同样带附件块与 outbox 提示
             let prompt = json!(prompt_blocks(req, image_ok));
             prompt_or_cancel(pipe, &json!(sid), prompt, cancel).await?;
