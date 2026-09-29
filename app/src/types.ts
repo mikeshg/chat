@@ -215,7 +215,15 @@ export interface ConvAgentRef {
   mode?: string;
 }
 
-/** A27：工作区 = 某台电脑上的一个目录 */
+/** A27：GET /agent-hosts/{id}/dirs。path 空 = 起点（盘符 / 主目录），parent 为 null = 回到起点 */
+export interface DirListing {
+  path: string;
+  parent: string | null;
+  dirs: { name: string; path: string }[];
+  error?: string | null;
+}
+
+/** A27：工作区 = 某台电脑上的一个目录；path 为空串是「无工作区」分组 */
 export interface AgentWorkspace {
   id: string;
   host_id: string;

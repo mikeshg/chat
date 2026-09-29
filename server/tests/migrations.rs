@@ -83,6 +83,7 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
         include_str!("../migrations/0031_agent_context_epoch.sql"),
         include_str!("../migrations/0032_host_offline_grace.sql"),
         include_str!("../migrations/0033_agent_workspaces.sql"),
+        include_str!("../migrations/0034_agent_scratch_workspace.sql"),
     ] {
         sqlx::raw_sql(script).execute(&pool).await.unwrap();
     }

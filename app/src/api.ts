@@ -6,6 +6,7 @@ import type {
   AgentUserSettings,
   AgentView,
   AgentWorkspace,
+  DirListing,
   RegistryList,
   AttachmentView,
   AuthResponse,
@@ -416,7 +417,10 @@ export const agents = {
   /** 加工作区；同一路径移除过就恢复（连同对话）。400 bad_path */
   addWorkspace: (hostId: string, path: string) =>
     post<AgentWorkspace>(`/agent-hosts/${hostId}/workspaces`, { path }),
-  /** 移除工作区（对话跟着隐藏，再加同一路径会回来） */
+  /** 请电脑列出 path 下的子目录。离线 409 host_offline，10 秒无响应 504 */
+  dirs: (hostId: string, path: string) =>
+    get<DirListing>(`/agent-hosts/${hostId}/dirs?path=${encodeURIComponent(path)}`),
+  /** 移除工作区（对话跟着隐藏，再加同一路径会回来）。「无工作区」不能移除 */
   removeWorkspace: (id: string) => del<void>(`/agent-workspaces/${id}`),
   /** 新对话：Agent 必须和工作区在同一台电脑上（否则 400 agent_on_other_host） */
   createSession: (wsId: string, body: { agent_id: string; name?: string; model?: string; mode?: string }) =>

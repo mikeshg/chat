@@ -100,11 +100,19 @@ impl AgentSpec {
             name: v.get("name")?.as_str()?.to_string(),
             command,
             args,
-            cwd: v
-                .get("cwd")
+            // A27：无工作区对话带 scratch = 对话 id，工作目录是程序安装目录下的 tmp/<对话 id>
+            cwd: match v
+                .get("scratch")
                 .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
+                .and_then(|s| Uuid::parse_str(s).ok())
+            {
+                Some(conv) => scratch_dir(conv).to_string_lossy().to_string(),
+                None => v
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            },
             env: json_env(v),
             instructions: v
                 .get("instructions")
@@ -333,4 +341,21 @@ pub trait AgentRuntime: Send + Sync + 'static {
 /// 按 spec 选运行时。目前只有 ACP；原生实现加在这里。
 pub fn runtime_for(_spec: &AgentSpec) -> Arc<dyn AgentRuntime> {
     Arc::new(crate::acp::AcpRuntime)
+}
+
+/// A27：无工作区对话的工作目录：程序所在目录下的 tmp/<对话 id>，按需创建。
+/// 安装目录不可写（如装在 Program Files）时退回系统临时目录下的 chat-agent/<对话 id>。
+pub fn scratch_dir(conv: Uuid) -> std::path::PathBuf {
+    let name = conv.to_string();
+    let beside_exe = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.join("tmp").join(&name)));
+    if let Some(dir) = beside_exe {
+        if std::fs::create_dir_all(&dir).is_ok() {
+            return dir;
+        }
+    }
+    let dir = std::env::temp_dir().join("chat-agent").join(&name);
+    let _ = std::fs::create_dir_all(&dir);
+    dir
 }

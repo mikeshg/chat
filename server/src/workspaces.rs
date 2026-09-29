@@ -78,10 +78,18 @@ pub async fn list_workspaces(
 ) -> AppResult<Json<Vec<WorkspaceView>>> {
     let uid = uid(&headers, &st).await?;
     own_host(&st, uid, host).await?;
+    // 「无工作区」分组（路径空串）每台电脑都有，第一次列出时补上，排在最前
+    sqlx::query(
+        "INSERT INTO agent_workspaces (host_id, path) VALUES ($1, '')
+         ON CONFLICT (host_id, path) DO UPDATE SET deleted_at = NULL",
+    )
+    .bind(host)
+    .execute(&st.pool)
+    .await?;
     let rows = sqlx::query_as::<_, WorkspaceView>(
         "SELECT id, host_id, path, created_at FROM agent_workspaces
           WHERE host_id = $1 AND deleted_at IS NULL
-          ORDER BY created_at, id",
+          ORDER BY path = '' DESC, created_at, id",
     )
     .bind(host)
     .fetch_all(&st.pool)
@@ -117,7 +125,7 @@ pub async fn add_workspace(
     Ok(Json(row))
 }
 
-/// DELETE /agent-workspaces/{id}：软删除，它的对话跟着从列表里消失。
+/// DELETE /agent-workspaces/{id}：软删除，它的对话跟着从列表里消失。「无工作区」分组不能移除（404）。
 pub async fn remove_workspace(
     State(st): State<SharedState>,
     headers: HeaderMap,
@@ -127,7 +135,8 @@ pub async fn remove_workspace(
     let done = sqlx::query(
         "UPDATE agent_workspaces w SET deleted_at = now()
            FROM agent_hosts h
-          WHERE w.id = $1 AND h.id = w.host_id AND h.user_id = $2 AND w.deleted_at IS NULL",
+          WHERE w.id = $1 AND h.id = w.host_id AND h.user_id = $2 AND w.deleted_at IS NULL
+            AND w.path <> ''",
     )
     .bind(id)
     .bind(uid)
@@ -278,4 +287,48 @@ pub async fn delete_session(
     }
     crate::api::notify(&st, &[uid], "conversations");
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+pub struct DirsQuery {
+    #[serde(default)]
+    pub path: String,
+}
+
+/// GET /agent-hosts/{id}/dirs?path=：请那台电脑列出 path 下的子目录（空 = 盘符 / 主目录）。
+/// 离线 409 host_offline，10 秒无响应 504。
+pub async fn list_dirs(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(host): Path<Uuid>,
+    axum::extract::Query(q): axum::extract::Query<DirsQuery>,
+) -> AppResult<Json<serde_json::Value>> {
+    let uid = uid(&headers, &st).await?;
+    own_host(&st, uid, host).await?;
+    if q.path.chars().count() > 500 {
+        return Err(AppError::bad_request("bad_path"));
+    }
+    let request_id = Uuid::new_v4();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    st.registry_wait.insert(request_id, tx);
+    let payload =
+        serde_json::json!({"type": "list_dirs", "request_id": request_id, "path": q.path})
+            .to_string();
+    if !st.host_online(host) || !st.send_to_host(host, &payload) {
+        st.registry_wait.remove(&request_id);
+        return Err(AppError::conflict("host_offline"));
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+        Ok(Ok(mut v)) => {
+            if let Some(o) = v.as_object_mut() {
+                o.remove("type");
+                o.remove("request_id");
+            }
+            Ok(Json(v))
+        }
+        _ => {
+            st.registry_wait.remove(&request_id);
+            Err(AppError::gateway_timeout("dirs_timeout"))
+        }
+    }
 }

@@ -60,7 +60,9 @@ export default function AgentSessionNew({
         </button>
         <div className="am-head-text">
           <h2>新对话 · {folderName(workspace.path)}</h2>
-          <div className="am-sub">{workspace.path}</div>
+          <div className="am-sub">
+            {workspace.path || "不在任何项目里：电脑会在 Chat 程序目录下建 tmp/<对话> 给它用"}
+          </div>
         </div>
       </header>
       <div className="am-scroll">

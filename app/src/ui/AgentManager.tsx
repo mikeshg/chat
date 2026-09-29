@@ -25,6 +25,7 @@ import AgentDetail from "./AgentDetail";
 import AgentSessionNew from "./AgentSessionNew";
 import AgentSettings from "./AgentSettings";
 import ChatView from "./ChatView";
+import DirPicker from "./DirPicker";
 
 type Pane =
   | { kind: "blank" }
@@ -65,6 +66,7 @@ export default function AgentManager() {
   const [workspaces, setWorkspaces] = useState<AgentWorkspace[]>([]);
   const [addingWs, setAddingWs] = useState(false);
   const [wsPath, setWsPath] = useState("");
+  const [browsing, setBrowsing] = useState(false);
 
   const local = resolveLocalComputer({
     desktopShell: isDesktopShell(),
@@ -246,14 +248,15 @@ export default function AgentManager() {
     }
   };
 
-  const addWorkspace = async () => {
+  const addWorkspace = async (path = wsPath) => {
     if (!hostId || rowBusy) return;
     setRowBusy(true);
     setRowErr("");
     try {
-      const ws = await agents.addWorkspace(hostId, wsPath);
+      const ws = await agents.addWorkspace(hostId, path);
       setWorkspaces((cur) => (cur.some((w) => w.id === ws.id) ? cur : [...cur, ws]));
       setAddingWs(false);
+      setBrowsing(false);
       setWsPath("");
     } catch (e) {
       setRowErr(agentErrText(e));
@@ -444,6 +447,7 @@ export default function AgentManager() {
                   aria-label="添加工作区"
                   onClick={() => {
                     setAddingWs(!addingWs);
+                    setBrowsing(false);
                     setRowErr("");
                   }}
                 >
@@ -466,21 +470,34 @@ export default function AgentManager() {
                     autoFocus
                     onChange={(e) => setWsPath(e.target.value)}
                   />
+                  <button type="button" disabled={rowBusy || !host.online} onClick={() => setBrowsing(!browsing)}>
+                    浏览…
+                  </button>
                   <button type="submit" className="primary" disabled={rowBusy || !wsPath.trim()}>
                     添加
                   </button>
                 </form>
               )}
+              {addingWs && !host.online && <div className="am-empty">电脑在线时才能浏览目录，也可以直接粘贴路径</div>}
+              {addingWs && browsing && (
+                <DirPicker
+                  hostId={host.id}
+                  onPick={(p) => void addWorkspace(p)}
+                  onCancel={() => setBrowsing(false)}
+                />
+              )}
               {addingWs && rowErr && <div className="auth-err am-pad">{rowErr}</div>}
-              {workspaces.length === 0 && !addingWs && (
-                <div className="am-empty">还没有工作区。点「＋」填这台电脑上的一个目录。</div>
+              {workspaces.every((w) => w.path === "") && !addingWs && (
+                <div className="am-empty">点「＋」选这台电脑上的一个目录作为工作区。</div>
               )}
               {workspaces.map((ws) => {
                 const sessions = workspaceSessions(s.conversations, ws.id);
                 return (
                   <div className="am-ws" key={ws.id}>
-                    <div className="am-ws-head" title={ws.path}>
-                      <span className="am-ws-name">📁 {folderName(ws.path)}</span>
+                    <div className="am-ws-head" title={ws.path || "在电脑上 Chat 程序目录下的 tmp/<对话> 里干活"}>
+                      <span className="am-ws-name">
+                        {ws.path ? "📁" : "💬"} {folderName(ws.path)}
+                      </span>
                       <button
                         type="button"
                         className={`am-more${view.kind === "new" && view.wsId === ws.id ? " on" : ""}`}
@@ -490,9 +507,10 @@ export default function AgentManager() {
                       >
                         ＋
                       </button>
-                      {menuButton(`ws:${ws.id}`, folderName(ws.path), [
-                        { text: "移除", run: () => void removeWorkspace(ws) },
-                      ])}
+                      {ws.path !== "" &&
+                        menuButton(`ws:${ws.id}`, folderName(ws.path), [
+                          { text: "移除", run: () => void removeWorkspace(ws) },
+                        ])}
                     </div>
                     {sessions.length === 0 && <div className="am-empty">还没有对话</div>}
                     {sessions.map(sessionRow)}

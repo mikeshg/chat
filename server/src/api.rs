@@ -135,6 +135,7 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
             "/agent-hosts/{id}/workspaces",
             get(crate::workspaces::list_workspaces).post(crate::workspaces::add_workspace),
         )
+        .route("/agent-hosts/{id}/dirs", get(crate::workspaces::list_dirs))
         .route(
             "/agent-workspaces/{id}",
             delete(crate::workspaces::remove_workspace),

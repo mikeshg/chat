@@ -2016,8 +2016,11 @@ async fn invocation_start_payload(
         .ok()
         .flatten();
         if let Some((path, model, mode)) = conv {
-            if let Some(path) = path {
-                snapshot["cwd"] = json!(path);
+            match path.as_deref() {
+                // 无工作区：电脑自己放到程序目录下的 tmp/<对话 id>
+                Some("") => snapshot["scratch"] = json!(inv.conversation_id),
+                Some(path) => snapshot["cwd"] = json!(path),
+                None => {}
             }
             if !model.is_empty() {
                 snapshot["model"] = json!(model);

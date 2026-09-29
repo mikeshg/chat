@@ -185,6 +185,7 @@ async fn read_loop(
                     "invocation_start" => start_invocation(s, &v),
                     "agent_probe" => start_probe(s, &v),
                     "registry_list" => start_registry_list(s, &v),
+                    "list_dirs" => start_list_dirs(s, &v),
                     "registry_install" => start_registry_install(s, &v),
                     "invocation_cancel" => {
                         // 不直接 abort：让 ACP 先发 session/cancel，最多再等 5 秒才杀进程。
@@ -445,6 +446,21 @@ fn start_registry_list(s: &Arc<Shared>, v: &Value) {
             "entries": outcome.entries,
             "error": outcome.error,
         });
+        s.lane.emit_ephemeral(Message::Text(msg.to_string().into()));
+    });
+}
+
+/// A27：选工作区时列这台电脑上的目录
+fn start_list_dirs(s: &Arc<Shared>, v: &Value) {
+    let request_id = v["request_id"].clone();
+    let path = v["path"].as_str().unwrap_or_default().to_string();
+    let s = s.clone();
+    tokio::spawn(async move {
+        let mut msg = tokio::task::spawn_blocking(move || crate::dirs::list(&path))
+            .await
+            .unwrap_or_else(|e| json!({"dirs": [], "error": e.to_string()}));
+        msg["type"] = json!("dirs_result");
+        msg["request_id"] = request_id;
         s.lane.emit_ephemeral(Message::Text(msg.to_string().into()));
     });
 }

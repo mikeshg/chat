@@ -18970,3 +18970,98 @@ async fn a27_workspace_scope_and_lifecycle() {
     h1.shutdown().await;
     h2.shutdown().await;
 }
+
+/// 无工作区：每台电脑都有路径为空串的分组（排最前、不能移除）；
+/// 它下面的对话在宿主程序目录下的 tmp/<对话 id> 里干活。
+#[tokio::test]
+async fn a27_scratch_session_runs_in_tmp_dir() {
+    use reqwest::Method as M;
+    let base = spawn_named_db(&format!("chat_t_a27t_{}", uniq())).await;
+    let a = register(&base, &format!("a27t_{}", uniq())).await;
+    let (h, host_id) = spawn_host(&base, &a, uuid::Uuid::new_v4()).await;
+    let (_, agent) = create_agent(&base, &a, &host_id, "tmpbot").await;
+    let agent_id = agent["id"].as_str().unwrap();
+    let url = format!("{base}/v1/agent-hosts/{host_id}/workspaces");
+    let _ = a27_req(M::POST, url.clone(), &a, Some(json!({"path": "C:/zz"}))).await;
+    let (s, list) = a27_req(M::GET, url.clone(), &a, None).await;
+    assert_eq!(s, 200);
+    let scratch = &list.as_array().unwrap()[0];
+    assert_eq!(scratch["path"], "");
+    let ws_id = scratch["id"].as_str().unwrap().to_string();
+    // 再列一次不会多出第二个
+    let (_, again) = a27_req(M::GET, url, &a, None).await;
+    assert_eq!(again.as_array().unwrap().len(), 2);
+    let (s, _) = a27_req(
+        M::DELETE,
+        format!("{base}/v1/agent-workspaces/{ws_id}"),
+        &a,
+        None,
+    )
+    .await;
+    assert_eq!(s, 404, "无工作区分组不能移除");
+
+    let (_, created) = a27_req(
+        M::POST,
+        format!("{base}/v1/agent-workspaces/{ws_id}/sessions"),
+        &a,
+        Some(json!({ "agent_id": agent_id })),
+    )
+    .await;
+    let conv = created["conversation_id"].as_str().unwrap().to_string();
+    let (mut sa, _) = tokio_tungstenite::connect_async(ws_url(&base, &a).await)
+        .await
+        .unwrap();
+    send_ws(&mut sa, &conv, "t1", "whoami").await;
+    let text = a27_reply(&mut sa).await;
+    let cwd = text
+        .lines()
+        .find_map(|l| l.strip_prefix("cwd="))
+        .unwrap_or_default()
+        .replace('\\', "/");
+    assert!(cwd.ends_with(&format!("tmp/{conv}")), "{text}");
+    assert!(std::path::Path::new(&cwd).is_dir(), "{cwd}");
+    let _ = std::fs::remove_dir_all(&cwd);
+    h.shutdown().await;
+}
+
+/// 列目录：在线时回子目录；别人的电脑 404；离线 409。
+#[tokio::test]
+async fn a27_list_dirs_through_host() {
+    use reqwest::Method as M;
+    let base = spawn_named_db(&format!("chat_t_a27d_{}", uniq())).await;
+    let a = register(&base, &format!("a27d_{}", uniq())).await;
+    let b = register(&base, &format!("a27db_{}", uniq())).await;
+    let (h, host_id) = spawn_host(&base, &a, uuid::Uuid::new_v4()).await;
+    let dir = std::env::temp_dir().join(format!("a27dir_{}", uniq()));
+    std::fs::create_dir_all(dir.join("sub-one")).unwrap();
+    let q = |p: &str| {
+        format!(
+            "{base}/v1/agent-hosts/{host_id}/dirs?path={}",
+            urlencoding(p)
+        )
+    };
+    let (s, v) = a27_req(M::GET, q(&dir.to_string_lossy()), &a, None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["dirs"][0]["name"], "sub-one");
+    let (s, v) = a27_req(M::GET, q(""), &a, None).await;
+    assert_eq!(s, 200);
+    assert!(!v["dirs"].as_array().unwrap().is_empty());
+    let (s, _) = a27_req(M::GET, q(""), &b, None).await;
+    assert_eq!(s, 404);
+    h.shutdown().await;
+    tokio::time::sleep(A01Dur::from_millis(500)).await;
+    let (s, _) = a27_req(M::GET, q(""), &a, None).await;
+    assert_eq!(s, 409);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn urlencoding(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}

@@ -201,6 +201,7 @@ describe("A27 工作区与对话", () => {
     expect(folderName("D:\\projects\\chat\\")).toBe("chat");
     expect(folderName("/home/me/app")).toBe("app");
     expect(folderName("C:")).toBe("C:");
+    expect(folderName("")).toBe("无工作区");
   });
 
   it("选电脑：保持当前 → 本机 → 在线 → 第一台", () => {

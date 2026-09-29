@@ -210,6 +210,7 @@ export function agentErrText(e: unknown): string {
     bad_path: "路径不合法（1–500 字，不能有控制字符）",
     agent_on_other_host: "这个 Agent 不在这台电脑上",
     invocation_running: "还有没结束的调用，先取消或等它结束",
+    dirs_timeout: "电脑没有响应，稍后再试",
   };
   if (known[e.message]) return known[e.message];
   if (e.status === 409) return known.name_taken;
@@ -220,13 +221,16 @@ export function agentErrText(e: unknown): string {
 
 // ===== Agent A27：工作区与对话 =====
 
+export const NO_WORKSPACE = "无工作区";
+
 /** 可选项 id → 名字；列表里没有就显示 id */
 export function optionName(id: string, items: AgentOptionItem[] | undefined): string {
   return items?.find((o) => o.id === id)?.name ?? id;
 }
 
-/** 路径最后一段当工作区名（兼容 / 和 \） */
+/** 路径最后一段当工作区名（兼容 / 和 \）；空串是「无工作区」 */
 export function folderName(path: string): string {
+  if (path === "") return NO_WORKSPACE;
   const parts = path.split(/[\\/]+/).filter(Boolean);
   return parts[parts.length - 1] ?? path;
 }
