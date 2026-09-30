@@ -3,6 +3,7 @@ import { getServer, osOfUa } from "../api";
 import {
   apkUrl,
   assetFor,
+  hasInstaller,
   assetLabel,
   downloadUrl,
   fetchLatest,
@@ -66,7 +67,11 @@ function ShellUpdate() {
   }, []);
 
   if (!current) return null;
-  const hasNew = !!latest && isNewer(latest.version, current);
+  const newer = !!latest && isNewer(latest.version, current);
+  const hasNew =
+    newer && hasInstaller(osOfUa(navigator.userAgent), latest.assets.map((a) => a.name));
+  // tag 说明第一行常就是版本号，不重复显示
+  const notes = latest?.notes.replace(new RegExp(`^v?${latest.version}\\s*\\n`), "").trim();
 
   const install = async () => {
     if (!latest || busy) return;
@@ -97,12 +102,13 @@ function ShellUpdate() {
       <h3>应用更新</h3>
       <div className="muted">
         当前版本 {current}
-        {latest && !hasNew && " · 已是最新"}
+        {latest && !newer && " · 已是最新"}
+        {newer && !hasNew && ` · 新版本 ${latest.version} 的安装包还在打包，稍后再看`}
       </div>
       {hasNew && (
         <>
           <div>发现新版本 {latest.version}</div>
-          {latest.notes && <div className="muted" style={{ whiteSpace: "pre-wrap" }}>{latest.notes}</div>}
+          {notes && <div className="muted" style={{ whiteSpace: "pre-wrap" }}>{notes}</div>}
           <button className="primary" disabled={busy} onClick={() => void install()}>
             {android ? "下载新版" : "更新并重启"}
           </button>

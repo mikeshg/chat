@@ -56,3 +56,10 @@ export function assetFor(os: string, names: string[]): string | undefined {
   const suffix = ({ Windows: "-setup.exe", Android: ".apk", Linux: ".AppImage" } as Record<string, string>)[os];
   return suffix ? names.find((n) => n.endsWith(suffix)) : undefined;
 }
+
+/** 本平台的安装包已上传（桌面还要有 .sig 才能在线更新）。Release 先建、各平台包陆续上传，
+ *  没传完之前不提示新版本，免得点了装不上 */
+export function hasInstaller(os: string, names: string[]): boolean {
+  const pkg = assetFor(os, names);
+  return !!pkg && (os === "Android" || names.includes(`${pkg}.sig`));
+}

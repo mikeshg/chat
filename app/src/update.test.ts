@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assetFor, assetLabel, isNewer } from "./update";
+import { assetFor, assetLabel, hasInstaller, isNewer } from "./update";
 
 describe("isNewer", () => {
   it.each([
@@ -39,5 +39,15 @@ describe("安装包挑选", () => {
       "Android",
       "Windows",
     ]);
+  });
+});
+
+describe("hasInstaller", () => {
+  it("本平台包传完（桌面带 .sig）才算有", () => {
+    const linuxOnly = ["Chat_0.2.1_amd64.AppImage", "Chat_0.2.1_amd64.AppImage.sig"];
+    expect(hasInstaller("Linux", linuxOnly)).toBe(true);
+    expect(hasInstaller("Windows", linuxOnly)).toBe(false);
+    expect(hasInstaller("Windows", ["Chat_0.2.1_x64-setup.exe"])).toBe(false);
+    expect(hasInstaller("Android", ["Chat_0.2.1.apk"])).toBe(true);
   });
 });
