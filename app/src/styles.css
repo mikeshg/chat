@@ -51,7 +51,7 @@ body {
   color: var(--text);
   font-size: 14px;
 }
-button {
+button, a.btn {
   border: 1px solid var(--line);
   background: var(--panel);
   border-radius: 4px;
@@ -60,9 +60,10 @@ button {
   font-size: 13px;
   color: var(--text);
 }
-button:hover { background: var(--hover); }
-button.primary { background: var(--green); border-color: var(--green); color: var(--on-accent); }
-button.primary:hover { background: var(--green-dk); }
+button:hover, a.btn:hover { background: var(--hover); }
+button.primary, a.btn.primary { background: var(--green); border-color: var(--green); color: var(--on-accent); }
+button.primary:hover, a.btn.primary:hover { background: var(--green-dk); }
+a.btn { display: inline-block; text-decoration: none; align-self: flex-start; }
 button.danger { color: var(--danger); }
 button:disabled { opacity: 0.5; cursor: default; }
 input, textarea {

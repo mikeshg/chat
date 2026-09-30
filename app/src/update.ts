@@ -32,7 +32,27 @@ export async function fetchLatest(): Promise<ClientLatest | null> {
   }
 }
 
+export function downloadUrl(name: string): string {
+  return `${getServer()}/v1/client/download/${encodeURIComponent(name)}`;
+}
+
 export function apkUrl(latest: ClientLatest): string | null {
   const a = latest.assets.find((x) => x.name.endsWith(".apk"));
-  return a ? `${getServer()}/v1/client/download/${encodeURIComponent(a.name)}` : null;
+  return a ? downloadUrl(a.name) : null;
+}
+
+/** 安装包给人看的平台名；.sig 是更新签名，不给人下载 → null */
+export function assetLabel(name: string): string | null {
+  if (name.endsWith(".sig")) return null;
+  if (name.endsWith("-setup.exe")) return "Windows";
+  if (name.endsWith(".apk")) return "Android";
+  if (name.endsWith(".deb")) return "Linux（deb）";
+  if (name.endsWith(".AppImage")) return "Linux（AppImage）";
+  return name;
+}
+
+/** 按 osOfUa 的结果挑推荐安装包；没有对应平台（macOS、iOS）→ undefined */
+export function assetFor(os: string, names: string[]): string | undefined {
+  const suffix = ({ Windows: "-setup.exe", Android: ".apk", Linux: ".AppImage" } as Record<string, string>)[os];
+  return suffix ? names.find((n) => n.endsWith(suffix)) : undefined;
 }

@@ -227,7 +227,7 @@ const put = <T>(p: string, body?: unknown) =>
 
 // ---------- 设备名（V2 P1-5） ----------
 // 登录/注册带给服务端的 device_label：Tauri 壳固定文案，Web 端按 UA 拼「浏览器 · 系统」。
-function osOfUa(ua: string): string {
+export function osOfUa(ua: string): string {
   if (/Windows NT/i.test(ua)) return "Windows";
   if (/Android/i.test(ua)) return "Android";
   if (/iPhone|iPad|iPod/i.test(ua)) return "iOS";

@@ -1,10 +1,59 @@
 import { useEffect, useState } from "react";
-import { getServer } from "../api";
-import { apkUrl, fetchLatest, isNewer, type ClientLatest } from "../update";
+import { getServer, osOfUa } from "../api";
+import {
+  apkUrl,
+  assetFor,
+  assetLabel,
+  downloadUrl,
+  fetchLatest,
+  isNewer,
+  type ClientLatest,
+} from "../update";
 
-/** 「我」页应用更新。只在 Tauri 壳里显示（浏览器端刷新就是新版）。 */
+/** 「我」页：Tauri 壳里是应用更新；浏览器里是下载客户端（浏览器端刷新就是新版，不需要更新）。 */
 export default function UpdateSetting() {
-  const shell = "__TAURI_INTERNALS__" in window;
+  return "__TAURI_INTERNALS__" in window ? <ShellUpdate /> : <DownloadClient />;
+}
+
+/** 浏览器里：按当前系统给一个推荐安装包，「更多」里列全部平台。没配置在线更新 / 没有 Release → 不显示 */
+function DownloadClient() {
+  const [latest, setLatest] = useState<ClientLatest | null>(null);
+  useEffect(() => {
+    void fetchLatest().then(setLatest);
+  }, []);
+  if (!latest) return null;
+  const os = osOfUa(navigator.userAgent);
+  const names = latest.assets.map((a) => a.name);
+  const mine = assetFor(os, names);
+  const all = names.filter((n) => assetLabel(n));
+  if (!all.length) return null;
+  return (
+    <section className="card">
+      <h3>下载客户端</h3>
+      <div className="muted">最新版本 {latest.version}</div>
+      {mine ? (
+        <a className="btn primary" href={downloadUrl(mine)} download>
+          下载 {assetLabel(mine)} 版
+        </a>
+      ) : (
+        <div className="muted">暂时没有 {os} 版，可以在下面选其他平台</div>
+      )}
+      <details className="am-adv">
+        <summary>更多</summary>
+        {all.map((n) => (
+          <div key={n}>
+            <a href={downloadUrl(n)} download>
+              {assetLabel(n)}
+            </a>
+            <span className="muted"> · {n}</span>
+          </div>
+        ))}
+      </details>
+    </section>
+  );
+}
+
+function ShellUpdate() {
   const android = /Android/i.test(navigator.userAgent);
   const [current, setCurrent] = useState("");
   const [latest, setLatest] = useState<ClientLatest | null>(null);
@@ -12,12 +61,11 @@ export default function UpdateSetting() {
   const [hint, setHint] = useState("");
 
   useEffect(() => {
-    if (!shell) return;
     void import("@tauri-apps/api/app").then((m) => m.getVersion()).then(setCurrent);
     void fetchLatest().then(setLatest);
-  }, [shell]);
+  }, []);
 
-  if (!shell || !current) return null;
+  if (!current) return null;
   const hasNew = !!latest && isNewer(latest.version, current);
 
   const install = async () => {
