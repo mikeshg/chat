@@ -10,12 +10,15 @@ export default function RegistryPicker({
   query,
   selectedId,
   onSelect,
+  leading,
   children,
 }: {
   hostId: string;
   query: string;
   selectedId: string;
   onSelect: (entry: RegistryEntry) => void;
+  /** A28：卡片网格最前面的固定卡片（内置），不参与搜索过滤 */
+  leading?: ReactNode;
   children?: ReactNode;
 }) {
   const [entries, setEntries] = useState<RegistryEntry[]>([]);
@@ -102,6 +105,7 @@ export default function RegistryPicker({
       {loading && entries.length === 0 && <div className="am-hint">正在读取登记表…</div>}
       {error && <div className="auth-err">{error}</div>}
       <div className="am-cards">
+        {leading}
         {shown.length === 0 && query.trim() && !loading && (
           <div className="am-hint am-span">
             登记表里没有「{query.trim()}」。可以用下面的自定义命令。

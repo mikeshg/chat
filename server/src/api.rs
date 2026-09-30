@@ -130,6 +130,8 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
                 .layer(DefaultBodyLimit::max(AVATAR_MAX_BYTES + UPLOAD_BODY_MARGIN)),
         )
         .route("/agents/{id}/probe", post(crate::agents::probe_agent))
+        // Agent A28：内置 Agent 的可选模型（管理员配置的端点×模型）
+        .route("/agent-builtin/models", get(crate::agents::builtin_models))
         // ---------- Agent A27：工作区与工作区对话 ----------
         .route(
             "/agent-hosts/{id}/workspaces",

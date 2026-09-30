@@ -19,6 +19,7 @@ import {
   type AgentDraftFields,
 } from "./agentPage";
 import { shapeAgentPatch } from "./agentForm";
+import { isBuiltin, useBuiltinModels } from "./agentBuiltin";
 import { PERMISSION_TIERS } from "./approval";
 import AgentAvatar from "./AgentAvatar";
 import AgentSchedules from "./AgentSchedules";
@@ -78,6 +79,8 @@ export default function AgentDetail({
   dirtyRef.current = dirty;
   const bar = agentSaveBar(dirty);
   const pin = agent.runtime?.registry;
+  const builtin = isBuiltin(agent.runtime);
+  const builtinOpts = useBuiltinModels(builtin);
   const computer = host ? hostDisplayName(host) : "未知电脑";
   const online = host?.online ?? agent.host_online;
   const os = platformLabel(host?.platform);
@@ -95,7 +98,7 @@ export default function AgentDetail({
   }, [agent]);
 
   useEffect(() => {
-    if (!pin) return;
+    if (!pin || builtin) return;
     let alive = true;
     agents
       .registry(agent.host_id)
@@ -135,6 +138,7 @@ export default function AgentDetail({
           queueTimeout: draft.queueTimeout,
           permissionTier: draft.permissionTier,
           registry: pin?.id ? pin : undefined,
+          builtin,
         }),
       );
       setDraft(draftFromAgent(updated));
@@ -166,11 +170,11 @@ export default function AgentDetail({
     }
   };
 
-  // 从没读到过可选项（新建的 Agent）且电脑在线：自动读一次
-  const neverProbed = !agent.reported_options?.modes && !agent.reported_options?.models;
+  // 从没读到过可选项（新建的 Agent）且电脑在线：自动读一次。内置的模型列表走服务端，不 probe
+  const neverProbed = !builtin && !agent.reported_options?.modes && !agent.reported_options?.models;
   useEffect(() => {
     if (neverProbed && online) void probe();
-  }, [agent.id, online]);
+  }, [agent.id, online, builtin]);
 
   const onAvatar = async (file: File | undefined) => {
     if (!file) return;
@@ -309,7 +313,12 @@ export default function AgentDetail({
 
           {tab === "prog" && (
             <>
-              {pin ? (
+              {builtin ? (
+                <div className="am-field">
+                  <span className="am-lb">程序</span>
+                  <div className="am-ro">内置 · Chat 自带，使用管理员配置的模型</div>
+                </div>
+              ) : pin ? (
                 <div className="am-field">
                   <span className="am-lb">程序</span>
                   <div className="am-ro">
@@ -337,13 +346,14 @@ export default function AgentDetail({
               <ModelModeFields
                 model={draft.model}
                 mode={draft.mode}
-                options={reported}
-                probing={probing}
+                options={builtin ? { models: builtinOpts.items } : reported}
+                probing={builtin ? builtinOpts.loading : probing}
                 error={probeErr}
                 disabled={busy}
+                hideMode={builtin}
                 onModel={(model) => patchDraft({ model })}
                 onMode={(mode) => patchDraft({ mode })}
-                onReload={() => void probe()}
+                onReload={builtin ? builtinOpts.reload : () => void probe()}
               />
               <div className="am-field">
                 <label htmlFor="f-instr">附加指令</label>
@@ -510,7 +520,7 @@ export default function AgentDetail({
           <button
             type="button"
             className="primary"
-            disabled={busy || !draft.name.trim() || (!pin && !draft.command.trim())}
+            disabled={busy || !draft.name.trim() || (!pin && !builtin && !draft.command.trim())}
             onClick={() => void save()}
           >
             {busy ? "保存中…" : "保存"}

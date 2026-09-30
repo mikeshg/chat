@@ -50,6 +50,8 @@ pub struct ServerSettings {
     pub agent_enabled: bool,
     /// 没有逐用户覆盖时，普通用户默认能否使用 Agent
     pub agent_default_allowed: bool,
+    /// 内置 Agent 的模型端点（A28）。api_key 只写不读：GET 里每项只有 api_key_set
+    pub builtin_endpoints: Vec<BuiltinEndpointView>,
 }
 
 impl Default for ServerSettings {
@@ -64,8 +66,172 @@ impl Default for ServerSettings {
             meeting_base_url: DEFAULT_MEETING_BASE_URL.into(),
             agent_enabled: true,
             agent_default_allowed: true,
+            builtin_endpoints: Vec::new(),
         }
     }
+}
+
+// ---------- 内置 Agent 端点（A28） ----------
+
+/// 内置 Agent 的一个模型端点。完整形状（含 api_key）只出现在 server_settings
+/// 存值与下发给宿主的调用快照里；REST GET 一律走 BuiltinEndpointView。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuiltinEndpoint {
+    /// 服务端生成；改名 / 改地址不变
+    pub id: Uuid,
+    /// 1–40 字符
+    pub name: String,
+    /// chat = Chat Completions；responses = OpenAI Responses
+    pub protocol: String,
+    /// http/https，入库时已去掉末尾 /
+    pub base_url: String,
+    /// 可空（本地 vLLM 等）；≤500 字符
+    #[serde(default)]
+    pub api_key: String,
+    /// 去重后 1–50 个，每个 1–200 字符
+    pub models: Vec<String>,
+}
+
+/// GET /admin/settings 里的端点：去掉 api_key、加 api_key_set
+#[derive(Debug, Clone, Serialize)]
+pub struct BuiltinEndpointView {
+    pub id: Uuid,
+    pub name: String,
+    pub protocol: String,
+    pub base_url: String,
+    pub api_key_set: bool,
+    pub models: Vec<String>,
+}
+
+impl BuiltinEndpoint {
+    fn view(&self) -> BuiltinEndpointView {
+        BuiltinEndpointView {
+            id: self.id,
+            name: self.name.clone(),
+            protocol: self.protocol.clone(),
+            base_url: self.base_url.clone(),
+            api_key_set: !self.api_key.is_empty(),
+            models: self.models.clone(),
+        }
+    }
+}
+
+fn parse_builtin_endpoints(v: &serde_json::Value) -> Vec<BuiltinEndpoint> {
+    serde_json::from_value::<Vec<BuiltinEndpoint>>(v.clone()).unwrap_or_default()
+}
+
+/// 原始端点数组（含 api_key）：调用快照与 PUT 的 key 合并用。行缺失 / 非法 → 空数组。
+pub async fn load_builtin_endpoints(
+    executor: impl sqlx::PgExecutor<'_>,
+) -> AppResult<Vec<BuiltinEndpoint>> {
+    let v = sqlx::query_scalar::<_, Option<serde_json::Value>>(
+        "SELECT value FROM server_settings WHERE key = 'builtin_endpoints'",
+    )
+    .fetch_optional(executor)
+    .await?
+    .flatten();
+    Ok(v.map(|v| parse_builtin_endpoints(&v)).unwrap_or_default())
+}
+
+const BUILTIN_MAX_ENDPOINTS: usize = 20;
+const BUILTIN_MAX_MODELS: usize = 50;
+
+/// 端点地址：http/https、无空白、去掉末尾 /、scheme 之后必须有内容。
+fn normalize_endpoint_url(raw: &str) -> Option<String> {
+    let url = raw.trim();
+    if url.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let scheme_len = if url.starts_with("https://") {
+        8
+    } else if url.starts_with("http://") {
+        7
+    } else {
+        return None;
+    };
+    // 只剥路径末尾的 /，保住 scheme 的 //
+    let mut end = url.len();
+    let bytes = url.as_bytes();
+    while end > scheme_len && bytes[end - 1] == b'/' {
+        end -= 1;
+    }
+    (end > scheme_len).then(|| url[..end].to_string())
+}
+
+/// 校验并合并 PUT 的 builtin_endpoints：整体替换；元素里 api_key 缺省 = 按已存在的
+/// id 保留原 key，"" = 清空。id 只在命中已有端点时保留，否则服务端生成新的。
+fn normalize_builtin_endpoints(
+    v: &serde_json::Value,
+    cur: &[BuiltinEndpoint],
+) -> AppResult<Vec<BuiltinEndpoint>> {
+    let bad = || AppError::bad_request("bad_builtin_endpoints");
+    let list = v.as_array().ok_or_else(bad)?;
+    if list.len() > BUILTIN_MAX_ENDPOINTS {
+        return Err(bad());
+    }
+    let mut out = Vec::with_capacity(list.len());
+    for item in list {
+        let name = item["name"].as_str().map(str::trim).unwrap_or_default();
+        if name.is_empty() || name.chars().count() > 40 {
+            return Err(bad());
+        }
+        let protocol = item["protocol"].as_str().unwrap_or_default();
+        if !matches!(protocol, "chat" | "responses") {
+            return Err(bad());
+        }
+        let base_url = item["base_url"]
+            .as_str()
+            .and_then(normalize_endpoint_url)
+            .ok_or_else(bad)?;
+        let id = item["id"]
+            .as_str()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .filter(|id| cur.iter().any(|c| c.id == *id))
+            .unwrap_or_else(Uuid::new_v4);
+        let api_key = match item.get("api_key") {
+            None | Some(serde_json::Value::Null) => cur
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| c.api_key.clone())
+                .unwrap_or_default(),
+            Some(k) => {
+                let k = k.as_str().map(str::trim).ok_or_else(bad)?;
+                if k.chars().count() > 500 {
+                    return Err(bad());
+                }
+                k.to_string()
+            }
+        };
+        let models_v = item["models"].as_array().ok_or_else(bad)?;
+        let mut models: Vec<String> = Vec::new();
+        for m in models_v {
+            let Some(m) = m.as_str() else {
+                return Err(bad());
+            };
+            let m = m.trim();
+            if m.is_empty() {
+                continue;
+            }
+            if m.chars().count() > 200 {
+                return Err(bad());
+            }
+            if !models.iter().any(|x| x == m) {
+                models.push(m.to_string());
+            }
+        }
+        if models.is_empty() || models.len() > BUILTIN_MAX_MODELS {
+            return Err(bad());
+        }
+        out.push(BuiltinEndpoint {
+            id,
+            name: name.to_string(),
+            protocol: protocol.to_string(),
+            base_url,
+            api_key,
+            models,
+        });
+    }
+    Ok(out)
 }
 
 /// 一次查出全部行，缺省键用默认值；未知键与非法值忽略（前向兼容）
@@ -115,6 +281,11 @@ pub async fn load(executor: impl sqlx::PgExecutor<'_>) -> AppResult<ServerSettin
             if let Some(b) = v.as_bool() {
                 s.agent_default_allowed = b;
             }
+        } else if k == "builtin_endpoints" {
+            s.builtin_endpoints = parse_builtin_endpoints(&v)
+                .iter()
+                .map(BuiltinEndpoint::view)
+                .collect();
         }
     }
     Ok(s)
@@ -167,6 +338,8 @@ pub struct UpdateSettingsReq {
     pub agent_enabled: Option<bool>,
     /// 新用户 / 未覆盖用户的默认。缺省不改
     pub agent_default_allowed: Option<bool>,
+    /// 内置 Agent 端点（A28）：整体替换；api_key 缺省 = 保留原 key，"" = 清空
+    pub builtin_endpoints: Option<serde_json::Value>,
 }
 
 /// 管理员写入的地址类字段：http/https 且 ≤200 字符；空串合法（= 关闭/清除）。
@@ -290,6 +463,21 @@ pub async fn update(
     }
     if let Some(v) = req.agent_default_allowed {
         upsert_bool(tx, "agent_default_allowed", v, updated_by).await?;
+    }
+    if let Some(v) = &req.builtin_endpoints {
+        // 整体替换；api_key 按 id 从旧值里找回（缺省 = 保留）
+        let cur = load_builtin_endpoints(&mut **tx).await?;
+        let eps = normalize_builtin_endpoints(v, &cur)?;
+        sqlx::query(
+            "INSERT INTO server_settings (key, value, updated_by)
+             VALUES ('builtin_endpoints', $1, $2)
+             ON CONFLICT (key) DO UPDATE
+                SET value = EXCLUDED.value, updated_at = now(), updated_by = EXCLUDED.updated_by",
+        )
+        .bind(serde_json::to_value(&eps).map_err(AppError::internal)?)
+        .bind(updated_by)
+        .execute(&mut **tx)
+        .await?;
     }
     load(&mut **tx).await
 }

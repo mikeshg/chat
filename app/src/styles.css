@@ -1412,3 +1412,40 @@ button.agent-host-name:hover { background: transparent; color: var(--link); }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .dir-picker-list button:hover { background: var(--hover); }
+
+/* ===== Agent A28 ===== */
+/* 后台「内置 Agent 模型端点」编辑区 */
+.a28-eps {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.a28-eps > .am-hint { display: block; }
+.a28-ep {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.a28-ep input,
+.a28-ep select,
+.a28-ep textarea {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 13px;
+  background: var(--input-bg);
+  color: var(--text);
+  min-width: 0;
+}
+.a28-ep textarea { resize: vertical; }
+.a28-ep-head { display: flex; gap: 8px; align-items: center; }
+.a28-ep-head input { flex: 1; min-width: 0; }
+.a28-ep-head select { flex-shrink: 0; }
+.a28-ep-key { display: flex; gap: 8px; align-items: center; }
+.a28-ep-key .grow { flex: 1; min-width: 0; }

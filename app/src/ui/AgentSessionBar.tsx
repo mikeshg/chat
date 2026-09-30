@@ -3,6 +3,7 @@ import { agents as agentsApi } from "../api";
 import { setState } from "../store";
 import type { AgentView, ConversationView } from "../types";
 import { OptionSelect } from "./ModelModeFields";
+import { isBuiltin, useBuiltinModels } from "./agentBuiltin";
 import { optionName } from "./agentPage";
 
 /** A27：Agent 对话输入框上方的模型 / 模式。空值 = 跟随 Agent 配置；下一条消息起生效。 */
@@ -28,6 +29,10 @@ export default function AgentSessionBar({ conv }: { conv: ConversationView }) {
   }, [ref.id]);
 
   const options = agent?.reported_options ?? {};
+  // A28：内置 Agent 的模型选项来自服务端配置，没有模式
+  const builtin = isBuiltin(agent?.runtime);
+  const builtinModels = useBuiltinModels(builtin);
+  const models = builtin ? builtinModels.items : options.models;
   const save = async (body: { model?: string; mode?: string }) => {
     setBusy(true);
     setErr("");
@@ -55,19 +60,21 @@ export default function AgentSessionBar({ conv }: { conv: ConversationView }) {
       <OptionSelect
         label="模型"
         value={ref.model ?? ""}
-        items={labeled("模型", options.models)}
-        defaultText={follow(agent?.model, options.models)}
+        items={labeled("模型", models)}
+        defaultText={follow(agent?.model, models)}
         disabled={busy}
         onChange={(v) => void save({ model: v })}
       />
-      <OptionSelect
-        label="模式"
-        value={ref.mode ?? ""}
-        items={labeled("模式", options.modes)}
-        defaultText={follow(agent?.mode, options.modes)}
-        disabled={busy}
-        onChange={(v) => void save({ mode: v })}
-      />
+      {!builtin && (
+        <OptionSelect
+          label="模式"
+          value={ref.mode ?? ""}
+          items={labeled("模式", options.modes)}
+          defaultText={follow(agent?.mode, options.modes)}
+          disabled={busy}
+          onChange={(v) => void save({ mode: v })}
+        />
+      )}
       {err && <span className="auth-err">{err}</span>}
     </div>
   );

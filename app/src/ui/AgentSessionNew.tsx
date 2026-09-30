@@ -4,6 +4,7 @@ import type { AgentView, AgentWorkspace } from "../types";
 import { openConversation, refreshCatalogs, sendChat } from "../ws";
 import ChoiceCards from "./ChoiceCards";
 import { OptionSelect } from "./ModelModeFields";
+import { isBuiltin, useBuiltinModels } from "./agentBuiltin";
 import { NO_AGENTS_ON_COMPUTER, agentErrText, folderName, optionName, programLine, sessionName } from "./agentPage";
 
 /** A27：工作区里新开一条对话。选定 Agent 后这条对话里不能再换；模型、模式之后还能改。 */
@@ -28,6 +29,10 @@ export default function AgentSessionNew({
   const [err, setErr] = useState("");
   const agent = agents.find((a) => a.id === agentId) ?? null;
   const opts = agent?.reported_options ?? {};
+  // A28：内置 Agent 的模型选项来自服务端配置，没有模式
+  const builtin = isBuiltin(agent?.runtime);
+  const builtinModels = useBuiltinModels(builtin);
+  const models = builtin ? builtinModels.items : opts.models;
   const follow = (id: string | undefined, items: { id: string; name: string }[] | undefined) =>
     `跟随 Agent（${id ? optionName(id, items) : "程序默认"}）`;
 
@@ -90,22 +95,24 @@ export default function AgentSessionNew({
                 <span className="am-hint">开始后这条对话里不能换 Agent。</span>
               </div>
               <div className="am-field">
-                <span className="am-lb">模型和模式</span>
+                <span className="am-lb">{builtin ? "模型" : "模型和模式"}</span>
                 <div className="am-row">
                   <OptionSelect
                     label="模型"
                     value={model}
-                    items={opts.models ?? []}
-                    defaultText={follow(agent?.model, opts.models)}
+                    items={models ?? []}
+                    defaultText={follow(agent?.model, models)}
                     onChange={setModel}
                   />
-                  <OptionSelect
-                    label="模式"
-                    value={mode}
-                    items={opts.modes ?? []}
-                    defaultText={follow(agent?.mode, opts.modes)}
-                    onChange={setMode}
-                  />
+                  {!builtin && (
+                    <OptionSelect
+                      label="模式"
+                      value={mode}
+                      items={opts.modes ?? []}
+                      defaultText={follow(agent?.mode, opts.modes)}
+                      onChange={setMode}
+                    />
+                  )}
                 </div>
                 <span className="am-hint">对话里随时可以改，下一条消息起生效。</span>
               </div>

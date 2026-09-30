@@ -30,8 +30,9 @@ export function registryEntryUi(status: string, reason?: string): RegistryEntryU
   };
 }
 
-/** 编辑页运行时一行：登记表用名称和版本，否则是自定义命令。 */
+/** 编辑页运行时一行：内置固定文案；登记表用名称和版本，否则是自定义命令。 */
 export function runtimeLabel(runtime: AgentRuntime | undefined, displayName?: string): string {
+  if (runtime?.builtin === true) return "内置";
   const pin = runtime?.registry;
   if (pin?.id && pin.version) {
     const name = displayName?.trim() || pin.id;
