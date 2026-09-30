@@ -48,6 +48,7 @@ import InvocationStatus from "./InvocationStatus";
 import { NestedInvocations } from "./NestedInvocation";
 import { LiveRunBubble, StepRecord } from "./AgentRun";
 import AgentSessionBar from "./AgentSessionBar";
+import { PaperclipIcon, PollIcon } from "./icons";
 
 function fmtSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -941,6 +942,9 @@ export default function ChatView() {
   return (
     <main className="chat-view">
       <header className="chat-head">
+        <button className="chat-back" aria-label="返回" onClick={() => setState({ activeConv: null })}>
+          ‹
+        </button>
         {conv.kind === "agent" && conv.agent && (
           <AgentAvatar
             agentId={conv.agent.id}
@@ -1361,7 +1365,6 @@ export default function ChatView() {
               <div className="readonly-hint">管理员已关闭你的 Agent 功能</div>
             )}
             {agentDeleted && !agentClosed && <div className="readonly-hint">该 Agent 已删除</div>}
-            {conv.kind === "agent" && conv.agent && !composerLocked && <AgentSessionBar conv={conv} />}
             <input ref={fileInput} type="file" hidden multiple onChange={onFile} />
             {s.replyingTo && (
               <div className="composer-banner">
@@ -1446,30 +1449,7 @@ export default function ChatView() {
               </div>
             )}
             {sendErr && <div className="pf-err">{sendErr}</div>}
-            <div className="composer-row">
-              <button
-                className="icon-btn attach-btn"
-                title="发送图片/文件（也可直接粘贴）"
-                disabled={composerLocked}
-                onClick={() => fileInput.current?.click()}
-              >
-                📎
-              </button>
-              <VoiceRecorder
-                convId={conv.id}
-                disabled={sending || mutBusy || composerLocked}
-                onError={setMutErr}
-              />
-              {conv.kind === "group" && (
-                <button
-                  className="icon-btn"
-                  title="发起投票"
-                  aria-label="发起投票"
-                  onClick={() => setShowPoll(true)}
-                >
-                  🗳
-                </button>
-              )}
+            <div className="composer-box">
               <textarea
                 ref={taRef}
                 value={text}
@@ -1501,15 +1481,41 @@ export default function ChatView() {
                 }}
                 rows={3}
               />
-              <button
-                className="primary send-btn"
-                onClick={send}
-                disabled={
-                  composerLocked || sending || mutBusy || (!text.trim() && pendingFiles.length === 0)
-                }
-              >
-                {s.editingMessage ? (mutBusy ? "保存中…" : "保存") : sending ? "发送中…" : "发送"}
-              </button>
+              <div className="composer-tools">
+                <button
+                  className="icon-btn"
+                  title="发送图片/文件（也可直接粘贴）"
+                  disabled={composerLocked}
+                  onClick={() => fileInput.current?.click()}
+                >
+                  <PaperclipIcon />
+                </button>
+                <VoiceRecorder
+                  convId={conv.id}
+                  disabled={sending || mutBusy || composerLocked}
+                  onError={setMutErr}
+                />
+                {conv.kind === "group" && (
+                  <button
+                    className="icon-btn"
+                    title="发起投票"
+                    aria-label="发起投票"
+                    onClick={() => setShowPoll(true)}
+                  >
+                    <PollIcon />
+                  </button>
+                )}
+                {conv.kind === "agent" && conv.agent && !composerLocked && <AgentSessionBar conv={conv} />}
+                <button
+                  className="primary send-btn"
+                  onClick={send}
+                  disabled={
+                    composerLocked || sending || mutBusy || (!text.trim() && pendingFiles.length === 0)
+                  }
+                >
+                  {s.editingMessage ? (mutBusy ? "保存中…" : "保存") : sending ? "发送中…" : "发送"}
+                </button>
+              </div>
             </div>
           </>
         )}

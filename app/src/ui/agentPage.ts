@@ -229,6 +229,24 @@ export function optionName(id: string, items: AgentOptionItem[] | undefined): st
   return items?.find((o) => o.id === id)?.name ?? id;
 }
 
+/** 「sub · grok-4.7」按供应商分组，组内只留模型名；没有「 · 」的放 loose */
+export function groupOptions(items: AgentOptionItem[] | undefined): {
+  loose: AgentOptionItem[];
+  groups: [string, AgentOptionItem[]][];
+} {
+  const loose: AgentOptionItem[] = [];
+  const groups = new Map<string, AgentOptionItem[]>();
+  for (const o of items ?? []) {
+    const i = o.name.indexOf(" · ");
+    if (i < 0) loose.push(o);
+    else {
+      const g = o.name.slice(0, i);
+      groups.set(g, [...(groups.get(g) ?? []), { ...o, name: o.name.slice(i + 3) }]);
+    }
+  }
+  return { loose, groups: [...groups] };
+}
+
 /** 路径最后一段当工作区名（兼容 / 和 \）；空串是「无工作区」 */
 export function folderName(path: string): string {
   if (path === "") return NO_WORKSPACE;

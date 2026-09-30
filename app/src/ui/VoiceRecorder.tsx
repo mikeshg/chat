@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { files } from "../api";
 import type { AttachmentView } from "../types";
 import { sendChat } from "../ws";
+import { MicIcon } from "./icons";
 import {
   MIC_DENIED,
   MIC_UNAVAILABLE,
@@ -174,7 +175,7 @@ export default function VoiceRecorder({ convId, disabled, onError }: Props) {
       disabled={!supported || disabled}
       onClick={() => void start()}
     >
-      🎤
+      <MicIcon />
     </button>
   );
 }

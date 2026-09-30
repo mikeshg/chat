@@ -17,6 +17,17 @@ export default function ChatScreen() {
     void refreshCatalogs().catch((e) => console.warn("initial load failed", e));
   }, []);
 
+  // 打开会话压一条历史记录：安卓返回键 / 浏览器后退先关会话回列表，而不是退出 app
+  useEffect(() => {
+    if (s.activeConv && !history.state?.chat) history.pushState({ chat: 1 }, "");
+    else if (!s.activeConv && history.state?.chat) history.back();
+  }, [s.activeConv]);
+  useEffect(() => {
+    const onPop = () => !history.state?.chat && setState({ activeConv: null });
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+
   const pendingCount = s.requests.incoming.length;
   // A27：工作区对话的未读算在 Agent 按钮上
   const totalUnread = s.conversations.reduce((a, c) => a + (isWorkspaceConv(c) ? 0 : c.unread_count), 0);

@@ -10,6 +10,7 @@ import {
   canAddAgent,
   draftFromAgent,
   filterPrograms,
+  groupOptions,
   followDefaultOutputHint,
   followDefaultQueueOption,
   hostGroupStatus,
@@ -228,5 +229,24 @@ describe("A27 工作区与对话", () => {
     expect([...sessionName("字".repeat(40))].length).toBe(30);
     expect(optionName("smart", [{ id: "smart", name: "Smart" }])).toBe("Smart");
     expect(optionName("x", undefined)).toBe("x");
+  });
+});
+
+describe("groupOptions", () => {
+  it("按「供应商 · 」分组，组内只留模型名", () => {
+    expect(
+      groupOptions([
+        { id: "a", name: "sub · grok-4.7" },
+        { id: "b", name: "api · gpt-5" },
+        { id: "c", name: "sub · gpt-5" },
+        { id: "d", name: "Smart" },
+      ]),
+    ).toEqual({
+      loose: [{ id: "d", name: "Smart" }],
+      groups: [
+        ["sub", [{ id: "a", name: "grok-4.7" }, { id: "c", name: "gpt-5" }]],
+        ["api", [{ id: "b", name: "gpt-5" }]],
+      ],
+    });
   });
 });

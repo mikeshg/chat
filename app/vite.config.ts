@@ -7,6 +7,8 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: Number(process.env.CHAT_WEB_PORT ?? 5173),
+    // Windows 上 Node 默认只监听 ::1，走 127.0.0.1 的浏览器（如 Claude 预览面板）连不上
+    host: "127.0.0.1",
     proxy: {
       "/v1": {
         target: process.env.CHAT_API ?? "http://localhost:28080",
