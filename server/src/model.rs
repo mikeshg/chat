@@ -707,7 +707,7 @@ pub struct CreateAgentReq {
     pub mode: String,
 }
 
-/// 两种运行时：自定义命令，或登记表条目（只校验字段，不联网）。
+/// 三种运行时：自定义命令、登记表条目（只校验字段，不联网）、内置 agent（A28）。
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum AgentRuntimeReq {
@@ -718,6 +718,10 @@ pub enum AgentRuntimeReq {
         command: String,
         #[serde(default)]
         args: Vec<String>,
+    },
+    /// builtin 必须为 true，否则 normalize_runtime 回 bad_runtime
+    Builtin {
+        builtin: bool,
     },
 }
 

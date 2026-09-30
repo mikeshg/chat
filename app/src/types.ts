@@ -246,11 +246,12 @@ export interface RegistryPin {
   version: string;
 }
 
-/** Agent 运行描述：自定义命令，或登记表条目。 */
+/** Agent 运行描述：自定义命令、登记表条目，或内置（A28，runtime.builtin === true）。 */
 export interface AgentRuntime {
   command?: string;
   args?: string[];
   registry?: RegistryPin;
+  builtin?: boolean;
 }
 
 /** GET /agent-hosts/{id}/registry 的一条 */
@@ -655,6 +656,24 @@ export interface AdminSettings {
   agent_enabled?: boolean;
   /** 没有逐用户覆盖时，普通用户默认能否使用 */
   agent_default_allowed?: boolean;
+  /** 内置 Agent 的模型端点（A28）。GET 每项带 api_key_set；PUT 整体替换 */
+  builtin_endpoints?: BuiltinEndpointConf[];
+}
+
+/**
+ * builtin_endpoints 的一个端点（A28）。
+ * GET：api_key 永不返回，只有 api_key_set。
+ * PUT：api_key 缺省 = 按 id 保留原 key；"" = 清空；id 缺省 = 新端点（服务端发 id）。
+ */
+export interface BuiltinEndpointConf {
+  id?: string;
+  name: string;
+  /** chat = Chat Completions；responses = OpenAI Responses */
+  protocol: string;
+  base_url: string;
+  api_key?: string;
+  api_key_set?: boolean;
+  models: string[];
 }
 
 /** GET/PUT /users/me/push 与 rotate/test 返回（V2 P3-3） */

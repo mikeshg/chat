@@ -107,6 +107,7 @@ export function followDefaultQueueOption(currentLabel: string): string {
 
 /** 列表一行右侧：程序名 · 权限档位。 */
 export function programLine(runtime: AgentRuntime | undefined, registryName?: string): string {
+  if (runtime?.builtin === true) return "内置";
   const pin = runtime?.registry;
   if (pin?.id) return registryName?.trim() || pin.id;
   const cmd = runtime?.command?.trim();

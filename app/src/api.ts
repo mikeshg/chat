@@ -3,6 +3,7 @@ import type {
   AdminSettings,
   AdminUserView,
   AgentHostView,
+  AgentOptionItem,
   AgentUserSettings,
   AgentView,
   AgentWorkspace,
@@ -422,6 +423,8 @@ export const agents = {
     get<DirListing>(`/agent-hosts/${hostId}/dirs?path=${encodeURIComponent(path)}`),
   /** 移除工作区（对话跟着隐藏，再加同一路径会回来）。「无工作区」不能移除 */
   removeWorkspace: (id: string) => del<void>(`/agent-workspaces/${id}`),
+  /** A28：内置 Agent 的可选模型（端点×模型），不带地址与 key；无使用权 403 */
+  builtinModels: () => get<AgentOptionItem[]>("/agent-builtin/models"),
   /** 新对话：Agent 必须和工作区在同一台电脑上（否则 400 agent_on_other_host） */
   createSession: (wsId: string, body: { agent_id: string; name?: string; model?: string; mode?: string }) =>
     post<{ conversation_id: string }>(`/agent-workspaces/${wsId}/sessions`, body),

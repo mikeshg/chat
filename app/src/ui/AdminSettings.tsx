@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { admin, getServer } from "../api";
 import { inviteLink } from "../invite";
 import type { InviteView, RegistrationMode } from "../types";
+import AdminBuiltinEndpoints from "./AdminBuiltinEndpoints";
 
 const MODES: { v: RegistrationMode; label: string }[] = [
   { v: "open", label: "开放注册" },
@@ -281,6 +282,7 @@ export default function AdminSettings() {
           新用户默认可用
         </label>
       </div>
+      <AdminBuiltinEndpoints />
 
       <h3>存储配额</h3>
       <div className="row ad-quota">

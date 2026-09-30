@@ -22,6 +22,8 @@ export interface AgentFormInput {
   queueTimeout: string;
   /** 有它就按登记表形状提交，不再带自定义命令 */
   registry?: { id: string; version: string };
+  /** A28：内置 Agent 提交 {"builtin": true}，优先于 registry/command */
+  builtin?: boolean;
   /** read_only / workspace / full */
   permissionTier: string;
 }
@@ -43,9 +45,11 @@ export function shapeAgentPatch(input: AgentFormInput): PatchAgentReq {
   }
   return {
     name: input.name.trim(),
-    runtime: input.registry
-      ? { registry: { id: input.registry.id, version: input.registry.version } }
-      : { command: input.command.trim(), args: lines(input.argsText) },
+    runtime: input.builtin
+      ? { builtin: true }
+      : input.registry
+        ? { registry: { id: input.registry.id, version: input.registry.version } }
+        : { command: input.command.trim(), args: lines(input.argsText) },
     cwd: input.cwd.trim(),
     extra_dirs: lines(input.extraDirsText),
     model: input.model,

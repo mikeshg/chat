@@ -319,6 +319,13 @@ fn normalize_runtime(rt: &AgentRuntimeReq, cwd: &str) -> AppResult<(Value, Strin
             }
             json!({"command": command, "args": args})
         }
+        // A28：内置 agent；builtin 只允许 true
+        AgentRuntimeReq::Builtin { builtin } => {
+            if !builtin {
+                return Err(AppError::bad_request("bad_runtime"));
+            }
+            json!({"builtin": true})
+        }
     };
     Ok((value, cwd))
 }
@@ -749,7 +756,7 @@ pub async fn probe_agent(
     let payload = json!({
         "type": "agent_probe",
         "request_id": request_id,
-        "agent": agent_snapshot(&cfg),
+        "agent": agent_snapshot(&st.pool, &cfg).await,
     })
     .to_string();
     if !st.send_to_host(cfg.host_id, &payload) {
@@ -821,6 +828,27 @@ fn clean_option_list(v: &Value) -> Vec<Value> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// GET /v1/agent-builtin/models（A28）：内置 Agent 的可选模型。
+/// 端点×模型展开成 [{id: "<端点id>/<模型>", name: "<端点名> · <模型>"}]；
+/// 不带 base_url / api_key。无使用权 403（与普通 Agent REST 同一条闸）。
+pub async fn builtin_models(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+) -> AppResult<Json<Vec<Value>>> {
+    uid(&headers, &st).await?;
+    let eps = crate::settings::load_builtin_endpoints(&st.pool).await?;
+    let mut out = Vec::new();
+    for e in &eps {
+        for m in &e.models {
+            out.push(json!({
+                "id": format!("{}/{}", e.id, m),
+                "name": format!("{} · {}", e.name, m),
+            }));
+        }
+    }
+    Ok(Json(out))
 }
 
 #[derive(Deserialize)]
@@ -1431,8 +1459,9 @@ async fn agent_of_conv(pool: &PgPool, conv: Uuid) -> Result<Option<AgentRow>, sq
 }
 
 /// invocation_start / agent_probe 共用的配置快照。改配置在下一次调用生效。
-fn agent_snapshot(a: &AgentRow) -> Value {
-    json!({
+/// A28：内置 Agent 追加 builtin.endpoints（每次调用从 server_settings 现读，含 api_key）。
+async fn agent_snapshot(pool: &PgPool, a: &AgentRow) -> Value {
+    let mut v = json!({
         "id": a.id,
         "name": a.name,
         "runtime": a.runtime,
@@ -1443,7 +1472,17 @@ fn agent_snapshot(a: &AgentRow) -> Value {
         "instructions": a.instructions,
         "env": a.env,
         "permission_tier": a.permission_tier,
-    })
+    });
+    if a.runtime["builtin"].as_bool() == Some(true) {
+        let endpoints = crate::settings::load_builtin_endpoints(pool)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = ?e, "load builtin_endpoints failed");
+                Vec::new()
+            });
+        v["builtin"] = json!({"endpoints": endpoints});
+    }
+    v
 }
 
 /// 新文字消息落库后的唯一挂点。
@@ -1999,7 +2038,7 @@ async fn invocation_start_payload(
     .map_err(|e| tracing::error!(error = ?e, "tools_token mint failed"))
     .ok();
     let attachments = attachment_meta(&st.pool, &inv.attachment_ids).await;
-    let mut snapshot = agent_snapshot(agent);
+    let mut snapshot = agent_snapshot(&st.pool, agent).await;
     // A27：在 Agent 自己的对话里直接发的消息，用这条对话选的模型 / 模式，
     // 工作区对话再用工作区目录。定时、互调的上下文键不是会话 id，不走这里。
     if context_key == inv.conversation_id.to_string() {

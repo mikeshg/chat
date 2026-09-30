@@ -3,6 +3,7 @@ import { probeLocal } from "../agentHost";
 import { agents } from "../api";
 import type { AgentHostView, AgentRuntime, AgentView, RegistryEntry, ReportedOptions } from "../types";
 import { hostDisplayName } from "./agentHosts";
+import { readPickOptions } from "./agentBuiltin";
 import { agentErrText, platformLabel } from "./agentPage";
 import { PERMISSION_TIERS } from "./approval";
 import ChoiceCards from "./ChoiceCards";
@@ -12,6 +13,7 @@ import RegistryPicker from "./RegistryPicker";
 type Pick =
   | { kind: "reg"; entry: RegistryEntry }
   | { kind: "cmd" }
+  | { kind: "builtin" }
   | null;
 
 /** 只加到当前这台电脑。先选程序，选好后再填名字、工作目录和权限。 */
@@ -36,11 +38,13 @@ export default function AgentAdd({
   const [options, setOptions] = useState<ReportedOptions>({});
   const [probing, setProbing] = useState(false);
   const [probeErr, setProbeErr] = useState("");
+  const [builtinTried, setBuiltinTried] = useState(false);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
   const probeSeq = useRef(0);
 
-  const ready = pick?.kind === "cmd" || (pick?.kind === "reg" && pick.entry.status === "ready");
+  const builtin = pick?.kind === "builtin";
+  const ready = pick?.kind === "cmd" || builtin || (pick?.kind === "reg" && pick.entry.status === "ready");
   const os = platformLabel(host.platform);
 
   const selectEntry = (entry: RegistryEntry) => {
@@ -52,13 +56,15 @@ export default function AgentAdd({
   const runtimeOf = (p: NonNullable<Pick>): AgentRuntime =>
     p.kind === "reg"
       ? { registry: { id: p.entry.id, version: p.entry.version } }
-      : {
-          command: command.trim(),
-          args: args
-            .split("\n")
-            .map((x) => x.trim())
-            .filter(Boolean),
-        };
+      : p.kind === "builtin"
+        ? { builtin: true }
+        : {
+            command: command.trim(),
+            args: args
+              .split("\n")
+              .map((x) => x.trim())
+              .filter(Boolean),
+          };
 
   /** 换了程序：清掉上一个程序的可选项和选择，丢弃还在路上的读取结果。 */
   const resetOptions = () => {
@@ -68,26 +74,38 @@ export default function AgentAdd({
     setModel("");
     setMode("");
     setProbeErr("");
+    setBuiltinTried(false);
   };
 
-  /** 在这台电脑上试起一次程序，读它提供的模型和模式。 */
+  /**
+   * 读选中程序的可选模型 / 模式。
+   * 登记表 / 自定义命令在本机试起程序；A28 内置走服务端 GET /agent-builtin/models，
+   * 不调用 probeLocal。
+   */
   const probe = async (p: NonNullable<Pick>) => {
     resetOptions();
     const seq = probeSeq.current;
     setProbing(true);
     try {
-      const res = await probeLocal(runtimeOf(p), cwd.trim());
+      const res = await readPickOptions(p.kind === "builtin" ? "builtin" : "program", {
+        probe: () => probeLocal(runtimeOf(p), cwd.trim()),
+        builtinModels: agents.builtinModels,
+      });
       if (seq === probeSeq.current) setOptions(res);
     } catch (e) {
       if (seq === probeSeq.current) setProbeErr(e instanceof Error ? e.message : String(e));
     } finally {
-      if (seq === probeSeq.current) setProbing(false);
+      if (seq === probeSeq.current) {
+        setProbing(false);
+        if (p.kind === "builtin") setBuiltinTried(true);
+      }
     }
   };
 
-  // 选中已安装的登记表程序就自动读；自定义命令填好后点「重新读取」
+  // 选中已安装的登记表程序或内置就自动读；自定义命令填好后点「重新读取」
   useEffect(() => {
-    if (pick?.kind === "reg" && pick.entry.status === "ready") void probe(pick);
+    if (pick?.kind === "builtin") void probe(pick);
+    else if (pick?.kind === "reg" && pick.entry.status === "ready") void probe(pick);
     else resetOptions();
   }, [pick]);
 
@@ -113,7 +131,13 @@ export default function AgentAdd({
     }
   };
 
-  const canCreate = !!name.trim() && ready && (pick?.kind !== "cmd" || !!command.trim());
+  const builtinModels = options.models ?? [];
+  const builtinEmpty = builtin && builtinTried && !probing && !probeErr && builtinModels.length === 0;
+  const canCreate =
+    !!name.trim() &&
+    ready &&
+    (pick?.kind !== "cmd" || !!command.trim()) &&
+    (!builtin || builtinModels.length > 0);
 
   return (
     <section className="am-pane">
@@ -142,7 +166,26 @@ export default function AgentAdd({
               value={query}
               onChange={(e) => setQuery(e.target.value)}
             />
-            <RegistryPicker hostId={host.id} query={query} selectedId={pick?.kind === "reg" ? pick.entry.id : ""} onSelect={selectEntry}>
+            <RegistryPicker
+              hostId={host.id}
+              query={query}
+              selectedId={pick?.kind === "reg" ? pick.entry.id : ""}
+              onSelect={selectEntry}
+              leading={
+                <button
+                  type="button"
+                  className={`am-pick${builtin ? " on" : ""}`}
+                  onClick={() => {
+                    setPick({ kind: "builtin" });
+                    setErr("");
+                  }}
+                >
+                  <b>内置</b>
+                  <span className="am-st ok">Chat 自带</span>
+                  <span className="am-ds">Chat 自带，使用管理员配置的模型</span>
+                </button>
+              }
+            >
               <button
                 type="button"
                 className={`am-pick${pick?.kind === "cmd" ? " on" : ""}`}
@@ -191,10 +234,12 @@ export default function AgentAdd({
                 probing={probing}
                 error={probeErr}
                 disabled={pick.kind === "cmd" && !command.trim()}
+                hideMode={builtin}
                 onModel={setModel}
                 onMode={setMode}
                 onReload={() => void probe(pick)}
               />
+              {builtinEmpty && <span className="am-hint">管理员还没有配置模型</span>}
               <div className="am-field">
                 <label htmlFor="n-name">名字</label>
                 <input id="n-name" value={name} onChange={(e) => setName(e.target.value)} />
