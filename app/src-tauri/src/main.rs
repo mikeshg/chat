@@ -11,5 +11,11 @@ fn main() {
         let r = tauri::async_runtime::block_on(agent_host::mcp_bridge::run(url));
         std::process::exit(if r.is_ok() { 0 } else { 1 });
     }
+    // Agent A29：内置 agent 子进程模式。`<本程序> --builtin-agent` 时只跑
+    // stdin/stdout 上的 ACP 服务，不起窗口。
+    if args.iter().any(|a| a == "--builtin-agent") {
+        let r = tauri::async_runtime::block_on(agent_host::builtin::run_stdio());
+        std::process::exit(if r.is_ok() { 0 } else { 1 });
+    }
     chat_app_lib::run();
 }

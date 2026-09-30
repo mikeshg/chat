@@ -34,6 +34,9 @@ pub struct AgentSpec {
     pub permission_tier: String,
     /// 登记表形状。调用前由宿主解析成 command / args；自定义命令时为 None。
     pub registry: Option<RegistryPin>,
+    /// Agent A29：内置 agent。`runtime.builtin == true` 时 Some
+    /// （值是快照里的 `builtin` 字段，即 `{"endpoints": [...]}`）。
+    pub builtin: Option<Value>,
 }
 
 /// agents.runtime 里的 `{ "registry": { "id", "version" } }`。
@@ -83,7 +86,8 @@ impl AgentSpec {
     /// 登记表形状没有 command，由宿主在调用时再解析。
     pub fn from_json(v: &Value) -> Option<Self> {
         let registry = registry_pin(v);
-        let (command, args) = if registry.is_some() {
+        let builtin = v.pointer("/runtime/builtin").and_then(Value::as_bool) == Some(true);
+        let (command, args) = if registry.is_some() || builtin {
             (String::new(), Vec::new())
         } else {
             (
@@ -131,6 +135,7 @@ impl AgentSpec {
                 .to_string(),
             extra_dirs: json_string_list(v, "extra_dirs"),
             registry,
+            builtin: builtin.then(|| v.get("builtin").cloned().unwrap_or(Value::Null)),
             permission_tier: v
                 .get("permission_tier")
                 .and_then(Value::as_str)

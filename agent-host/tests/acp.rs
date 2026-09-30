@@ -27,6 +27,7 @@ fn fake() -> AgentSpec {
         mode: String::new(),
         extra_dirs: Vec::new(),
         registry: None,
+        builtin: None,
         permission_tier: "read_only".into(),
     }
 }

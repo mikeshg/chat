@@ -65,6 +65,7 @@ fn spawn_host(base: &str, install: Uuid) -> agent_host::HostHandle {
             label: "a23".into(),
             platform: "test".into(),
             mcp_bridge: None,
+            builtin_agent: None,
             registry_url: "http://127.0.0.1:9/no-registry.json".into(),
             data_dir: data,
         },
