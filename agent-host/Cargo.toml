@@ -22,6 +22,11 @@ sha2 = "0.10"
 # Agent A05：图片附件走 ACP image 块（base64 内联）；产出文件上传按扩展名猜 MIME
 base64 = "0.22"
 mime_guess = "2"
+# Agent A29：内置 agent 底座（LLM Provider + 运行循环 + 工具/钩子；edition 2024）
+agent = { git = "http://192.168.6.210:3000/xiefan/agent.git", tag = "v0.1.0" }
+schemars = "1"
+async-trait = "0.1"
+regex = "1"
 
 [dev-dependencies]
 anyhow = "1"

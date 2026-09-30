@@ -293,12 +293,13 @@ fn start_invocation(s: &Arc<Shared>, v: &Value) {
     let cancels = s.cancels.clone();
     let dir = s.data_dir.clone();
     let registry_url = s.cfg.registry_url.clone();
+    let builtin_agent = s.cfg.builtin_agent.clone();
     let cancel_flag = cancel_rx.clone();
     let ask_lane = lane.clone();
     let task = tokio::spawn(async move {
         // 映射的生命周期钉在这次调用上：任务结束/被 abort 时 drop
         let _mcp_handle = mcp_handle;
-        let spec = match materialize(spec, &dir, &registry_url).await {
+        let spec = match materialize(spec, &dir, &registry_url, &builtin_agent).await {
             Ok(s) => s,
             Err(e) => {
                 if !*cancel_flag.borrow() {
@@ -364,7 +365,15 @@ pub async fn probe(
     data_dir: std::path::PathBuf,
     registry_url: &str,
 ) -> Result<RunOutput, String> {
-    let spec = materialize(spec, &data_dir, registry_url).await?;
+    // A29：内置 agent 的模型列表走服务端接口（A28），探测不起子进程。
+    if spec.builtin.is_some() {
+        return Ok(RunOutput {
+            modes: Some(Vec::new()),
+            models: Some(Vec::new()),
+            ..RunOutput::default()
+        });
+    }
+    let spec = materialize(spec, &data_dir, registry_url, &None).await?;
     let rt = runtime::runtime_for(&spec);
     let (events, _) = tokio::sync::mpsc::unbounded_channel();
     rt.run(runtime::RunRequest::for_probe(spec, data_dir), events)
@@ -418,12 +427,36 @@ fn send_probe_result(
     lane.emit_ephemeral(Message::Text(v.to_string().into()));
 }
 
-/// 登记表形状在这里换成本机命令；没装就返回 registry_not_installed。
+/// 登记表 / 内置形状在这里换成本机命令；登记项没装就返回 registry_not_installed，
+/// 宿主没配内置 agent 启动方式（非桌面端）就报「不支持」。
 async fn materialize(
     mut spec: AgentSpec,
     data_dir: &std::path::Path,
     registry_url: &str,
+    builtin_agent: &Option<(String, Vec<String>)>,
 ) -> Result<AgentSpec, String> {
+    if spec.builtin.is_some() {
+        let Some((command, args)) = builtin_agent else {
+            return Err("这台电脑不支持内置 agent".into());
+        };
+        spec.command = command.clone();
+        spec.args = args.clone();
+        // 端点配置（含 api_key）随调用下发给内置 agent 进程；会话存档目录隔离在
+        // data_dir/builtin 下。
+        let endpoints = spec
+            .builtin
+            .as_ref()
+            .and_then(|b| b.get("endpoints"))
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        spec.env
+            .push(("CHAT_BUILTIN_ENDPOINTS".into(), endpoints.to_string()));
+        spec.env.push((
+            "CHAT_BUILTIN_STATE_DIR".into(),
+            data_dir.join("builtin").to_string_lossy().to_string(),
+        ));
+        return Ok(spec);
+    }
     let Some(pin) = spec.registry.clone() else {
         return Ok(spec);
     };
@@ -715,5 +748,61 @@ mod tests {
                 json!({"type":"step_end","id":"s1","ok":false}),
             ]
         );
+    }
+
+    // ===== Agent A29：内置 agent 的 spec 识别与 materialize =====
+
+    fn builtin_spec() -> AgentSpec {
+        AgentSpec::from_json(&json!({
+            "id": Uuid::new_v4(),
+            "name": "内置",
+            "runtime": {"builtin": true},
+            "builtin": {"endpoints": [{
+                "id": "ep1", "name": "主站", "protocol": "chat",
+                "base_url": "http://127.0.0.1:1", "api_key": "k",
+                "models": ["m-a"],
+            }]},
+        }))
+        .expect("内置形状的 spec 应解析")
+    }
+
+    #[test]
+    fn builtin_runtime_flag_makes_spec() {
+        let spec = builtin_spec();
+        assert!(spec.builtin.is_some());
+        // 快照里没有 command 也能解析（由宿主本地配置补）
+        assert!(spec.command.is_empty());
+    }
+
+    #[tokio::test]
+    async fn builtin_without_launch_config_is_refused() {
+        let dir = std::env::temp_dir();
+        let e = materialize(builtin_spec(), &dir, "", &None)
+            .await
+            .unwrap_err();
+        assert!(e.contains("这台电脑不支持内置 agent"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn builtin_materialize_injects_env() {
+        let dir = std::env::temp_dir().join(format!("a29-mat-{}", Uuid::new_v4().simple()));
+        let spec = materialize(
+            builtin_spec(),
+            &dir,
+            "",
+            &Some(("my-exe".into(), vec!["--builtin-agent".into()])),
+        )
+        .await
+        .expect("有启动配置应物化");
+        assert_eq!(spec.command, "my-exe");
+        assert_eq!(spec.args, vec!["--builtin-agent".to_string()]);
+        let env: std::collections::HashMap<_, _> = spec.env.iter().cloned().collect();
+        let endpoints = env.get("CHAT_BUILTIN_ENDPOINTS").expect("应下发端点");
+        let parsed: Value = serde_json::from_str(endpoints).unwrap();
+        assert_eq!(parsed[0]["id"], "ep1");
+        assert_eq!(parsed[0]["models"], json!(["m-a"]));
+        let state = env.get("CHAT_BUILTIN_STATE_DIR").expect("应有存档目录");
+        let want = dir.join("builtin").to_string_lossy().to_string();
+        assert_eq!(state, &want);
     }
 }

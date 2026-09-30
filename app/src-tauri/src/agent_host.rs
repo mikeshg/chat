@@ -161,6 +161,14 @@ pub async fn agent_host_start(
             vec!["--agent-mcp-bridge".to_string()],
         )
     });
+    // Agent A29：内置 agent = 本程序 + --builtin-agent（main.rs 入口拦截，
+    // 拉起 ACP stdio 服务）。拿不到本程序路径就视为不支持内置 agent。
+    let builtin_agent = std::env::current_exe().ok().map(|exe| {
+        (
+            exe.to_string_lossy().to_string(),
+            vec!["--builtin-agent".to_string()],
+        )
+    });
     let given = label.trim();
     let label = if given.is_empty() {
         default_host_label()
@@ -173,6 +181,7 @@ pub async fn agent_host_start(
         label,
         platform: std::env::consts::OS.to_string(),
         mcp_bridge,
+        builtin_agent,
         registry_url: agent_host::DEFAULT_REGISTRY_URL.into(),
         data_dir: agent_host::default_data_dir(),
     };

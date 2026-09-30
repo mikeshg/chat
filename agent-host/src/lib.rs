@@ -5,6 +5,7 @@
 // 不支持 GUI：纯库 + CLI 示例；Tauri 壳在 app/src-tauri 侧桥接。
 
 pub mod acp;
+pub mod builtin;
 pub mod command;
 mod conn;
 mod dirs;
@@ -39,6 +40,9 @@ pub struct HostConfig {
     /// Agent 不支持 http MCP 时用；None = 无桥接兜底（此时不声明 http 能力的
     /// Agent 拿不到注入工具）。
     pub mcp_bridge: Option<(String, Vec<String>)>,
+    /// Agent A29：内置 agent 的启动方式（程序 + 参数）。桌面端填
+    /// 「当前可执行文件 + --builtin-agent」；None = 这台电脑不支持内置 agent。
+    pub builtin_agent: Option<(String, Vec<String>)>,
     /// ACP 登记表索引。测试指向本地假登记表。
     pub registry_url: String,
     /// 登记表缓存和安装目录。空 cwd 的 Agent 也用这里当工作目录。

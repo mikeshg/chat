@@ -669,13 +669,20 @@ impl Pipe {
             link.registry.finish(&request_id);
             return Ok(cancelled_outcome(&id));
         }
+        // 发送端已丢（没人会取消）时不再盯取消信号，只等审批决定；与
+        // wait_resp_or_cancel 的口径一致。
+        let mut cancel_open = true;
         let decided = loop {
             tokio::select! {
                 biased;
-                res = self.cancel.changed() => {
-                    if res.is_err() || *self.cancel.borrow() {
-                        link.registry.finish(&request_id);
-                        return Ok(cancelled_outcome(&id));
+                res = self.cancel.changed(), if cancel_open => {
+                    match res {
+                        Ok(()) if *self.cancel.borrow() => {
+                            link.registry.finish(&request_id);
+                            return Ok(cancelled_outcome(&id));
+                        }
+                        Ok(()) => {}
+                        Err(_) => cancel_open = false,
                     }
                 }
                 ans = &mut rx => {

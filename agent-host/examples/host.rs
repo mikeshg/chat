@@ -150,6 +150,21 @@ async fn main() {
             vec!["--mcp-stdio-bridge".into()],
         )
     });
+    // Agent A29：内置 agent = 同批编译的 chat-builtin-agent 二进制。
+    // examples 编到 target/<profile>/examples/ 下，二进制在上一级目录。
+    let builtin_agent = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.to_path_buf()))
+        .and_then(|dir| dir.parent().map(|d| d.to_path_buf()))
+        .map(|dir| {
+            dir.join(if cfg!(windows) {
+                "chat-builtin-agent.exe"
+            } else {
+                "chat-builtin-agent"
+            })
+        })
+        .filter(|p| p.exists())
+        .map(|p| (p.to_string_lossy().to_string(), Vec::new()));
     let handle = spawn(
         HostConfig {
             server_url: server,
@@ -157,6 +172,7 @@ async fn main() {
             label,
             platform: platform.into(),
             mcp_bridge,
+            builtin_agent,
             registry_url: get("--registry-url")
                 .unwrap_or_else(|| agent_host::DEFAULT_REGISTRY_URL.into()),
             data_dir: get("--data-dir")
