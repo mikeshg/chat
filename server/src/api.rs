@@ -230,6 +230,15 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
         .route("/ws/ticket", get(ws_ticket))
         .route("/ws", get(ws::ws_handler))
         .route("/server-info", get(settings::server_info))
+        .route("/client/latest", get(crate::client_update::latest))
+        .route(
+            "/client/update/{target}/{arch}/{current}",
+            get(crate::client_update::tauri_update),
+        )
+        .route(
+            "/client/download/{name}",
+            get(crate::client_update::download),
+        )
         // ---------- 后台管理（admin only） ----------
         .route("/admin/overview", get(admin_overview))
         .route(

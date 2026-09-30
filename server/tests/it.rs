@@ -19386,3 +19386,152 @@ async fn a28_builtin_models_endpoint() {
     assert_eq!(models(&u).await.status(), 403);
     assert_eq!(models(&admin).await.status(), 200);
 }
+
+/// 假 Gitea：一个 Release（tag v9.9.9），带 Windows 安装包、签名和 APK
+async fn fake_gitea() -> String {
+    use axum::routing::get;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let b = base.clone();
+    let app = axum::Router::new()
+        .route(
+            "/api/v1/repos/o/r/releases/latest",
+            get(move || {
+                let b = b.clone();
+                async move {
+                    axum::Json(json!({
+                        "tag_name": "v9.9.9",
+                        "body": "修了一些问题",
+                        "published_at": "2026-09-30T00:00:00Z",
+                        "assets": [
+                            {"name": "Chat_9.9.9_x64-setup.exe", "size": 5, "browser_download_url": format!("{b}/dl/exe")},
+                            {"name": "Chat_9.9.9_x64-setup.exe.sig", "size": 3, "browser_download_url": format!("{b}/dl/sig")},
+                            {"name": "Chat_9.9.9.apk", "size": 3, "browser_download_url": format!("{b}/dl/apk")},
+                            {"name": "Chat_9.9.9_amd64.deb", "size": 3, "browser_download_url": format!("{b}/dl/apk")},
+                            {"name": "Chat_9.9.9_amd64.deb.sig", "size": 3, "browser_download_url": format!("{b}/dl/sig")},
+                        ]
+                    }))
+                }
+            }),
+        )
+        .route("/dl/exe", get(|| async { "EXE!!" }))
+        .route("/dl/sig", get(|| async { "SIG\n" }))
+        .route("/dl/apk", get(|| async { "APK" }));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    base
+}
+
+#[tokio::test]
+async fn client_update_from_gitea_release() {
+    let (base, _st) = spawn_named_state(&format!("chat_it_upd_{}", uniq())).await;
+    let admin = register(&base, &format!("updadm_{}", uniq())).await;
+    let c = http();
+
+    // 没配置仓库 → 404；Windows 更新检查同样 404（插件当作检查失败，不会误装）
+    let r = c
+        .get(format!("{base}/v1/client/latest"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+
+    // 不是仓库地址 → 400
+    let r = admin_put_settings(
+        &base,
+        &admin,
+        json!({"update_repo_url": "http://g.example.com/x"}),
+    )
+    .await;
+    assert_eq!(r.status(), 400);
+
+    let gitea = fake_gitea().await;
+    let r = admin_put_settings(
+        &base,
+        &admin,
+        json!({"update_repo_url": format!("{gitea}/o/r/")}),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        admin_get_settings(&base, &admin).await["update_repo_url"],
+        format!("{gitea}/o/r")
+    );
+
+    let v: Value = c
+        .get(format!("{base}/v1/client/latest"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["version"], "9.9.9");
+    assert_eq!(v["notes"], "修了一些问题");
+    assert_eq!(v["assets"].as_array().unwrap().len(), 5);
+
+    // Tauri 动态更新格式：下载地址指回本服务，签名去掉末尾换行
+    let u: Value = c
+        .get(format!("{base}/v1/client/update/windows/x86_64/0.1.0"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(u["version"], "9.9.9");
+    assert_eq!(u["signature"], "SIG");
+    assert_eq!(
+        u["url"],
+        format!("{base}/v1/client/download/Chat_9.9.9_x64-setup.exe")
+    );
+
+    // Linux 按安装方式挑：deb 有包；AppImage 这个 Release 里没有 → 204；mac 不支持 → 204
+    let u2: Value = c
+        .get(format!(
+            "{base}/v1/client/update/linux/x86_64/0.1.0?bundle=deb"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        u2["url"],
+        format!("{base}/v1/client/download/Chat_9.9.9_amd64.deb")
+    );
+    for q in [
+        "linux/x86_64/0.1.0?bundle=appimage",
+        "darwin/aarch64/0.1.0?bundle=app",
+    ] {
+        let r = c
+            .get(format!("{base}/v1/client/update/{q}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 204, "{q}");
+    }
+
+    // 下载经服务端中转
+    let r = c.get(u["url"].as_str().unwrap()).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "EXE!!");
+    let r = c
+        .get(format!("{base}/v1/client/download/nope.exe"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+
+    // 清空 = 关闭
+    let r = admin_put_settings(&base, &admin, json!({"update_repo_url": ""})).await;
+    assert_eq!(r.status(), 200);
+    let r = c
+        .get(format!("{base}/v1/client/latest"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+}

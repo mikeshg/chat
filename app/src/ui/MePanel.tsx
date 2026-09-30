@@ -9,6 +9,7 @@ import ThemeSetting from "./ThemeSetting";
 import SecuritySettings from "./SecuritySettings";
 import StorageUsage from "./StorageUsage";
 import AvatarSetting from "./AvatarSetting";
+import UpdateSetting from "./UpdateSetting";
 
 export default function MePanel() {
   const s = useApp();
@@ -58,6 +59,7 @@ export default function MePanel() {
         {hint && <div className="muted">{hint}</div>}
       </section>
 
+      <UpdateSetting />
       <AutostartSetting />
 
       <NotifySettings />

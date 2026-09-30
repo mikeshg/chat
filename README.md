@@ -178,6 +178,23 @@ cd gen/android && ./gradlew assembleDebug \
 
 需要 NDK（`sdkmanager "ndk;<ver>"`）+ `rustup target add aarch64-linux-android` 等。
 
+## 发布新版本（在线更新）
+
+推 `v*` 标签后，Gitea Actions 在 Windows runner 上打 Windows 安装包和 Android APK、在 Ubuntu runner 上打 deb 和 AppImage，发到本仓库的 Release。Chat 服务端读最新 Release：「我」页显示新版本，Windows / Linux 点「更新并重启」自动装，Android 下载 APK 后由系统覆盖安装。浏览器端不用管，服务端更新后刷新就是新版。
+
+发一个版本：
+
+```bash
+# 1. 改 app/src-tauri/tauri.conf.json 的 version（如 0.2.0），提交
+# 2. 打标签并推送，标签必须和 version 一致；标签说明就是更新说明
+git tag -a v0.2.0 -m "更新说明"
+git push origin v0.2.0
+```
+
+一次性准备（打包机器、Secrets、后台设置）见 [docs/release-runners.md](docs/release-runners.md)。
+
+第一个能在线更新的版本需要手动安装一次：之前装的版本里没有更新功能。
+
 ## Agent
 
 桌面端登录后，这台电脑会自动上线。关掉窗口后留在系统托盘里继续跑。开机自启在「我」页打开，默认关。

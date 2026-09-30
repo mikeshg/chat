@@ -5,6 +5,7 @@ pub mod api;
 pub mod approvals;
 pub mod auth;
 pub mod backup;
+pub mod client_update;
 pub mod config;
 pub mod db;
 pub mod domain;
