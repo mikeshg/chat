@@ -52,6 +52,8 @@ pub struct ServerSettings {
     pub agent_default_allowed: bool,
     /// 内置 Agent 的模型端点（A28）。api_key 只写不读：GET 里每项只有 api_key_set
     pub builtin_endpoints: Vec<BuiltinEndpointView>,
+    /// 客户端安装包所在的 Gitea 仓库地址（如 http://gitea:3000/owner/repo）；空 = 不提供在线更新
+    pub update_repo_url: String,
 }
 
 impl Default for ServerSettings {
@@ -67,6 +69,7 @@ impl Default for ServerSettings {
             agent_enabled: true,
             agent_default_allowed: true,
             builtin_endpoints: Vec::new(),
+            update_repo_url: String::new(),
         }
     }
 }
@@ -281,6 +284,10 @@ pub async fn load(executor: impl sqlx::PgExecutor<'_>) -> AppResult<ServerSettin
             if let Some(b) = v.as_bool() {
                 s.agent_default_allowed = b;
             }
+        } else if k == "update_repo_url" {
+            if let Some(v) = v.as_str() {
+                s.update_repo_url = v.trim_end_matches('/').to_string();
+            }
         } else if k == "builtin_endpoints" {
             s.builtin_endpoints = parse_builtin_endpoints(&v)
                 .iter()
@@ -340,6 +347,8 @@ pub struct UpdateSettingsReq {
     pub agent_default_allowed: Option<bool>,
     /// 内置 Agent 端点（A28）：整体替换；api_key 缺省 = 保留原 key，"" = 清空
     pub builtin_endpoints: Option<serde_json::Value>,
+    /// 在线更新的 Gitea 仓库地址；空 = 关闭。缺省不改
+    pub update_repo_url: Option<String>,
 }
 
 /// 管理员写入的地址类字段：http/https 且 ≤200 字符；空串合法（= 关闭/清除）。
@@ -457,6 +466,16 @@ pub async fn update(
         .bind(updated_by)
         .execute(&mut **tx)
         .await?;
+    }
+    if let Some(v) = &req.update_repo_url {
+        let v = normalize_http_url(v)
+            .filter(|v| v.is_empty() || crate::client_update::api_base(v).is_some())
+            .ok_or_else(|| {
+                AppError::bad_request(
+                    "update_repo_url 必须是 Gitea 仓库地址，如 http://gitea:3000/owner/repo",
+                )
+            })?;
+        upsert_text(tx, "update_repo_url", &v, updated_by).await?;
     }
     if let Some(v) = req.agent_enabled {
         upsert_bool(tx, "agent_enabled", v, updated_by).await?;

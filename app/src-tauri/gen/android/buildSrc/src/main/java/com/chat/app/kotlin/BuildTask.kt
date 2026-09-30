@@ -16,7 +16,8 @@ open class BuildTask : DefaultTask() {
 
     @TaskAction
     fun assemble() {
-        val executable = """C:\Program Files\nodejs\node""";
+        // 生成时写死了开发机的 node 路径且缺脚本参数；pnpm 走 PATH，Windows 下回退到 pnpm.cmd
+        val executable = "pnpm";
         try {
             runTauriCli(executable)
         } catch (e: Exception) {

@@ -40,6 +40,8 @@ export default function AdminSettings() {
   const [pushSaving, setPushSaving] = useState(false);
   const [meetingUrl, setMeetingUrl] = useState("");
   const [meetingSaving, setMeetingSaving] = useState(false);
+  const [updateRepo, setUpdateRepo] = useState("");
+  const [updateSaving, setUpdateSaving] = useState(false);
   const [agentEnabled, setAgentEnabled] = useState(true);
   const [agentDefault, setAgentDefault] = useState(true);
   const [agentSaving, setAgentSaving] = useState(false);
@@ -61,6 +63,7 @@ export default function AdminSettings() {
       setPublicUrl(s.public_url ?? "");
       setNtfyToken("");
       setMeetingUrl(s.meeting_base_url ?? "");
+      setUpdateRepo(s.update_repo_url ?? "");
       setAgentEnabled(s.agent_enabled !== false);
       setAgentDefault(s.agent_default_allowed !== false);
       setInvites(list);
@@ -187,6 +190,21 @@ export default function AdminSettings() {
       setErr(e instanceof Error ? e.message : "保存失败");
     } finally {
       setMeetingSaving(false);
+    }
+  };
+  const saveUpdateRepo = async () => {
+    setUpdateSaving(true);
+    setErr("");
+    setSaved(false);
+    try {
+      const s = await admin.updateSettings({ update_repo_url: updateRepo.trim() });
+      setUpdateRepo(s.update_repo_url ?? "");
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "保存失败");
+    } finally {
+      setUpdateSaving(false);
     }
   };
   const create = async () => {
@@ -360,6 +378,25 @@ export default function AdminSettings() {
           {meetingSaving ? "保存中…" : "保存"}
         </button>
       </div>
+
+      <h3>客户端在线更新</h3>
+      <div className="row ad-quota">
+        <input
+          className="grow"
+          value={updateRepo}
+          disabled={updateSaving}
+          placeholder="Gitea 仓库地址，如 http://192.168.6.210:3000/xiefan/chat（留空 = 关闭）"
+          onChange={(e) => setUpdateRepo(e.target.value)}
+        />
+        <button
+          className="primary"
+          disabled={updateSaving}
+          onClick={() => void saveUpdateRepo()}
+        >
+          {updateSaving ? "保存中…" : "保存"}
+        </button>
+      </div>
+      <div className="muted">客户端从这个仓库的最新 Release 获取安装包，下载经本服务中转</div>
 
       <h3>邀请码</h3>
       <div className="row ad-invite-form">

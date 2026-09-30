@@ -26,5 +26,15 @@
     "targets": ["nsis"],
     "icon": ["icons/icon.png", "icons/icon.ico"],
     "shortDescription": "LAN-first chat"
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDY2OEY1MTM2RDlGREI4QjMKUldTenVQM1pObEdQWnZxNHoybFhhK2hlMlgyRFk4NXYzbVdoWGFvWWdPcDBzWjJsdkdsbnMwVHAK",
+      "endpoints": [],
+      "dangerousInsecureTransportProtocol": true,
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

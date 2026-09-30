@@ -658,6 +658,8 @@ export interface AdminSettings {
   agent_default_allowed?: boolean;
   /** 内置 Agent 的模型端点（A28）。GET 每项带 api_key_set；PUT 整体替换 */
   builtin_endpoints?: BuiltinEndpointConf[];
+  /** 在线更新的 Gitea 仓库地址（安装包在它的 Release 上）；空 = 关闭 */
+  update_repo_url?: string;
 }
 
 /**

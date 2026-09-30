@@ -4,6 +4,8 @@ mod agent_host;
 // Agent A09：托盘、关窗隐藏仅桌面
 #[cfg(desktop)]
 mod tray;
+#[cfg(desktop)]
+mod updater;
 
 /// macOS 从 Finder / Dock 启动的程序只拿到 launchd 的精简 PATH（/usr/bin:/bin:…），
 /// Homebrew / nvm 装的 node、claude 都找不到：登记表会误报「需要先安装 Node.js」，
@@ -53,6 +55,8 @@ pub fn run() {
         None,
     ));
     #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    #[cfg(desktop)]
     let builder = builder
         .manage(agent_host::AgentHostState::new())
         .invoke_handler(tauri::generate_handler![
@@ -60,6 +64,7 @@ pub fn run() {
             agent_host::agent_host_stop,
             agent_host::agent_host_ticket,
             agent_host::agent_host_probe,
+            updater::install_update,
         ])
         .setup(|app| {
             tray::install(app.handle())?;
