@@ -248,6 +248,21 @@ pub fn broadcast_reaction_update(st: &SharedState, ch: &ReactionChange) {
     }
 }
 
+/// 普通新消息的统一入口：落库后立即 broadcast_posted（推送、解归档、Agent 调用都挂在那里）。
+/// 例外：审批卡片要与调用行锁同事务，走 post_message_in_tx 提交后再广播；
+/// 投票创建、转发由 domain 组装结果，在 api 层逐条 broadcast_posted。
+pub async fn post_and_broadcast(
+    st: &SharedState,
+    msg: domain::PostMessage<'_>,
+    agent_targets: Vec<Uuid>,
+) -> Result<domain::Posted, domain::PostError> {
+    let conv = msg.conversation_id;
+    let mut posted = domain::post_message(&st.pool, msg).await?;
+    posted.agent_targets = agent_targets;
+    broadcast_posted(st, conv, &posted).await;
+    Ok(posted)
+}
+
 /// 新消息广播：成员各连一帧 + 被 @ 解归档成员的个人偏好帧。
 /// WS send_message / REST create_poll / REST forward 三处共用
 /// （第 3 阶段离线推送也挂在它上面，所有新消息必须经过这里）。
@@ -429,31 +444,19 @@ async fn send_message(
     reply_to_id: Option<Uuid>,
     agent_targets: Vec<Uuid>,
 ) -> WsResult {
-    let mut posted = domain::post_message(
-        &st.pool,
+    // 投票、转发、Agent、审批字段保持 text() 的空值：用户 WS 不能伪造这些负载与身份
+    let posted = post_and_broadcast(
+        st,
         domain::PostMessage {
-            conversation_id: conv,
-            sender_id: uid,
-            content,
             client_msg_id: client_msg_id.as_deref(),
             attachment_id,
             reply_to_id,
-            // WS 不接受投票负载：kind='poll' 只能经 REST create_poll 产生（防伪造）
-            poll: None,
-            // 转发字段仅服务端转发端点可达：WS 发送不能伪造转发来源/克隆附件
-            forwarded_from: None,
-            forward_attachment: None,
-            // agent_id 仅服务端宿主回写路径可达：用户 WS 不能伪造 Agent 身份
-            agent_id: None,
-            agent_steps: None,
-            approval: None,
+            ..domain::PostMessage::text(conv, uid, content)
         },
+        agent_targets,
     )
     .await
     .map_err(domain::PostError::into_ws)?;
-    posted.agent_targets = agent_targets;
-
-    broadcast_posted(st, conv, &posted).await;
     // ack 只回发起连接：携带 client_msg_id 完成乐观替换
     let _ = tx.try_send(ConnMsg::Frame(frame(&WsOut::MessageAck {
         client_msg_id,

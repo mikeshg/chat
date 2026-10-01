@@ -14,8 +14,8 @@
 use crate::permission;
 pub use crate::runtime::AgentSpec;
 use crate::runtime::{
-    AgentOption, AgentRuntime, ApprovalLink, ApprovalNotice, Events, InjectedMcp, LocalFile,
-    RunEvent, RunFuture, RunOutput, RunRequest, StepRecord,
+    AgentOption, ApprovalLink, ApprovalNotice, Events, InjectedMcp, LocalFile,
+    RunEvent, RunOutput, RunRequest, StepRecord,
 };
 use base64::Engine;
 use serde_json::{json, Value};
@@ -31,15 +31,6 @@ use uuid::Uuid;
 
 /// 收到 session/cancel 后，最多再等这么久让 session/prompt 返回，然后杀进程。
 const CANCEL_GRACE: Duration = Duration::from_secs(5);
-
-/// ACP 运行时：每次调用起一个 agent 子进程。
-pub struct AcpRuntime;
-
-impl AgentRuntime for AcpRuntime {
-    fn run(&self, req: RunRequest, events: Events) -> RunFuture {
-        Box::pin(async move { run_invocation(req, events).await })
-    }
-}
 
 enum In {
     Msg(Value),

@@ -1,4 +1,4 @@
-// Agent A29：内置 agent（chat-builtin-agent 二进制）经 AcpRuntime 端到端测试。
+// Agent A29：内置 agent（chat-builtin-agent 二进制）经 acp::run_invocation 端到端测试。
 //
 // 假模型端点：本地 axum 起的 OpenAI Chat Completions SSE 服务，按脚本逐请求
 // 出数据（文本 / tool_calls / 慢响应），并记录每次请求体供断言。

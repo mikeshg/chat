@@ -2,13 +2,12 @@
 //
 // 宿主只认这里的类型：一次调用 = RunRequest 进、RunEvent 流出、RunOutput 结束。
 // 新能力（上下文恢复、流式步骤、注入工具、附件、配置项）往这几个结构里加字段，
-// 不改 run 的签名；某个 CLI 需要原生对接时，在 runtime_for 里按 spec 选实现。
+// 不改 acp::run_invocation 的签名。目前只有 ACP；某个 CLI 需要原生对接时，
+// 再在 conn.rs 的两个调用点按 spec 分派。
 
 use serde_json::Value;
 use std::collections::HashMap;
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -335,18 +334,6 @@ pub struct StepRecord {
 
 /// 事件出口；接收端丢弃时发送静默失败，运行不受影响。
 pub type Events = mpsc::UnboundedSender<RunEvent>;
-
-pub type RunFuture = Pin<Box<dyn Future<Output = Result<RunOutput, String>> + Send>>;
-
-pub trait AgentRuntime: Send + Sync + 'static {
-    /// Err 为人类可读原因（调用方负责截断）。
-    fn run(&self, req: RunRequest, events: Events) -> RunFuture;
-}
-
-/// 按 spec 选运行时。目前只有 ACP；原生实现加在这里。
-pub fn runtime_for(_spec: &AgentSpec) -> Arc<dyn AgentRuntime> {
-    Arc::new(crate::acp::AcpRuntime)
-}
 
 /// A27：无工作区对话的工作目录：程序所在目录下的 tmp/<对话 id>，按需创建。
 /// 安装目录不可写（如装在 Program Files）时退回系统临时目录下的 chat-agent/<对话 id>。

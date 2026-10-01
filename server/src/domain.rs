@@ -554,6 +554,27 @@ pub struct PostMessage<'a> {
     pub approval: Option<ApprovalDraft<'a>>,
 }
 
+impl<'a> PostMessage<'a> {
+    /// 普通发送：投票、转发、Agent、审批字段全为空。特殊路径在此基础上改字段，
+    /// 如 `PostMessage { agent_id: Some(a), ..PostMessage::text(conv, owner, body) }`。
+    pub fn text(conversation_id: Uuid, sender_id: Uuid, content: &'a str) -> Self {
+        Self {
+            conversation_id,
+            sender_id,
+            content,
+            client_msg_id: None,
+            attachment_id: None,
+            reply_to_id: None,
+            poll: None,
+            forwarded_from: None,
+            forward_attachment: None,
+            agent_id: None,
+            agent_steps: None,
+            approval: None,
+        }
+    }
+}
+
 /// 审批卡片随消息一起落库的种子。request / options 由调用方整形。
 pub struct ApprovalDraft<'a> {
     pub invocation_id: Uuid,
@@ -2205,18 +2226,7 @@ pub async fn create_poll(
     post_message(
         pool,
         PostMessage {
-            conversation_id: conv,
-            sender_id: uid,
-            // poll 路径的正文由 write_message 用 '[投票] question' 组装，content 不用
-            content: "",
             client_msg_id: req.client_msg_id.as_deref(),
-            attachment_id: None,
-            reply_to_id: None,
-            forwarded_from: None,
-            forward_attachment: None,
-            agent_id: None,
-            agent_steps: None,
-            approval: None,
             poll: Some(PollSpec {
                 question,
                 options,
@@ -2224,6 +2234,8 @@ pub async fn create_poll(
                 anonymous: req.anonymous,
                 expires_at: req.expires_at,
             }),
+            // poll 路径的正文由 write_message 用 '[投票] question' 组装，content 不用
+            ..PostMessage::text(conv, uid, "")
         },
     )
     .await
@@ -2499,22 +2511,14 @@ pub async fn forward_message(
         let key = format!("fwd:{op}:{conv}");
         let posted = post_message(
             pool,
+            // 视图里的 content 已含附件占位文本（'[图片]'/'[文件] x'），
+            // 重发同名附件时 normalize_body 不会重复拼装。
+            // 转发不保留回复指向（task：strip reply_to）
             PostMessage {
-                conversation_id: *conv,
-                sender_id: uid,
-                // 视图里的 content 已含附件占位文本（'[图片]'/'[文件] x'），
-                // 重发同名附件时 normalize_body 不会重复拼装。
-                content: &src.content,
                 client_msg_id: Some(&key),
-                attachment_id: None,
-                // 转发不保留回复指向（task：strip reply_to）
-                reply_to_id: None,
-                poll: None,
                 forwarded_from: Some(&src.sender_name),
                 forward_attachment: src.att_id,
-                agent_id: None,
-                agent_steps: None,
-                approval: None,
+                ..PostMessage::text(*conv, uid, &src.content)
             },
         )
         .await;

@@ -113,22 +113,13 @@ pub async fn handle_request(st: &SharedState, host_id: Uuid, v: &Value) {
     let posted = domain::post_message_in_tx(
         &mut tx,
         domain::PostMessage {
-            conversation_id: agent_conv,
-            sender_id: owner,
-            content: &text,
-            client_msg_id: None,
-            attachment_id: None,
-            reply_to_id: None,
-            poll: None,
-            forwarded_from: None,
-            forward_attachment: None,
             agent_id: Some(agent_id),
-            agent_steps: None,
             approval: Some(domain::ApprovalDraft {
                 invocation_id: inv_id,
                 request: &request,
                 options: &options_value,
             }),
+            ..domain::PostMessage::text(agent_conv, owner, &text)
         },
     )
     .await;

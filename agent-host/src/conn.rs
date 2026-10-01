@@ -313,7 +313,6 @@ fn start_invocation(s: &Arc<Shared>, v: &Value) {
         let bridge = tokio::spawn(forward_approvals(ask_rx, ask_lane, inv_id));
         // A05：工作目录随任务存活，结束时整树删除（inv-<id>/）
         let (_wd, in_dir, out_dir) = crate::files::WorkDir::create(&dir, inv_id);
-        let rt = runtime::runtime_for(&spec);
         // A03：事件经 invocation_event 帧外发；文本段 ~100ms 窗口合并。
         // 离线时增量丢掉，finish 里仍有全文。
         let (events, ev_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -332,7 +331,7 @@ fn start_invocation(s: &Arc<Shared>, v: &Value) {
         req.attachments =
             crate::files::download_inputs(&http, &http_base, &in_dir, &att_metas).await;
         req.outbox = Some(out_dir.clone());
-        let r = rt.run(req, events).await;
+        let r = crate::acp::run_invocation(req, events).await;
         bridge.abort();
         // run 结束 = events sender 释放，转发循环冲刷剩余文本后自行退出
         let _ = fwd.await;
@@ -374,9 +373,8 @@ pub async fn probe(
         });
     }
     let spec = materialize(spec, &data_dir, registry_url, &None).await?;
-    let rt = runtime::runtime_for(&spec);
     let (events, _) = tokio::sync::mpsc::unbounded_channel();
-    rt.run(runtime::RunRequest::for_probe(spec, data_dir), events)
+    crate::acp::run_invocation(runtime::RunRequest::for_probe(spec, data_dir), events)
         .await
 }
 

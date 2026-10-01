@@ -2740,22 +2740,13 @@ pub(crate) async fn start_child_call(st: &SharedState, req: ChildReq) -> AppResu
     let root = req.parent_root.unwrap_or(req.parent_conversation);
     let excerpt: String = req.prompt.chars().take(200).collect();
     let record = format!("📨 被 @{} 调用：{excerpt}", req.caller_name);
-    let posted = domain::post_message(
-        &st.pool,
+    let posted = crate::ws::post_and_broadcast(
+        st,
         domain::PostMessage {
-            conversation_id: callee_conv,
-            sender_id: req.owner,
-            content: &record,
-            client_msg_id: None,
-            attachment_id: None,
-            reply_to_id: None,
-            poll: None,
-            forwarded_from: None,
-            forward_attachment: None,
             agent_id: Some(agent.id),
-            agent_steps: None,
-            approval: None,
+            ..domain::PostMessage::text(callee_conv, req.owner, &record)
         },
+        Vec::new(),
     )
     .await
     .map_err(|e| match e {
@@ -2763,7 +2754,6 @@ pub(crate) async fn start_child_call(st: &SharedState, req: ChildReq) -> AppResu
         PostError::Db(err) => AppError::internal(err),
     })?;
     let trigger = posted.message.id;
-    crate::ws::broadcast_posted(st, callee_conv, &posted).await;
 
     let link = InvLink {
         parent: Some(req.parent_id),
@@ -3212,26 +3202,18 @@ async fn post_agent_files(
     .await
     .unwrap_or_default();
     for att_id in rows {
-        let posted = domain::post_message(
-            &st.pool,
+        let posted = crate::ws::post_and_broadcast(
+            st,
             domain::PostMessage {
-                conversation_id: conv,
-                sender_id: owner,
-                content: "",
-                client_msg_id: None,
                 attachment_id: Some(att_id),
-                reply_to_id: None,
-                poll: None,
-                forwarded_from: None,
-                forward_attachment: None,
                 agent_id: Some(agent_id),
-                agent_steps: None,
-                approval: None,
+                ..domain::PostMessage::text(conv, owner, "")
             },
+            Vec::new(),
         )
         .await;
         match posted {
-            Ok(p) => crate::ws::broadcast_posted(st, conv, &p).await,
+            Ok(_) => {}
             Err(PostError::Deny { code, message }) => {
                 tracing::warn!(code, message, "agent file message rejected");
             }
@@ -3269,26 +3251,18 @@ pub async fn post_agent_text(
     }
     let last = chunks.len().saturating_sub(1);
     for (i, chunk) in chunks.iter().enumerate() {
-        let posted = domain::post_message(
-            &st.pool,
+        let posted = crate::ws::post_and_broadcast(
+            st,
             domain::PostMessage {
-                conversation_id: conv,
-                sender_id: owner,
-                content: chunk,
-                client_msg_id: None,
-                attachment_id: None,
-                reply_to_id: None,
-                poll: None,
-                forwarded_from: None,
-                forward_attachment: None,
                 agent_id: Some(agent_id),
                 agent_steps: if i == last { agent_steps.clone() } else { None },
-                approval: None,
+                ..domain::PostMessage::text(conv, owner, chunk)
             },
+            Vec::new(),
         )
         .await;
         match posted {
-            Ok(p) => crate::ws::broadcast_posted(st, conv, &p).await,
+            Ok(_) => {}
             Err(PostError::Deny { code, message }) => {
                 tracing::warn!(code, message, "agent message rejected");
                 break;

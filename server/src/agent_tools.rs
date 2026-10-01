@@ -633,28 +633,18 @@ async fn post_agent_one(
     content: &str,
     attachment_id: Option<Uuid>,
 ) -> AppResult<Uuid> {
-    let posted = domain::post_message(
-        &st.pool,
+    let posted = crate::ws::post_and_broadcast(
+        st,
         domain::PostMessage {
-            conversation_id: conv,
-            sender_id: ctx.owner,
-            content,
-            client_msg_id: None,
             attachment_id,
-            reply_to_id: None,
-            poll: None,
-            forwarded_from: None,
-            forward_attachment: None,
             agent_id: Some(ctx.agent),
-            agent_steps: None,
-            approval: None,
+            ..domain::PostMessage::text(conv, ctx.owner, content)
         },
+        Vec::new(),
     )
     .await
     .map_err(map_post)?;
-    let id = posted.message.id;
-    crate::ws::broadcast_posted(st, conv, &posted).await;
-    Ok(id)
+    Ok(posted.message.id)
 }
 
 /// POST /v1/agent-tools/messages：以当前调用的 Agent 身份发到主人参与的会话。
