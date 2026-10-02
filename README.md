@@ -237,14 +237,19 @@ CHAT_REAL_AGENT_SMOKE=1 cargo test -p agent-host --test smoke -- --nocapture --t
 ## 架构
 
 ```
-app/            React + TS + Vite（Web/Tauri 共用 UI）
-  src-tauri/    Tauri v2 壳（Windows/Android）
-agent-host/     宿主运行时库（ACP 客户端；桌面端拉起，测试也可直接驱动）
-server/         axum + sqlx + PostgreSQL
-  src/api.rs    REST：auth/users/friends/conversations/messages/群管理/ws ticket
-  src/ws.rs     WS：连接注册、消息广播、presence、typing、read、sync
-  src/domain.rs membership / seq / 消息行转换
-  migrations/   SQL 迁移（sqlx::migrate! 编译期嵌入）
+app/              React + TS + Vite（Web/Tauri 共用 UI）
+  src/ui/         chat/ agent/ admin/ me/ 按页面分组；Avatar、icons 等公用件在根下
+  src-tauri/      Tauri v2 壳（Windows/Android）
+agent-host/       宿主运行时库（ACP 客户端；桌面端拉起，测试也可直接驱动）
+server/           axum + sqlx + PostgreSQL
+  src/api/        REST：account/users/friends/conversations/messages/avatar/files/admin
+  src/agents/     Agent REST、设置、调用派发、宿主事件流、登记表
+  src/domain/     membership / seq / 发消息 / 消息生命周期 / 投票 / 转发
+  src/ws.rs       WS：连接注册、消息广播、presence、typing、read、sync
+  migrations/     SQL 迁移（sqlx::migrate! 编译期嵌入）
+  tests/it/       集成测试，按领域分文件，公用 helper 在 common.rs
+docs/archive/     已完成的开发计划、任务单、交付文档（只读）
+scripts/devin/    并行派发 Devin / Grok 的 worktree 脚本
 docker-compose.yml  db + server（托管 app/dist）
 ```
 
