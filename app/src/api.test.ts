@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { auth, browserDeviceLabel, clearSession, convs, deviceLabel, saveSession, setServer } from "./api";
+import { auth, browserDeviceLabel, clearSession, convs, deviceLabel, saveSession, setServer, watchIdentity } from "./api";
 import type { AuthResponse } from "./types";
 
 const login = (name: string): AuthResponse => ({ access_token: `${name}-access`, refresh_token: `${name}-refresh`, access_expires_in: 900, user: { id: name, username: name, display_name: name, role: "user", last_seen_at: null } });
@@ -111,8 +111,9 @@ describe("device labels", () => {
 
 // ===== Agent A25 =====
 describe("cross-tab refresh", () => {
+  // 刷新换的是同一账号（beforeEach 登录的 old）的令牌
   const creds = (access: string, refresh: string): AuthResponse => ({
-    ...login("u"),
+    ...login("old"),
     access_token: access,
     refresh_token: refresh,
   });
@@ -203,5 +204,49 @@ describe("cross-tab refresh", () => {
     expect(localStorage.getItem("chat_refresh")).toBeNull();
     expect(localStorage.getItem("chat_access")).toBeNull();
     expect(logout).toHaveBeenCalledTimes(1);
+  });
+});
+
+// 另一个标签页直接改写共享的 localStorage（不经过本模块）
+const otherTabLogin = (name: string) => {
+  const r = login(name);
+  localStorage.setItem("chat_access", r.access_token);
+  localStorage.setItem("chat_refresh", r.refresh_token);
+  localStorage.setItem("chat_user", JSON.stringify(r.user));
+};
+
+describe("cross-tab identity", () => {
+  it("never sends another tab's account token from this tab", async () => {
+    const fetcher = vi.fn(() => Promise.resolve(new Response("{}", { status: 200 })));
+    vi.stubGlobal("fetch", fetcher);
+    otherTabLogin("bob");
+    await expect(convs.rename("g1", "x")).rejects.toThrow("session changed");
+    expect(fetcher).not.toHaveBeenCalled();
+    // 也不能替别的标签页登出
+    auth.logout();
+    expect(localStorage.getItem("chat_refresh")).toBe("bob-refresh");
+  });
+
+  it("token rotation of the same account keeps working", async () => {
+    const fetcher = vi.fn((_url: string, _init?: RequestInit) => Promise.resolve(new Response("{}", { status: 200 })));
+    vi.stubGlobal("fetch", fetcher);
+    otherTabLogin("old"); // 同一用户 id，只是换了令牌
+    localStorage.setItem("chat_access", "rotated-access");
+    await convs.rename("g1", "x");
+    const headers = fetcher.mock.calls[0][1]?.headers as Record<string, string>;
+    expect(headers.authorization).toBe("Bearer rotated-access");
+  });
+
+  it("notifies when another tab switches account, not on rotation", () => {
+    const onChange = vi.fn();
+    watchIdentity(onChange);
+    const storageEvent = (key: string) => Object.assign(new Event("storage"), { key });
+    localStorage.setItem("chat_access", "rotated");
+    window.dispatchEvent(storageEvent("chat_access"));
+    window.dispatchEvent(storageEvent("chat_user"));
+    expect(onChange).not.toHaveBeenCalled();
+    otherTabLogin("bob");
+    window.dispatchEvent(storageEvent("chat_user"));
+    expect(onChange).toHaveBeenCalledTimes(1);
   });
 });

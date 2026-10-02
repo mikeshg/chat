@@ -1,29 +1,29 @@
 // Agent A12：按权限档位决定 session/request_permission 自动放行还是交给主人。
 //
-// read_only：read / search / think / fetch 自动允许。
-// workspace：在只读基础上，edit / delete / move 且每个 location 都在工作目录或额外目录内。
+// read_only：think 自动允许；read / search 每个 location 都在工作目录或额外目录内才自动允许。
+// workspace：在只读基础上，edit / delete / move 同样要求每个 location 都在目录内。
 // full：全部自动允许。
+// fetch 只有 full 自动允许：群里别人的消息会进上下文，读到的东西再经 fetch 发出去就是外泄。
 // 自动允许时选 agent 给的 allow_once；没有就选第一个 allow 类选项。
 
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 
-const READ_KINDS: &[&str] = &["read", "search", "think", "fetch"];
+const READ_KINDS: &[&str] = &["read", "search"];
 const WRITE_KINDS: &[&str] = &["edit", "delete", "move"];
 
-/// 档位内可以自动放行。locations 为空的写入不算「都在目录内」。
+/// 档位内可以自动放行。locations 为空的读写不算「都在目录内」。
 pub fn within_tier(tier: &str, kind: &str, locations: &[String], roots: &[PathBuf]) -> bool {
     if tier == "full" {
         return true;
     }
     let kind = kind.to_ascii_lowercase();
-    if READ_KINDS.contains(&kind.as_str()) {
+    if kind == "think" {
         return true;
     }
-    if tier == "workspace" && WRITE_KINDS.contains(&kind.as_str()) {
-        return !locations.is_empty() && locations.iter().all(|p| path_inside(p, roots));
-    }
-    false
+    let scoped = READ_KINDS.contains(&kind.as_str())
+        || (tier == "workspace" && WRITE_KINDS.contains(&kind.as_str()));
+    scoped && !locations.is_empty() && locations.iter().all(|p| path_inside(p, roots))
 }
 
 /// 从 ACP toolCall.locations 抽出路径。元素可以是字符串或 `{path}`。
@@ -238,18 +238,33 @@ mod tests {
     }
 
     #[test]
-    fn read_only_allows_read_search_think_fetch_only() {
+    fn read_only_allows_think_and_reads_inside_only() {
         let t = Tree::new();
         let roots = t.roots();
         assert!(within_tier(
             "read_only",
             "read",
+            &[s(&t.work.join("x"))],
+            &roots
+        ));
+        assert!(within_tier(
+            "read_only",
+            "search",
+            &[s(&t.work.join("src"))],
+            &roots
+        ));
+        // 目录外、没说读哪里、fetch：都要主人批准
+        assert!(!within_tier(
+            "read_only",
+            "read",
             &[s(&t.outside.join("x"))],
             &roots
         ));
-        assert!(within_tier("read_only", "search", &[], &roots));
+        assert!(!within_tier("read_only", "search", &[], &roots));
+        assert!(!within_tier("workspace", "read", &[s(&t.outside.join("x"))], &roots));
+        assert!(!within_tier("read_only", "fetch", &[], &roots));
+        assert!(!within_tier("workspace", "fetch", &[], &roots));
         assert!(within_tier("read_only", "think", &[], &roots));
-        assert!(within_tier("read_only", "fetch", &[], &roots));
         assert!(!within_tier(
             "read_only",
             "edit",

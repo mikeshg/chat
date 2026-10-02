@@ -236,7 +236,7 @@ fn start_invocation(s: &Arc<Shared>, v: &Value) {
     let spec = match AgentSpec::from_json(&v["agent"]) {
         Some(x) => x,
         None => {
-            send_finish(&s.lane, inv_id, Err("agent 描述非法".into()), Vec::new(), 0);
+            send_finish(&s.lane, inv_id, Err("agent 描述非法".into()), Default::default());
             return;
         }
     };
@@ -303,7 +303,7 @@ fn start_invocation(s: &Arc<Shared>, v: &Value) {
             Ok(s) => s,
             Err(e) => {
                 if !*cancel_flag.borrow() {
-                    send_finish(&lane_finish, inv_id, Err(e), Vec::new(), 0);
+                    send_finish(&lane_finish, inv_id, Err(e), Default::default());
                 }
                 running.lock().unwrap().remove(&inv_id);
                 cancels.lock().unwrap().remove(&inv_id);
@@ -338,18 +338,18 @@ fn start_invocation(s: &Arc<Shared>, v: &Value) {
         // 取消过的调用不回 invocation_finish（服务端已标 cancelled，再回也会被忽略）
         if !*cancel_flag.borrow() {
             // A05：凭据只在调用进行中有效——先传产出文件再回 finish
-            let (files, files_skipped) = match &r {
+            let uploaded = match &r {
                 Ok(_) => {
                     crate::files::upload_outbox(&http, &http_base, &out_dir, tools_token.as_deref())
                         .await
                 }
-                Err(_) => (Vec::new(), 0),
+                Err(_) => Default::default(),
             };
             if let Ok(out) = &r {
                 // 正常调用结束后也上报一次可选项（session/new 里有才发）
                 send_options(&lane, agent_id, out, false);
             }
-            send_finish(&lane_finish, inv_id, r, files, files_skipped);
+            send_finish(&lane_finish, inv_id, r, uploaded);
         }
         running.lock().unwrap().remove(&inv_id);
         cancels.lock().unwrap().remove(&inv_id);
@@ -634,19 +634,18 @@ fn send_event_frame(emit: &impl Fn(Message), inv_id: Uuid, ev: Value) {
     ));
 }
 
-/// A05：files 是本次调用上传到服务端的产出附件 id（按上传顺序），
-/// files_skipped 是因配额被拒的数量（服务端追加提示到正文）。
+/// A05：files 是本次调用上传到服务端的产出附件 id（按上传顺序）；
+/// files_skipped（配额被拒）和 files_failed（上传失败）由服务端追加提示到正文。
 fn send_finish(
     lane: &crate::outbound::Outbound,
     id: Uuid,
     r: Result<RunOutput, String>,
-    files: Vec<String>,
-    files_skipped: usize,
+    up: crate::files::Uploaded,
 ) {
     let v = match r {
         Ok(o) => json!({"type":"invocation_finish","invocation_id":id,"ok":true,
             "text": o.text, "session_id": o.session_id, "steps": o.steps,
-            "files": files, "files_skipped": files_skipped}),
+            "files": up.ids, "files_skipped": up.skipped, "files_failed": up.failed}),
         // error 截断 500 字符，避免超长 stderr 刷屏。失败不带 session_id，服务端不更新上下文。
         Err(e) => json!({"type":"invocation_finish","invocation_id":id,"ok":false,
             "error":e.chars().take(500).collect::<String>()}),

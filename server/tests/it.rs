@@ -14287,7 +14287,7 @@ fn latest_inv_status(rows: &Value) -> Option<&str> {
     rows.as_array()?.first()?.get("status")?.as_str()
 }
 
-/// 1 + 7：只读档位 read 自动放行且没有卡片；edit 出卡片、调用变 awaiting_approval，并计入未读。
+/// 1 + 7：只读档位工作目录内的 read 自动放行且没有卡片；edit 出卡片、调用变 awaiting_approval，并计入未读。
 #[tokio::test]
 async fn a12_read_only_auto_read_and_approval_card_counts_unread() {
     let base = spawn_named_db(&format!("chat_it_a12ro_{}", uniq())).await;
@@ -14302,7 +14302,7 @@ async fn a12_read_only_auto_read_and_approval_card_counts_unread() {
     let (mut sa, _) = tokio_tungstenite::connect_async(ws_url(&base, &a).await)
         .await
         .unwrap();
-    send_ws(&mut sa, &conv, "r1", "perm:read:/x").await;
+    send_ws(&mut sa, &conv, "r1", "perm:read:notes.txt").await;
     wait_reply_count(&base, &a, &conv, "allowed:allow", 1).await;
     let msgs = conv_messages(&base, &a, &conv).await;
     assert!(
@@ -15122,7 +15122,7 @@ async fn a05_output_over_quota_skipped() {
     ha.shutdown().await;
 }
 
-/// 凭据与归属：tools_token 只在调用存活期有效；finish 里别调用的附件 id 被忽略
+/// 凭据与归属：tools_token 只在调用存活期有效；finish 里别调用的附件 id 被忽略；files_failed 进正文
 #[tokio::test]
 async fn a05_tool_upload_scoped_to_invocation() {
     let base = spawn_named_db(&format!("chat_t_a05g_{}", uniq())).await;
@@ -15175,7 +15175,7 @@ async fn a05_tool_upload_scoped_to_invocation() {
     let inv2 = s2["invocation_id"].as_str().unwrap().to_string();
     sh.send(WsMsg::Text(
         json!({"type":"invocation_finish","invocation_id":inv2,"ok":true,"text":"done",
-               "files":[att_a]})
+               "files":[att_a], "files_failed": 2})
         .to_string()
         .into(),
     ))
@@ -15187,7 +15187,12 @@ async fn a05_tool_upload_scoped_to_invocation() {
         .filter(|f| f["type"] == "message" && f["message"]["agent"].is_object())
         .collect();
     assert_eq!(agent_msgs.len(), 1, "越权附件 id 不应产生消息: {frames:?}");
-    assert_eq!(agent_msgs[0]["message"]["content"], "done");
+    // 宿主上传失败的产出要在正文里说出来
+    assert_eq!(
+        agent_msgs[0]["message"]["content"],
+        "done
+（2 个文件上传失败未发送）"
+    );
 
     // inv1 还活着：凭据仍可用；finish 里写自己的两个文件 → 两条附件消息按序到达
     let r = tool_upload(

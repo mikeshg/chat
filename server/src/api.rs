@@ -2424,13 +2424,29 @@ async fn get_avatar(
 
 // ---------- 文件上传/下载 ----------
 
-/// 新附件只存 uuid 文件名；历史行可能是带目录的相对路径或绝对路径。
+/// 新附件只存 uuid 文件名；历史行是 "{FILES_DIR}/{uuid}"，文件始终平铺在 FILES_DIR 里。
+/// 只取最后的文件名：库里的路径不可信（恢复的备份可以篡改），不能让它指到 FILES_DIR 外面去读或删。
 fn stored_file_path(files_dir: &str, stored: &str) -> std::path::PathBuf {
-    let path = std::path::Path::new(stored);
-    if path.is_absolute() || path.components().count() > 1 {
-        path.to_path_buf()
-    } else {
-        std::path::Path::new(files_dir).join(path)
+    let name = std::path::Path::new(stored).file_name().unwrap_or_default();
+    std::path::Path::new(files_dir).join(name)
+}
+
+#[cfg(test)]
+mod stored_path_tests {
+    use super::stored_file_path;
+    use std::path::Path;
+
+    #[test]
+    fn stays_inside_files_dir() {
+        let d = Path::new("/data/files");
+        assert_eq!(stored_file_path("/data/files", "abc"), d.join("abc"));
+        assert_eq!(stored_file_path("/data/files", "abc.thumb.jpg"), d.join("abc.thumb.jpg"));
+        // 历史格式
+        assert_eq!(stored_file_path("/data/files", "/data/files/abc"), d.join("abc"));
+        assert_eq!(stored_file_path("/data/files", "./data/files/abc"), d.join("abc"));
+        // 篡改的备份
+        assert_eq!(stored_file_path("/data/files", "/proc/self/environ"), d.join("environ"));
+        assert_eq!(stored_file_path("/data/files", ".."), d.to_path_buf());
     }
 }
 

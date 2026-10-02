@@ -131,6 +131,15 @@ async fn up(
                 auth,
                 name: name.clone(),
             });
+            // flaky：每个名字第一次 503，之后成功（模拟断网 / 服务端重启）
+            if name.starts_with("flaky")
+                && st.uploads.lock().unwrap().iter().filter(|u| u.name == name).count() == 1
+            {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            if name.starts_with("reject") {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
             if name.starts_with("big") {
                 return (
                     StatusCode::PAYLOAD_TOO_LARGE,
@@ -184,7 +193,7 @@ async fn download_inputs_writes_in_dir_and_skips_failures() {
     std::fs::remove_dir_all(&root).unwrap();
 }
 
-/// upload_outbox：按序上传、413 计 skipped 继续、其余失败跳过；无 token 直接跳过
+/// upload_outbox：按序上传、413 计 skipped 继续、401 剩余全计 failed；无 token 直接跳过
 #[tokio::test]
 async fn upload_outbox_order_skip_and_auth() {
     let (base, st) = stub().await;
@@ -195,10 +204,10 @@ async fn upload_outbox_order_skip_and_auth() {
     std::fs::write(dir.join("c.txt"), b"ccc").unwrap();
     let http = reqwest::Client::new();
 
-    let (ids, skipped) = files::upload_outbox(&http, &base, &dir, Some("tok-1")).await;
+    let up = files::upload_outbox(&http, &base, &dir, Some("tok-1")).await;
     // 排序 a < big < c；big 413 跳过，两个成功
-    assert_eq!(ids, vec!["att-a.txt-2", "att-c.txt-3"]);
-    assert_eq!(skipped, 1);
+    assert_eq!(up.ids, vec!["att-a.txt-2", "att-c.txt-3"]);
+    assert_eq!((up.skipped, up.failed), (1, 0));
     let ups = st.uploads.lock().unwrap();
     assert_eq!(ups.len(), 3);
     assert!(ups
@@ -207,14 +216,28 @@ async fn upload_outbox_order_skip_and_auth() {
     drop(ups);
 
     // 无 token：全部不可传
-    let (ids, skipped) = files::upload_outbox(&http, &base, &dir, None).await;
-    assert!(ids.is_empty());
-    assert_eq!(skipped, 0);
+    let up = files::upload_outbox(&http, &base, &dir, None).await;
+    assert_eq!(up, files::Uploaded::default());
 
-    // 凭据错误 → 401（非 413）：记日志跳过，不计 skipped
-    let (ids, skipped) = files::upload_outbox(&http, &base, &dir, Some("bad-tok")).await;
-    assert!(ids.is_empty());
-    assert_eq!(skipped, 0);
+    // 凭据失效 → 401：调用已结束，全部计 failed（不能悄悄丢）
+    let up = files::upload_outbox(&http, &base, &dir, Some("bad-tok")).await;
+    assert!(up.ids.is_empty());
+    assert_eq!((up.skipped, up.failed), (0, 3));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 暂时失败（503）重试后成功；被明确拒绝（400）计 failed
+#[tokio::test]
+async fn upload_outbox_retries_transient_and_reports_rejected() {
+    let (base, st) = stub().await;
+    let dir = std::env::temp_dir().join(format!("a05-retry-{}", Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("flaky.txt"), b"ff").unwrap();
+    std::fs::write(dir.join("reject.txt"), b"r").unwrap();
+    let up = files::upload_outbox(&reqwest::Client::new(), &base, &dir, Some("tok-1")).await;
+    assert_eq!(up.ids, vec!["att-flaky.txt-2"]);
+    assert_eq!((up.skipped, up.failed), (0, 1));
+    assert_eq!(st.uploads.lock().unwrap().len(), 3, "flaky 两次 + reject 一次");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

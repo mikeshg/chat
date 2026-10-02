@@ -475,6 +475,12 @@ where
         progress(STAGE_FAILED, Some("没有下载地址"));
         return;
     }
+    // 登记表里约一半条目没给 sha256：那就只认 https，完整性靠 TLS
+    let has_sum = bin.sha256.as_deref().is_some_and(|s| !s.trim().is_empty());
+    if !has_sum && !bin.archive.starts_with("https://") {
+        progress(STAGE_FAILED, Some("没有 sha256 的条目只允许 https 下载"));
+        return;
+    }
     progress(STAGE_DOWNLOAD, None);
     let bytes = match download(&bin.archive).await {
         Ok(b) => b,
@@ -642,11 +648,10 @@ fn extract_tar_gz(bytes: &[u8], dest: &Path) -> Result<(), String> {
         if !path_is_relative_safe(&rel) {
             return Err("压缩包路径不合法".into());
         }
-        let out = dest.join(&rel);
-        if let Some(parent) = out.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        // unpack_in：父目录解析后必须仍在 dest 里，挡住「先放指向外面的 symlink，再往里写」
+        if !entry.unpack_in(dest).map_err(|e| format!("解压失败：{e}"))? {
+            return Err("压缩包路径不合法".into());
         }
-        entry.unpack(&out).map_err(|e| format!("解压失败：{e}"))?;
     }
     Ok(())
 }
@@ -901,5 +906,54 @@ mod split_tests {
         );
         assert_eq!(split_package("plain"), ("plain".into(), None));
         assert_eq!(split_package("trailing@"), ("trailing@".into(), None));
+    }
+}
+
+#[cfg(test)]
+mod extract_tests {
+    use super::extract_tar_gz;
+
+    fn tar_gz(build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        build(&mut b);
+        let raw = b.into_inner().unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut gz, &raw).unwrap();
+        gz.finish().unwrap()
+    }
+
+    fn file(b: &mut tar::Builder<Vec<u8>>, path: &str, data: &[u8]) {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(data.len() as u64);
+        h.set_mode(0o755);
+        h.set_cksum();
+        b.append_data(&mut h, path, data).unwrap();
+    }
+
+    // Windows 没有建 symlink 的权限时，新旧实现都会在 symlink 那步报错；回归保护靠 Linux / macOS 上跑
+    #[test]
+    fn symlink_cannot_redirect_writes_outside_dest() {
+        let root = std::env::temp_dir().join(format!("chat-extract-{}", uuid::Uuid::new_v4()));
+        let (dest, outside) = (root.join("dest"), root.join("outside"));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&dest).unwrap(); // extract_archive 先建好 dest
+
+        let ok = tar_gz(|b| file(b, "bin/agent", b"x"));
+        extract_tar_gz(&ok, &dest).unwrap();
+        assert!(dest.join("bin/agent").is_file());
+
+        let evil = tar_gz(|b| {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_size(0);
+            h.set_cksum();
+            b.append_link(&mut h, "link", &outside).unwrap();
+            file(b, "link/pwned", b"x");
+        });
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(&dest).unwrap();
+        assert!(extract_tar_gz(&evil, &dest).is_err());
+        assert!(!outside.join("pwned").exists(), "写穿了 symlink");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

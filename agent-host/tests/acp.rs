@@ -375,8 +375,13 @@ async fn acp_stepfail_emits_failed_end() {
 
 #[tokio::test]
 async fn acp_perm_read_only_auto_allows_read_and_rejects_edit() {
-    let out = run("perm:read:/x").await.expect("read 应自动放行");
+    let out = run("perm:read:notes.txt").await.expect("目录内 read 应自动放行");
     assert_eq!(out.text, "allowed:allow");
+    let outside = if cfg!(windows) { "C:/Windows/win.ini" } else { "/etc/passwd" };
+    let out = run(&format!("perm:read:{outside}"))
+        .await
+        .expect("目录外 read 应取消而不是挂起");
+    assert_eq!(out.text, "rejected", "目录外的 read 不能自动放行");
     let out = run("perm:edit:C:/outside/a.rs")
         .await
         .expect("超档应取消而不是挂起");

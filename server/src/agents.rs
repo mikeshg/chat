@@ -3114,6 +3114,14 @@ pub async fn handle_finish(st: &SharedState, host_id: Uuid, v: &serde_json::Valu
             }
             text.push_str(&format!("（{skipped} 个文件因存储空间不足未发送）"));
         }
+        // 断网重试到期等原因没传上去的产出，不能当作没产出
+        let failed = v["files_failed"].as_i64().unwrap_or(0).max(0);
+        if failed > 0 {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&format!("（{failed} 个文件上传失败未发送）"));
+        }
         // 步骤记录：finish 帧带的 steps 优先（宿主权威记录），缺省退回事件累积
         let steps: Vec<AgentStepView> = match v["steps"].as_array() {
             Some(arr) => arr

@@ -208,22 +208,38 @@ pub async fn collect_outbox(dir: &Path) -> Vec<PathBuf> {
     names.into_iter().map(|(_, p)| p).collect()
 }
 
+/// 断网 / 5xx 时重试多久。服务端给掉线宿主留 10 分钟，调用期凭据在这段时间里一直有效。
+const UPLOAD_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(9 * 60);
+
+/// 上传产出文件的结果
+#[derive(Debug, Default, PartialEq)]
+pub struct Uploaded {
+    /// 成功的 attachment_id（按上传顺序）
+    pub ids: Vec<String>,
+    /// 因配额 / 大小被拒（413）
+    pub skipped: usize,
+    /// 重试到期仍失败、或被服务端拒绝；不能悄悄丢，要在回复里说明
+    pub failed: usize,
+}
+
 /// 把 out/ 的产出逐个上传：POST {base}/v1/agent-tools/files（Invocation 凭据）。
-/// 返回 (attachment_id 列表, 因 413 跳过的数量)；其他失败记日志跳过。
-/// 无凭据直接返回空——上传必须要调用期凭据。
+/// 断网、5xx、429 退避重试（总共 UPLOAD_RETRY_WINDOW）；413 计 skipped；
+/// 401 说明调用已结束，剩下的全部计 failed。无凭据直接返回空——上传必须要调用期凭据。
 pub async fn upload_outbox(
     http: &reqwest::Client,
     base: &str,
     out_dir: &Path,
     tools_token: Option<&str>,
-) -> (Vec<String>, usize) {
+) -> Uploaded {
+    let mut res = Uploaded::default();
     let Some(token) = tools_token else {
-        return (Vec::new(), 0);
+        return res;
     };
     let files = collect_outbox(out_dir).await;
-    let mut ids = Vec::new();
-    let mut skipped = 0usize;
-    for path in files {
+    let total = files.len();
+    let deadline = std::time::Instant::now() + UPLOAD_RETRY_WINDOW;
+    let mut wait = std::time::Duration::from_secs(1);
+    for (i, path) in files.into_iter().enumerate() {
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -232,46 +248,73 @@ pub async fn upload_outbox(
         let data = match tokio::fs::read(&path).await {
             Ok(d) => d,
             Err(e) => {
-                tracing::warn!(error = %e, file = %name, "产出文件读失败，跳过");
+                tracing::warn!(error = %e, file = %name, "产出文件读失败");
+                res.failed += 1;
                 continue;
             }
         };
         let mime = mime_guess::from_path(&path).first_or_octet_stream();
-        let part = match reqwest::multipart::Part::bytes(data)
-            .file_name(name.clone())
-            .mime_str(mime.as_ref())
-        {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(error = %e, file = %name, "产出文件 MIME 非法，跳过");
-                continue;
-            }
-        };
-        let resp = http
-            .post(format!("{base}/v1/agent-tools/files"))
-            .header("authorization", format!("Invocation {token}"))
-            .multipart(reqwest::multipart::Form::new().part("file", part))
-            .send()
-            .await;
-        match resp {
-            Ok(r) if r.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE => {
-                skipped += 1;
-            }
-            Ok(r) if r.status().is_success() => match r.json::<Value>().await {
-                Ok(v) => {
-                    if let Some(id) = v["attachment_id"].as_str() {
-                        ids.push(id.to_string());
-                    }
+        loop {
+            let part = match reqwest::multipart::Part::bytes(data.clone())
+                .file_name(name.clone())
+                .mime_str(mime.as_ref())
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(error = %e, file = %name, "产出文件 MIME 非法");
+                    res.failed += 1;
+                    break;
                 }
-                Err(e) => tracing::warn!(error = %e, file = %name, "产出上传响应解析失败"),
-            },
-            Ok(r) => {
-                tracing::warn!(status = %r.status(), file = %name, "产出上传被拒，跳过");
+            };
+            let resp = http
+                .post(format!("{base}/v1/agent-tools/files"))
+                .header("authorization", format!("Invocation {token}"))
+                .multipart(reqwest::multipart::Form::new().part("file", part))
+                .send()
+                .await;
+            let transient = match resp {
+                Ok(r) if r.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE => {
+                    res.skipped += 1;
+                    break;
+                }
+                Ok(r) if r.status().is_success() => {
+                    match r.json::<Value>().await {
+                        Ok(v) if v["attachment_id"].is_string() => {
+                            res.ids.push(v["attachment_id"].as_str().unwrap().to_string());
+                        }
+                        other => {
+                            tracing::warn!(?other, file = %name, "产出上传响应解析失败");
+                            res.failed += 1;
+                        }
+                    }
+                    break;
+                }
+                Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                    tracing::warn!(file = %name, "调用已结束，剩余产出无法上传");
+                    res.failed += total - i;
+                    return res;
+                }
+                Ok(r) if r.status().is_server_error()
+                    || r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS =>
+                {
+                    format!("HTTP {}", r.status())
+                }
+                Ok(r) => {
+                    tracing::warn!(status = %r.status(), file = %name, "产出上传被拒");
+                    res.failed += 1;
+                    break;
+                }
+                Err(e) => e.to_string(),
+            };
+            if std::time::Instant::now() + wait > deadline {
+                tracing::warn!(error = %transient, file = %name, "产出上传重试到期");
+                res.failed += 1;
+                break;
             }
-            Err(e) => {
-                tracing::warn!(error = %e, file = %name, "产出上传失败，跳过");
-            }
+            tracing::info!(error = %transient, file = %name, ?wait, "产出上传失败，稍后重试");
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(std::time::Duration::from_secs(30));
         }
     }
-    (ids, skipped)
+    res
 }

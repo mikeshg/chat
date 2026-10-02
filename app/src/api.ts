@@ -59,6 +59,7 @@ export function setServer(url: string) {
   if (next !== getServer()) {
     localStorage.setItem(LS_SERVER, next);
     sessionGen++; // 服务器切换：旧服务器的异步结果一律作废
+    boundIdentity = storedIdentity();
   }
 }
 export function wsBase(): string {
@@ -73,11 +74,38 @@ export function session(): number {
   return sessionGen;
 }
 
+// localStorage 是所有标签页共享的：别的标签页换账号 / 换服务器 / 登出后，存储里的凭据就不再属于本页。
+// 本页记住自己的身份（服务器 + 用户 id），对不上时一律不发请求，等页面重载换成新身份。
+// 同一账号的令牌轮换不改身份，照常使用。
+function storedIdentity(): string {
+  let id = "";
+  try {
+    id = JSON.parse(localStorage.getItem(LS_USER) ?? "null")?.id ?? "";
+  } catch {}
+  return `${getServer()}|${id}`;
+}
+let boundIdentity: string | null = null;
+function identityMatches(): boolean {
+  boundIdentity ??= storedIdentity();
+  return storedIdentity() === boundIdentity;
+}
+function requireIdentity() {
+  if (!identityMatches()) throw new ApiError(0, "session changed");
+}
+/** 别的标签页改了账号或服务器时回调（本页应重载）。 */
+export function watchIdentity(onChange: () => void) {
+  window.addEventListener("storage", (e) => {
+    if (e.key !== null && e.key !== LS_USER && e.key !== LS_SERVER) return;
+    if (!identityMatches()) onChange();
+  });
+}
+
 export function saveSession(r: AuthResponse) {
   localStorage.setItem(LS_ACCESS, r.access_token);
   localStorage.setItem(LS_REFRESH, r.refresh_token);
   localStorage.setItem(LS_USER, JSON.stringify(r.user));
   sessionGen++; // 新登录 = 新会话
+  boundIdentity = storedIdentity();
 }
 export function loadSession(): { user: UserPublic } | null {
   const u = localStorage.getItem(LS_USER);
@@ -93,6 +121,7 @@ export function clearSession() {
   localStorage.removeItem(LS_REFRESH);
   localStorage.removeItem(LS_USER);
   sessionGen++; // 登出 = 旧会话作废
+  boundIdentity = storedIdentity();
 }
 
 export class ApiError extends Error {
@@ -144,6 +173,7 @@ async function refreshOnce(gen: number, srv: string, rt: string): Promise<boolea
 
 async function tryRefresh(gen: number, srv: string): Promise<boolean> {
   requireSession(gen);
+  requireIdentity();
   if (refreshing?.gen === gen) return refreshing.promise;
   const rt = localStorage.getItem(LS_REFRESH);
   if (!rt) return false;
@@ -171,6 +201,7 @@ async function tryRefresh(gen: number, srv: string): Promise<boolean> {
 }
 
 async function raw(srv: string, path: string, init?: RequestInit): Promise<Response> {
+  requireIdentity();
   const headers: Record<string, string> = {
     ...(init?.headers as Record<string, string>),
   };
@@ -193,6 +224,7 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
       requireSession(gen);
     }
     if (!refreshed || res.status === 401) {
+      requireIdentity(); // 别的标签页已换账号：那是它的会话，不能替它登出
       clearSession();
       window.dispatchEvent(new Event("chat:logout"));
       throw new ApiError(401, "unauthorized");
@@ -271,6 +303,7 @@ export const auth = {
   login: (username: string, password: string) =>
     post<AuthResponse>("/auth/login", { username, password, device_label: deviceLabel() }),
   logout: () => {
+    if (!identityMatches()) return; // 存储里已是别的标签页的账号
     const rt = localStorage.getItem(LS_REFRESH);
     if (rt) post("/auth/logout", { refresh_token: rt }).catch(() => {});
     clearSession();
@@ -589,6 +622,7 @@ export const admin = {
       const fd = new FormData();
       fd.append("file", file, "backup.tar.gz");
       fd.append("confirm", "RESTORE");
+      if (!identityMatches()) return reject(new ApiError(0, "session changed"));
       const xhr = new XMLHttpRequest();
       xhr.open("POST", `${getServer()}/v1/admin/restore`);
       const at = localStorage.getItem(LS_ACCESS);
