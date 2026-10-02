@@ -5,13 +5,12 @@
 // （once 则停用），同一行只有一个事务能成功，所以并发两次扫描只建一个调用。
 // 停机错过的周期不回填：下一次用 now() 重算，而不是从旧槽位逐个补。
 //
-// 触发前的准入在 `schedule::schedule_block_reason`。A08 的使用权检查挂在那个函数上。
+// 触发前的准入在 `spec::schedule_block_reason`。A08 的使用权检查挂在那个函数上。
 
 use crate::agent_tools::{require_invocation, ToolCtx};
 use crate::auth;
 use crate::domain;
 use crate::error::{AppError, AppResult};
-use crate::schedule::{self, ScheduleSpec};
 use crate::state::SharedState;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -19,10 +18,13 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use spec::ScheduleSpec;
 use sqlx::PgPool;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+pub mod spec;
 
 const SCHEDULE_COLS: &str = "id, agent_id, owner_id, name, prompt, target_conversation_id, spec, \
      timezone, enabled, next_run_at, last_run_at, created_by, created_at, disabled_reason";
@@ -139,11 +141,11 @@ struct ParsedSpec {
 }
 
 fn parse_timing(spec_v: &Value, timezone: &str, now: DateTime<Utc>) -> AppResult<ParsedSpec> {
-    let spec = schedule::parse_spec(spec_v).map_err(|_| AppError::bad_request("bad_spec"))?;
+    let spec = spec::parse_spec(spec_v).map_err(|_| AppError::bad_request("bad_spec"))?;
     let tz =
-        schedule::parse_timezone(timezone).map_err(|_| AppError::bad_request("bad_timezone"))?;
+        spec::parse_timezone(timezone).map_err(|_| AppError::bad_request("bad_timezone"))?;
     let next =
-        schedule::next_run(&spec, tz, now).ok_or_else(|| AppError::bad_request("bad_spec"))?;
+        spec::next_run(&spec, tz, now).ok_or_else(|| AppError::bad_request("bad_spec"))?;
     Ok(ParsedSpec {
         spec,
         tz_name: tz.name().to_string(),
@@ -165,7 +167,7 @@ async fn insert_schedule(
     let target = body.target_conversation_id.unwrap_or(default_target);
     ensure_target(&st.pool, owner, target).await?;
     let timing = parse_timing(&body.spec, &body.timezone, Utc::now())?;
-    let spec_json = schedule::spec_to_json(&timing.spec);
+    let spec_json = spec::spec_to_json(&timing.spec);
 
     let mut tx = st.pool.begin().await?;
     // 锁住主人，避免并发创建冲破 50 条
@@ -315,7 +317,7 @@ pub async fn patch_schedule(
         let timing = parse_timing(&spec_v, &tz_name, Utc::now())?;
         let enabled = body.enabled.unwrap_or(row.enabled);
         (
-            schedule::spec_to_json(&timing.spec),
+            spec::spec_to_json(&timing.spec),
             timing.tz_name,
             Some(timing.next),
             None,
@@ -515,7 +517,7 @@ async fn claim_one(
 
     // 使用权（A08）不通过时与下面一样停用，reason = "agent_access"
     let allowed = crate::agent_access::user_allows(&mut *tx, row.owner_id).await?;
-    let reason = schedule::schedule_block_reason(
+    let reason = spec::schedule_block_reason(
         row.disabled_at.is_some(),
         row.agent_deleted_at.is_some(),
         still_member,
@@ -528,7 +530,7 @@ async fn claim_one(
         return Ok(None);
     }
 
-    let spec = match schedule::parse_spec(&row.spec) {
+    let spec = match spec::parse_spec(&row.spec) {
         Ok(s) => s,
         Err(_) => {
             disable_in(&mut *tx, row.id, "bad_spec").await?;
@@ -536,7 +538,7 @@ async fn claim_one(
             return Ok(None);
         }
     };
-    let tz = match schedule::parse_timezone(&row.timezone) {
+    let tz = match spec::parse_timezone(&row.timezone) {
         Ok(tz) => tz,
         Err(_) => {
             disable_in(&mut *tx, row.id, "bad_spec").await?;
@@ -566,7 +568,7 @@ async fn claim_one(
         return Ok(Some((tx, job)));
     }
 
-    let Some(next) = schedule::next_run(&spec, tz, Utc::now()) else {
+    let Some(next) = spec::next_run(&spec, tz, Utc::now()) else {
         disable_in(&mut *tx, row.id, "bad_spec").await?;
         tx.commit().await?;
         return Ok(None);
