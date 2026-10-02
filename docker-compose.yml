@@ -28,6 +28,8 @@ services:
       APP_DIST: /app/dist
       FILES_DIR: /data/files
       UPLOAD_MAX_MB: ${UPLOAD_MAX_MB:-25}
+      # 挂在反向代理后面才设 1（见 README）
+      TRUST_PROXY: ${TRUST_PROXY:-}
     volumes:
       - chat-files:/data/files
     ports:
