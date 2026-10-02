@@ -18,7 +18,8 @@ jsonwebtoken = "9"
 rand_core = { version = "0.6", features = ["getrandom"] }
 sha2 = "0.10"
 hex = "0.4"
-tower-http = { version = "0.6", features = ["fs", "cors", "trace"] }
+tower-http = { version = "0.6", features = ["fs", "cors", "trace", "set-header"] }
+tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"

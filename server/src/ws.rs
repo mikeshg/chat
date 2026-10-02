@@ -50,6 +50,10 @@ pub async fn ws_handler(
     Ok(ws.on_upgrade(move |socket| handle_session(socket, st, access)))
 }
 
+/// 单连接入站上限：INBOUND_WINDOW 内最多这么多帧
+const INBOUND_MAX_FRAMES: u32 = 300;
+const INBOUND_WINDOW: Duration = Duration::from_secs(10);
+
 fn frame(out: &WsOut) -> String {
     serde_json::to_string(out).unwrap()
 }
@@ -100,6 +104,10 @@ pub async fn handle_session(
     let mut ping = tokio::time::interval(ping_every);
     ping.tick().await; // 跳过立即触发
     let mut last_inbound = Instant::now();
+    // 入站限速：每帧都要查库，刷帧的连接直接断开（客户端重连后照常）。
+    // 窗口放宽到 10 秒，重连后批量补发已读这类正常突发不会误伤。
+    let mut window_start = Instant::now();
+    let mut window_frames = 0u32;
 
     // 每次写都限时 idle_timeout：对端收不下（死连接把发送缓冲塞满）就断开，
     // 否则一次写卡住会饿死同一 select 里的心跳超时与踢下线
@@ -140,6 +148,16 @@ pub async fn handle_session(
                 match incoming {
                     Some(Ok(msg)) => {
                         last_inbound = Instant::now();
+                        if window_start.elapsed() > INBOUND_WINDOW {
+                            window_start = last_inbound;
+                            window_frames = 0;
+                        }
+                        window_frames += 1;
+                        if window_frames > INBOUND_MAX_FRAMES {
+                            tracing::warn!(user_id = %uid, "WS 入站帧过多，断开");
+                            send_timed(&mut sink, Message::Close(None), t).await;
+                            break;
+                        }
                         match msg {
                             Message::Text(text) => {
                                 if !on_text(&st, uid, conn_id, grant.session_version, grant.sid, &tx, &text).await {

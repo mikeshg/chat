@@ -44,7 +44,7 @@ const MIGRATION_VERSION_SQL: &str =
     "SELECT COALESCE(MAX(version), 0) FROM _sqlx_migrations WHERE success";
 
 /// 备份/恢复过程中 FILES_DIR 里需要排除的顶层前缀
-const EXCLUDE_PREFIXES: &[&str] = &[".backups", ".restore-", ".spool-"];
+const EXCLUDE_PREFIXES: &[&str] = &[".backups", ".restore-", ".spool-", ".upload-"];
 
 fn qi(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))

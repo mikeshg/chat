@@ -73,16 +73,20 @@ pub async fn change_password(
         return Err(AppError::bad_request("password must be 6-72 chars"));
     }
 
+    // Argon2 在锁外算：先验旧密码、算新哈希，锁行后核对哈希没被并发改过
+    if !auth::verify_password(&authn.user.password_hash, &req.old_password).await {
+        return Err(AppError::forbidden("原密码不正确"));
+    }
+    let hash = auth::hash_password(&req.new_password).await?;
     let mut tx = st.pool.begin().await?;
     // 用户行锁：与登录/refresh/管理员重置共用同一加锁顺序（先用户行），串行化并发改密
     let row = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE id = $1 FOR UPDATE")
         .bind(uid)
         .fetch_one(&mut *tx)
         .await?;
-    if !auth::verify_password(&row.password_hash, &req.old_password) {
+    if row.password_hash != authn.user.password_hash {
         return Err(AppError::forbidden("原密码不正确"));
     }
-    let hash = auth::hash_password(&req.new_password)?;
     let row = sqlx::query_as::<_, UserRow>(
         "UPDATE users SET password_hash = $2, session_version = session_version + 1
          WHERE id = $1 RETURNING *",

@@ -7,6 +7,9 @@ pub struct Config {
     pub app_dist: Option<String>,
     pub files_dir: String,
     pub upload_max_bytes: usize,
+    /// 服务端挂在反向代理后面：限流按 X-Forwarded-For 最右一跳认客户端 IP。
+    /// 不在代理后面时千万别开，否则谁都能伪造这个头绕过限流。
+    pub trust_proxy: bool,
 }
 
 impl Config {
@@ -28,6 +31,10 @@ impl Config {
                 .unwrap_or(25)
                 * 1024
                 * 1024,
+            trust_proxy: matches!(
+                std::env::var("TRUST_PROXY").as_deref(),
+                Ok("1") | Ok("true")
+            ),
         }
     }
 }

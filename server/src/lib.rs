@@ -26,7 +26,9 @@ use axum::Router;
 use config::Config;
 use state::{AppState, SharedState};
 use std::net::SocketAddr;
+use axum::http::{header, HeaderValue};
 use tower_http::cors::CorsLayer;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
@@ -49,10 +51,29 @@ pub fn build_router(state: SharedState, cfg: &Config) -> Router {
         .with_state(state);
     if let Some(dist) = &cfg.app_dist {
         let index = format!("{dist}/index.html");
-        app = app.fallback_service(ServeDir::new(dist).not_found_service(ServeFile::new(index)));
+        let pages = ServeDir::new(dist).not_found_service(ServeFile::new(index));
+        // 网页端的 CSP 与 Tauri 壳一致（tauri.conf.json）。登录凭据存在 localStorage，
+        // 一旦有 XSS 就能拿走：CSP 只允许本站脚本，是最后一道闸。
+        let headers = tower::ServiceBuilder::new()
+            .layer(SetResponseHeaderLayer::if_not_present(
+                header::CONTENT_SECURITY_POLICY,
+                HeaderValue::from_static(WEB_CSP),
+            ))
+            .layer(SetResponseHeaderLayer::if_not_present(
+                header::X_CONTENT_TYPE_OPTIONS,
+                HeaderValue::from_static("nosniff"),
+            ))
+            .layer(SetResponseHeaderLayer::if_not_present(
+                header::REFERRER_POLICY,
+                HeaderValue::from_static("no-referrer"),
+            ));
+        app = app.fallback_service(headers.service(pages));
     }
     app
 }
+
+/// 和 app/src-tauri/tauri.conf.json 的 csp 保持一致，另加不许被别的站点嵌进 iframe（点击劫持）。
+const WEB_CSP: &str = "default-src 'self'; connect-src 'self' http: https: ws: wss:; img-src 'self' data: blob: http: https:; media-src 'self' http: https: blob:; frame-src 'self' http: https:; object-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self'; base-uri 'self'; frame-ancestors 'self'";
 
 pub async fn run() {
     tracing_subscriber::fmt()

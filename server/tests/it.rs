@@ -68,6 +68,7 @@ async fn spawn() -> String {
             .to_string_lossy()
             .into(),
         upload_max_bytes: 25 * 1024 * 1024,
+        trust_proxy: false,
     };
     std::fs::create_dir_all(&cfg.files_dir).unwrap();
     let state = AppState::new(pool, cfg.clone());
@@ -637,6 +638,7 @@ async fn spawn_named_state(db_name: &str) -> (String, chat_server::state::Shared
             .to_string_lossy()
             .into(),
         upload_max_bytes: 25 * 1024 * 1024,
+        trust_proxy: false,
     };
     std::fs::create_dir_all(&cfg.files_dir).unwrap();
     let state = AppState::new(pool, cfg.clone());
@@ -1051,7 +1053,7 @@ async fn token_issuance_waits_for_user_authorization() {
         wait_for_blocker(&st.pool, pid, &task).await;
         // Commit the revocation while the issuance request waits for authorization.
         sqlx::query("UPDATE users SET password_hash = $2, session_version = session_version + 1 WHERE id = $1")
-            .bind(uid).bind(chat_server::auth::hash_password("new-password").unwrap())
+            .bind(uid).bind(chat_server::auth::hash_password("new-password").await.unwrap())
             .execute(&mut *reset).await.unwrap();
         sqlx::query("UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1")
             .bind(uid)
@@ -4886,6 +4888,61 @@ async fn copy_attachment(pool: &sqlx::PgPool, src_id: &str) -> String {
     copy_id.to_string()
 }
 
+/// WS 入站限速：短时间刷几百帧的连接被断开
+#[tokio::test]
+async fn ws_inbound_flood_disconnects() {
+    let base = spawn().await;
+    let a = register(&base, &format!("flood_{}", uniq())).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url(&base, &a).await)
+        .await
+        .unwrap();
+    for _ in 0..310 {
+        if ws.send(WsMsg::Text("{}".into())).await.is_err() {
+            break;
+        }
+    }
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(m) = ws.next().await {
+            if matches!(m, Ok(WsMsg::Close(_)) | Err(_)) {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "刷帧的连接应被断开");
+}
+
+/// 下载走流式：Range 回 206 片段（音视频拖动要用），类型和下载方式仍按库里记的
+#[tokio::test]
+async fn download_supports_range_and_keeps_headers() {
+    let base = spawn().await;
+    let a = register(&base, &format!("rng_{}", uniq())).await;
+    let b = register(&base, &format!("rngb_{}", uniq())).await;
+    befriend(&base, &a, &b).await;
+    let conv = dm_conv(&base, &a).await;
+    let body: Vec<u8> = (0..=255u8).cycle().take(10_000).collect();
+    let (st, att) = upload_att(&base, &conv, &a.access, "clip.mp4", "video/mp4", body.clone()).await;
+    assert_eq!(st, 200, "{att}");
+    let url = format!("{base}/v1/files/{}", att["id"].as_str().unwrap());
+
+    let full = http().get(&url).send().await.unwrap();
+    assert_eq!(full.status(), 200);
+    assert_eq!(full.headers()["content-type"], "video/mp4");
+    assert!(full.headers()["content-disposition"].to_str().unwrap().starts_with("inline;"));
+    assert_eq!(full.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(full.bytes().await.unwrap().to_vec(), body);
+
+    let part = http().get(&url).header("range", "bytes=100-199").send().await.unwrap();
+    assert_eq!(part.status(), 206);
+    assert_eq!(part.headers()["content-range"], "bytes 100-199/10000");
+    assert_eq!(part.headers()["content-type"], "video/mp4");
+    assert_eq!(part.bytes().await.unwrap().to_vec(), body[100..200].to_vec());
+
+    let dl = http().get(format!("{url}?dl=1")).send().await.unwrap();
+    assert!(dl.headers()["content-disposition"].to_str().unwrap().starts_with("attachment;"));
+    assert_eq!(http().get(format!("{base}/v1/files/{}", uuid::Uuid::new_v4())).send().await.unwrap().status(), 404);
+}
+
 /// 大图：上传记录宽高 + 生成缩略图；?thumb=1 拿 JPEG；消息视图字段一致
 #[tokio::test]
 async fn p2_1_image_dims_thumb() {
@@ -5309,6 +5366,7 @@ async fn spawn_avatar() -> (String, std::path::PathBuf) {
         app_dist: None,
         files_dir: files_dir.to_string_lossy().into(),
         upload_max_bytes: 25 * 1024 * 1024,
+        trust_proxy: false,
     };
     std::fs::create_dir_all(&cfg.files_dir).unwrap();
     let state = AppState::new(pool, cfg.clone());
@@ -7954,6 +8012,7 @@ async fn spawn_backup_env(
         app_dist: None,
         files_dir: files_dir.to_string_lossy().into(),
         upload_max_bytes: 25 * 1024 * 1024,
+        trust_proxy: false,
     };
     std::fs::create_dir_all(&cfg.files_dir).unwrap();
     let state = AppState::new(pool, cfg.clone());

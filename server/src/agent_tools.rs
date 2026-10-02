@@ -210,6 +210,7 @@ pub async fn tool_upload_file(
     }
     let (quota_mb, quota_bytes, used_bytes) = crate::api::upload_quota(&st, ctx.owner).await?;
     let rd = crate::api::read_upload(
+        &st.cfg.files_dir,
         &mut mp,
         st.cfg.upload_max_bytes,
         quota_bytes,
@@ -226,7 +227,7 @@ pub async fn tool_upload_file(
             crate::api::quota_message(used_bytes, quota_mb)
         )));
     }
-    if !rd.got_file || rd.buf.is_empty() {
+    if !rd.has_file() {
         return Err(AppError::bad_request("missing file"));
     }
     let att = crate::api::store_upload(
@@ -235,7 +236,7 @@ pub async fn tool_upload_file(
         conv,
         rd.file_name,
         rd.mime,
-        rd.buf,
+        rd.file.expect("has_file"),
         None,
         Some(ctx.invocation),
     )

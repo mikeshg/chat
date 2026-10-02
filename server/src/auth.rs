@@ -48,19 +48,30 @@ pub struct AccessGrant {
     pub sid: Option<Uuid>,
 }
 
-pub fn hash_password(pw: &str) -> AppResult<String> {
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(pw.as_bytes(), &salt)
-        .map(|h| h.to_string())
-        .map_err(AppError::internal)
+/// Argon2 每次几十毫秒纯 CPU：放 blocking 池，不占 async worker。
+pub async fn hash_password(pw: &str) -> AppResult<String> {
+    let pw = pw.to_string();
+    tokio::task::spawn_blocking(move || {
+        let salt = SaltString::generate(&mut OsRng);
+        Argon2::default()
+            .hash_password(pw.as_bytes(), &salt)
+            .map(|h| h.to_string())
+            .map_err(AppError::internal)
+    })
+    .await
+    .map_err(AppError::internal)?
 }
 
-pub fn verify_password(hash: &str, pw: &str) -> bool {
-    PasswordHash::new(hash)
-        .ok()
-        .map(|h| Argon2::default().verify_password(pw.as_bytes(), &h).is_ok())
-        .unwrap_or(false)
+pub async fn verify_password(hash: &str, pw: &str) -> bool {
+    let (hash, pw) = (hash.to_string(), pw.to_string());
+    tokio::task::spawn_blocking(move || {
+        PasswordHash::new(&hash)
+            .ok()
+            .map(|h| Argon2::default().verify_password(pw.as_bytes(), &h).is_ok())
+            .unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false)
 }
 
 pub fn mint_access(

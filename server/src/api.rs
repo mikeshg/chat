@@ -357,10 +357,51 @@ async fn push_presence(st: &SharedState, from: Uuid, to: Uuid) {
         st.send_to_user(to, &p);
     }
 }
+/// 限流用的客户端 IP。TRUST_PROXY 时取 X-Forwarded-For 最右一跳（代理自己追加的那个），
+/// 否则就是 TCP 对端——挂在代理后面却不开，所有人会共用代理的 IP 和同一个限流窗口。
+fn client_ip(st: &SharedState, headers: &HeaderMap, addr: SocketAddr) -> std::net::IpAddr {
+    st.cfg
+        .trust_proxy
+        .then(|| forwarded_ip(headers))
+        .flatten()
+        .unwrap_or(addr.ip())
+}
+
+/// X-Forwarded-For 最右一跳：前面的都是客户端自己能随便写的
+fn forwarded_ip(headers: &HeaderMap) -> Option<std::net::IpAddr> {
+    headers
+        .get("x-forwarded-for")?
+        .to_str()
+        .ok()?
+        .rsplit(',')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+#[cfg(test)]
+mod forwarded_ip_tests {
+    #[test]
+    fn takes_the_proxy_appended_hop() {
+        let mut h = axum::http::HeaderMap::new();
+        assert_eq!(super::forwarded_ip(&h), None);
+        h.insert("x-forwarded-for", "6.6.6.6, 10.0.0.7".parse().unwrap());
+        assert_eq!(super::forwarded_ip(&h), Some("10.0.0.7".parse().unwrap()));
+        h.insert("x-forwarded-for", "junk".parse().unwrap());
+        assert_eq!(super::forwarded_ip(&h), None);
+    }
+}
+
 /// IP/UID 滑动窗口限流（注册/登录按 IP、改密按 uid）：20 次 / 5 分钟
 pub(crate) fn rate_limit(st: &SharedState, key: String) -> AppResult<()> {
     const LIMIT: usize = 20;
     const WINDOW_SECS: u64 = 300;
+    // 过期的窗口不再占内存：表大了就整体扫一遍（扫一次很便宜，平时根本不触发）
+    if st.rate.len() > 10_000 {
+        st.rate
+            .retain(|_, v| v.last().is_some_and(|t| t.elapsed().as_secs() < WINDOW_SECS));
+    }
     let mut entry = st.rate.entry(key).or_default();
     entry.retain(|t| t.elapsed().as_secs() < WINDOW_SECS);
     if entry.len() >= LIMIT {
@@ -382,7 +423,7 @@ async fn register(
     headers: HeaderMap,
     Json(req): Json<RegisterReq>,
 ) -> AppResult<Json<AuthResponse>> {
-    rate_limit(&st, format!("reg:{}", addr.ip()))?;
+    rate_limit(&st, format!("reg:{}", client_ip(&st, &headers, addr)))?;
     let username = req.username.trim();
     if !valid_username(username) {
         return Err(AppError::bad_request(
@@ -400,7 +441,7 @@ async fn register(
         .unwrap_or(username)
         .to_string();
 
-    let hash = auth::hash_password(&req.password)?;
+    let hash = auth::hash_password(&req.password).await?;
     let mut tx = st.pool.begin().await?;
     // 注册全局串行：READ COMMITTED 下两个并发注册都会看到空库/同一闸门状态（双管理员）。
     // ponytail: 全局事务锁，注册低频够用。
@@ -476,17 +517,23 @@ async fn login(
     headers: HeaderMap,
     Json(req): Json<LoginReq>,
 ) -> AppResult<Json<AuthResponse>> {
-    rate_limit(&st, format!("login:{}", addr.ip()))?;
+    rate_limit(&st, format!("login:{}", client_ip(&st, &headers, addr)))?;
+    // 先不加锁验密码（Argon2 几十毫秒），再锁行；锁住后哈希变了（并发改密/重置）按密码错处理
+    let hash = sqlx::query_scalar::<_, String>("SELECT password_hash FROM users WHERE username = $1")
+        .bind(req.username.trim())
+        .fetch_optional(&st.pool)
+        .await?
+        .ok_or_else(|| AppError::unauthorized("invalid credentials"))?;
+    if !auth::verify_password(&hash, &req.password).await {
+        return Err(AppError::unauthorized("invalid credentials"));
+    }
     let mut tx = st.pool.begin().await?;
     let row = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE username = $1 FOR UPDATE")
         .bind(req.username.trim())
         .fetch_optional(&mut *tx)
         .await?
+        .filter(|r| r.password_hash == hash)
         .ok_or_else(|| AppError::unauthorized("invalid credentials"))?;
-
-    if !auth::verify_password(&row.password_hash, &req.password) {
-        return Err(AppError::unauthorized("invalid credentials"));
-    }
     if row.disabled_at.is_some() {
         return Err(AppError::forbidden("账号已被禁用"));
     }
@@ -2507,32 +2554,51 @@ pub(crate) async fn upload_quota(
     Ok((quota_mb, quota_bytes, used_bytes))
 }
 
-/// multipart 读取结果：file 字段进 buf（超限/超配额排空打标），
+/// 上传中的临时文件（FILES_DIR/.upload-*.part）。没被 store_upload 收走就在 Drop 时删掉。
+pub(crate) struct TempUpload {
+    path: std::path::PathBuf,
+    pub size: usize,
+}
+
+impl Drop for TempUpload {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// multipart 读取结果：file 字段边收边写临时文件（超限/超配额排空打标），
 /// text_fields 白名单里的普通文本字段收进 fields。
 pub(crate) struct UploadRead {
     pub fields: std::collections::HashMap<String, String>,
     pub file_name: String,
     pub mime: String,
-    pub buf: Vec<u8>,
-    pub got_file: bool,
+    pub file: Option<TempUpload>,
     pub too_large: bool,
     pub over_quota: bool,
 }
 
-/// 流式读 multipart：文件本体卡 upload_max_bytes 与配额，错误响应仍能送达。
+impl UploadRead {
+    /// 收到了非空文件
+    pub fn has_file(&self) -> bool {
+        self.file.as_ref().is_some_and(|f| f.size > 0)
+    }
+}
+
+/// 流式读 multipart：文件本体直接落盘（不进内存），卡 upload_max_bytes 与配额，错误响应仍能送达。
 pub(crate) async fn read_upload(
+    files_dir: &str,
     mp: &mut Multipart,
     max_bytes: usize,
     quota_bytes: Option<i64>,
     used_bytes: i64,
     text_fields: &[&'static str],
 ) -> AppResult<UploadRead> {
+    use tokio::io::AsyncWriteExt;
     let mut rd = UploadRead {
         fields: std::collections::HashMap::new(),
         file_name: "file".to_string(),
         mime: "application/octet-stream".to_string(),
-        buf: Vec::new(),
-        got_file: false,
+        file: None,
         too_large: false,
         over_quota: false,
     };
@@ -2542,14 +2608,22 @@ pub(crate) async fn read_upload(
         .map_err(|e| AppError::bad_request(format!("bad multipart: {e}")))?
     {
         let name = field.name().unwrap_or_default().to_string();
-        if name == "file" {
+        if name == "file" && rd.file.is_none() {
             if let Some(n) = field.file_name() {
                 rd.file_name = n.to_string();
             }
             if let Some(ct) = field.content_type() {
                 rd.mime = ct.to_string();
             }
-            rd.got_file = true;
+            // 守卫先建：中途断开 / 读失败 / 写失败都不留临时文件
+            let mut tmp = TempUpload {
+                path: std::path::Path::new(files_dir)
+                    .join(format!(".upload-{}.part", Uuid::new_v4().simple())),
+                size: 0,
+            };
+            let mut f = tokio::fs::File::create(&tmp.path)
+                .await
+                .map_err(|e| AppError::internal(format!("store file: {e}")))?;
             while let Some(chunk) = field
                 .chunk()
                 .await
@@ -2558,16 +2632,22 @@ pub(crate) async fn read_upload(
                 if rd.too_large || rd.over_quota {
                     continue; // 排空剩余 body，保证错误响应能送达
                 }
-                rd.buf.extend_from_slice(&chunk);
-                if rd.buf.len() > max_bytes {
+                tmp.size += chunk.len();
+                if tmp.size > max_bytes {
                     rd.too_large = true;
-                    rd.buf.clear();
-                } else if let Some(qb) = quota_bytes {
-                    if used_bytes + rd.buf.len() as i64 > qb {
-                        rd.over_quota = true;
-                        rd.buf.clear();
-                    }
+                } else if quota_bytes.is_some_and(|qb| used_bytes + tmp.size as i64 > qb) {
+                    rd.over_quota = true;
+                } else {
+                    f.write_all(&chunk)
+                        .await
+                        .map_err(|e| AppError::internal(format!("store file: {e}")))?;
                 }
+            }
+            f.flush()
+                .await
+                .map_err(|e| AppError::internal(format!("store file: {e}")))?;
+            if !rd.too_large && !rd.over_quota {
+                rd.file = Some(tmp);
             }
         } else if text_fields.contains(&name.as_str()) {
             let v = field
@@ -2588,26 +2668,31 @@ pub(crate) async fn store_upload(
     conv: Uuid,
     file_name: String,
     mime: String,
-    buf: Vec<u8>,
+    file: TempUpload,
     duration_ms: Option<i32>,
     agent_invocation_id: Option<Uuid>,
 ) -> AppResult<AttachmentView> {
     let id = Uuid::new_v4();
-    // 只存文件名。FILES_DIR 换位置时仍能拼回来；旧的绝对路径在下载时照旧使用。
+    // 只存文件名，文件固定在 FILES_DIR 里
     let stored = id.to_string();
     let path = stored_file_path(&st.cfg.files_dir, &stored);
-    tokio::fs::write(&path, &buf)
+    tokio::fs::rename(&file.path, &path)
         .await
         .map_err(|e| AppError::internal(format!("store file: {e}")))?;
-    let size = buf.len() as i64;
+    let size = file.size as i64;
 
-    // 图片解码/缩略图（V2 P2-1）：CPU 密集放 blocking 池；解码失败只记日志、照常入库
-    let meta = {
-        let mime2 = mime.clone();
-        tokio::task::spawn_blocking(move || crate::media::inspect_image(&mime2, &buf))
-            .await
-            .ok()
-            .flatten()
+    // 图片解码/缩略图（V2 P2-1）：只有图片才读回内存；CPU 密集放 blocking 池；解码失败只记日志、照常入库
+    let meta = if mime.starts_with("image/") {
+        let (mime2, path2) = (mime.clone(), path.clone());
+        tokio::task::spawn_blocking(move || {
+            let buf = std::fs::read(path2).ok()?;
+            crate::media::inspect_image(&mime2, &buf)
+        })
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
     };
     if meta.is_none()
         && matches!(
@@ -2671,6 +2756,7 @@ async fn upload_file(
     let uid = uid_of(&headers, &st).await?;
     let (quota_mb, quota_bytes, used_bytes) = upload_quota(&st, uid).await?;
     let rd = read_upload(
+        &st.cfg.files_dir,
         &mut mp,
         st.cfg.upload_max_bytes,
         quota_bytes,
@@ -2692,7 +2778,7 @@ async fn upload_file(
             Uuid::parse_str(v.trim()).map_err(|_| AppError::bad_request("bad conversation_id"))?
         }
     };
-    if !rd.got_file || rd.buf.is_empty() {
+    if !rd.has_file() {
         return Err(AppError::bad_request("missing file"));
     }
     require_member(&st, conv, uid).await?;
@@ -2715,7 +2801,7 @@ async fn upload_file(
             conv,
             rd.file_name,
             rd.mime,
-            rd.buf,
+            rd.file.expect("has_file"),
             duration_ms,
             None,
         )
@@ -2768,7 +2854,8 @@ async fn download_file(
     State(st): State<SharedState>,
     Path(id): Path<Uuid>,
     Query(q): Query<FileQuery>,
-) -> AppResult<impl IntoResponse> {
+    req: axum::extract::Request,
+) -> AppResult<axum::response::Response> {
     let (file_name, mime, stored, thumb_stored) =
         sqlx::query_as::<_, (String, String, String, Option<String>)>(
             "SELECT file_name, mime, storage_path, thumb_path FROM attachments WHERE id = $1",
@@ -2780,29 +2867,16 @@ async fn download_file(
     // ?thumb=1：有缩略图返回 JPEG 缩略图（缓存头与原图一致）；没有/读取失败回退原图。dl=1 忽略 thumb。
     if q.thumb == Some(1) && q.dl != Some(1) {
         if let Some(tp) = &thumb_stored {
-            if let Ok(data) = tokio::fs::read(stored_file_path(&st.cfg.files_dir, tp)).await {
+            let path = stored_file_path(&st.cfg.files_dir, tp);
+            if tokio::fs::metadata(&path).await.is_ok() {
                 let dispo = format!(
                     "inline; filename*=UTF-8''{}",
                     pct_encode(&format!("{file_name}.thumb.jpg"))
                 );
-                return Ok((
-                    [
-                        (header::CONTENT_TYPE, "image/jpeg".to_string()),
-                        (header::CONTENT_DISPOSITION, dispo),
-                        (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
-                        (
-                            header::CACHE_CONTROL,
-                            "private, max-age=31536000, immutable".into(),
-                        ),
-                    ],
-                    data,
-                ));
+                return serve_stored(path, req, "image/jpeg", &dispo).await;
             }
         }
     }
-    let data = tokio::fs::read(stored_file_path(&st.cfg.files_dir, &stored))
-        .await
-        .map_err(|_| AppError::not_found("file not found"))?;
     // dl=1 → attachment 触发下载；inline 只留给安全媒体白名单（防 Stored XSS）
     let mode = if q.dl != Some(1) && inline_safe(&mime) {
         "inline"
@@ -2810,18 +2884,44 @@ async fn download_file(
         "attachment"
     };
     let dispo = format!("{}; filename*=UTF-8''{}", mode, pct_encode(&file_name));
-    Ok((
-        [
-            (header::CONTENT_TYPE, mime),
-            (header::CONTENT_DISPOSITION, dispo),
-            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
-            (
-                header::CACHE_CONTROL,
-                "private, max-age=31536000, immutable".into(),
-            ),
-        ],
-        data,
-    ))
+    serve_stored(stored_file_path(&st.cfg.files_dir, &stored), req, &mime, &dispo).await
+}
+
+/// 流式发文件（不整个读进内存），支持 Range（音视频拖动、iOS 播放要用）和条件请求。
+/// 类型、下载方式、缓存头用库里记的，不用按扩展名猜的。
+async fn serve_stored(
+    path: std::path::PathBuf,
+    req: axum::extract::Request,
+    mime: &str,
+    dispo: &str,
+) -> AppResult<axum::response::Response> {
+    use tower::ServiceExt;
+    let res = tower_http::services::ServeFile::new(path)
+        .oneshot(req)
+        .await
+        .map_err(AppError::internal)?;
+    if res.status() == StatusCode::NOT_FOUND {
+        return Err(AppError::not_found("file not found"));
+    }
+    let mut res = res.map(axum::body::Body::new);
+    let h = res.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_str(mime)
+            .unwrap_or(header::HeaderValue::from_static("application/octet-stream")),
+    );
+    if let Ok(v) = header::HeaderValue::from_str(dispo) {
+        h.insert(header::CONTENT_DISPOSITION, v);
+    }
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("private, max-age=31536000, immutable"),
+    );
+    Ok(res)
 }
 
 // ---------- ws ticket ----------
@@ -3241,7 +3341,7 @@ async fn admin_reset_password(
     if !(6..=72).contains(&req.password.len()) {
         return Err(AppError::bad_request("password must be 6-72 chars"));
     }
-    let hash = auth::hash_password(&req.password)?;
+    let hash = auth::hash_password(&req.password).await?;
     let mut tx = st.pool.begin().await?;
     let res = sqlx::query(
         "UPDATE users SET password_hash = $2, session_version = session_version + 1
