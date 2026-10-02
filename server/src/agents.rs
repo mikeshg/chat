@@ -2077,6 +2077,20 @@ async fn invocation_start_payload(
     )
     .map_err(|e| tracing::error!(error = ?e, "tools_token mint failed"))
     .ok();
+    // 根会话里有主人以外的人（群 / 私聊，或由它们派生的互调）：别人的消息进了上下文，
+    // 宿主据此让读主人其他会话、建定时任务先走审批。查不到时按共享处理，宁可多问。
+    let shared: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM agent_invocations i
+               JOIN memberships m
+                 ON m.conversation_id = COALESCE(i.root_conversation_id, i.conversation_id)
+              WHERE i.id = $1 AND m.user_id <> $2)",
+    )
+    .bind(inv.id)
+    .bind(agent.owner)
+    .fetch_one(&st.pool)
+    .await
+    .unwrap_or(true);
     let attachments = attachment_meta(&st.pool, &inv.attachment_ids).await;
     let mut snapshot = agent_snapshot(&st.pool, agent).await;
     // A27：在 Agent 自己的对话里直接发的消息，用这条对话选的模型 / 模式，
@@ -2117,6 +2131,7 @@ async fn invocation_start_payload(
         "context": {"key": context_key, "session_id": session_id},
         "tools_token": tools_token,
         "attachments": attachments,
+        "shared": shared,
     })
     .to_string()
 }

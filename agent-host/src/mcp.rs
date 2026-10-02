@@ -29,6 +29,9 @@ struct Binding {
     token: String,
     permission_tier: String,
     approvals: Option<crate::runtime::ApprovalLink>,
+    /// 调用源自有别人在场的会话（群 / 私聊，或由它们派生的互调）。
+    /// 别人写的消息会进上下文，可能是提示词注入：读主人其他会话、建定时任务都要主人先批准。
+    shared: bool,
 }
 
 type Routes = Arc<Mutex<HashMap<String, Binding>>>;
@@ -100,7 +103,7 @@ impl McpServer {
     /// server 是 http(s) 基址（conn 侧已把 ws(s) 换算好）。
     /// 档位缺省按只读，且没有审批通道——只给不发消息的测试用。
     pub fn register(&self, server: String, token: String) -> McpHandle {
-        self.register_with(server, token, "read_only".into(), None)
+        self.register_with(server, token, "read_only".into(), None, false)
     }
 
     /// 把这次调用的权限档位和审批通道一起登记。send_message 用它们决定要不要先问主人。
@@ -110,6 +113,7 @@ impl McpServer {
         token: String,
         permission_tier: String,
         approvals: Option<crate::runtime::ApprovalLink>,
+        shared: bool,
     ) -> McpHandle {
         let id = uuid::Uuid::new_v4().simple().to_string();
         self.routes.lock().unwrap().insert(
@@ -119,6 +123,7 @@ impl McpServer {
                 token,
                 permission_tier,
                 approvals,
+                shared,
             },
         );
         McpHandle {
@@ -574,13 +579,26 @@ async fn await_send_approval(
     detail: &str,
     locations: &[String],
 ) -> Result<(), String> {
+    await_approval(b, "send_message", title, detail, locations)
+        .await
+        .map_err(|e| if e.is_empty() { "主人拒绝了发送".into() } else { e })
+}
+
+/// 向主人要一次批准。拒绝返回空串 Err，由调用方换成具体说法。
+async fn await_approval(
+    b: &Binding,
+    kind: &str,
+    title: &str,
+    detail: &str,
+    locations: &[String],
+) -> Result<(), String> {
     let Some(link) = b.approvals.clone() else {
         return Err("审批通道不可用".into());
     };
     let request_id = uuid::Uuid::new_v4().to_string();
     let tool_call = json!({
         "title": title,
-        "kind": "send_message",
+        "kind": kind,
         "locations": locations,
         "detail": detail,
     });
@@ -607,9 +625,40 @@ async fn await_send_approval(
     }
     let option_id = rx.await.map_err(|_| "审批等待被中断".to_string())?;
     if !option_allowed(&options, &option_id) {
-        return Err("主人拒绝了发送".into());
+        return Err(String::new());
     }
     Ok(())
+}
+
+/// shared 调用里要先问主人的工具：都能把主人别处的内容带进这次（有别人在场的）调用，
+/// 或者在无人值守时再跑一遍。
+const SHARED_GATED: &[&str] = &[
+    "list_conversations",
+    "search_messages",
+    "read_conversation",
+    "create_schedule",
+];
+
+async fn shared_gate(b: &Binding, name: &str, args: &Value) -> Result<(), String> {
+    if !b.shared || !SHARED_GATED.contains(&name) {
+        return Ok(());
+    }
+    let (kind, what) = match name {
+        "list_conversations" => ("read", "列出你的全部会话".to_string()),
+        "search_messages" => (
+            "search",
+            format!("搜索你的全部会话：{}", args["query"].as_str().unwrap_or("")),
+        ),
+        "read_conversation" => (
+            "read",
+            format!("读取会话 {}", args["conversation_id"].as_str().unwrap_or("")),
+        ),
+        _ => ("other", format!("创建定时任务：{}", args["prompt"].as_str().unwrap_or(""))),
+    };
+    let title: String = format!("（群聊 / 私聊里触发）{what}").chars().take(200).collect();
+    await_approval(b, kind, &title, &args.to_string(), &[])
+        .await
+        .map_err(|e| if e.is_empty() { "主人拒绝了这次操作".into() } else { e })
 }
 
 fn file_paths(args: &Value) -> Result<Vec<String>, String> {
@@ -1009,6 +1058,9 @@ async fn call_tool(st: &McpState, b: &Binding, params: &Value) -> Result<Value, 
         return Err((-32602, format!("unknown tool {name}")));
     };
     // 工具执行失败按 MCP 约定走 isError 结果，而不是 JSON-RPC 层 error
+    if let Err(e) = shared_gate(b, name, args).await {
+        return Ok(json!({"content":[{"type":"text","text":e}],"isError":true}));
+    }
     match (tool.call)(st, b, args).await {
         Ok(text) => Ok(json!({"content":[{"type":"text","text":text}]})),
         Err(e) => Ok(json!({"content":[{"type":"text","text":e}],"isError":true})),

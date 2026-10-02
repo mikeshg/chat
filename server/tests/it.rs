@@ -11603,6 +11603,28 @@ async fn a11_other_member_at_does_not_invoke() {
     host.shutdown().await;
 }
 
+/// invocation_start.shared：专属会话里只有主人 → false；群里 @ → true（宿主据此让读其他会话先审批）
+#[tokio::test]
+async fn invocation_start_marks_shared_when_others_present() {
+    let base = spawn_named_db(&format!("chat_it_shr_{}", uniq())).await;
+    let owner = register(&base, &format!("shro_{}", uniq())).await;
+    let member = register(&base, &format!("shrm_{}", uniq())).await;
+    let (mut sh, host_id) = spawn_raw_host(&base, &owner).await;
+    let (st, agent) = create_agent(&base, &owner, &host_id, "bot").await;
+    assert_eq!(st, 200, "{agent}");
+    let own_conv = agent["conversation_id"].as_str().unwrap().to_string();
+    let gid = a11_group(&base, &owner, &[&member]).await;
+    let (mut so, _) = tokio_tungstenite::connect_async(ws_url(&base, &owner).await)
+        .await
+        .unwrap();
+    for (conv, text, shared) in [(own_conv.as_str(), "hi", false), (gid.as_str(), "@bot hi", true)] {
+        send_ws(&mut so, conv, &uuid::Uuid::new_v4().to_string(), text).await;
+        let f = until_frame(&mut sh, "invocation_start", A01Dur::from_secs(10)).await;
+        let start = f.iter().find(|x| x["type"] == "invocation_start").unwrap();
+        assert_eq!(start["shared"], shared, "{text}: {start}");
+    }
+}
+
 /// 3. 同名：主人的手打 @bot 调用 Agent 且不提及成员；别人的 @bot 只提及成员。
 #[tokio::test]
 async fn a11_same_name_prefers_own_agent() {

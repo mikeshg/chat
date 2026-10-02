@@ -267,6 +267,8 @@ fn start_invocation(s: &Arc<Shared>, v: &Value) {
                 token,
                 spec.permission_tier.clone(),
                 Some(approvals.clone()),
+                // 旧服务端不带这个字段：按不共享处理（保持原行为）
+                v["shared"].as_bool().unwrap_or(false),
             );
             (
                 vec![InjectedMcp {

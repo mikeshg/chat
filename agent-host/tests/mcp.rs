@@ -365,7 +365,7 @@ async fn send_message_read_only_reject_does_not_post() {
         tx,
         registry: registry.clone(),
     };
-    let h = mcp.register_with(backend, "TOK".into(), "read_only".into(), Some(link));
+    let h = mcp.register_with(backend, "TOK".into(), "read_only".into(), Some(link), false);
     let url = h.url.clone();
     let long = "字".repeat(90);
     let call = tokio::spawn(async move {
@@ -413,6 +413,51 @@ async fn send_message_read_only_reject_does_not_post() {
     let text = v["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("主人拒绝了发送"), "{text}");
     assert!(seen.lock().unwrap().iter().all(|s| !s.starts_with("POST")));
+}
+
+/// 有别人在场的调用（shared）：读主人的其他会话要先批准；拒绝不碰服务端，批准后照常；
+/// 只有主人在场的调用不问。
+#[tokio::test]
+async fn shared_invocation_gates_reading_other_conversations() {
+    let (backend, _bt, seen) = fake_send_backend().await;
+    let mcp = McpServer::start().unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let registry = agent_host::runtime::ApprovalRegistry::new();
+    let link = agent_host::runtime::ApprovalLink {
+        tx,
+        registry: registry.clone(),
+    };
+    let list = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                      "params":{"name":"list_conversations","arguments":{}}});
+    let gets = || seen.lock().unwrap().iter().filter(|s| s.starts_with("GET")).count();
+
+    let shared = mcp.register_with(backend.clone(), "TOK".into(), "full".into(), Some(link), true);
+    for (decision, expect_get) in [("reject_once", 0), ("allow_once", 1)] {
+        let (url, body) = (shared.url.clone(), list.clone());
+        let call = tokio::spawn(async move { rpc(&url, body).await });
+        let notice = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("shared 调用应先发审批（即使档位是 full）")
+            .unwrap();
+        assert_eq!(notice.tool_call["kind"], "read");
+        assert!(notice.tool_call["title"].as_str().unwrap().contains("全部会话"));
+        assert_eq!(gets(), 0, "批准前不应读服务端");
+        assert!(registry.resolve(&notice.request_id, decision.into()));
+        let v = call.await.unwrap().1.unwrap();
+        assert_eq!(gets(), expect_get, "{decision}");
+        if decision == "reject_once" {
+            assert_eq!(v["result"]["isError"], true);
+            let text = v["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("主人拒绝了这次操作"), "{text}");
+        } else {
+            assert!(v["result"]["isError"].is_null(), "{v}");
+        }
+    }
+
+    let private = mcp.register_with(backend, "TOK".into(), "read_only".into(), None, false);
+    let v = rpc(&private.url, list).await.1.unwrap();
+    assert!(v["result"]["isError"].is_null(), "只有主人在场不应要批准: {v}");
+    assert_eq!(gets(), 2);
 }
 
 // ===== Agent A20 =====
@@ -509,7 +554,7 @@ async fn send_message_read_only_discloses_full_text_and_paths() {
         tx,
         registry: registry.clone(),
     };
-    let h = mcp.register_with(backend, "TOK".into(), "read_only".into(), Some(link));
+    let h = mcp.register_with(backend, "TOK".into(), "read_only".into(), Some(link), false);
     let url = h.url.clone();
 
     // 真实文件，用带 .. 的绝对路径传入：展示/上传的应是规范化后的绝对路径
@@ -586,7 +631,7 @@ async fn send_message_read_only_over_limit_no_approval() {
         tx,
         registry: registry.clone(),
     };
-    let h = mcp.register_with(backend, "TOK".into(), "read_only".into(), Some(link));
+    let h = mcp.register_with(backend, "TOK".into(), "read_only".into(), Some(link), false);
 
     let (st, v) = rpc(
         &h.url,
@@ -656,7 +701,7 @@ async fn send_message_workspace_and_full_post_directly() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let registry = agent_host::runtime::ApprovalRegistry::new();
         let link = agent_host::runtime::ApprovalLink { tx, registry };
-        let h = mcp.register_with(backend, "TOK".into(), tier.into(), Some(link));
+        let h = mcp.register_with(backend, "TOK".into(), tier.into(), Some(link), false);
         let (st, v) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             rpc(
