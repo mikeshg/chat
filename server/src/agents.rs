@@ -348,6 +348,28 @@ fn valid_tier(tier: &str) -> bool {
     matches!(tier, "read_only" | "workspace" | "full")
 }
 
+/// 档位从低到高：read_only < workspace < full
+fn tier_rank(tier: &str) -> u8 {
+    match tier {
+        "full" => 2,
+        "workspace" => 1,
+        _ => 0,
+    }
+}
+
+/// patch_agent 锁行时读出的现值：归属 + 决定宿主执行什么的字段
+#[derive(sqlx::FromRow)]
+struct ExecRow {
+    owner_id: Uuid,
+    deleted_at: Option<DateTime<Utc>>,
+    host_id: Uuid,
+    runtime: Value,
+    cwd: String,
+    extra_dirs: Vec<String>,
+    env: Value,
+    permission_tier: String,
+}
+
 /// 缺省 = 只读。非法值 400。
 fn normalize_tier(tier: Option<&str>) -> AppResult<String> {
     match tier.map(str::trim).filter(|s| !s.is_empty()) {
@@ -513,7 +535,11 @@ pub async fn patch_agent(
     Path(id): Path<Uuid>,
     Json(req): Json<PatchAgentReq>,
 ) -> AppResult<Json<AgentView>> {
-    let uid = uid(&headers, &st).await?;
+    let ctx = auth::require_auth(&st, &headers).await?;
+    let uid = ctx.user.id;
+    if !crate::agent_access::user_allows(&st.pool, uid).await? {
+        return Err(AppError::forbidden("agent_access_denied"));
+    }
     if let Some(Some(m)) = &req.output_mode {
         if !valid_output_mode(m) {
             return Err(AppError::bad_request("bad_output_mode"));
@@ -569,18 +595,32 @@ pub async fn patch_agent(
     };
 
     let mut tx = st.pool.begin().await?;
-    let row = sqlx::query_as::<_, (Uuid, Option<DateTime<Utc>>)>(
-        "SELECT owner_id, deleted_at FROM agents WHERE id = $1 FOR UPDATE",
+    let row = sqlx::query_as::<_, ExecRow>(
+        "SELECT owner_id, deleted_at, host_id, runtime, cwd, extra_dirs, env, permission_tier
+           FROM agents WHERE id = $1 FOR UPDATE",
     )
     .bind(id)
     .fetch_optional(&mut *tx)
     .await?;
     // 已删除与不存在、别人的 Agent 一样 404，不暴露存在性
-    if !matches!(&row, Some((owner, None)) if *owner == uid) {
+    let Some(cur) = row.filter(|r| r.owner_id == uid && r.deleted_at.is_none()) else {
         return Err(AppError::not_found("agent not found"));
-    }
+    };
     if req.host_id {
         return Err(AppError::bad_request("host_immutable"));
+    }
+    // 决定宿主上跑什么、在哪跑、能做多少的字段，和添加一样只能在那台电脑本机改：
+    // 否则任何拿到登录凭据的客户端都能把命令换掉，再发条消息就在宿主上执行。
+    // 前端保存时整表单提交，所以只拦真正变化的字段；降权限档位任何客户端都可以。
+    let changes_exec = new_runtime.as_ref().is_some_and(|v| *v != cur.runtime)
+        || new_cwd.as_ref().is_some_and(|v| *v != cur.cwd)
+        || extra_dirs.as_ref().is_some_and(|v| *v != cur.extra_dirs)
+        || env.as_ref().is_some_and(|v| *v != cur.env)
+        || permission_tier
+            .as_deref()
+            .is_some_and(|t| tier_rank(t) > tier_rank(&cur.permission_tier));
+    if changes_exec && !st.host_is_local_session(cur.host_id, ctx.sid) {
+        return Err(AppError::forbidden("host_not_local"));
     }
     if let Some(m) = req.output_mode {
         sqlx::query("UPDATE agents SET output_mode = $2, updated_at = now() WHERE id = $1")

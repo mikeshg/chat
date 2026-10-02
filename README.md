@@ -37,6 +37,7 @@
 ## 快速开始（服务端）
 
 ```bash
+echo "JWT_SECRET=$(openssl rand -hex 32)" > .env   # 只做一次；没有它服务端拒绝启动
 docker compose up -d          # WSL/任意有 Docker 的环境
 # 浏览器打开 http://localhost:28080
 ```
@@ -47,15 +48,15 @@ docker compose up -d          # WSL/任意有 Docker 的环境
 git pull && docker compose up -d --build
 ```
 
-环境变量：`DATABASE_URL`、`JWT_SECRET`（生产必须改）、`PORT`、`BIND`、`APP_DIST`、`FILES_DIR`（附件存储目录，compose 挂 `chat-files` 卷）、`UPLOAD_MAX_MB`（单文件上限，默认 25）。
+环境变量：`DATABASE_URL`、`JWT_SECRET`（必填，至少 32 个字符；不设置服务端拒绝启动。换掉后已登录的设备会自动刷新凭据，不用重新登录）、`PORT`、`BIND`、`APP_DIST`、`FILES_DIR`（附件存储目录，compose 挂 `chat-files` 卷）、`UPLOAD_MAX_MB`（单文件上限，默认 25）。
 
 ## 开发
 
 ```bash
-# 数据库（主机端口 15432）
+# 数据库（只监听本机 127.0.0.1:15432）
 docker compose up db -d
-# 后端（:28080）
-cd server && cargo run
+# 后端（:28080）；开发用任意 32 位以上的字符串即可
+cd server && JWT_SECRET=$(openssl rand -hex 32) cargo run
 # 前端（:5173，已配置 /v1 代理到 :28080）
 pnpm install && pnpm dev
 ```

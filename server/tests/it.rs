@@ -18635,6 +18635,61 @@ async fn a26_create_agent_requires_local_host_session() {
     assert_eq!(body["error"], "host_not_local");
 }
 
+/// 命令 / 目录 / 环境变量 / 调高档位只能在本机改；其余字段、原样回传、降档任何客户端都行。
+#[tokio::test]
+async fn a26_patch_exec_fields_requires_local_host_session() {
+    let base = spawn_named_db(&format!("chat_it_a26p_{}", uniq())).await;
+    let name = format!("a26p_{}", uniq());
+    let a = register(&base, &name).await;
+    let (ha, host_id) = spawn_host(&base, &a, uuid::Uuid::new_v4()).await;
+    let (st, agent) = create_agent(&base, &a, &host_id, "guarded").await;
+    assert_eq!(st, 200, "{agent}");
+    let id = agent["id"].as_str().unwrap();
+    let phone = login_device(&base, &name, "secret123", "phone").await;
+
+    for body in [
+        json!({"runtime": {"command": "powershell", "args": ["-c", "calc"]}}),
+        json!({"env": {"NODE_OPTIONS": "--require evil.js"}}),
+        json!({"cwd": "C:/elsewhere"}),
+        json!({"extra_dirs": ["C:/"]}),
+        json!({"permission_tier": "full"}),
+    ] {
+        let r = patch_agent(&base, &phone, id, body.clone()).await;
+        assert_eq!(r.status().as_u16(), 403, "远程改 {body} 应拒绝");
+        let v: Value = r.json().await.unwrap();
+        assert_eq!(v["error"], "host_not_local");
+    }
+
+    // 手机整表单保存：执行字段原样带回、只改了 model → 放行
+    let r = patch_agent(
+        &base,
+        &phone,
+        id,
+        json!({
+            "runtime": agent["runtime"],
+            "cwd": agent["cwd"],
+            "extra_dirs": agent["extra_dirs"],
+            "env": agent["env"],
+            "permission_tier": agent["permission_tier"],
+            "model": "fast",
+        }),
+    )
+    .await;
+    assert_eq!(r.status().as_u16(), 200);
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["model"], "fast");
+    assert_eq!(v["runtime"], agent["runtime"], "被拒的改动不应落库");
+
+    // 本机调高，远程可以降回去
+    let r = patch_agent(&base, &a, id, json!({"permission_tier": "workspace"})).await;
+    assert_eq!(r.status().as_u16(), 200);
+    let r = patch_agent(&base, &phone, id, json!({"permission_tier": "read_only"})).await;
+    assert_eq!(r.status().as_u16(), 200);
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["permission_tier"], "read_only");
+    ha.shutdown().await;
+}
+
 // ===== 未知 /v1 路径 =====
 // 客户端比服务端新时调用了不存在的接口：回带 CORS 的 JSON 404，而不是落到静态托管的 405
 #[tokio::test]

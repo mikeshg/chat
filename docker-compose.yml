@@ -6,7 +6,8 @@ services:
       POSTGRES_PASSWORD: chat
       POSTGRES_DB: chat
     ports:
-      - "15432:5432"
+      # 只给本机开发用；服务端走 compose 内网，不需要对外开放
+      - "127.0.0.1:15432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -21,7 +22,8 @@ services:
       dockerfile: server/Dockerfile
     environment:
       DATABASE_URL: postgres://chat:chat@db:5432/chat
-      JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me}
+      # 必填：在本目录 .env 里写 JWT_SECRET=<openssl rand -hex 32>，没设置服务端拒绝启动
+      JWT_SECRET: ${JWT_SECRET:-}
       PORT: 8080
       APP_DIST: /app/dist
       FILES_DIR: /data/files

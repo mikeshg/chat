@@ -205,7 +205,8 @@ export function agentErrText(e: unknown): string {
     bad_queue_timeout: "排队超时不合法",
     bad_permission_tier: "权限档位不合法",
     host_offline: "电脑不在线",
-    host_not_local: "只能添加到正在运行 Chat 桌面端的这台电脑",
+    host_not_local:
+      "添加 Agent、改命令 / 目录 / 环境变量、调高权限，只能在运行它的那台电脑的 Chat 桌面端上操作",
     bad_label: "名称需要 1–60 个字符",
     probe_timeout: "读取超时，程序可能卡在启动或登录",
     bad_path: "路径不合法（1–500 字，不能有控制字符）",
