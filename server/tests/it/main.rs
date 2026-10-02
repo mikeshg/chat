@@ -1,0 +1,61 @@
+//! 集成测试：需要本地 Postgres（docker compose up db）。测试库 chat_test 自动创建。
+//! 运行：cargo test --manifest-path server/Cargo.toml
+
+use chat_server::build_router;
+use chat_server::config::Config;
+use chat_server::state::AppState;
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{json, Value};
+use sqlx::postgres::PgPoolOptions;
+use std::net::SocketAddr;
+use std::time::Duration as A01Dur;
+use tokio::net::TcpListener;
+use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+mod admin;
+mod agent_access;
+mod agent_approvals;
+mod agent_attachments;
+mod agent_basic;
+mod agent_builtin;
+mod agent_calls;
+mod agent_config;
+mod agent_context;
+mod agent_hosts;
+mod agent_invocations;
+mod agent_mentions;
+mod agent_registry;
+mod agent_schedules;
+mod agent_tools;
+mod agent_workspaces;
+mod announcements;
+mod attachments;
+mod avatar;
+mod backup;
+mod basics;
+mod common;
+mod conv_prefs;
+mod forward;
+mod invites;
+mod messages;
+mod polls;
+mod push;
+mod regressions;
+mod search;
+mod sessions;
+mod voice;
+
+use agent_approvals::*;
+use agent_config::*;
+use agent_invocations::*;
+use agent_mentions::*;
+use agent_schedules::*;
+use agent_tools::*;
+use avatar::*;
+use backup::*;
+use common::*;
+use conv_prefs::*;
+use messages::*;
+use push::*;
+use regressions::*;
+use sessions::*;
