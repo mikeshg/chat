@@ -1,8 +1,4 @@
-pub mod agent_access;
-pub mod agent_tools;
-pub mod agents;
 pub mod api;
-pub mod approvals;
 pub mod auth;
 pub mod backup;
 pub mod client_update;
@@ -10,15 +6,12 @@ pub mod config;
 pub mod db;
 pub mod domain;
 pub mod error;
-pub mod host_ws;
 pub mod media;
 pub mod model;
 pub mod push;
-pub mod schedules;
 pub mod sessions;
 pub mod settings;
 pub mod state;
-pub mod workspaces;
 pub mod ws;
 
 use axum::Router;

@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react";
-import { stopAgentHost, syncAgentHost } from "./agentHost";
 import { auth, loadSession } from "./api";
 import { readDrafts } from "./drafts";
 import { syncWindowTitle, unreadTitle } from "./notify";
@@ -16,7 +15,6 @@ export default function App() {
     const onLogout = () => {
       flushDrafts(); // 先把在途草稿落盘（本地存储保留，同账号下次登录恢复）
       stopWs();
-      void stopAgentHost(); // A01：桌面端退出登录停掉宿主
       setState({
         me: null,
         conversations: [],
@@ -33,7 +31,6 @@ export default function App() {
         drafts: {},
         avatars: {},
         pendingJump: null,
-        localHostId: null,
       });
     };
     window.addEventListener("chat:logout", onLogout);
@@ -48,7 +45,6 @@ export default function App() {
         const me = await auth.me();
         setState({ me, drafts: readDrafts(localStorage, me.id) });
         void startWs();
-        void syncAgentHost(me); // 桌面壳：有使用权才拉起宿主
       } catch {
         // session 已失效
       } finally {

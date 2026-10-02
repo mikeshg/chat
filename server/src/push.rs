@@ -293,13 +293,6 @@ async fn dispatch(st: &SharedState, conv: Uuid, msg: &MessageView) -> AppResult<
         return Ok(());
     }
     // 候选成员一条 SQL 取齐：已开推送（排除发送者）+ 会话偏好（无行 = 未静音未归档）。
-    // Agent A01：Agent 消息的作者栏是 Agent——对主人按「别人发来的消息」处理，
-    // 不排除 sender_id（=主人），否则主人收不到自己 Agent 的回复推送。
-    let exclude = if msg.agent.is_some() {
-        Uuid::nil()
-    } else {
-        msg.sender_id
-    };
     let rows = sqlx::query_as::<
         _,
         (
@@ -320,7 +313,7 @@ async fn dispatch(st: &SharedState, conv: Uuid, msg: &MessageView) -> AppResult<
           WHERE ps.enabled AND ps.user_id <> $2",
     )
     .bind(conv)
-    .bind(exclude)
+    .bind(msg.sender_id)
     .fetch_all(&st.pool)
     .await?;
     if rows.is_empty() {
@@ -332,12 +325,7 @@ async fn dispatch(st: &SharedState, conv: Uuid, msg: &MessageView) -> AppResult<
         st.push_last.retain(|_, t| t.elapsed() < COALESCE * 4);
     }
 
-    // Agent A01：推送标题/正文署名用 Agent 名（sender_name 是主人自己，看着别扭）
-    let sender_display = msg
-        .agent
-        .as_ref()
-        .map(|a| a.name.clone())
-        .unwrap_or_else(|| msg.sender_name.clone());
+    let sender_display = msg.sender_name.clone();
     let title = match domain::conv_kind(&st.pool, conv).await?.as_deref() {
         Some("group") => {
             sqlx::query_scalar::<_, Option<String>>("SELECT name FROM conversations WHERE id = $1")

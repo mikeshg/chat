@@ -1,11 +1,9 @@
 import { useEffect } from "react";
-import { canUseAgent } from "../agentAccess";
-import { dismissToast, isWorkspaceConv, setState, useApp } from "../store";
+import { dismissToast, setState, useApp } from "../store";
 import { openConversation, refreshCatalogs } from "../ws";
 import ConvList from "./chat/ConvList";
 import ChatView from "./chat/ChatView";
 import ContactsPanel from "./ContactsPanel";
-import AgentManager from "./agent/AgentManager";
 import MePanel from "./me/MePanel";
 import AdminPanel from "./admin/AdminPanel";
 import Avatar from "./Avatar";
@@ -29,10 +27,7 @@ export default function ChatScreen() {
   }, []);
 
   const pendingCount = s.requests.incoming.length;
-  // A27：工作区对话的未读算在 Agent 按钮上
-  const totalUnread = s.conversations.reduce((a, c) => a + (isWorkspaceConv(c) ? 0 : c.unread_count), 0);
-  const agentUnread = s.conversations.reduce((a, c) => a + (isWorkspaceConv(c) ? c.unread_count : 0), 0);
-  const activeInAgents = isWorkspaceConv(s.conversations.find((c) => c.id === s.activeConv));
+  const totalUnread = s.conversations.reduce((a, c) => a + c.unread_count, 0);
 
   return (
     <div className="shell">
@@ -47,7 +42,7 @@ export default function ChatScreen() {
         />
         <button
           className={`rail-btn ${s.tab === "chats" ? "on" : ""}`}
-          onClick={() => setState(activeInAgents ? { tab: "chats", activeConv: null } : { tab: "chats" })}
+          onClick={() => setState({ tab: "chats" })}
           title="聊天"
         >
           会话
@@ -61,16 +56,6 @@ export default function ChatScreen() {
           联系人
           {pendingCount > 0 && <i className="badge">{pendingCount}</i>}
         </button>
-        {canUseAgent(s.me) && (
-          <button
-            className={`rail-btn ${s.tab === "agents" ? "on" : ""}`}
-            onClick={() => setState({ tab: "agents" })}
-            title="Agent"
-          >
-            Agent
-            {agentUnread > 0 && <i className="badge">{agentUnread > 99 ? "99+" : agentUnread}</i>}
-          </button>
-        )}
         <button
           className={`rail-btn ${s.tab === "me" ? "on" : ""}`}
           onClick={() => setState({ tab: "me" })}
@@ -99,7 +84,6 @@ export default function ChatScreen() {
         </>
       )}
       {s.tab === "contacts" && <ContactsPanel />}
-      {s.tab === "agents" && canUseAgent(s.me) && <AgentManager />}
       {s.tab === "me" && <MePanel />}
       {s.tab === "admin" && s.me?.role === "admin" && <AdminPanel />}
 

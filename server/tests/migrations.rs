@@ -84,6 +84,7 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
         include_str!("../migrations/0032_host_offline_grace.sql"),
         include_str!("../migrations/0033_agent_workspaces.sql"),
         include_str!("../migrations/0034_agent_scratch_workspace.sql"),
+        include_str!("../migrations/0035_drop_agents.sql"),
     ] {
         sqlx::raw_sql(script).execute(&pool).await.unwrap();
     }
@@ -137,61 +138,20 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
             assert_eq!(deleted.orphan_files, vec!["migration-shared-path"]);
         }
     }
-    let access_col = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(
-            SELECT 1 FROM information_schema.columns
-             WHERE table_name = 'users' AND column_name = 'agent_access')",
+    // 0035 把 Agent 的表、列和设置全部拿掉
+    let leftovers = sqlx::query_scalar::<_, i64>(
+        "SELECT (SELECT count(*) FROM information_schema.tables WHERE table_name LIKE 'agent%')
+              + (SELECT count(*) FROM information_schema.columns
+                  WHERE column_name IN ('agent_id', 'agent_access', 'agent_steps', 'workspace_id'))
+              + (SELECT count(*) FROM server_settings WHERE key LIKE 'agent%')",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(access_col, "0025 adds users.agent_access on existing data");
-    let enabled = sqlx::query_scalar::<_, Option<bool>>(
-        "SELECT (value = 'true'::jsonb) FROM server_settings WHERE key = 'agent_enabled'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(enabled, Some(true));
-    let tier_col = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(
-            SELECT 1 FROM information_schema.columns
-             WHERE table_name = 'agents' AND column_name = 'permission_tier')",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert!(tier_col, "0028 adds agents.permission_tier");
-    let approvals = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(
-            SELECT 1 FROM information_schema.tables
-             WHERE table_name = 'agent_approvals')",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert!(approvals, "0028 creates agent_approvals");
-    let parent_col = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(
-            SELECT 1 FROM information_schema.columns
-             WHERE table_name = 'agent_invocations' AND column_name = 'parent_invocation_id')",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert!(
-        parent_col,
-        "0029 adds agent_invocations.parent_invocation_id"
+    assert_eq!(
+        leftovers, 0,
+        "0035 drops every agent table, column and setting"
     );
-    let depth_col = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(
-            SELECT 1 FROM information_schema.columns
-             WHERE table_name = 'agent_user_settings' AND column_name = 'max_call_depth')",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert!(depth_col, "0029 adds agent_user_settings.max_call_depth");
 
     pool.close().await;
     sqlx::query(&format!("DROP DATABASE {name}"))
@@ -407,6 +367,118 @@ async fn upgrade_creates_search_trgm_index() {
     .await
     .unwrap();
     assert_eq!(hits, 1);
+
+    pool.close().await;
+    sqlx::query(&format!("DROP DATABASE {name}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+}
+
+/// 0035：Agent 专属会话整个删掉；Agent 在群里发的消息删掉，人发的留下。
+#[tokio::test]
+async fn drop_agents_removes_agent_messages_and_conversations() {
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://chat:chat@localhost:15432/postgres".into());
+    let options = PgConnectOptions::from_str(&database_url).unwrap();
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone())
+        .await
+        .unwrap();
+    let name = format!("chat_migration_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE DATABASE {name}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let pool = PgPoolOptions::new()
+        .max_connections(3)
+        .connect_with(options.database(&name))
+        .await
+        .unwrap();
+    let mut files: Vec<_> = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    files.sort();
+    let (before, after): (Vec<_>, Vec<_>) = files
+        .into_iter()
+        .partition(|p| p.file_name().unwrap().to_str().unwrap() < "0035");
+    for p in &before {
+        sqlx::raw_sql(&std::fs::read_to_string(p).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let owner = Uuid::new_v4();
+    let group = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id,username,display_name,password_hash) VALUES ($1,'owner','Owner','x')")
+        .bind(owner).execute(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO conversations (id,type,name,owner_id,last_seq) VALUES ($1,'group','G',$2,2)",
+    )
+    .bind(group)
+    .bind(owner)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let host: Uuid = sqlx::query_scalar(
+        "INSERT INTO agent_hosts (user_id,install_id) VALUES ($1,gen_random_uuid()) RETURNING id",
+    )
+    .bind(owner)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let agent: Uuid = sqlx::query_scalar(
+        "INSERT INTO agents (owner_id,host_id,name,runtime) VALUES ($1,$2,'bot','{}') RETURNING id",
+    )
+    .bind(owner)
+    .bind(host)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let agent_conv: Uuid = sqlx::query_scalar("INSERT INTO conversations (type,owner_id,agent_id,last_seq) VALUES ('agent',$1,$2,1) RETURNING id")
+        .bind(owner).bind(agent).fetch_one(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO messages (conversation_id,seq,sender_id,content) VALUES ($1,1,$2,'hi agent')",
+    )
+    .bind(agent_conv)
+    .bind(owner)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO messages (conversation_id,seq,sender_id,content) VALUES ($1,1,$2,'@bot hi')",
+    )
+    .bind(group)
+    .bind(owner)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO messages (conversation_id,seq,sender_id,content,agent_id) VALUES ($1,2,$2,'reply',$3)")
+        .bind(group).bind(owner).bind(agent).execute(&pool).await.unwrap();
+
+    for p in &after {
+        sqlx::raw_sql(&std::fs::read_to_string(p).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let left: Vec<String> =
+        sqlx::query_scalar("SELECT content FROM message_views WHERE conversation_id = $1")
+            .bind(group)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(left, vec!["@bot hi".to_string()]);
+    let agent_convs: i64 = sqlx::query_scalar("SELECT count(*) FROM conversations WHERE id = $1")
+        .bind(agent_conv)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(agent_convs, 0);
 
     pool.close().await;
     sqlx::query(&format!("DROP DATABASE {name}"))

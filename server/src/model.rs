@@ -1,5 +1,4 @@
 use chrono::{DateTime, Utc};
-use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -19,8 +18,6 @@ pub struct UserRow {
     pub avatar_path: Option<String>,
     /// 每次更换/移除 +1，客户端据此失效头像缓存
     pub avatar_version: i32,
-    /// Agent 使用权覆盖。NULL = 跟随全局默认（A08）
-    pub agent_access: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -33,9 +30,6 @@ pub struct UserPublic {
     /// 头像版本（拼进 GET /users/{id}/avatar?v= 做缓存失效）
     pub avatar_version: i32,
     pub has_avatar: bool,
-    /// 生效后的 Agent 使用权。只出现在「自己」的响应里（GET /users/me、登录）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent_access: Option<bool>,
 }
 
 impl From<&UserRow> for UserPublic {
@@ -48,15 +42,7 @@ impl From<&UserRow> for UserPublic {
             last_seen_at: u.last_seen_at,
             avatar_version: u.avatar_version,
             has_avatar: u.avatar_path.is_some(),
-            agent_access: None,
         }
-    }
-}
-
-impl UserPublic {
-    pub fn with_agent_access(mut self, allowed: bool) -> Self {
-        self.agent_access = Some(allowed);
-        self
     }
 }
 
@@ -243,51 +229,6 @@ pub struct MessageView {
     pub sender_has_avatar: bool,
     /// 转发消息：原发送者展示名快照
     pub forwarded_from: Option<String>,
-    /// Agent A01：非空 = 本消息由该 Agent 发出（sender_id 仍是主人）。
-    /// 客户端归属判断一律看本字段，不能只看 sender_id。
-    pub agent: Option<AgentRef>,
-    /// Agent A03：该消息附带的已完成步骤记录（仅 Agent 消息可能有值）
-    pub agent_steps: Option<Vec<AgentStepView>>,
-    /// Agent A12：kind='approval' 时的审批卡片。旧客户端忽略。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub approval: Option<ApprovalView>,
-}
-
-/// 审批卡片（挂在 Agent 专属会话的消息上）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApprovalView {
-    pub id: Uuid,
-    pub status: String,
-    pub request: serde_json::Value,
-    pub options: serde_json::Value,
-    pub decision: Option<String>,
-}
-
-/// 一条已完成步骤的持久化形状（messages.agent_steps jsonb 元素）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentStepView {
-    pub id: String,
-    pub title: String,
-    pub kind: String,
-    pub ok: bool,
-}
-
-/// Agent A03：agent_stream 帧的步骤对象；ok=null 表示进行中。
-#[derive(Debug, Clone, Serialize)]
-pub struct StreamStepView {
-    pub id: String,
-    pub title: String,
-    pub kind: String,
-    pub ok: Option<bool>,
-}
-
-/// 消息上的 Agent 归属标记（messages.agent_id → agents.id/name 快照读）。
-#[derive(Debug, Clone, Serialize)]
-pub struct AgentRef {
-    pub id: Uuid,
-    pub name: String,
-    /// 当前头像版本；0 = 没有头像。客户端用 GET /agents/{id}/avatar?v=
-    pub avatar_version: i32,
 }
 
 /// 群公告（会话列表随 ConversationView 下发；清空时整字段为 null）。
@@ -332,27 +273,7 @@ pub struct ConversationView {
     pub preference: ConversationPref,
     /// 群公告；私聊 / 文件传输助手 / 未设置时为 null。旧客户端忽略
     pub announcement: Option<AnnouncementView>,
-    /// Agent A01：kind='agent' 时的专属 Agent（含宿主在线态，供列表/标题用）
-    pub agent: Option<ConvAgentRef>,
     pub created_at: DateTime<Utc>,
-}
-
-/// AgentConversation 上的 Agent 摘要。host_id 随帧下发，便于宿主上下线广播直接定位。
-#[derive(Debug, Clone, Serialize)]
-pub struct ConvAgentRef {
-    pub id: Uuid,
-    pub name: String,
-    pub host_id: Uuid,
-    pub host_online: bool,
-    /// 当前头像版本；0 = 没有头像
-    pub avatar_version: i32,
-    /// 软删除后专属会话仍在，输入只读
-    pub deleted: bool,
-    /// A27：非空 = 工作区对话（只在 Agent 页显示）；空 = 专属会话
-    pub workspace_id: Option<Uuid>,
-    /// A27：对话里选的模型 / 模式，空串 = 跟随 Agent 配置
-    pub model: String,
-    pub mode: String,
 }
 
 /// GET /conversations/preferences 的条目：{conversation_id, preference}
@@ -420,9 +341,6 @@ pub struct TicketRes {
 #[derive(Debug, Deserialize)]
 pub struct WsTicketQuery {
     pub ticket: String,
-    /// Agent A01："host" = 桌面端宿主连接（不产生 presence，走 host_hello 握手）；
-    /// 缺省/其它值 = 普通用户连接
-    pub role: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -439,9 +357,6 @@ pub enum WsIn {
         /// 回复目标：必须是同会话消息
         #[serde(default)]
         reply_to_id: Option<Uuid>,
-        /// A11：输入框补全里选中的 Agent。缺省为空；不属于发送者或已删除的 id 会被忽略。
-        #[serde(default)]
-        agent_targets: Vec<Uuid>,
     },
     EditMessage {
         message_id: Uuid,
@@ -544,7 +459,7 @@ pub enum WsOut {
         preference: ConversationPref,
     },
     Invalidate {
-        what: &'static str, // "friends" | "conversations" | "requests" | "me" | "agents"
+        what: &'static str, // "friends" | "conversations" | "requests" | "me"
     },
     /// 置顶列表变更：成员收到后重新拉 GET /conversations/{id}/pins
     PinsUpdated {
@@ -557,217 +472,6 @@ pub enum WsOut {
         /// 非发送类 mutation 的回执关联；与 client_msg_id 不混用
         client_op_id: Option<Uuid>,
     },
-    /// Agent A01：宿主上/下线，只发给宿主主人的普通连接。
-    /// A09：改名时带 label；上下线省略该字段（旧客户端忽略未知字段）。
-    AgentHostStatus {
-        host_id: Uuid,
-        online: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        label: Option<String>,
-    },
-    /// Agent A01：调用状态推进，发给调用会话成员（A01 里即主人）的普通连接
-    AgentInvocation {
-        invocation: InvocationView,
-    },
-    /// Agent A03：stream 模式的增量帧。delta 为追加文本（可空），step 为步骤
-    /// 开始/结束（ok=null 进行中）。同调用帧序 = 事件发生序。
-    AgentStream {
-        invocation_id: Uuid,
-        conversation_id: Uuid,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        delta: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        step: Option<StreamStepView>,
-    },
-}
-
-// ---------- Agent A01：宿主 / Agent / 调用 ----------
-
-/// GET /v1/agent-hosts 的条目：只含本人的宿主
-#[derive(Debug, Serialize)]
-pub struct AgentHostView {
-    pub id: Uuid,
-    pub label: String,
-    pub platform: String,
-    pub online: bool,
-    pub last_seen_at: DateTime<Utc>,
-}
-
-/// GET /v1/agents 与 POST /v1/agents 的视图
-#[derive(Debug, Serialize)]
-pub struct AgentView {
-    pub id: Uuid,
-    pub name: String,
-    pub host_id: Uuid,
-    pub host_online: bool,
-    /// 运行时：{"command","args"} 或 {"registry":{"id","version"}}
-    pub runtime: serde_json::Value,
-    /// 宿主机工作目录；空串 = 宿主决定
-    pub cwd: String,
-    /// 专属 AgentConversation
-    pub conversation_id: Uuid,
-    pub created_at: DateTime<Utc>,
-    /// 覆盖项：null = 跟随主人的个人默认（见 AgentUserSettings）
-    pub output_mode: Option<String>,
-    pub queue_timeout_secs: Option<i32>,
-    /// 宿主机上的额外可访问目录
-    pub extra_dirs: Vec<String>,
-    /// 空串 = 用 agent 自己的默认模型 / 模式
-    pub model: String,
-    pub mode: String,
-    /// 附加指令；只在新建运行时会话时放在用户指令前
-    pub instructions: String,
-    /// 环境变量（明文）。只出现在主人自己的 GET /agents 与 PATCH 响应里
-    pub env: serde_json::Value,
-    /// 宿主上报的可选模型 / 模式：{"modes":[{"id","name"}],"models":[...]}
-    pub reported_options: serde_json::Value,
-    /// 头像版本；0 = 没有头像
-    pub avatar_version: i32,
-    /// 软删除后列表不再返回；字段留给已经拿到的视图
-    pub deleted: bool,
-    /// read_only / workspace / full。新建默认只读。
-    pub permission_tier: String,
-}
-
-/// 个人 Agent 默认设置（GET/PUT /v1/users/me/agent-settings）；也用作「生效值」
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
-pub struct AgentUserSettings {
-    /// stream（实时流式）/ status（状态 + 最终结果）/ steps（每步一条消息）
-    pub output_mode: String,
-    /// 排队超时秒数，0 = 永不
-    pub queue_timeout_secs: i32,
-    /// 互调深度上限（1–10）。子调用 depth = 父 depth + 1，超过则拒绝。
-    pub max_call_depth: i32,
-}
-
-/// PUT /v1/users/me/agent-settings：缺省字段不改
-#[derive(Debug, Deserialize)]
-pub struct UpdateAgentUserSettingsReq {
-    pub output_mode: Option<String>,
-    pub queue_timeout_secs: Option<i32>,
-    /// 1–10。缺省 = 不改。
-    pub max_call_depth: Option<i32>,
-}
-
-/// PATCH /v1/agents/{id}：字段缺省 = 不改；覆盖项显式 null = 清除、回到个人默认。
-/// 请求里出现 host_id（任何值）→ 400 host_immutable。
-#[derive(Debug, Deserialize)]
-pub struct PatchAgentReq {
-    #[serde(default, deserialize_with = "double_option")]
-    pub output_mode: Option<Option<String>>,
-    #[serde(default, deserialize_with = "double_option")]
-    pub queue_timeout_secs: Option<Option<i32>>,
-    pub name: Option<String>,
-    pub runtime: Option<AgentRuntimeReq>,
-    pub cwd: Option<String>,
-    pub extra_dirs: Option<Vec<String>>,
-    pub model: Option<String>,
-    pub mode: Option<String>,
-    pub instructions: Option<String>,
-    pub env: Option<serde_json::Value>,
-    /// read_only / workspace / full。缺省 = 不改。
-    pub permission_tier: Option<String>,
-    /// 只要 JSON 里带了这个键就为 true（值本身忽略）
-    #[serde(default, deserialize_with = "flag_present")]
-    pub host_id: bool,
-}
-
-/// 区分「字段缺省」(None) 与「显式 null」(Some(None))
-fn double_option<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Option::<T>::deserialize(d).map(Some)
-}
-
-/// 字段出现即为 true；缺省走 serde default（false）
-fn flag_present<'de, D>(d: D) -> Result<bool, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    IgnoredAny::deserialize(d).map(|_| true)
-}
-
-/// POST /v1/agents 请求体
-#[derive(Debug, Deserialize)]
-pub struct CreateAgentReq {
-    pub name: String,
-    pub host_id: Uuid,
-    pub runtime: AgentRuntimeReq,
-    #[serde(default)]
-    pub cwd: String,
-    /// 缺省 = read_only。
-    #[serde(default)]
-    pub permission_tier: Option<String>,
-    /// 缺省 = 程序自己的默认
-    #[serde(default)]
-    pub model: String,
-    #[serde(default)]
-    pub mode: String,
-}
-
-/// 三种运行时：自定义命令、登记表条目（只校验字段，不联网）、内置 agent（A28）。
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum AgentRuntimeReq {
-    Registry {
-        registry: RegistryPin,
-    },
-    Command {
-        command: String,
-        #[serde(default)]
-        args: Vec<String>,
-    },
-    /// builtin 必须为 true，否则 normalize_runtime 回 bad_runtime
-    Builtin {
-        builtin: bool,
-    },
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RegistryPin {
-    #[serde(default)]
-    pub id: String,
-    #[serde(default)]
-    pub version: String,
-}
-
-/// agent_invocations 行的视图（WS agent_invocation 帧与历史 GET 共用形状）
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
-pub struct InvocationView {
-    pub id: Uuid,
-    pub agent_id: Uuid,
-    pub conversation_id: Uuid,
-    /// 主人发消息触发时有值。定时调用没有触发消息，为 null。
-    pub trigger_message_id: Option<Uuid>,
-    /// 定时调用的来源。普通消息触发时不出现在 JSON 里。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[sqlx(default)]
-    pub schedule_id: Option<Uuid>,
-    pub status: String,
-    pub error: Option<String>,
-    /// Agent A05：这次调用带走的主人附件 id（派发时定下的清单；空数组 = 没带附件）
-    /// 查询漏了这一列时按空处理，而不是整行解码失败（A12 合并时吃过这个亏）
-    #[sqlx(default)]
-    pub attachment_ids: Vec<Uuid>,
-    pub created_at: DateTime<Utc>,
-    pub started_at: Option<DateTime<Utc>>,
-    pub finished_at: Option<DateTime<Utc>>,
-    /// Agent A03：当前进行中步骤标题；仅存内存（AppState.inv_runs），
-    /// 广播前由调用上下文填充，历史查询对 running 调用回填、其余为 null。
-    #[sqlx(default)]
-    pub current_step: Option<String>,
-    /// 父调用。主人直接发起的调用为 null。
-    pub parent_invocation_id: Option<Uuid>,
-    /// 整条调用链的根会话。子调用继承；主人直接发起的为 null。
-    pub root_conversation_id: Option<Uuid>,
-    /// 被调 Agent 的名字（给嵌套展示用，不落在调用行上）。
-    pub agent_name: String,
-    /// 子调用进入 succeeded 时的回复前 2000 字。其余调用和非终态为 null。
-    /// 不落库：历史查询现算，避免把完整 result_text 放进帧。
-    #[sqlx(default)]
-    pub result_preview: Option<String>,
 }
 
 // ---------- 消息生命周期 REST ----------
@@ -887,10 +591,6 @@ pub struct AdminUserView {
     pub has_avatar: bool,
     /// 该用户附件已用存储（按 storage_path 去重）
     pub storage_bytes: i64,
-    /// 逐用户覆盖；null = 跟随全局默认
-    pub agent_access: Option<bool>,
-    /// 按管理员 / 全局开关 / 覆盖 / 默认算出的生效值
-    pub agent_access_effective: bool,
 }
 
 /// GET /users/me/storage（V2 P2-1）：quota_bytes 为 null 表示不限额

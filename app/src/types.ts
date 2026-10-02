@@ -8,8 +8,6 @@ export interface UserPublic {
   /** 头像版本（拼进 /users/{id}/avatar?v=）；旧服务端缺省 */
   avatar_version?: number;
   has_avatar?: boolean;
-  /** 生效后的 Agent 使用权。只在「自己」的资料里出现；false 时藏入口 */
-  agent_access?: boolean;
 }
 
 export interface AuthResponse {
@@ -147,284 +145,6 @@ export interface MessageView {
   sender_has_avatar?: boolean;
   /** 转发消息：原发送者展示名 */
   forwarded_from?: string | null;
-  /** Agent A01：Agent 发出的消息携带归属（sender_id 仍是主人）；旧服务端缺省 */
-  agent?: AgentRef | null;
-  /** Agent A03：该消息附带的已完成步骤记录（仅 Agent 消息；旧服务端缺省） */
-  agent_steps?: AgentStep[] | null;
-  /** Agent A12：kind='approval' 时的审批卡片（旧服务端缺省） */
-  approval?: ApprovalView | null;
-}
-
-/** 审批卡片上 agent 给的一个选项 */
-export interface ApprovalOption {
-  optionId: string;
-  name: string;
-  kind: string;
-}
-
-/** 审批请求摘要。invocation_id 用来从状态行跳到这张卡片。 */
-export interface ApprovalRequest {
-  title?: string;
-  kind?: string;
-  locations?: string[];
-  /** A20：完整正文（只读档发消息审批展示的内容就是实际发出的），旧服务端缺省 */
-  detail?: string;
-  request_id?: string;
-  invocation_id?: string;
-}
-
-/** kind='approval' 消息上的卡片 */
-export interface ApprovalView {
-  id: string;
-  status: string;
-  request: ApprovalRequest;
-  options: ApprovalOption[];
-  decision?: string | null;
-}
-
-/** 一条已完成步骤的持久化形状（messages.agent_steps 元素，A03） */
-export interface AgentStep {
-  id: string;
-  title: string;
-  kind: string;
-  ok: boolean;
-}
-
-/** 消息上的 Agent 归属（A01） */
-export interface AgentRef {
-  id: string;
-  name: string;
-  /** 头像版本；0 或旧服务端缺省 = 没有头像 */
-  avatar_version?: number;
-}
-
-/** 会话上的 Agent 归属（kind='agent' 时出现，A01） */
-export interface ConvAgentRef {
-  id: string;
-  name: string;
-  host_id: string;
-  /** 宿主实时在线态（随 agent_host_status 帧更新） */
-  host_online: boolean;
-  avatar_version?: number;
-  /** 软删除后专属会话只读 */
-  deleted?: boolean;
-  /** A27：非空 = 工作区对话（只在 Agent 页显示）；空 = 专属会话 */
-  workspace_id?: string | null;
-  /** A27：对话里选的模型 / 模式，空串 = 跟随 Agent 配置 */
-  model?: string;
-  mode?: string;
-}
-
-/** A27：GET /agent-hosts/{id}/dirs。path 空 = 起点（盘符 / 主目录），parent 为 null = 回到起点 */
-export interface DirListing {
-  path: string;
-  parent: string | null;
-  dirs: { name: string; path: string }[];
-  error?: string | null;
-}
-
-/** A27：工作区 = 某台电脑上的一个目录；path 为空串是「无工作区」分组 */
-export interface AgentWorkspace {
-  id: string;
-  host_id: string;
-  path: string;
-  created_at: string;
-}
-
-/** GET /agent-hosts 单条宿主视图（A01） */
-export interface AgentHostView {
-  id: string;
-  label: string;
-  platform: string;
-  online: boolean;
-  last_seen_at: string;
-}
-
-/** 登记表里钉住的一条（id + 版本）。安装路径由宿主自己解析。 */
-export interface RegistryPin {
-  id: string;
-  version: string;
-}
-
-/** Agent 运行描述：自定义命令、登记表条目，或内置（A28，runtime.builtin === true）。 */
-export interface AgentRuntime {
-  command?: string;
-  args?: string[];
-  registry?: RegistryPin;
-  builtin?: boolean;
-}
-
-/** GET /agent-hosts/{id}/registry 的一条 */
-export interface RegistryEntry {
-  id: string;
-  name: string;
-  version: string;
-  description: string;
-  icon: string;
-  kinds: string[];
-  status: string;
-  reason?: string;
-}
-
-export interface RegistryList {
-  entries: RegistryEntry[];
-  error?: string | null;
-}
-
-/** 宿主上报的一个模型或模式 */
-export interface AgentOptionItem {
-  id: string;
-  name: string;
-}
-
-/** reported_options：还没探测过时是 {} */
-export interface ReportedOptions {
-  modes?: AgentOptionItem[];
-  models?: AgentOptionItem[];
-}
-
-/** 试读可选项的结果；程序起不来时 error 是原因 */
-export interface ProbeResult {
-  modes: AgentOptionItem[];
-  models: AgentOptionItem[];
-  error: string | null;
-}
-
-/** GET /agents 单条 Agent 视图（A01；A06 补配置与头像） */
-export interface AgentView {
-  id: string;
-  name: string;
-  host_id: string;
-  host_online: boolean;
-  runtime: AgentRuntime;
-  cwd: string;
-  conversation_id: string;
-  created_at: string;
-  /** 覆盖项：null = 跟随个人默认（旧服务端无此字段） */
-  output_mode?: AgentOutputMode | null;
-  queue_timeout_secs?: number | null;
-  extra_dirs?: string[];
-  /** 空串 = 用 agent 默认 */
-  model?: string;
-  mode?: string;
-  instructions?: string;
-  /** 只在主人自己的列表 / PATCH 响应里 */
-  env?: Record<string, string>;
-  reported_options?: ReportedOptions;
-  avatar_version?: number;
-  deleted?: boolean;
-  /** read_only / workspace / full。旧服务端缺省时按只读 */
-  permission_tier?: "read_only" | "workspace" | "full" | string;
-}
-
-/** 输出方式：实时流式 / 状态 + 最终结果 / 每步一条消息 */
-export type AgentOutputMode = "stream" | "status" | "steps";
-
-/** 个人 Agent 默认设置（GET/PUT /users/me/agent-settings） */
-export interface AgentUserSettings {
-  output_mode: AgentOutputMode;
-  /** 排队超时秒数，0 = 永不 */
-  queue_timeout_secs: number;
-  /** 互调深度上限，1–10。缺省时按 3 */
-  max_call_depth: number;
-}
-
-/** 定时任务时间表，与服务端 spec 同形 */
-export interface ScheduleSpec {
-  type: "once" | "daily" | "weekly" | "interval";
-  at?: string;
-  time?: string;
-  days?: number[];
-  minutes?: number;
-}
-
-export interface ScheduleView {
-  id: string;
-  agent_id: string;
-  owner_id: string;
-  name: string;
-  prompt: string;
-  target_conversation_id: string;
-  spec: ScheduleSpec;
-  timezone: string;
-  enabled: boolean;
-  next_run_at: string | null;
-  last_run_at: string | null;
-  created_by: string;
-  created_at: string;
-  disabled_reason?: string | null;
-}
-
-export interface CreateScheduleReq {
-  name: string;
-  prompt: string;
-  target_conversation_id?: string;
-  spec: ScheduleSpec;
-  timezone: string;
-}
-
-export interface PatchScheduleReq {
-  name?: string;
-  prompt?: string;
-  target_conversation_id?: string;
-  spec?: ScheduleSpec;
-  timezone?: string;
-  enabled?: boolean;
-}
-
-/** PATCH /agents/{id}：缺省字段不改；覆盖项 null = 清除、回到个人默认 */
-export interface PatchAgentReq {
-  output_mode?: AgentOutputMode | null;
-  queue_timeout_secs?: number | null;
-  name?: string;
-  runtime?: AgentRuntime;
-  cwd?: string;
-  extra_dirs?: string[];
-  model?: string;
-  mode?: string;
-  instructions?: string;
-  env?: Record<string, string>;
-  permission_tier?: string;
-}
-
-/** POST /agents 请求体（A01） */
-export interface CreateAgentReq {
-  name: string;
-  host_id: string;
-  runtime: AgentRuntime;
-  cwd?: string;
-  permission_tier?: string;
-  /** 空串 = 程序自己的默认 */
-  model?: string;
-  mode?: string;
-}
-
-/** 一次 Agent 调用记录。status：queued / running / awaiting_approval / succeeded / failed / cancelled / timed_out */
-export interface InvocationView {
-  id: string;
-  agent_id: string;
-  conversation_id: string;
-  /** 触发这条调用的主人消息 id。定时调用没有触发消息，为 null */
-  trigger_message_id: string | null;
-  /** 定时调用的来源；普通消息触发时缺省 */
-  schedule_id?: string | null;
-  status: string;
-  error: string | null;
-  /** Agent A05：本次调用带走的附件 id（旧服务端缺省 → 视为空） */
-  attachment_ids?: string[];
-  created_at: string;
-  started_at: string | null;
-  finished_at: string | null;
-  /** Agent A03：running 期间为当前步骤标题；终态/旧服务端为 null 或缺省 */
-  current_step?: string | null;
-  /** 父调用。主人直接发起时为 null 或缺省 */
-  parent_invocation_id?: string | null;
-  /** 整条调用链的根会话。主人直接发起时为 null 或缺省 */
-  root_conversation_id?: string | null;
-  /** 被调 Agent 的名字（嵌套展示用） */
-  agent_name?: string | null;
-  /** 子调用成功时的回复前 2000 字。其余调用和非终态为空 */
-  result_preview?: string | null;
 }
 
 /** 会话偏好（用户维度；旧服务端无此字段 → 视为全默认） */
@@ -452,7 +172,7 @@ export interface ConversationPrefEntry {
 
 export interface ConversationView {
   id: string;
-  kind: string; // "dm" | "group" | "self"（文件传输助手）| "agent"（A01 专属会话）
+  kind: string; // "dm" | "group" | "self"（文件传输助手）
   name: string | null;
   owner_id: string | null;
   peer: UserPublic | null;
@@ -465,8 +185,6 @@ export interface ConversationView {
   preference?: ConversationPref | null;
   /** 群公告；未设置 / 旧服务端缺省为 null */
   announcement?: AnnouncementView | null;
-  /** kind='agent' 时的 Agent 归属（旧服务端缺省） */
-  agent?: ConvAgentRef | null;
   created_at: string;
 }
 
@@ -548,34 +266,6 @@ export type WsOut =
     }
   | { type: "invalidate"; what: string }
   | { type: "pins_updated"; conversation_id: string }
-  | {
-      /** Agent A01：本人宿主上/下线（只发主人普通连接）。A09 改名时带 label */
-      type: "agent_host_status";
-      host_id: string;
-      online: boolean;
-      label?: string;
-    }
-  | {
-      /** Agent A01：调用状态变化（发给会话成员的普通连接） */
-      type: "agent_invocation";
-      invocation: InvocationView;
-    }
-  | {
-      /** Agent A03：stream 模式增量帧（delta 追加文本；step.ok=null 进行中） */
-      type: "agent_stream";
-      invocation_id: string;
-      conversation_id: string;
-      delta?: string;
-      step?: { id: string; title: string; kind: string; ok: boolean | null };
-    }
-  | {
-      /** Agent A07：登记表安装进度，只发给宿主主人的普通连接 */
-      type: "registry_install_progress";
-      host_id: string;
-      entry_id: string;
-      stage: string;
-      error?: string;
-    }
   | { type: "force_logout"; reason: string }
   | {
       type: "error";
@@ -613,10 +303,6 @@ export interface AdminUserView {
   has_avatar?: boolean;
   /** 该用户附件已用存储（V2 P2-1；旧服务端缺省） */
   storage_bytes?: number;
-  /** 逐用户覆盖；null = 跟随全局默认 */
-  agent_access?: boolean | null;
-  /** 生效值 */
-  agent_access_effective?: boolean;
 }
 
 /** GET /users/me/storage（V2 P2-1）：quota_bytes 为 null/缺省表示不限额 */
@@ -652,30 +338,8 @@ export interface AdminSettings {
   push_ntfy_token_set?: boolean;
   /** 本服务对外地址，推送通知点击跳转用；空 = 不带 */
   public_url?: string;
-  /** 全局是否允许使用 Agent（管理员始终可用） */
-  agent_enabled?: boolean;
-  /** 没有逐用户覆盖时，普通用户默认能否使用 */
-  agent_default_allowed?: boolean;
-  /** 内置 Agent 的模型端点（A28）。GET 每项带 api_key_set；PUT 整体替换 */
-  builtin_endpoints?: BuiltinEndpointConf[];
   /** 在线更新的 Gitea 仓库地址（安装包在它的 Release 上）；空 = 关闭 */
   update_repo_url?: string;
-}
-
-/**
- * builtin_endpoints 的一个端点（A28）。
- * GET：api_key 永不返回，只有 api_key_set。
- * PUT：api_key 缺省 = 按 id 保留原 key；"" = 清空；id 缺省 = 新端点（服务端发 id）。
- */
-export interface BuiltinEndpointConf {
-  id?: string;
-  name: string;
-  /** chat = Chat Completions；responses = OpenAI Responses */
-  protocol: string;
-  base_url: string;
-  api_key?: string;
-  api_key_set?: boolean;
-  models: string[];
 }
 
 /** GET/PUT /users/me/push 与 rotate/test 返回（V2 P3-3） */

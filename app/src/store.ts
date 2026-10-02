@@ -1,13 +1,9 @@
 import { useSyncExternalStore } from "react";
-import { applyStreamFrame, dropRun, fmtElapsed, type AgentRuns, type AgentStreamFrame } from "./agentRun";
-import { mergeChildIndex, type ChildIndex } from "./invocationTree";
 import { writeDrafts } from "./drafts";
 import type {
-  AgentHostView,
   ConversationPref,
   ConversationView,
   FriendView,
-  InvocationView,
   MessageView,
   RequestsView,
   UserPublic,
@@ -37,7 +33,7 @@ export interface AppState {
   friends: FriendView[];
   requests: RequestsView;
   wsReady: boolean;
-  tab: "chats" | "contacts" | "agents" | "me" | "admin";
+  tab: "chats" | "contacts" | "me" | "admin";
   /** composer 引用卡片：正在回复的目标消息（null=普通发送） */
   replyingTo: MessageView | null;
   /** composer 编辑态：正在编辑的消息（expected_version 取其当前 edit_version） */
@@ -52,16 +48,6 @@ export interface AppState {
   avatars: Record<string, AvatarInfo>;
   /** 全局搜索跳转目标（V2 P3-1）：打开会话后由 ChatView 消费并清空 */
   pendingJump: { convId: string; messageId: string; seq: number } | null;
-  /** Agent A01：本人电脑列表（管理页拉取 / agent_host_status 帧更新 online） */
-  agentHosts: AgentHostView[];
-  /** 桌面端宿主就绪后的本机 host id。网页、Android、尚未就绪时为 null。 */
-  localHostId: string | null;
-  /** Agent A01/A11：conv_id -> trigger_message_id -> 调用记录（一条消息可以触发多个 Agent） */
-  invocations: Record<string, Record<string, InvocationView[]>>;
-  /** Agent A03：conv_id -> invocation_id -> 进行中调用的临时输出（不落库、不跨设备） */
-  agentRuns: AgentRuns;
-  /** Agent A15：parent_invocation_id -> 子调用（派出顺序）。帧和历史列表一起维护。 */
-  childInvocations: ChildIndex;
 }
 
 /** 头像缓存条目：版本较大的那组才有效。 */
@@ -90,11 +76,6 @@ let state: AppState = {
   drafts: {},
   avatars: {},
   pendingJump: null,
-  agentHosts: [],
-  localHostId: null,
-  invocations: {},
-  agentRuns: {},
-  childInvocations: {},
 };
 
 const listeners = new Set<() => void>();
@@ -129,19 +110,12 @@ export function convTitle(c: ConversationView, meId?: string): string {
   if (c.kind === "group") return c.name ?? `群聊(${c.member_count})`;
   // V2 P2-4：self 会话 name 恒 NULL、peer 恒空，标题固定
   if (c.kind === "self") return "文件传输助手";
-  // Agent A01：专属会话 name 恒 NULL，标题是 Agent 名
-  // A27：工作区对话有自己的名字，没起名时同样显示 Agent 名
-  if (c.kind === "agent") return c.name ?? c.agent?.name ?? "Agent";
   return c.peer?.display_name ?? c.name ?? "会话";
 }
 
-/**
- * 「这条消息是不是我发的」唯一判定（Agent A01）：
- * Agent 消息的 sender_id 仍是主人，但带 m.agent —— 对主人它是「别人发来的」
- * （气泡在左、计未读、可触发通知、不可编辑）。各处一律走这个纯函数。
- */
+/** 「这条消息是不是我发的」：气泡在右、不计未读、不通知、可编辑。 */
 export function isOwnMessage(m: MessageView, meId?: string | null): boolean {
-  return !!meId && m.sender_id === meId && !m.agent;
+  return !!meId && m.sender_id === meId;
 }
 
 /** 把一批 UserPublic 合并进头像表，只接受更大的版本。 */
@@ -331,18 +305,9 @@ export function applyPrefUpdate(
   };
 }
 
-/** A27：工作区对话只在 Agent 页打开，其余会话在会话页 */
-export function isWorkspaceConv(c: ConversationView | undefined): boolean {
-  return !!c?.agent?.workspace_id;
-}
-
-export function convTab(s: AppState, id: string): "chats" | "agents" {
-  return isWorkspaceConv(s.conversations.find((c) => c.id === id)) ? "agents" : "chats";
-}
-
-/** 这个会话此刻是否正打开在它所在的页上 */
+/** 这个会话此刻是否正打开在会话页上 */
 export function isViewing(s: AppState, id: string): boolean {
-  return s.activeConv === id && s.tab === convTab(s, id);
+  return s.activeConv === id && s.tab === "chats";
 }
 
 /**
@@ -442,7 +407,6 @@ export function applyLiveMessage(s: AppState, m: MessageView, foreground = true)
   const exists = list.some((x) => x.id === m.id) || s.conversations.some((c) => c.last_message?.id === m.id);
   const refreshed = applyRefreshed(s, m.conversation_id, [m]);
   const isActive = isViewing(s, m.conversation_id) && foreground;
-  // Agent 消息对主人按「别人发来的」计未读（sender_id 仍是主人，由 m.agent 区分）
   const mine = isOwnMessage(m, s.me?.id);
   const { [m.conversation_id]: _typing, ...typing } = s.typing;
   return {
@@ -559,138 +523,6 @@ export function dropConversationCache(s: AppState, convId: string): Partial<AppS
   const typing = { ...s.typing };
   delete typing[convId];
   return { messages, hasMore, historyLoaded, typing };
-}
-
-// ---------- Agent A01：宿主在线态 / 调用记录 ----------
-
-/** agent_host_status 帧：更新在线态；带 label 时同时改名（上下线帧不带 label，保留原名） */
-export function applyHostStatus(
-  s: AppState,
-  hostId: string,
-  online: boolean,
-  label?: string,
-): Partial<AppState> {
-  return {
-    agentHosts: s.agentHosts.map((h) =>
-      h.id === hostId ? { ...h, online, ...(label ? { label } : {}) } : h,
-    ),
-    conversations: s.conversations.map((c) =>
-      c.agent?.host_id === hostId && c.agent.host_online !== online
-        ? { ...c, agent: { ...c.agent, host_online: online } }
-        : c,
-    ),
-  };
-}
-
-/** agent_invocation 帧 / 历史 GET 共用合并入口：同一触发消息下按调用 id 覆盖，不同调用都保留。
- *  A03：调用进终态时顺手摘除它的临时流式输出（定稿消息已含全部内容）。
- *  A15：有父调用的同时写进 childInvocations（按 id 覆盖，派出顺序由纯函数排）。 */
-export function applyInvocations(
-  s: AppState,
-  incoming: InvocationView[],
-): Partial<AppState> {
-  if (incoming.length === 0) return {};
-  const invocations = { ...s.invocations };
-  let agentRuns = s.agentRuns;
-  const childInvocations = mergeChildIndex(s.childInvocations, incoming);
-  let touched = false;
-  for (const inv of incoming) {
-    // 定时调用没有触发消息，状态不挂在某一条消息下面（回复本身会出现在会话里）
-    if (!inv.trigger_message_id) continue;
-    touched = true;
-    const cur = { ...(invocations[inv.conversation_id] ?? {}) };
-    const prev = cur[inv.trigger_message_id] ?? [];
-    const idx = prev.findIndex((x) => x.id === inv.id);
-    cur[inv.trigger_message_id] =
-      idx >= 0 ? prev.map((x, i) => (i === idx ? inv : x)) : [...prev, inv];
-    invocations[inv.conversation_id] = cur;
-    const convRuns = agentRuns[inv.conversation_id];
-    if (inv.finished_at != null && convRuns?.[inv.id]) {
-      if (agentRuns === s.agentRuns) agentRuns = { ...agentRuns };
-      const next = dropRun(convRuns, inv.id) ?? {};
-      if (Object.keys(next).length) {
-        agentRuns[inv.conversation_id] = next;
-      } else {
-        delete agentRuns[inv.conversation_id];
-      }
-    }
-  }
-  const patch: Partial<AppState> = {};
-  if (touched) patch.invocations = invocations;
-  if (agentRuns !== s.agentRuns) patch.agentRuns = agentRuns;
-  if (childInvocations !== s.childInvocations) patch.childInvocations = childInvocations;
-  return patch;
-}
-
-/** agent_stream 帧：临时输出追加；调用已知终态后迟到的帧丢弃（防状态残留）。 */
-export function applyAgentStream(
-  s: AppState,
-  f: AgentStreamFrame,
-): Partial<AppState> {
-  const invs = s.invocations[f.conversation_id];
-  const inv = invs && Object.values(invs).flat().find((i) => i.id === f.invocation_id);
-  if (inv?.finished_at != null) return {};
-  const convRuns = s.agentRuns[f.conversation_id];
-  const next = applyStreamFrame(convRuns, f);
-  if (next === convRuns) return {};
-  return { agentRuns: { ...s.agentRuns, [f.conversation_id]: next } };
-}
-
-/** 调用状态标签的查表：running → 进行中标签；failed → 失败原因；其余 → null 不渲染。
- *  A04 往本表加 queued / cancelled / timed_out 行。 */
-export function invocationStatusView(
-  inv: Pick<InvocationView, "status" | "error" | "current_step">,
-  elapsedSecs: number,
-): { icon: string; text: string } | null {
-  switch (inv.status) {
-    case "running":
-      return inv.current_step
-        ? {
-            icon: "⏳",
-            text: `正在工作 · 已用 ${fmtElapsed(elapsedSecs)} · 当前：${inv.current_step}`,
-          }
-        : { icon: "⏳", text: "正在处理" };
-    case "failed":
-      return { icon: "⚠", text: `失败：${invocationErrorText(inv.error)}` };
-    case "queued":
-      return { icon: "⏸", text: "排队中：Agent 所在电脑不在线" };
-    case "cancelled":
-      return { icon: "", text: "已取消" };
-    case "timed_out":
-      return { icon: "", text: "排队超时，已取消" };
-    case "awaiting_approval":
-      return { icon: "⏸", text: "等待主人批准" };
-    default:
-      return null;
-  }
-}
-
-/** 状态标签的纯文本形式（不含已用时长、当前步骤），由 invocationStatusView 派生 */
-export function invocationStatusLabel(
-  status: string,
-  error: string | null | undefined,
-): string | null {
-  const v = invocationStatusView({ status, error: error ?? null, current_step: null }, 0);
-  return v ? `${v.icon} ${v.text}`.trim() : null;
-}
-
-/** 主人可以取消的状态：排队、运行中、等待审批 */
-export function invocationCancellable(status: string): boolean {
-  return status === "queued" || status === "running" || status === "awaiting_approval";
-}
-
-/** 调用失败原因的展示文案（host 侧稳定错误码 → 中文） */
-export function invocationErrorText(error: string | null | undefined): string {
-  switch (error) {
-    case "host_offline":
-      return "Agent 所在电脑不在线";
-    case "host_disconnected":
-      return "Agent 所在电脑断开了";
-    case "agent_deleted":
-      return "该 Agent 已删除";
-    default:
-      return error ?? "未知原因";
-  }
 }
 
 /** ack 到达：用服务端消息替换乐观副本（message 回显可能先于 ack，需按 id 去重） */

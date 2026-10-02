@@ -17,10 +17,6 @@ use uuid::Uuid;
 
 pub const ACCESS_TTL_SECS: i64 = 15 * 60;
 pub const REFRESH_TTL_DAYS: i64 = 30;
-/// Agent A13：调用凭据的兜底过期时间；真正的生命周期由调用状态约束
-/// （结束即失效——校验时查 agent_invocations.status），exp 只是兜底。
-pub const INVOCATION_TTL_SECS: i64 = 6 * 3600;
-
 #[derive(Serialize, Deserialize)]
 struct Claims {
     sub: String,
@@ -34,8 +30,8 @@ struct Claims {
     /// None 时不序列化，使签出的 token 与升级前形状一致。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sid: Option<Uuid>,
-    /// Agent A13：凭据种类。access token 无此字段；调用凭据 kind="invocation"。
-    /// 任何带 kind 的 token 一律不得通过普通用户鉴权（互不通用）。
+    /// 凭据种类。access token 无此字段；旧版签发过 kind="invocation" 的调用凭据，
+    /// 任何带 kind 的 token 一律不得通过普通用户鉴权。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
 }
@@ -105,7 +101,7 @@ pub fn verify_access(token: &str, secret: &str) -> AppResult<AccessGrant> {
         &Validation::new(Algorithm::HS256),
     )
     .map_err(|_| AppError::unauthorized("invalid or expired access token"))?;
-    // Agent A13：调用凭据（kind="invocation"）签名也合法，必须在这里挡住
+    // 旧版调用凭据（kind="invocation"）签名也合法，必须在这里挡住
     if data.claims.kind.is_some() {
         return Err(AppError::unauthorized("invalid or expired access token"));
     }
@@ -116,71 +112,6 @@ pub fn verify_access(token: &str, secret: &str) -> AppResult<AccessGrant> {
         session_version: data.claims.sv,
         sid: data.claims.sid,
     })
-}
-
-// ---------- Agent A13：调用期凭据（tools_token） ----------
-// 随 invocation_start 下发给宿主，宿主本地 MCP 服务拿它调 /v1/agent-tools/*。
-// 与 access token 互不通用：这边要求 kind="invocation"，那边拒绝一切带 kind 的 token。
-
-#[derive(Serialize, Deserialize)]
-pub struct InvocationClaims {
-    /// 恒 "invocation"
-    pub kind: String,
-    /// 调用 id（agent_invocations.id）
-    pub sub: Uuid,
-    /// 主人（发起会话 owner）
-    pub owner: Uuid,
-    /// 被调用的 Agent
-    pub agent: Uuid,
-    /// 调用行上的深度（主人直接发起为 0，子调用逐层 +1）
-    pub depth: i64,
-    pub iat: usize,
-    pub exp: usize,
-}
-
-/// 签发调用凭据。不落库：是否有效由调用状态 + 签名决定。
-pub fn mint_invocation(
-    inv: Uuid,
-    owner: Uuid,
-    agent: Uuid,
-    depth: i64,
-    secret: &str,
-) -> AppResult<String> {
-    let now = Utc::now().timestamp();
-    let claims = InvocationClaims {
-        kind: "invocation".into(),
-        sub: inv,
-        owner,
-        agent,
-        depth,
-        iat: now as usize,
-        exp: (now + INVOCATION_TTL_SECS) as usize,
-    };
-    encode(
-        &Header::new(Algorithm::HS256),
-        &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
-    )
-    .map_err(AppError::internal)
-}
-
-/// 只验 JWT 层（签名/过期/kind）；调用状态与主人禁用由 agent_tools::require_invocation 查库。
-pub fn verify_invocation(token: &str, secret: &str) -> AppResult<InvocationClaims> {
-    // 调用凭据是短命凭据，过期不给宽限（默认 leeway=60s 会放进刚过期的 token）
-    let mut validation = Validation::new(Algorithm::HS256);
-    validation.leeway = 0;
-    let data = decode::<InvocationClaims>(
-        token,
-        &DecodingKey::from_secret(secret.as_bytes()),
-        &validation,
-    )
-    .map_err(|_| AppError::unauthorized("invalid or expired invocation token"))?;
-    if data.claims.kind != "invocation" {
-        return Err(AppError::unauthorized(
-            "invalid or expired invocation token",
-        ));
-    }
-    Ok(data.claims)
 }
 
 /// 生成不透明刷新令牌：(给客户端的原始值, 落库的 sha256 hex)
@@ -313,8 +244,6 @@ pub async fn issue_tokens(
     user: &UserRow,
     session_id: Uuid,
 ) -> AppResult<AuthResponse> {
-    // 同一事务里读：注册刚插入的用户行，别的连接还看不见
-    let allowed = crate::agent_access::user_allows(&mut **tx, user.id).await?;
     let (access, expires_in) = mint_access(
         user.id,
         user.session_version as i64,
@@ -336,6 +265,6 @@ pub async fn issue_tokens(
         access_token: access,
         refresh_token: raw,
         access_expires_in: expires_in,
-        user: UserPublic::from(user).with_agent_access(allowed),
+        user: UserPublic::from(user),
     })
 }

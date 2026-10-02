@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { admin, getServer } from "../../api";
 import { inviteLink } from "../../invite";
 import type { InviteView, RegistrationMode } from "../../types";
-import AdminBuiltinEndpoints from "./AdminBuiltinEndpoints";
 
 const MODES: { v: RegistrationMode; label: string }[] = [
   { v: "open", label: "开放注册" },
@@ -42,9 +41,6 @@ export default function AdminSettings() {
   const [meetingSaving, setMeetingSaving] = useState(false);
   const [updateRepo, setUpdateRepo] = useState("");
   const [updateSaving, setUpdateSaving] = useState(false);
-  const [agentEnabled, setAgentEnabled] = useState(true);
-  const [agentDefault, setAgentDefault] = useState(true);
-  const [agentSaving, setAgentSaving] = useState(false);
   // 创建表单
   const [maxUses, setMaxUses] = useState<number | null>(1);
   const [expHours, setExpHours] = useState<number | null>(24 * 7);
@@ -64,8 +60,6 @@ export default function AdminSettings() {
       setNtfyToken("");
       setMeetingUrl(s.meeting_base_url ?? "");
       setUpdateRepo(s.update_repo_url ?? "");
-      setAgentEnabled(s.agent_enabled !== false);
-      setAgentDefault(s.agent_default_allowed !== false);
       setInvites(list);
       setErr("");
     } catch (e) {
@@ -91,26 +85,6 @@ export default function AdminSettings() {
       setErr(e instanceof Error ? e.message : "保存失败");
     } finally {
       setSwitching(false);
-    }
-  };
-
-  const saveAgentFlag = async (patch: {
-    agent_enabled?: boolean;
-    agent_default_allowed?: boolean;
-  }) => {
-    setAgentSaving(true);
-    setErr("");
-    setSaved(false);
-    try {
-      const s = await admin.updateSettings(patch);
-      setAgentEnabled(s.agent_enabled !== false);
-      setAgentDefault(s.agent_default_allowed !== false);
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : "保存失败");
-    } finally {
-      setAgentSaving(false);
     }
   };
 
@@ -278,29 +252,6 @@ export default function AdminSettings() {
         {switching && <span className="muted">保存中…</span>}
         {saved && <span className="muted ad-saved">已保存</span>}
       </div>
-
-      <h3>Agent</h3>
-      <div className="row ad-mode">
-        <label className="ad-radio">
-          <input
-            type="checkbox"
-            checked={agentEnabled}
-            disabled={agentSaving}
-            onChange={(e) => void saveAgentFlag({ agent_enabled: e.target.checked })}
-          />
-          允许使用 Agent
-        </label>
-        <label className="ad-radio">
-          <input
-            type="checkbox"
-            checked={agentDefault}
-            disabled={agentSaving}
-            onChange={(e) => void saveAgentFlag({ agent_default_allowed: e.target.checked })}
-          />
-          新用户默认可用
-        </label>
-      </div>
-      <AdminBuiltinEndpoints />
 
       <h3>存储配额</h3>
       <div className="row ad-quota">

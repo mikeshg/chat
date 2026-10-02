@@ -103,7 +103,6 @@ export default function AdminPanel() {
             <span>注册时间</span>
             <span>最后在线</span>
             <span>存储</span>
-            <span>Agent</span>
             <span>操作</span>
           </div>
           {users.map((u) => (
@@ -127,22 +126,6 @@ export default function AdminPanel() {
               <span className="muted">{u.online ? "现在" : fmtTime(u.last_seen_at)}</span>
               {/* V2 P2-1：该用户附件已用存储（按 storage_path 去重） */}
               <span className="muted">{fmtBytes(u.storage_bytes ?? 0)}</span>
-              <span className="ad-agent">
-                <select
-                  aria-label={`${u.display_name} 的 Agent 使用权`}
-                  value={u.agent_access == null ? "default" : u.agent_access ? "allow" : "deny"}
-                  onChange={(e) => {
-                    const v = e.target.value;
-                    const allowed = v === "allow" ? true : v === "deny" ? false : null;
-                    void act(() => admin.setAgentAccess(u.id, allowed));
-                  }}
-                >
-                  <option value="default">跟随默认</option>
-                  <option value="allow">允许</option>
-                  <option value="deny">禁止</option>
-                </select>
-                <small>{u.agent_access_effective === false ? "生效：不可用" : "生效：可用"}</small>
-              </span>
               <span className="ad-actions">
                 {u.id !== s.me?.id && (
                   <>

@@ -60,23 +60,6 @@ pub(super) struct ConvRow {
     m_sender_avatar_version: Option<i32>,
     m_sender_has_avatar: Option<bool>,
     m_forwarded_from: Option<String>,
-    // Agent A01：末条消息的 Agent 归属（非空 = Agent 所写）
-    m_agent_id: Option<Uuid>,
-    m_agent_name: Option<String>,
-    m_agent_avatar_version: Option<i32>,
-    // Agent A03：末条消息附带的步骤记录
-    m_agent_steps: Option<sqlx::types::Json<Vec<crate::model::AgentStepView>>>,
-    m_approval: Option<sqlx::types::Json<crate::model::ApprovalView>>,
-    // Agent A01：专属会话的 Agent 摘要（kind='agent' 时有值）
-    c_agent_id: Option<Uuid>,
-    c_agent_name: Option<String>,
-    c_agent_host_id: Option<Uuid>,
-    c_agent_avatar_version: Option<i32>,
-    c_agent_deleted: Option<bool>,
-    // Agent A27：工作区对话所属工作区与对话里选的模型 / 模式
-    c_workspace_id: Option<Uuid>,
-    c_agent_model: String,
-    c_agent_mode: String,
     // 本人偏好（conversation_preferences 左连接，无行则全 NULL/false）
     p_pinned_at: Option<DateTime<Utc>>,
     p_archived_at: Option<DateTime<Utc>>,
@@ -116,22 +99,12 @@ pub(super) async fn list_conversations(
                 lm.att_has_thumb AS m_att_has_thumb, lm.att_duration_ms AS m_att_duration_ms,
                 lm.sender_avatar_version AS m_sender_avatar_version,
                 lm.sender_has_avatar AS m_sender_has_avatar, lm.forwarded_from AS m_forwarded_from,
-                lm.agent_id AS m_agent_id, lm.agent_name AS m_agent_name,
-                lm.agent_avatar_version AS m_agent_avatar_version,
-                lm.agent_steps AS m_agent_steps, lm.approval AS m_approval,
-                ag.id AS c_agent_id, ag.name AS c_agent_name, ag.host_id AS c_agent_host_id,
-                ag.avatar_version AS c_agent_avatar_version,
-                (ag.deleted_at IS NOT NULL) AS c_agent_deleted,
-                c.workspace_id AS c_workspace_id, c.agent_model AS c_agent_model,
-                c.agent_mode AS c_agent_mode,
                 cp.pinned_at AS p_pinned_at, cp.archived_at AS p_archived_at,
                 cp.muted_until AS p_muted_until, cp.mute_forever AS p_mute_forever,
                 cp.updated_at AS p_updated_at,
                 c.announcement, au.display_name AS announcement_by_name, c.announcement_at
            FROM memberships m
            JOIN conversations c ON c.id = m.conversation_id
-           LEFT JOIN agents ag ON ag.id = c.agent_id
-           LEFT JOIN agent_workspaces ws ON ws.id = c.workspace_id
            LEFT JOIN users au ON au.id = c.announcement_by
            LEFT JOIN conversation_preferences cp
                   ON cp.conversation_id = c.id AND cp.user_id = m.user_id
@@ -158,16 +131,13 @@ pub(super) async fn list_conversations(
                       att_id, att_name, att_mime, att_size, mentions,
                       reply_to_id, reply_to, edited_at, edit_version, deleted_at, reactions, poll,
                       att_width, att_height, att_has_thumb, att_duration_ms,
-                      sender_avatar_version, sender_has_avatar, forwarded_from,
-                      agent_id, agent_name, agent_avatar_version, agent_steps, approval
+                      sender_avatar_version, sender_has_avatar, forwarded_from
                  FROM message_views
                 WHERE conversation_id = c.id
                 ORDER BY seq DESC
                 LIMIT 1
            ) lm ON true
           WHERE m.user_id = $1
-            -- 移除了的工作区连同对话一起隐藏
-            AND (c.workspace_id IS NULL OR ws.deleted_at IS NULL)
           -- 置顶块在前按 pinned_at DESC，块内与未置顶均按原活动时间 DESC、id 兜底
           ORDER BY (cp.pinned_at IS NOT NULL) DESC, cp.pinned_at DESC,
                    COALESCE(lm.created_at, c.created_at) DESC, c.id",
@@ -187,7 +157,6 @@ pub(super) async fn list_conversations(
                 last_seen_at: r.peer_last_seen,
                 avatar_version: r.peer_avatar_version.unwrap_or(0),
                 has_avatar: r.peer_has_avatar.unwrap_or(false),
-                agent_access: None,
             });
             let last_message = r.m_id.map(|id| MessageView {
                 id,
@@ -232,13 +201,6 @@ pub(super) async fn list_conversations(
                 sender_avatar_version: r.m_sender_avatar_version.unwrap_or(0),
                 sender_has_avatar: r.m_sender_has_avatar.unwrap_or(false),
                 forwarded_from: r.m_forwarded_from.clone(),
-                agent: r.m_agent_id.map(|id| crate::model::AgentRef {
-                    id,
-                    name: r.m_agent_name.clone().unwrap_or_default(),
-                    avatar_version: r.m_agent_avatar_version.unwrap_or(0),
-                }),
-                agent_steps: r.m_agent_steps.map(|j| j.0),
-                approval: r.m_approval.map(|j| j.0),
             });
             ConversationView {
                 id: r.id,
@@ -262,20 +224,6 @@ pub(super) async fn list_conversations(
                     text,
                     updated_by_name: r.announcement_by_name.clone(),
                     updated_at: r.announcement_at,
-                }),
-                agent: r.c_agent_id.map(|id| crate::model::ConvAgentRef {
-                    id,
-                    name: r.c_agent_name.clone().unwrap_or_default(),
-                    host_id: r.c_agent_host_id.unwrap_or_default(),
-                    host_online: r
-                        .c_agent_host_id
-                        .map(|h| st.host_online(h))
-                        .unwrap_or(false),
-                    avatar_version: r.c_agent_avatar_version.unwrap_or(0),
-                    deleted: r.c_agent_deleted.unwrap_or(false),
-                    workspace_id: r.c_workspace_id,
-                    model: r.c_agent_model.clone(),
-                    mode: r.c_agent_mode.clone(),
                 }),
                 created_at: r.created_at,
             }
@@ -459,7 +407,6 @@ pub(super) async fn conversation_detail(
                     last_seen_at: r.last_seen_at,
                     avatar_version: r.avatar_version,
                     has_avatar: r.has_avatar,
-                    agent_access: None,
                 },
                 role: r.role,
                 joined_at: r.joined_at,
@@ -604,7 +551,6 @@ pub(super) async fn leave_conversation(
         }
     }
     tx.commit().await?;
-    crate::agents::refresh_run_members(&st, conv).await;
 
     notify(&st, &others, "conversations");
     notify(&st, &[uid], "conversations");
@@ -625,9 +571,9 @@ pub(super) async fn kick_member(
     let Some((kind, _, _)) = domain::lock_conversation(&mut tx, conv).await? else {
         return Err(AppError::forbidden("not a member of this conversation"));
     };
-    // self/agent 会话单人不可变：成员操作与 dm 一样拒绝，但统一 400（群主身份本是唯一成员，
+    // self 会话单人不可变：成员操作与 dm 一样拒绝，但统一 400（群主身份本是唯一成员，
     // 不做类型守卫会落到 member not found 的 404）
-    if kind == "self" || kind == "agent" {
+    if kind == "self" {
         return Err(AppError::bad_request(
             "this conversation has no members to manage",
         ));
@@ -650,7 +596,6 @@ pub(super) async fn kick_member(
     }
     let rest = domain::member_ids(&mut *tx, conv).await?;
     tx.commit().await?;
-    crate::agents::refresh_run_members(&st, conv).await;
 
     notify(&st, &rest, "conversations");
     notify(&st, &[target], "conversations");
@@ -668,10 +613,10 @@ pub(super) async fn rename_conversation(
     if me.role != "owner" {
         return Err(AppError::forbidden("only the owner can rename"));
     }
-    // self/agent 会话 name 恒 NULL（客户端按 kind 显示标题），改名无意义 → 400
+    // self 会话 name 恒 NULL（客户端按 kind 显示标题），改名无意义 → 400
     if matches!(
         domain::conv_kind(&st.pool, conv).await?.as_deref(),
-        Some("self") | Some("agent")
+        Some("self")
     ) {
         return Err(AppError::bad_request("this conversation cannot be renamed"));
     }
@@ -839,8 +784,8 @@ pub(super) async fn dissolve_conversation(
     let Some((kind, _, _)) = domain::lock_conversation(&mut tx, conv).await? else {
         return Err(AppError::forbidden("not a member of this conversation"));
     };
-    // self/agent 会话不可解散：唯一成员即 owner，不做类型守卫会把会话连同成员一起删掉
-    if kind == "self" || kind == "agent" {
+    // self 会话不可解散：唯一成员即 owner，不做类型守卫会把会话连同成员一起删掉
+    if kind == "self" {
         return Err(AppError::bad_request(
             "this conversation cannot be dissolved",
         ));
@@ -871,7 +816,6 @@ pub(super) async fn dissolve_conversation(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    crate::agents::refresh_run_members(&st, conv).await;
     notify(&st, &members, "conversations");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -896,8 +840,8 @@ pub(super) async fn transfer_ownership(
     let Some((kind, _, _)) = domain::lock_conversation(&mut tx, conv).await? else {
         return Err(AppError::forbidden("not a member of this conversation"));
     };
-    // self/agent 会话归属本人不可转让（唯一成员即 owner）
-    if kind == "self" || kind == "agent" {
+    // self 会话归属本人不可转让（唯一成员即 owner）
+    if kind == "self" {
         return Err(AppError::bad_request(
             "this conversation cannot be transferred",
         ));

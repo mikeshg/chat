@@ -61,7 +61,6 @@ pub(crate) fn quota_message(used_bytes: i64, quota_mb: i64) -> String {
 }
 
 /// 存储配额三件套（V2 P2-1）：quota_mb、折算字节（0=不限）、当前已用。
-/// POST /v1/files 与 /v1/agent-tools/files（A05）共用。
 pub(crate) async fn upload_quota(
     st: &SharedState,
     uploader: Uuid,
@@ -183,7 +182,6 @@ pub(crate) async fn read_upload(
 }
 
 /// 写盘 + 图片尺寸/缩略图 + attachments 行。
-/// agent_invocation_id 是 A05 产出文件的归属标记（普通上传为 None）。
 pub(crate) async fn store_upload(
     st: &SharedState,
     uploader: Uuid,
@@ -192,7 +190,6 @@ pub(crate) async fn store_upload(
     mime: String,
     file: TempUpload,
     duration_ms: Option<i32>,
-    agent_invocation_id: Option<Uuid>,
 ) -> AppResult<AttachmentView> {
     let id = Uuid::new_v4();
     // 只存文件名，文件固定在 FILES_DIR 里
@@ -240,8 +237,8 @@ pub(crate) async fn store_upload(
     sqlx::query(
         "INSERT INTO attachments
              (id, uploader_id, conv_id, file_name, mime, size, storage_path, width, height, thumb_path,
-              duration_ms, agent_invocation_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+              duration_ms)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(id)
     .bind(uploader)
@@ -254,7 +251,6 @@ pub(crate) async fn store_upload(
     .bind(height)
     .bind(&thumb_path)
     .bind(duration_ms)
-    .bind(agent_invocation_id)
     .execute(&st.pool)
     .await?;
     Ok(AttachmentView {
@@ -325,7 +321,6 @@ pub(super) async fn upload_file(
             rd.mime,
             rd.file.expect("has_file"),
             duration_ms,
-            None,
         )
         .await?,
     ))

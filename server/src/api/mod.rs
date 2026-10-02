@@ -9,7 +9,7 @@ use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{delete, get, patch, post, put},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
@@ -122,122 +122,6 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
         .route("/conversations/{id}/members/me", delete(leave_conversation))
         .route("/conversations/{id}/members/{uid}", delete(kick_member))
         .route("/conversations/{id}/transfer", post(transfer_ownership))
-        // ---------- Agent A01 ----------
-        .route("/agent-hosts", get(crate::agents::list_hosts))
-        .route("/agent-hosts/{id}", patch(crate::agents::patch_host))
-        .route(
-            "/agent-hosts/{id}/registry",
-            get(crate::agents::registry_list),
-        )
-        .route(
-            "/agent-hosts/{id}/registry/{entry_id}/install",
-            post(crate::agents::registry_install),
-        )
-        .route(
-            "/agents",
-            get(crate::agents::list_agents).post(crate::agents::create_agent),
-        )
-        .route(
-            "/agents/{id}",
-            patch(crate::agents::patch_agent).delete(crate::agents::delete_agent),
-        )
-        .route(
-            "/agents/{id}/avatar",
-            get(crate::agents::get_agent_avatar)
-                .put(crate::agents::put_agent_avatar)
-                .layer(DefaultBodyLimit::max(AVATAR_MAX_BYTES + UPLOAD_BODY_MARGIN)),
-        )
-        .route("/agents/{id}/probe", post(crate::agents::probe_agent))
-        // Agent A28：内置 Agent 的可选模型（管理员配置的端点×模型）
-        .route("/agent-builtin/models", get(crate::agents::builtin_models))
-        // ---------- Agent A27：工作区与工作区对话 ----------
-        .route(
-            "/agent-hosts/{id}/workspaces",
-            get(crate::workspaces::list_workspaces).post(crate::workspaces::add_workspace),
-        )
-        .route("/agent-hosts/{id}/dirs", get(crate::workspaces::list_dirs))
-        .route(
-            "/agent-workspaces/{id}",
-            delete(crate::workspaces::remove_workspace),
-        )
-        .route(
-            "/agent-workspaces/{id}/sessions",
-            post(crate::workspaces::create_session),
-        )
-        .route(
-            "/agent-sessions/{id}",
-            patch(crate::workspaces::patch_session).delete(crate::workspaces::delete_session),
-        )
-        .route(
-            "/agents/{id}/schedules",
-            get(crate::schedules::list_schedules).post(crate::schedules::create_schedule),
-        )
-        .route(
-            "/agent-schedules/{id}",
-            patch(crate::schedules::patch_schedule).delete(crate::schedules::delete_schedule),
-        )
-        .route(
-            "/users/me/agent-settings",
-            get(crate::agents::get_user_settings).put(crate::agents::put_user_settings),
-        )
-        .route(
-            "/conversations/{id}/agent-invocations",
-            get(crate::agents::list_invocations),
-        )
-        // Agent A13：调用期凭据专用工具端点（与普通用户鉴权互不通用）
-        .route(
-            "/agent-tools/history",
-            get(crate::agent_tools::tool_history),
-        )
-        // Agent A16：主人参与的会话、搜索、读历史、以 Agent 身份发消息
-        .route(
-            "/agent-tools/conversations",
-            get(crate::agent_tools::tool_conversations),
-        )
-        .route(
-            "/agent-tools/conversations/{id}/messages",
-            get(crate::agent_tools::tool_conversation_messages),
-        )
-        .route("/agent-tools/search", get(crate::agent_tools::tool_search))
-        .route(
-            "/agent-tools/messages",
-            post(crate::agent_tools::tool_send_message),
-        )
-        // Agent A05：产出文件上传（Invocation 凭据）；body 上限与普通上传一致
-        .route(
-            "/agent-tools/files",
-            post(crate::agent_tools::tool_upload_file).layer(DefaultBodyLimit::max(
-                cfg.upload_max_bytes + UPLOAD_BODY_MARGIN,
-            )),
-        )
-        .route(
-            "/agent-tools/invocations",
-            post(crate::agent_tools::tool_create_invocation),
-        )
-        .route(
-            "/agent-tools/invocations/{id}",
-            get(crate::agent_tools::tool_get_invocation),
-        )
-        .route(
-            "/agent-tools/schedules",
-            get(crate::schedules::tool_list_schedules).post(crate::schedules::tool_create_schedule),
-        )
-        .route(
-            "/agent-tools/schedules/{id}",
-            delete(crate::schedules::tool_delete_schedule),
-        )
-        .route(
-            "/conversations/{id}/agent-context/reset",
-            post(crate::agents::reset_context),
-        )
-        .route(
-            "/agent-invocations/{id}/cancel",
-            post(crate::agents::cancel_invocation),
-        )
-        .route(
-            "/agent-approvals/{id}/decide",
-            post(crate::approvals::decide),
-        )
         .route(
             "/files",
             post(upload_file).layer(DefaultBodyLimit::max(
@@ -270,10 +154,6 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
         .route("/admin/invites/{id}", delete(settings::revoke_invite))
         .route("/admin/users", get(admin_users))
         .route("/admin/users/{id}/disable", post(admin_disable))
-        .route(
-            "/admin/users/{id}/agent-access",
-            put(admin_set_agent_access),
-        )
         .route("/admin/users/{id}/enable", post(admin_enable))
         .route("/admin/users/{id}/role", post(admin_set_role))
         .route("/admin/users/{id}/password", post(admin_reset_password))
@@ -306,10 +186,8 @@ async fn uid_of(headers: &HeaderMap, st: &SharedState) -> AppResult<Uuid> {
     Ok(auth::require_user(st, headers).await?.id)
 }
 
-/// 自己的公开资料带上生效后的 Agent 使用权（A08）
-async fn self_public(st: &SharedState, row: &UserRow) -> AppResult<UserPublic> {
-    let allowed = crate::agent_access::user_allows(&st.pool, row.id).await?;
-    Ok(UserPublic::from(row).with_agent_access(allowed))
+async fn self_public(_st: &SharedState, row: &UserRow) -> AppResult<UserPublic> {
+    Ok(UserPublic::from(row))
 }
 
 pub(crate) fn notify(st: &SharedState, uids: &[Uuid], what: &'static str) {

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
-import { isDesktopShell } from "../../agentHost";
+import { isDesktopShell } from "../../api";
 
-/** Agent A09：「我」页开机自动启动。只在桌面壳显示，默认关闭（不在这里调用 enable）。 */
+/** 「我」页开机自动启动。只在桌面壳显示，默认关闭（不在这里调用 enable）。 */
 export default function AutostartSetting() {
   const desktop = isDesktopShell();
   const [enabled, setEnabled] = useState(false);
@@ -61,7 +61,7 @@ export default function AutostartSetting() {
         />
         <span>登录系统后自动打开 Chat</span>
       </label>
-      <div className="muted">默认关闭。关闭窗口后 Agent 会留在托盘里继续运行。</div>
+      <div className="muted">默认关闭。关闭窗口后 Chat 会留在托盘里继续接收消息。</div>
       {hint && <div className="muted">{hint}</div>}
     </section>
   );

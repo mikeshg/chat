@@ -17,15 +17,9 @@ tauri-plugin-notification = "2"
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Agent A01：桌面端宿主运行时（Android 不编译）
-agent-host = { path = "../../agent-host" }
-uuid = { version = "1", features = ["v4"] }
-tokio = { version = "1", features = ["sync"] }
 
 # 开机自启只有桌面平台（Android 不编译这个插件）
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-autostart = "2"
 # 在线更新（Windows 安装包；Android 走下载 APK）
 tauri-plugin-updater = "2"
-# 宿主日志写 stderr：从终端启动 Chat 就能看到连接失败等原因
-tracing-subscriber = "0.3"

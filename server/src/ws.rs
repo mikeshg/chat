@@ -41,12 +41,6 @@ pub async fn ws_handler(
         session_version: grant.session_version,
         sid: grant.sid,
     };
-    // Agent A01：role=host 走宿主会话（不计 presence、收 invocation_start）
-    if q.role.as_deref() == Some("host") {
-        return Ok(ws.on_upgrade(move |socket| async move {
-            let _ = crate::host_ws::host_session(socket, st, access).await;
-        }));
-    }
     Ok(ws.on_upgrade(move |socket| handle_session(socket, st, access)))
 }
 
@@ -266,17 +260,14 @@ pub fn broadcast_reaction_update(st: &SharedState, ch: &ReactionChange) {
     }
 }
 
-/// 普通新消息的统一入口：落库后立即 broadcast_posted（推送、解归档、Agent 调用都挂在那里）。
-/// 例外：审批卡片要与调用行锁同事务，走 post_message_in_tx 提交后再广播；
+/// 普通新消息的统一入口：落库后立即 broadcast_posted（推送、解归档、bot 回调都挂在那里）。
 /// 投票创建、转发由 domain 组装结果，在 api 层逐条 broadcast_posted。
 pub async fn post_and_broadcast(
     st: &SharedState,
     msg: domain::PostMessage<'_>,
-    agent_targets: Vec<Uuid>,
 ) -> Result<domain::Posted, domain::PostError> {
     let conv = msg.conversation_id;
-    let mut posted = domain::post_message(&st.pool, msg).await?;
-    posted.agent_targets = agent_targets;
+    let posted = domain::post_message(&st.pool, msg).await?;
     broadcast_posted(st, conv, &posted).await;
     Ok(posted)
 }
@@ -291,20 +282,15 @@ pub async fn broadcast_posted(st: &SharedState, conv: Uuid, posted: &domain::Pos
         });
         st.send_to_users(&posted.member_ids, &p);
         // 发送者已读位置在事务内推进到这条：同步给他的其他设备清角标。
-        // Agent 消息没有推进主人 last_read_seq（对主人是「别人发来的」），不发 read_sync。
-        if posted.message.agent.is_none() {
-            st.send_to_user(
-                posted.message.sender_id,
-                &frame(&WsOut::ReadSync {
-                    conversation_id: conv,
-                    seq: posted.message.seq,
-                }),
-            );
-        }
+        st.send_to_user(
+            posted.message.sender_id,
+            &frame(&WsOut::ReadSync {
+                conversation_id: conv,
+                seq: posted.message.seq,
+            }),
+        );
         // V2 P3-3：离线推送（ntfy）——判定与发送全在 spawned 任务里，不拖慢广播
         crate::push::schedule(st, conv, posted);
-        // Agent A01/A11：文字消息落库后的唯一调用挂点（专属会话，或私聊/群里的 @）
-        crate::agents::maybe_invoke(st, conv, posted).await;
     }
     // 新 @本人消息已在事务内解除其归档：偏好帧只发给本人全部连接（其他成员不可见）
     for target in &posted.unarchived {
@@ -359,7 +345,6 @@ async fn on_text(
             content,
             attachment_id,
             reply_to_id,
-            agent_targets,
             ..
         }) => {
             let res = send_message(
@@ -371,7 +356,6 @@ async fn on_text(
                 &content,
                 attachment_id,
                 reply_to_id,
-                agent_targets,
             )
             .await;
             (res, client_msg_id, None)
@@ -460,9 +444,8 @@ async fn send_message(
     content: &str,
     attachment_id: Option<Uuid>,
     reply_to_id: Option<Uuid>,
-    agent_targets: Vec<Uuid>,
 ) -> WsResult {
-    // 投票、转发、Agent、审批字段保持 text() 的空值：用户 WS 不能伪造这些负载与身份
+    // 投票、转发字段保持 text() 的空值：用户 WS 不能伪造这些负载
     let posted = post_and_broadcast(
         st,
         domain::PostMessage {
@@ -471,7 +454,6 @@ async fn send_message(
             reply_to_id,
             ..domain::PostMessage::text(conv, uid, content)
         },
-        agent_targets,
     )
     .await
     .map_err(domain::PostError::into_ws)?;
@@ -541,13 +523,13 @@ async fn reaction(
 }
 
 async fn typing(st: &SharedState, uid: Uuid, conv: Uuid) -> WsResult {
-    // self/agent 会话不广播 typing（唯一成员即本人；显式短路，省得查成员再空转）
+    // self 会话不广播 typing（唯一成员即本人；显式短路，省得查成员再空转）
     if matches!(
         domain::conv_kind(&st.pool, conv)
             .await
             .map_err(|_| ws_err("internal", "db error"))?
             .as_deref(),
-        Some("self") | Some("agent")
+        Some("self")
     ) {
         return Ok(());
     }
@@ -647,7 +629,6 @@ async fn user_public(st: &SharedState, uid: Uuid) -> Result<UserPublic, (&'stati
             last_seen_at,
             avatar_version,
             has_avatar,
-            agent_access: None,
         },
     )
     .map_err(|_| ws_err("internal", "db error"))

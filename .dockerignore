@@ -5,5 +5,4 @@ server/target
 .git
 .devin
 data/
-agent-host/target
 app/src-tauri/target

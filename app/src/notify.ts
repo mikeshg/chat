@@ -109,7 +109,6 @@ function windowForeground(): boolean {
  */
 export function shouldSystemNotify(s: AppState, m: MessageView, env: NotifyEnv): boolean {
   if (!env.enabled || env.foreground) return false;
-  // Agent 消息（m.agent 非空）对主人也算「别人发来的」→ 照常通知
   if (s.me == null || isOwnMessage(m, s.me.id)) return false;
   const conv = s.conversations.find((c) => c.id === m.conversation_id);
   if (conv && isMuted(conv) && !m.mentions.includes(s.me.id)) return false;
@@ -151,7 +150,7 @@ export function notificationBody(
         ? "[语音]"
         : `[文件] ${m.attachment.file_name}`
     : kindLabel(m.kind) || m.content.slice(0, 80);
-  return `${o.mentioned ? "[有人@我] " : ""}${m.agent?.name ?? m.sender_name}: ${excerpt}`;
+  return `${o.mentioned ? "[有人@我] " : ""}${m.sender_name}: ${excerpt}`;
 }
 
 /**

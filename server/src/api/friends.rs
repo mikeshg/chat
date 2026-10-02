@@ -41,7 +41,6 @@ pub(super) async fn list_friends(
                     last_seen_at: r.last_seen_at,
                     avatar_version: r.avatar_version,
                     has_avatar: r.has_avatar,
-                    agent_access: None,
                 },
                 since: r.since,
             })
@@ -125,7 +124,6 @@ pub(super) async fn list_requests(
                     last_seen_at: r.cp_last_seen,
                     avatar_version: r.cp_avatar_version,
                     has_avatar: r.cp_has_avatar,
-                    agent_access: None,
                 },
                 message: r.message,
                 direction: dir,

@@ -15,7 +15,5 @@ scripts/.e2e-state.json
 scripts/shot-*.png
 data/
 
-# agent-host 命令行示例在当前目录保存的宿主标识
-agent_host_install_id
 .claude/settings.local.json
 .idea/

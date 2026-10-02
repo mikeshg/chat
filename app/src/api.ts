@@ -2,25 +2,11 @@ import type {
   AdminOverview,
   AdminSettings,
   AdminUserView,
-  AgentHostView,
-  AgentOptionItem,
-  AgentUserSettings,
-  AgentView,
-  AgentWorkspace,
-  DirListing,
-  RegistryList,
   AttachmentView,
   AuthResponse,
   BackupCreated,
   BackupList,
   BackupTicket,
-  CreateAgentReq,
-  CreateScheduleReq,
-  PatchAgentReq,
-  ProbeResult,
-  PatchScheduleReq,
-  ScheduleView,
-  InvocationView,
   RestoreResult,
   ConversationDetail,
   ConversationPref,
@@ -298,6 +284,13 @@ export function deviceLabel(): string {
   return browserDeviceLabel(ua);
 }
 
+/** Tauri 桌面壳（Windows / macOS / Linux）；网页与 Android 为 false */
+export function isDesktopShell(): boolean {
+  const w = globalThis as { __TAURI_INTERNALS__?: unknown; __TAURI__?: unknown; navigator?: { userAgent?: string } };
+  if (!w.__TAURI_INTERNALS__ && !w.__TAURI__) return false;
+  return !/Android/i.test(w.navigator?.userAgent ?? "");
+}
+
 // ---------- auth ----------
 export const auth = {
   register: (username: string, password: string, display_name?: string, inviteCode?: string) =>
@@ -399,81 +392,6 @@ export const convs = {
   pin: (id: string, messageId: string) => put<void>(`/conversations/${id}/pins/${messageId}`),
   unpin: (id: string, messageId: string) => del<void>(`/conversations/${id}/pins/${messageId}`),
   ticket: () => get<{ ticket: string; expires_in: number }>("/ws/ticket"),
-};
-
-// ---------- Agent A01 ----------
-export const agents = {
-  /** 本人的宿主列表（含实时 online） */
-  hosts: () => get<AgentHostView[]>("/agent-hosts"),
-  /** 改宿主名称（去首尾空白，1–60 字）。别人的宿主 404，空或超长 400 bad_label */
-  patchHost: (id: string, label: string) =>
-    patch<AgentHostView>(`/agent-hosts/${id}`, { label }),
-  /** 本人的 Agent 列表 */
-  list: () => get<AgentView[]>("/agents"),
-  /** 创建 Agent（同时建专属会话）；400 bad_name / 409 name_taken / 404 电脑非本人 / 403 host_not_local */
-  create: (body: CreateAgentReq) => post<AgentView>("/agents", body),
-  /** 向在线宿主要登记表。离线 409 host_offline，别人的宿主 404，20 秒无响应 504 */
-  registry: (hostId: string) => get<RegistryList>(`/agent-hosts/${hostId}/registry`),
-  /** 请宿主安装一条。202 后进度走 registry_install_progress 帧 */
-  installRegistry: (hostId: string, entryId: string, version: string) =>
-    post<{ ok?: boolean }>(
-      `/agent-hosts/${hostId}/registry/${encodeURIComponent(entryId)}/install`,
-      { version },
-    ),
-  /** 改 Agent；400 校验失败 / 409 name_taken / 404 不是自己的或已删除 */
-  patch: (id: string, body: PatchAgentReq) => patch<AgentView>(`/agents/${id}`, body),
-  /** 软删除。进行中的调用会被取消 */
-  remove: (id: string) => del<void>(`/agents/${id}`),
-  /** 让在线宿主重新读可选模型 / 模式，等到结果；离线 409 host_offline，60 秒无响应 504 */
-  probe: (id: string) => post<ProbeResult>(`/agents/${id}/probe`),  /** 上传头像（PNG / JPEG / WebP），返回更新后的 Agent */
-  uploadAvatar: (id: string, file: Blob) => {
-    const fd = new FormData();
-    const ext = file.type === "image/png" ? "png" : file.type === "image/webp" ? "webp" : "jpg";
-    fd.append("file", file, `avatar.${ext}`);
-    return call<AgentView>(`/agents/${id}/avatar`, { method: "PUT", body: fd });
-  },
-  /** 个人默认设置 */
-  settings: () => get<AgentUserSettings>("/users/me/agent-settings"),
-  updateSettings: (body: Partial<AgentUserSettings>) =>
-    put<AgentUserSettings>("/users/me/agent-settings", body),
-  /** 会话最近的调用记录（刷新后恢复状态行；仅成员可读） */
-  invocations: (convId: string, limit = 50) =>
-    get<InvocationView[]>(`/conversations/${convId}/agent-invocations?limit=${limit}`),
-  /** A02：清空本会话的 AgentContext（仅成员；非 agent 会话 400） */
-  resetContext: (convId: string) =>
-    post<void>(`/conversations/${convId}/agent-context/reset`),
-  /** 取消排队中 / 运行中 / 等待审批的调用。409 = 已经结束 */
-  cancel: (id: string) => post<InvocationView>(`/agent-invocations/${id}/cancel`),
-  /** A17：这个 Agent 的定时任务 */
-  schedules: (agentId: string) => get<ScheduleView[]>(`/agents/${agentId}/schedules`),
-  createSchedule: (agentId: string, body: CreateScheduleReq) =>
-    post<ScheduleView>(`/agents/${agentId}/schedules`, body),
-  patchSchedule: (id: string, body: PatchScheduleReq) =>
-    patch<ScheduleView>(`/agent-schedules/${id}`, body),
-  deleteSchedule: (id: string) => del<void>(`/agent-schedules/${id}`),
-  /** 主人决定一张审批卡片。404 不是主人，409 已不是 pending，400 选项不对 */
-  decideApproval: (id: string, optionId: string) =>
-    post<MessageView>(`/agent-approvals/${id}/decide`, { option_id: optionId }),
-  /** A27：这台电脑上的工作区。别人的电脑 404 */
-  workspaces: (hostId: string) => get<AgentWorkspace[]>(`/agent-hosts/${hostId}/workspaces`),
-  /** 加工作区；同一路径移除过就恢复（连同对话）。400 bad_path */
-  addWorkspace: (hostId: string, path: string) =>
-    post<AgentWorkspace>(`/agent-hosts/${hostId}/workspaces`, { path }),
-  /** 请电脑列出 path 下的子目录。离线 409 host_offline，10 秒无响应 504 */
-  dirs: (hostId: string, path: string) =>
-    get<DirListing>(`/agent-hosts/${hostId}/dirs?path=${encodeURIComponent(path)}`),
-  /** 移除工作区（对话跟着隐藏，再加同一路径会回来）。「无工作区」不能移除 */
-  removeWorkspace: (id: string) => del<void>(`/agent-workspaces/${id}`),
-  /** A28：内置 Agent 的可选模型（端点×模型），不带地址与 key；无使用权 403 */
-  builtinModels: () => get<AgentOptionItem[]>("/agent-builtin/models"),
-  /** 新对话：Agent 必须和工作区在同一台电脑上（否则 400 agent_on_other_host） */
-  createSession: (wsId: string, body: { agent_id: string; name?: string; model?: string; mode?: string }) =>
-    post<{ conversation_id: string }>(`/agent-workspaces/${wsId}/sessions`, body),
-  /** 改对话名（只限工作区对话）/ 模型 / 模式；空串 = 跟随 Agent */
-  patchSession: (id: string, body: { name?: string; model?: string; mode?: string }) =>
-    patch<void>(`/agent-sessions/${id}`, body),
-  /** 删工作区对话；进行中的调用未结束 409 invocation_running */
-  removeSession: (id: string) => del<void>(`/agent-sessions/${id}`),
 };
 
 // ---------- 消息生命周期 ----------
@@ -608,9 +526,6 @@ export const admin = {
     post(`/admin/users/${id}/role`, { role }),
   resetPassword: (id: string, password: string) =>
     post(`/admin/users/${id}/password`, { password }),
-  /** 逐用户覆盖：true 允许 / false 禁止 / null 跟随默认 */
-  setAgentAccess: (id: string, allowed: boolean | null) =>
-    put<void>(`/admin/users/${id}/agent-access`, { allowed }),
   // ---------- V2 P4-1 备份/恢复 ----------
   backups: () => get<BackupList>("/admin/backups"),
   createBackup: () => post<BackupCreated>("/admin/backups"),

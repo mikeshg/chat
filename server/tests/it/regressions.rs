@@ -1287,7 +1287,7 @@ async fn unknown_api_is_json_404_with_cors() {
     let c = reqwest::Client::new();
     let r = c
         .post(format!(
-            "{base}/v1/agent-hosts/{}/no-such-thing",
+            "{base}/v1/conversations/{}/no-such-thing",
             uuid::Uuid::nil()
         ))
         .header("Origin", "http://tauri.localhost")

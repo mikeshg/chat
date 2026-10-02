@@ -1,7 +1,7 @@
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    ApprovalView, AttachmentView, ConversationPref, CreatePollReq, MessageView, PollOptionView,
-    PollView, PrefUpdateReq, ReactionView, ReplyPreview,
+    AttachmentView, ConversationPref, CreatePollReq, MessageView, PollOptionView, PollView,
+    PrefUpdateReq, ReactionView, ReplyPreview,
 };
 use chrono::{DateTime, Utc};
 use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
@@ -221,15 +221,6 @@ pub struct MsgViewRow {
     pub sender_avatar_version: i32,
     pub sender_has_avatar: bool,
     pub forwarded_from: Option<String>,
-    // Agent A01（0019）：非空 = 该消息由 Agent 发出
-    pub agent_id: Option<Uuid>,
-    pub agent_name: Option<String>,
-    // Agent A06：消息上的 Agent 头像版本（无 Agent 时为 NULL）
-    pub agent_avatar_version: Option<i32>,
-    // Agent A03（0024）：该消息附带的已完成步骤记录
-    pub agent_steps: Option<sqlx::types::Json<Vec<crate::model::AgentStepView>>>,
-    // Agent A12（0028）：kind='approval' 的卡片；墓碑为 NULL
-    pub approval: Option<sqlx::types::Json<ApprovalView>>,
 }
 
 impl MsgViewRow {
@@ -275,13 +266,6 @@ impl MsgViewRow {
             sender_avatar_version: self.sender_avatar_version,
             sender_has_avatar: self.sender_has_avatar,
             forwarded_from: self.forwarded_from,
-            agent: self.agent_id.map(|id| crate::model::AgentRef {
-                id,
-                name: self.agent_name.unwrap_or_default(),
-                avatar_version: self.agent_avatar_version.unwrap_or(0),
-            }),
-            agent_steps: self.agent_steps.map(|j| j.0),
-            approval: self.approval.map(|j| j.0),
         }
     }
 }

@@ -11,8 +11,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-# A17：按 IANA 时区计算下次运行（含夏令时）
-chrono-tz = "0.10"
 argon2 = "0.5"
 jsonwebtoken = "9"
 rand_core = { version = "0.6", features = ["getrandom"] }
@@ -34,8 +32,6 @@ tokio-util = { version = "0.7", features = ["io"] }
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 tokio-tungstenite = "0.26"
-# Agent A01：集成测试用真实宿主库连真 WS
-agent-host = { path = "../agent-host" }
 # V2 P4-1：测试里解包/篡改备份文件
 tar = "0.4"
 flate2 = "1"

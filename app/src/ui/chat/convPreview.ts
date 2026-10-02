@@ -27,12 +27,6 @@ export function convPreview(c: ConversationView, o: ConvPreviewInput): ConvPrevi
   if (!o.active && draft) return { kind: "draft", text: draft.split("\n", 1)[0] };
   const m = c.last_message;
   if (!m) return { kind: "empty", text: "暂无消息" };
-  // Agent 会话里 agent 发的消息冠 Agent 名（sender_name 是主人）
-  const who =
-    c.kind === "agent" && m.agent
-      ? `${m.agent.name}：`
-      : c.kind === "group" && m.sender_id !== o.meId
-        ? `${m.sender_name}：`
-        : "";
+  const who = c.kind === "group" && m.sender_id !== o.meId ? `${m.sender_name}：` : "";
   return { kind: "message", text: `${who}${m.content}` };
 }

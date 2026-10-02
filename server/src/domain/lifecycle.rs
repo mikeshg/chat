@@ -22,8 +22,6 @@ pub(super) struct LockedMessage {
     pub(super) edit_version: i32,
     pub(super) edit_op_id: Option<String>,
     pub(super) attachment_id: Option<Uuid>,
-    /// Agent A01：非空 = Agent 所写（sender_id 是主人，但主人也不能编辑）
-    pub(super) agent_id: Option<Uuid>,
     pub(super) edit_expired: bool,
 }
 
@@ -64,12 +62,11 @@ pub(super) async fn lock_message_for_mutation(
             i32,
             Option<String>,
             Option<Uuid>,
-            Option<Uuid>,
             bool,
         ),
     >(
         "SELECT sender_id, kind, deleted_at, edit_version, edit_op_id, attachment_id,
-                agent_id, created_at + $2::interval <= now() AS edit_expired
+                created_at + $2::interval <= now() AS edit_expired
            FROM messages WHERE id = $1 FOR UPDATE",
     )
     .bind(message_id)
@@ -87,8 +84,7 @@ pub(super) async fn lock_message_for_mutation(
         edit_version: row.3,
         edit_op_id: row.4,
         attachment_id: row.5,
-        agent_id: row.6,
-        edit_expired: row.7,
+        edit_expired: row.6,
     })
 }
 
@@ -156,10 +152,6 @@ pub(super) async fn edit_in_tx(
     if op_key.is_some() && m.edit_op_id.as_deref() == op_key.as_deref() {
         return finish_edit(tx, m.conversation_id, message_id).await;
     }
-    // Agent 消息不可编辑：作者栏是 Agent，sender_id 只是承载用的主人 id
-    if m.agent_id.is_some() {
-        return Err(PostError::deny("bad_request", "agent messages cannot be edited").into());
-    }
     if m.sender_id != editor {
         return Err(PostError::deny("forbidden", "only the author can edit").into());
     }
@@ -201,8 +193,7 @@ pub(super) async fn edit_in_tx(
         .bind(m.conversation_id)
         .fetch_all(&mut **tx)
         .await?;
-        let agent_names = live_agent_names(tx, editor).await?;
-        for uid in parse_mentions(content, &members, editor, &agent_names) {
+        for uid in parse_mentions(content, &members, editor) {
             sqlx::query(
                 "INSERT INTO message_mentions (message_id, user_id) VALUES ($1, $2)
                  ON CONFLICT DO NOTHING",

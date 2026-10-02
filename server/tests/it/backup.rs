@@ -557,7 +557,7 @@ async fn p41_aborted_restore_upload_leaves_no_part_file() {
                 1,
             )),
             1 => {
-                tokio::time::sleep(A01Dur::from_millis(300)).await;
+                tokio::time::sleep(Dur::from_millis(300)).await;
                 Some((Err(std::io::Error::other("client aborted")), 2))
             }
             _ => None,
@@ -579,9 +579,9 @@ async fn p41_aborted_restore_upload_leaves_no_part_file() {
         .await;
     // 连接中断：客户端拿到错误，或服务端来得及回 400
     assert!(r.is_err() || r.unwrap().status() == 400);
-    let deadline = std::time::Instant::now() + A01Dur::from_secs(3);
+    let deadline = std::time::Instant::now() + Dur::from_secs(3);
     while !parts().is_empty() && std::time::Instant::now() < deadline {
-        tokio::time::sleep(A01Dur::from_millis(50)).await;
+        tokio::time::sleep(Dur::from_millis(50)).await;
     }
     assert!(parts().is_empty(), "残留上传文件: {:?}", parts());
 }

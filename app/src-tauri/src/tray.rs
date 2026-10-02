@@ -1,4 +1,4 @@
-// Agent A09：桌面托盘。关窗口只是隐藏，宿主继续跑；只有菜单「退出」才停宿主并结束进程。
+// 桌面托盘。关窗口只是隐藏，继续收消息通知；只有菜单「退出」才结束进程。
 // Android 不编译本模块。
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,7 +11,7 @@ use tauri_plugin_notification::NotificationExt;
 static QUITTING: AtomicBool = AtomicBool::new(false);
 static TRAY_HINT_SHOWN: AtomicBool = AtomicBool::new(false);
 
-const TRAY_HINT: &str = "Chat 已最小化到托盘，Agent 会继续运行";
+const TRAY_HINT: &str = "Chat 已最小化到托盘，会继续接收消息";
 
 fn box_err(err: impl std::error::Error + Send + Sync + 'static) -> Box<dyn std::error::Error> {
     Box::new(err)
@@ -67,21 +67,11 @@ fn reveal(app: &AppHandle) {
     let _ = window.set_focus();
 }
 
-/// 先停宿主再退出。QUITTING 让随后的 CloseRequested 真正关掉窗口。
+/// QUITTING 让随后的 CloseRequested 真正关掉窗口。
 fn request_quit(app: &AppHandle) {
-    if QUITTING.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let handle = app
-            .try_state::<crate::agent_host::AgentHostState>()
-            .and_then(|state| crate::agent_host::take_handle(&state));
-        if let Some(handle) = handle {
-            handle.shutdown().await;
-        }
+    if !QUITTING.swap(true, Ordering::SeqCst) {
         app.exit(0);
-    });
+    }
 }
 
 pub fn on_window_event(window: &Window, event: &WindowEvent) {

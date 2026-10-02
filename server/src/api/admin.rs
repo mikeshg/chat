@@ -117,7 +117,6 @@ pub(super) async fn admin_users(
     .await?
     .into_iter()
     .collect();
-    let policy = crate::agent_access::load_policy(&st.pool).await?;
     Ok(Json(
         rows.iter()
             .map(|u| AdminUserView {
@@ -132,58 +131,9 @@ pub(super) async fn admin_users(
                 storage_bytes: usage.get(&u.id).copied().unwrap_or(0),
                 avatar_version: u.avatar_version,
                 has_avatar: u.avatar_path.is_some(),
-                agent_access: u.agent_access,
-                agent_access_effective: crate::agent_access::effective(
-                    &u.role,
-                    policy.enabled,
-                    policy.default_allowed,
-                    u.agent_access,
-                ),
             })
             .collect(),
     ))
-}
-
-#[derive(Deserialize)]
-pub(super) struct SetAgentAccessReq {
-    /// true 允许 / false 禁止 / null 跟随全局默认
-    allowed: Option<bool>,
-}
-
-/// PUT /admin/users/{id}/agent-access
-pub(super) async fn admin_set_agent_access(
-    State(st): State<SharedState>,
-    headers: HeaderMap,
-    Path(target): Path<Uuid>,
-    Json(req): Json<SetAgentAccessReq>,
-) -> AppResult<StatusCode> {
-    auth::require_admin(&st, &headers).await?;
-    let row = sqlx::query_as::<_, (String, Option<bool>)>(
-        "SELECT role, agent_access FROM users WHERE id = $1",
-    )
-    .bind(target)
-    .fetch_optional(&st.pool)
-    .await?;
-    let Some((role, old_ov)) = row else {
-        return Err(AppError::not_found("user not found"));
-    };
-    let policy = crate::agent_access::load_policy(&st.pool).await?;
-    let before =
-        crate::agent_access::effective(&role, policy.enabled, policy.default_allowed, old_ov);
-    sqlx::query("UPDATE users SET agent_access = $2 WHERE id = $1")
-        .bind(target)
-        .bind(req.allowed)
-        .execute(&st.pool)
-        .await?;
-    let after =
-        crate::agent_access::effective(&role, policy.enabled, policy.default_allowed, req.allowed);
-    if before && !after {
-        crate::agents::revoke_access(&st, &[target]).await;
-    }
-    if before != after {
-        notify(&st, &[target], "me");
-    }
-    Ok(StatusCode::NO_CONTENT)
 }
 
 /// 禁用：顾问锁 + 行锁串行化 → 置标记并 bump 凭据版本 → 撤 refresh → 踢下线（帧 + 主动断连）
@@ -220,8 +170,6 @@ pub(super) async fn admin_disable(
     revoke_all_refresh(&mut tx, target).await?;
     revoke_all_sessions(&mut tx, target).await?;
     tx.commit().await?;
-    // 先取消进行中的调用并断开宿主，再踢普通连接（帧先于 force_logout）
-    crate::agents::revoke_access(&st, &[target]).await;
     notify(&st, &[target], "me");
     if let Some(epoch) = st.kick_user(target, "disabled") {
         ws::publish_offline(&st, target, epoch).await;
@@ -269,8 +217,8 @@ pub(super) async fn admin_set_role(
         .bind(ADMIN_LOCK_KEY)
         .execute(&mut *tx)
         .await?;
-    let (cur, disabled, access_ov) = sqlx::query_as::<_, (String, bool, Option<bool>)>(
-        "SELECT role, disabled_at IS NOT NULL, agent_access FROM users WHERE id = $1 FOR UPDATE",
+    let (cur, disabled) = sqlx::query_as::<_, (String, bool)>(
+        "SELECT role, disabled_at IS NOT NULL FROM users WHERE id = $1 FOR UPDATE",
     )
     .bind(target)
     .fetch_optional(&mut *tx)
@@ -299,23 +247,7 @@ pub(super) async fn admin_set_role(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    // 降成普通用户时，全局关 / 默认禁止会让生效值从有变无
-    if let Ok(policy) = crate::agent_access::load_policy(&st.pool).await {
-        let before =
-            crate::agent_access::effective(&cur, policy.enabled, policy.default_allowed, access_ov);
-        let after = crate::agent_access::effective(
-            &req.role,
-            policy.enabled,
-            policy.default_allowed,
-            access_ov,
-        );
-        if before && !after {
-            crate::agents::revoke_access(&st, &[target]).await;
-        }
-        if before != after {
-            notify(&st, &[target], "me");
-        }
-    }
+    notify(&st, &[target], "me");
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -43,46 +43,6 @@ impl Conn {
 /// user_id -> (conn_id -> 连接)
 pub type ConnMap = DashMap<Uuid, DashMap<Uuid, Conn>>;
 
-/// Agent A01：一条宿主连接。与 Conn 分表登记——宿主连接不计 presence、
-/// 不在 send_to_user 的扇出里。
-pub struct HostConn {
-    pub tx: mpsc::Sender<ConnMsg>,
-    /// 防陈旧注销：同 (user, install_id) 重连顶替后，旧连接的清理不得摘掉新连接
-    pub conn_id: Uuid,
-    /// 宿主所属用户（agent_hosts.user_id 快照，状态广播用）
-    pub user_id: Uuid,
-    /// 这条连接用的登录会话（ticket 里的 sid）。踢设备 / 改密时按它断开。
-    pub sid: Option<Uuid>,
-}
-
-/// Agent A03：一次进行中调用的运行时状态（纯内存；调用终结即摘）。
-/// 防伪造：宿主的 invocation_event 只受理 host_id 匹配的调用。
-pub struct InvRun {
-    /// 该调用派给的宿主
-    pub host_id: Uuid,
-    pub conversation_id: Uuid,
-    /// 流式 / 步骤帧的接收者。派发时是「调用会话成员 ∪ 根会话成员」，
-    /// 成员变更提交后按当时的成员重算（不在推流路径上查库）。
-    pub member_ids: Vec<Uuid>,
-    /// 主人 / Agent id（步骤消息与定稿消息的回写需要）
-    pub owner: Uuid,
-    pub agent_id: Uuid,
-    /// 派发时的调用视图快照（状态推进帧沿用，current_step 每次现填）
-    pub inv: crate::model::InvocationView,
-    /// 生效输出方式：stream / status / steps
-    pub mode: String,
-    /// 进行中步骤（按开始顺序）：(id, title, kind)
-    pub open: Vec<(String, String, String)>,
-    /// 已完成步骤（按收尾顺序）
-    pub steps: Vec<crate::model::AgentStepView>,
-    /// stream 模式待推送的文本增量
-    pub stream_buf: String,
-    /// 上次向成员推送 agent_stream 的时刻（200ms 限频窗口基准）
-    pub last_push: Instant,
-    /// 是否已有延迟冲刷任务在跑
-    pub flushing: bool,
-}
-
 /// 一次性 WS ticket 的内容：签发时的用户、凭据版本与登录会话
 pub struct TicketGrant {
     pub uid: Uuid,
@@ -112,28 +72,11 @@ pub struct AppState {
     pub maintenance: AtomicBool,
     /// V2 P4-1：备份/恢复互斥锁（同一时间只允许一个备份生成或一次恢复进行）。
     pub backup_busy: AtomicBool,
-    /// Agent A01：host_id -> 宿主连接（在线即有此表项）
-    pub hosts: DashMap<Uuid, HostConn>,
-    /// Agent A04：排队超时清扫间隔（毫秒），默认 30s。
-    /// 清扫循环每小段重读这个值，测试调小后不用等完原来的 30 秒。
-    pub queue_sweep_interval_ms: AtomicU64,
-    /// Agent A23：宿主离线后，进行中的调用再等多久判 host_disconnected（毫秒）。默认 10 分钟。
-    /// 和排队清扫共用一个循环；测试调小。起点在 agent_hosts.offline_since，重启后仍在。
-    pub host_offline_grace_ms: AtomicU64,
-    /// 下发 invocation_start 和 invocation_cancel 共用这把锁，避免取消帧早于启动帧。
-    /// 全局锁：只包一次状态查询和一次非阻塞发送。吞吐成问题时按调用 id 分锁。
-    pub inv_gate: tokio::sync::Mutex<()>,
-    /// Agent A03：invocation_id -> 进行中调用的运行时状态
-    pub inv_runs: DashMap<Uuid, InvRun>,
-    /// Agent A17：定时调用扫描间隔（毫秒），默认 30s。测试调小后不用等完原来的 30 秒。
-    pub schedule_sweep_interval_ms: AtomicU64,
-    /// Agent A07：登记表 / 试读请求 request_id → 等宿主回 registry_result / probe_result。超时从这里摘掉。
-    pub registry_wait: DashMap<Uuid, tokio::sync::oneshot::Sender<serde_json::Value>>,
 }
 
 impl AppState {
     pub fn new(pool: PgPool, cfg: Config) -> SharedState {
-        let st = Arc::new(Self {
+        Arc::new(Self {
             pool,
             cfg,
             conns: DashMap::new(),
@@ -145,17 +88,7 @@ impl AppState {
             ws_ping_interval_ms: AtomicU64::new(30_000),
             maintenance: AtomicBool::new(false),
             backup_busy: AtomicBool::new(false),
-            hosts: DashMap::new(),
-            queue_sweep_interval_ms: AtomicU64::new(30_000),
-            host_offline_grace_ms: AtomicU64::new(600_000),
-            inv_gate: tokio::sync::Mutex::new(()),
-            inv_runs: DashMap::new(),
-            schedule_sweep_interval_ms: AtomicU64::new(30_000),
-            registry_wait: DashMap::new(),
-        });
-        crate::agents::spawn_queue_sweeper(st.clone());
-        crate::schedules::spawn_sweeper(st.clone());
-        st
+        })
     }
 
     fn bump_epoch(&self, uid: Uuid) -> u64 {
@@ -236,9 +169,7 @@ impl AppState {
     /// 踢下线：给该用户所有连接发 force_logout 并主动断开 socket，同时摘掉连接表。
     /// 返回 Some(epoch) 表示刚才还在线，调用方负责广播离线。
     /// 断线清理看到连接已不在表里，不会再广播一次。
-    /// 该用户的宿主连接一并断开（A08：宿主跟随登录会话，禁用 / 恢复备份走这里）。
     pub fn kick_user(&self, uid: Uuid, reason: &str) -> Option<u64> {
-        self.disconnect_hosts(uid, |_| false, reason);
         let Some((_, bucket)) = self.conns.remove(&uid) else {
             return None;
         };
@@ -298,17 +229,15 @@ impl AppState {
         Some(epoch)
     }
 
-    /// 踢掉某个登录会话的全部连接（设备被移出），含该会话上的宿主。
+    /// 踢掉某个登录会话的全部连接（设备被移出）。
     pub fn kick_session(&self, uid: Uuid, sid: Uuid, reason: &str) -> Option<u64> {
-        self.disconnect_hosts(uid, |s| s != Some(sid), reason);
         self.kick_matching(uid, reason, |s| s != Some(sid))
     }
 
-    /// 踢掉除 keep 以外登录会话的全部连接（改密/一键退出其他设备），含对应宿主。
+    /// 踢掉除 keep 以外登录会话的全部连接（改密/一键退出其他设备）。
     /// keep=None（老 token 发起的请求）：只踢带 sid 的连接，无 sid 的老连接保留，
     /// 由 session_version 变化在下一帧自然断开。
     pub fn kick_other_sessions(&self, uid: Uuid, keep: Option<Uuid>, reason: &str) -> Option<u64> {
-        self.disconnect_hosts(uid, |s| s == keep, reason);
         self.kick_matching(uid, reason, |s| s == keep)
     }
 
@@ -344,100 +273,6 @@ impl AppState {
 
     pub fn conn_count(&self, uid: Uuid) -> usize {
         self.conns.get(&uid).map(|m| m.len()).unwrap_or(0)
-    }
-
-    // ---------- Agent A01：宿主连接表 ----------
-
-    /// 登记宿主连接；同 host 已有连接时给旧连接发 host_superseded 并断开。
-    /// sid 是这条连接的登录会话，供改密 / 移出设备时对上号。
-    pub fn register_host(
-        &self,
-        host_id: Uuid,
-        user_id: Uuid,
-        conn_id: Uuid,
-        sid: Option<Uuid>,
-        tx: mpsc::Sender<ConnMsg>,
-    ) {
-        if let Some(old) = self.hosts.insert(
-            host_id,
-            HostConn {
-                tx,
-                conn_id,
-                user_id,
-                sid,
-            },
-        ) {
-            let _ = old.tx.try_send(ConnMsg::Shutdown(
-                serde_json::json!({"type": "host_superseded"}).to_string(),
-            ));
-        }
-    }
-
-    /// 移除宿主连接；仅当表里的仍是这条连接时才移除（顶替保护）。
-    /// 返回 true = 本连接确实在册，调用方负责离线收尾。
-    pub fn unregister_host(&self, host_id: Uuid, conn_id: Uuid) -> bool {
-        self.hosts
-            .remove_if(&host_id, |_, c| c.conn_id == conn_id)
-            .is_some()
-    }
-
-    /// 宿主当前在线（连接表里有登记）
-    pub fn host_online(&self, host_id: Uuid) -> bool {
-        self.hosts.contains_key(&host_id)
-    }
-
-    /// 添加 Agent 用：这条在线连接的登录会话是不是这次请求的会话。
-    /// 没有 sid、电脑离线、或会话对不上，都不是本机。
-    pub fn host_is_local_session(&self, host_id: Uuid, sid: Option<Uuid>) -> bool {
-        let Some(sid) = sid else {
-            return false;
-        };
-        self.hosts.get(&host_id).is_some_and(|c| c.sid == Some(sid))
-    }
-
-    /// 断开该用户全部宿主（使用权收回）。不摘连接表，会话循环自己收尾并标离线。
-    pub fn disconnect_user_hosts(&self, uid: Uuid) {
-        self.disconnect_hosts(uid, |_| false, "agent_access_revoked");
-    }
-
-    /// keep 返回 true 的宿主留下。先发关闭帧，并立刻给主人推 online=false
-    /// （会话循环随后还会再推一次；GET 要等循环摘表才变离线）。
-    fn disconnect_hosts(&self, uid: Uuid, keep: impl Fn(Option<Uuid>) -> bool, reason: &str) {
-        let frame = serde_json::json!({
-            "type": "force_logout",
-            "reason": reason,
-        })
-        .to_string();
-        let ids: Vec<Uuid> = self
-            .hosts
-            .iter()
-            .filter(|e| e.user_id == uid && !keep(e.sid))
-            .map(|e| *e.key())
-            .collect();
-        for host_id in ids {
-            let Some(conn) = self.hosts.get(&host_id) else {
-                continue;
-            };
-            if conn.user_id != uid || keep(conn.sid) {
-                continue;
-            }
-            let _ = conn.tx.try_send(ConnMsg::Shutdown(frame.clone()));
-            drop(conn);
-            let status = serde_json::json!({
-                "type": "agent_host_status",
-                "host_id": host_id,
-                "online": false,
-            })
-            .to_string();
-            self.send_to_user(uid, &status);
-        }
-    }
-
-    /// 向宿主连接投递一帧；宿主离线或队列满返回 false
-    pub fn send_to_host(&self, host_id: Uuid, payload: &str) -> bool {
-        self.hosts
-            .get(&host_id)
-            .is_some_and(|c| c.tx.try_send(ConnMsg::Frame(payload.to_string())).is_ok())
     }
 
     pub fn issue_ticket(&self, uid: Uuid, session_version: i64, sid: Option<Uuid>) -> String {

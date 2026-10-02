@@ -7,7 +7,6 @@ import {
   isArchived,
   isMuted,
   isPinned,
-  isWorkspaceConv,
   setState,
   useApp,
 } from "../../store";
@@ -16,7 +15,6 @@ import { openConversation } from "../../ws";
 import { convPreview } from "./convPreview";
 import NewGroupModal from "./NewGroupModal";
 import SearchPanel from "./SearchPanel";
-import AgentAvatar from "../agent/AgentAvatar";
 import Avatar from "../Avatar";
 
 function fmtTime(iso?: string | null): string {
@@ -49,8 +47,7 @@ export default function ConvList() {
   const [menuBusy, setMenuBusy] = useState(false);
   const [menuErr, setMenuErr] = useState<string | null>(null);
 
-  // A27：工作区对话只在 Agent 页显示
-  const chats = s.conversations.filter((c) => !isWorkspaceConv(c));
+  const chats = s.conversations;
   const archivedCount = chats.filter(isArchived).length;
 
   const list = useMemo(() => {
@@ -164,8 +161,6 @@ export default function ConvList() {
         {list.map((c) => {
           const title = convTitle(c, s.me?.id);
           const peerOnline = c.kind === "dm" && c.peer ? !!s.online[c.peer.id] : false;
-          // A01：agent 会话的在线点 = 宿主在线（随 agent_host_status 帧翻转）
-          const hostOnline = c.kind === "agent" && (c.agent?.host_online ?? false);
           const typing = s.typing[c.id];
           const typingFresh = typing && Date.now() - typing.ts < 5000;
           const muted = isMuted(c);
@@ -192,16 +187,9 @@ export default function ConvList() {
                 >
                   {peerOnline && <i className="online-dot" />}
                 </Avatar>
-              ) : c.kind === "agent" && c.agent ? (
-                <AgentAvatar agentId={c.agent.id} name={c.agent.name} version={c.agent.avatar_version}>
-                  {hostOnline && <i className="online-dot" />}
-                </AgentAvatar>
               ) : (
-                <div
-                  className={`avatar ${c.kind === "self" ? "self-avatar" : ""} ${c.kind === "agent" ? "agent-avatar" : ""}`}
-                >
-                  {c.kind === "self" ? "🗂" : c.kind === "agent" ? "🤖" : convAvatarText(c)}
-                  {hostOnline && <i className="online-dot" />}
+                <div className={`avatar ${c.kind === "self" ? "self-avatar" : ""}`}>
+                  {c.kind === "self" ? "🗂" : convAvatarText(c)}
                 </div>
               )}
               <div className="conv-mid">

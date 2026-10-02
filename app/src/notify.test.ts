@@ -84,11 +84,6 @@ function state(patch: Partial<AppState> = {}): AppState {
     toasts: [],
     avatars: {},
     pendingJump: null,
-    agentHosts: [],
-    localHostId: null,
-    invocations: {},
-    agentRuns: {},
-    childInvocations: {},
     ...patch,
   };
 }

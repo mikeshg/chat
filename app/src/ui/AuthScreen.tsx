@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react";
-import { syncAgentHost } from "../agentHost";
 import { auth, getServer, saveSession, serverInfo, setServer } from "../api";
 import { readDrafts } from "../drafts";
 import { parseInviteParam } from "../invite";
@@ -71,7 +70,6 @@ export default function AuthScreen() {
       saveSession(r);
       setState({ me: r.user, drafts: readDrafts(localStorage, r.user.id) });
       void startWs();
-      void syncAgentHost(r.user);
     } catch (ex) {
       // fetch 连不上时只抛 TypeError（Safari 写作 "Load failed"），带上地址才好排查
       setErr(
