@@ -5,6 +5,6 @@
     "dev": "pnpm -F app dev",
     "build": "pnpm -F app build",
     "server": "cargo run --manifest-path server/Cargo.toml",
-    "test": "cargo test --manifest-path server/Cargo.toml"
+    "test": "cargo test --manifest-path server/Cargo.toml && cargo test --manifest-path agent-host/Cargo.toml && pnpm -F app test"
   }
 }
