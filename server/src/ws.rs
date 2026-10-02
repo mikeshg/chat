@@ -217,7 +217,7 @@ fn ws_err(code: &'static str, message: impl Into<String>) -> (&'static str, Stri
     (code, message.into())
 }
 
-// ---------- 生命周期广播（api.rs REST 路径复用） ----------
+// ---------- 生命周期广播（api/ REST 路径复用） ----------
 
 /// 编辑广播：reactions 含 reacted_by_me，必须逐成员分别序列化。
 pub async fn broadcast_message_updated(st: &SharedState, ed: &domain::Edited) {

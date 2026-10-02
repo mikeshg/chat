@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-// 调用行的返回列与 agents.rs 共用一份，免得两边列不一致导致行解码失败
+// 调用行的返回列与 agents/ 共用一份，免得两边列不一致导致行解码失败
 use crate::agents::INV_RETURNING;
 
 #[derive(Deserialize)]

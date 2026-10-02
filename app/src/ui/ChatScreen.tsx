@@ -2,12 +2,12 @@ import { useEffect } from "react";
 import { canUseAgent } from "../agentAccess";
 import { dismissToast, isWorkspaceConv, setState, useApp } from "../store";
 import { openConversation, refreshCatalogs } from "../ws";
-import ConvList from "./ConvList";
-import ChatView from "./ChatView";
+import ConvList from "./chat/ConvList";
+import ChatView from "./chat/ChatView";
 import ContactsPanel from "./ContactsPanel";
-import AgentManager from "./AgentManager";
-import MePanel from "./MePanel";
-import AdminPanel from "./AdminPanel";
+import AgentManager from "./agent/AgentManager";
+import MePanel from "./me/MePanel";
+import AdminPanel from "./admin/AdminPanel";
 import Avatar from "./Avatar";
 
 export default function ChatScreen() {

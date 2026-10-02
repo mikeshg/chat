@@ -1,0 +1,225 @@
+import { useEffect, useRef, useState } from "react";
+import { ApiError, msgs as msgsApi, session } from "../../api";
+import { applyLiveMessage, convTitle, getState, setState, useApp } from "../../store";
+import type { MessageView } from "../../types";
+import { forwardTargets } from "./forwardTargets";
+
+const MAX_TARGETS = 10;
+
+type ForwardSubmission = {
+  messageId: string;
+  targets: string[];
+  clientOpId: string;
+};
+
+/** 幂等提交载荷：目标集合规范化（排序）后未变 → 复用同一 client_op_id，
+ * 结果未确认的重试不会产生第二条转发消息；变了才换键算新提交。 */
+export function prepareForwardSubmission(
+  previous: ForwardSubmission | null,
+  messageId: string,
+  targets: string[],
+): ForwardSubmission {
+  const sorted = [...targets].sort();
+  if (
+    previous?.messageId === messageId &&
+    JSON.stringify(previous.targets) === JSON.stringify(sorted)
+  ) {
+    return previous;
+  }
+  if (sorted.length === 0 || sorted.length > MAX_TARGETS) {
+    throw new Error(`请选择 1–${MAX_TARGETS} 个目标会话`);
+  }
+  return { messageId, targets: sorted, clientOpId: crypto.randomUUID() };
+}
+
+type ForwardDone = {
+  ok: number;
+  fails: { title: string; text: string }[];
+};
+
+/**
+ * 转发弹窗（V2 P2-4）：搜索 + 会话多选（文件传输助手置顶，其余按列表顺序，
+ * 只读私聊已在 forwardTargets 排除），最多 10 个。逐目标结果在弹窗内汇总；
+ * 同一次提交的重试复用同一 client_op_id。收藏不走这里（直接调接口到 self）。
+ */
+export default function ForwardModal({
+  message,
+  onClose,
+}: {
+  message: MessageView;
+  onClose: () => void;
+}) {
+  const s = useApp();
+  const [q, setQ] = useState("");
+  const [selected, setSelected] = useState<string[]>([]);
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState<ForwardDone | null>(null);
+  const submitted = useRef<ForwardSubmission | null>(null);
+  const inflight = useRef(false);
+  const owner = useRef<object | null>(null);
+  const gen = session();
+  useEffect(() => {
+    const token = {};
+    owner.current = token;
+    submitted.current = null;
+    inflight.current = false;
+    return () => {
+      if (owner.current === token) owner.current = null;
+    };
+  }, [message.id, gen]);
+
+  const list = forwardTargets(s.conversations, s.friends);
+  const kw = q.trim().toLowerCase();
+  const shown = kw
+    ? list.filter((c) => convTitle(c).toLowerCase().includes(kw))
+    : list;
+
+  const toggle = (id: string) => {
+    setErr("");
+    setSelected((cur) =>
+      cur.includes(id)
+        ? cur.filter((x) => x !== id)
+        : cur.length >= MAX_TARGETS
+          ? cur
+          : [...cur, id],
+    );
+  };
+
+  const submit = async () => {
+    const token = owner.current;
+    const current = () => token != null && token === owner.current && gen === session();
+    if (inflight.current || !current()) return;
+    let payload: ForwardSubmission;
+    try {
+      payload = prepareForwardSubmission(submitted.current, message.id, selected);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "请选择目标");
+      return;
+    }
+    submitted.current = payload;
+    inflight.current = true;
+    setBusy(true);
+    setErr("");
+    try {
+      const resp = await msgsApi.forward(
+        payload.messageId,
+        payload.targets,
+        payload.clientOpId,
+      );
+      if (!current()) return;
+      // 成功目标立即并入本地（广播帧到达时按 id 去重，无闪烁）
+      const oks = resp.results.filter((r) => r.ok && r.message);
+      if (oks.length > 0) {
+        setState((st) => {
+          let cur = st;
+          for (const r of oks) cur = { ...cur, ...applyLiveMessage(cur, r.message!) };
+          return cur;
+        });
+      }
+      const byId = new Map(s.conversations.map((c) => [c.id, c]));
+      const fails = resp.results
+        .filter((r) => !r.ok)
+        .map((r) => ({
+          title: byId.has(r.conversation_id)
+            ? convTitle(byId.get(r.conversation_id)!)
+            : "未知会话",
+          text: r.message_text ?? r.error ?? "发送失败",
+        }));
+      setDone({ ok: oks.length, fails });
+      submitted.current = null;
+    } catch (e) {
+      if (!current()) return;
+      // 明确拒绝 → 换键重来；结果未确认（网络/5xx）→ 保留 client_op_id 幂等重试
+      const rejected = e instanceof ApiError && [400, 403, 404, 409, 422].includes(e.status);
+      if (rejected) submitted.current = null;
+      setErr(
+        rejected
+          ? e.message
+          : "结果未确认，请点重试（同一批目标幂等，不会重复发送）。",
+      );
+    } finally {
+      if (current()) {
+        inflight.current = false;
+        setBusy(false);
+      }
+    }
+  };
+
+  return (
+    <div className="modal-mask" onClick={onClose}>
+      <div className="modal fwd-modal" onClick={(e) => e.stopPropagation()}>
+        <h3>转发消息</h3>
+        {done ? (
+          <div className="fwd-result">
+            {done.ok > 0 && (
+              <div className="fwd-ok">已转发到 {done.ok} 个会话</div>
+            )}
+            {done.fails.map((f, i) => (
+              <div className="fwd-fail" key={i}>
+                {f.title}：{f.text}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <>
+            <input
+              autoFocus
+              className="search"
+              placeholder="搜索会话"
+              value={q}
+              disabled={busy}
+              onChange={(e) => setQ(e.target.value)}
+            />
+            <div className="fwd-list">
+              {shown.length === 0 && <div className="msg-sys">无可转发会话</div>}
+              {shown.map((c) => {
+                const on = selected.includes(c.id);
+                const full = !on && selected.length >= MAX_TARGETS;
+                return (
+                  <label
+                    key={c.id}
+                    className={`fwd-item ${on ? "on" : ""} ${full ? "dim" : ""}`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={on}
+                      disabled={busy || full}
+                      onChange={() => toggle(c.id)}
+                    />
+                    <span className={`avatar ${c.kind === "self" ? "self-avatar" : ""}`}>
+                      {c.kind === "self" ? "🗂" : convTitle(c)[0]?.toUpperCase()}
+                    </span>
+                    <span className="fwd-name">{convTitle(c)}</span>
+                  </label>
+                );
+              })}
+            </div>
+            <div className="muted fwd-count">
+              已选 {selected.length} / {MAX_TARGETS}
+            </div>
+            {err && <div className="auth-err">{err}</div>}
+          </>
+        )}
+        <div className="row end">
+          {done ? (
+            <button className="primary" onClick={onClose}>
+              完成
+            </button>
+          ) : (
+            <>
+              <button onClick={onClose}>取消</button>
+              <button
+                className="primary"
+                onClick={submit}
+                disabled={busy || selected.length === 0}
+              >
+                {busy ? "转发中…" : `转发${selected.length ? `（${selected.length}）` : ""}`}
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

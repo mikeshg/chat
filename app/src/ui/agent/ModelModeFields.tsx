@@ -1,0 +1,76 @@
+import type { AgentOptionItem, ReportedOptions } from "../../types";
+
+export function OptionSelect({
+  label,
+  value,
+  items,
+  onChange,
+  defaultText = "默认",
+  disabled,
+}: {
+  label: string;
+  value: string;
+  items: AgentOptionItem[];
+  onChange: (v: string) => void;
+  /** 空值那一项的说明，如「跟随 Agent（Smart）」 */
+  defaultText?: string;
+  disabled?: boolean;
+}) {
+  return (
+    <select aria-label={label} value={value} disabled={disabled} onChange={(e) => onChange(e.target.value)}>
+      <option value="">{label}：{defaultText}</option>
+      {value && !items.some((m) => m.id === value) && <option value={value}>{value}</option>}
+      {items.map((m) => (
+        <option key={m.id} value={m.id}>
+          {m.name}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+/** 添加页和详情页共用：模型 / 模式两个下拉 + 重新读取。可选项来自程序自己上报。 */
+export default function ModelModeFields({
+  model,
+  mode,
+  options,
+  probing,
+  error,
+  disabled,
+  hideMode,
+  onModel,
+  onMode,
+  onReload,
+}: {
+  model: string;
+  mode: string;
+  options: ReportedOptions;
+  probing: boolean;
+  error: string;
+  disabled?: boolean;
+  /** A28：内置 Agent 没有模式选项，只显示模型下拉 */
+  hideMode?: boolean;
+  onModel: (v: string) => void;
+  onMode: (v: string) => void;
+  onReload: () => void;
+}) {
+  return (
+    <div className="am-field">
+      <span className="am-lb">{hideMode ? "默认模型" : "默认模型和模式"}</span>
+      <div className="am-row">
+        <OptionSelect label="模型" value={model} items={options.models ?? []} onChange={onModel} />
+        {!hideMode && (
+          <OptionSelect label="模式" value={mode} items={options.modes ?? []} onChange={onMode} />
+        )}
+      </div>
+      <span className="am-hint">
+        每条对话可以另选。{hideMode ? "模型列表来自管理员配置的端点；" : "可选项由程序自己提供；"}列表不全时点
+        <button type="button" className="am-link" disabled={probing || disabled} onClick={onReload}>
+          {probing ? "读取中…" : "重新读取"}
+        </button>
+        （电脑需在线）。
+      </span>
+      {error && <span className="auth-err">读取失败：{error}</span>}
+    </div>
+  );
+}
