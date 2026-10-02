@@ -754,11 +754,13 @@ export default function ChatView() {
             {conv.kind === "self"
               ? "在你的设备间同步消息与文件"
               : conv.kind === "dm"
-                ? peerOnline
-                  ? "在线"
-                  : conv.peer?.last_seen_at
-                    ? `最后在线 ${new Date(conv.peer.last_seen_at).toLocaleString()}`
-                    : "离线"
+                ? conv.peer?.is_bot
+                  ? "机器人"
+                  : peerOnline
+                    ? "在线"
+                    : conv.peer?.last_seen_at
+                      ? `最后在线 ${new Date(conv.peer.last_seen_at).toLocaleString()}`
+                      : "离线"
                 : `${conv.member_count} 名成员`}
           </div>
         </div>

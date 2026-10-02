@@ -70,7 +70,7 @@ pub(super) async fn search_user(
         .replace('_', "\\_");
     let rows = sqlx::query_as::<_, UserRow>(
         "SELECT * FROM users
-          WHERE id <> $1 AND disabled_at IS NULL
+          WHERE id <> $1 AND disabled_at IS NULL AND bot_owner_id IS NULL
             AND (username ILIKE '%' || $2 || '%' ESCAPE '\\'
                               OR display_name ILIKE '%' || $2 || '%' ESCAPE '\\')
           ORDER BY (username = $3 OR display_name = $3) DESC, username

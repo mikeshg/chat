@@ -201,6 +201,7 @@ export default function GroupInfo({
                 <div className="grow">
                   {m.user.display_name}
                   {m.role === "owner" && <span className="tag">群主</span>}
+                  {m.user.is_bot && <span className="tag">机器人</span>}
                 </div>
                 {isOwner && m.user.id !== s.me?.id && (
                   <>

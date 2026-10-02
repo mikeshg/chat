@@ -18,6 +18,7 @@ mod attachments;
 mod avatar;
 mod backup;
 mod basics;
+mod bots;
 mod common;
 mod conv_prefs;
 mod forward;

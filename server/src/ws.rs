@@ -291,6 +291,7 @@ pub async fn broadcast_posted(st: &SharedState, conv: Uuid, posted: &domain::Pos
         );
         // V2 P3-3：离线推送（ntfy）——判定与发送全在 spawned 任务里，不拖慢广播
         crate::push::schedule(st, conv, posted);
+        crate::api::dispatch_bots(st, conv, &posted.message);
     }
     // 新 @本人消息已在事务内解除其归档：偏好帧只发给本人全部连接（其他成员不可见）
     for target in &posted.unarchived {
@@ -629,6 +630,7 @@ async fn user_public(st: &SharedState, uid: Uuid) -> Result<UserPublic, (&'stati
             last_seen_at,
             avatar_version,
             has_avatar,
+            is_bot: false,
         },
     )
     .map_err(|_| ws_err("internal", "db error"))

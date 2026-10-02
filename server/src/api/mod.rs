@@ -9,7 +9,7 @@ use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
@@ -22,6 +22,7 @@ use uuid::Uuid;
 mod account;
 mod admin;
 mod avatar;
+mod bots;
 mod conversations;
 mod files;
 mod friends;
@@ -31,6 +32,8 @@ mod users;
 use account::*;
 use admin::*;
 pub(crate) use avatar::*;
+pub(crate) use bots::dispatch as dispatch_bots;
+use bots::*;
 use conversations::*;
 pub(crate) use files::*;
 use friends::*;
@@ -122,6 +125,10 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
         .route("/conversations/{id}/members/me", delete(leave_conversation))
         .route("/conversations/{id}/members/{uid}", delete(kick_member))
         .route("/conversations/{id}/transfer", post(transfer_ownership))
+        .route("/bots", get(list_bots).post(create_bot))
+        .route("/bots/{id}", patch(patch_bot).delete(delete_bot))
+        .route("/bots/{id}/token", post(reset_bot_token))
+        .route("/hooks/{token}", post(post_hook))
         .route(
             "/files",
             post(upload_file).layer(DefaultBodyLimit::max(

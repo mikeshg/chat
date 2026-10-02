@@ -11,6 +11,7 @@ pub(super) struct MemberRow {
     joined_at: DateTime<Utc>,
     avatar_version: i32,
     has_avatar: bool,
+    is_bot: bool,
 }
 
 // ---------- conversations ----------
@@ -33,6 +34,7 @@ pub(super) struct ConvRow {
     peer_last_seen: Option<DateTime<Utc>>,
     peer_avatar_version: Option<i32>,
     peer_has_avatar: Option<bool>,
+    peer_is_bot: Option<bool>,
     m_id: Option<Uuid>,
     m_seq: Option<i64>,
     m_sender_id: Option<Uuid>,
@@ -86,6 +88,7 @@ pub(super) async fn list_conversations(
                 p.id AS peer_id, p.username::text AS peer_username, p.display_name AS peer_display,
                 p.role AS peer_role, p.last_seen_at AS peer_last_seen,
                 p.avatar_version AS peer_avatar_version, p.has_avatar AS peer_has_avatar,
+                p.is_bot AS peer_is_bot,
                 lm.id AS m_id, lm.seq AS m_seq, lm.sender_id AS m_sender_id,
                 lm.sender_username AS m_sender_username, lm.sender_name AS m_sender_name,
                 lm.content AS m_content, lm.kind AS m_kind, lm.created_at AS m_created_at,
@@ -111,6 +114,7 @@ pub(super) async fn list_conversations(
            LEFT JOIN LATERAL (
                SELECT u.id, u.username, u.display_name, u.role,
                       u.avatar_version, u.avatar_path IS NOT NULL AS has_avatar,
+                      u.bot_owner_id IS NOT NULL AS is_bot,
                       -- last_seen_at 属于 presence：删好友后保留的只读 DM 不得继续暴露
                       CASE WHEN EXISTS(SELECT 1 FROM friendships f
                                         WHERE (f.user_a = $1 AND f.user_b = u.id)
@@ -157,6 +161,7 @@ pub(super) async fn list_conversations(
                 last_seen_at: r.peer_last_seen,
                 avatar_version: r.peer_avatar_version.unwrap_or(0),
                 has_avatar: r.peer_has_avatar.unwrap_or(false),
+                is_bot: r.peer_is_bot.unwrap_or(false),
             });
             let last_message = r.m_id.map(|id| MessageView {
                 id,
@@ -381,7 +386,8 @@ pub(super) async fn conversation_detail(
 
     let members = sqlx::query_as::<_, MemberRow>(
         "SELECT u.id, u.username::text AS username, u.display_name, u.role AS urole, u.last_seen_at,
-                m.role, m.joined_at, u.avatar_version, u.avatar_path IS NOT NULL AS has_avatar
+                m.role, m.joined_at, u.avatar_version, u.avatar_path IS NOT NULL AS has_avatar,
+                u.bot_owner_id IS NOT NULL AS is_bot
            FROM memberships m JOIN users u ON u.id = m.user_id
           WHERE m.conversation_id = $1 ORDER BY m.joined_at",
     )
@@ -407,6 +413,7 @@ pub(super) async fn conversation_detail(
                     last_seen_at: r.last_seen_at,
                     avatar_version: r.avatar_version,
                     has_avatar: r.has_avatar,
+                    is_bot: r.is_bot,
                 },
                 role: r.role,
                 joined_at: r.joined_at,
@@ -502,10 +509,11 @@ pub(super) async fn leave_conversation(
     let me = domain::membership(&mut *tx, conv, uid)
         .await?
         .ok_or_else(|| AppError::forbidden("not a member of this conversation"))?;
+    // bot 不接任群主、也不撑着群：只剩 bot 时群随最后一个人解散
     let others = sqlx::query_scalar::<_, Uuid>(
-        "SELECT user_id FROM memberships
-         WHERE conversation_id = $1 AND user_id <> $2
-         ORDER BY joined_at",
+        "SELECT m.user_id FROM memberships m JOIN users u ON u.id = m.user_id
+         WHERE m.conversation_id = $1 AND m.user_id <> $2 AND u.bot_owner_id IS NULL
+         ORDER BY m.joined_at",
     )
     .bind(conv)
     .bind(uid)
@@ -857,6 +865,14 @@ pub(super) async fn transfer_ownership(
         .ok_or_else(|| AppError::not_found("member not found"))?;
     if target.role == "owner" {
         return Err(AppError::bad_request("target is already the owner"));
+    }
+    let target_is_bot =
+        sqlx::query_scalar::<_, bool>("SELECT bot_owner_id IS NOT NULL FROM users WHERE id = $1")
+            .bind(req.user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if target_is_bot {
+        return Err(AppError::bad_request("cannot transfer ownership to a bot"));
     }
 
     let res = sqlx::query(

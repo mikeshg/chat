@@ -18,6 +18,8 @@ pub struct UserRow {
     pub avatar_path: Option<String>,
     /// 每次更换/移除 +1，客户端据此失效头像缓存
     pub avatar_version: i32,
+    /// 非空 = webhook bot，值是它的主人
+    pub bot_owner_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -30,6 +32,7 @@ pub struct UserPublic {
     /// 头像版本（拼进 GET /users/{id}/avatar?v= 做缓存失效）
     pub avatar_version: i32,
     pub has_avatar: bool,
+    pub is_bot: bool,
 }
 
 impl From<&UserRow> for UserPublic {
@@ -42,6 +45,7 @@ impl From<&UserRow> for UserPublic {
             last_seen_at: u.last_seen_at,
             avatar_version: u.avatar_version,
             has_avatar: u.avatar_path.is_some(),
+            is_bot: u.bot_owner_id.is_some(),
         }
     }
 }

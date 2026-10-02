@@ -30,7 +30,8 @@
 - 视频会议：会话内打开会议链接（默认 Jitsi，管理员可改地址或关闭）
 - 手机推送：管理员配置 ntfy 后，用户在「我」页开启
 - 备份与恢复：管理后台一键生成备份（数据库全部表 + 附件 / 头像文件，tar.gz）、下载到本地；上传备份文件恢复（需键入 RESTORE 确认，恢复后所有用户需重新登录）
-- Agent：本地 agent（ACP，如 Claude Code、Codex，登记表里可以一键安装）。Agent 页像 Codex 一样组织：先选电脑，再选工作区（那台电脑上的一个目录），工作区里开对话；每条对话选一个 Agent（选定后不能换），模型和模式随时可改，Agent 配置里的只是默认值。也可以在专属会话里直接发消息，或在任意会话里 `@名字` 调用。输出可以是实时流式、只显示状态和最终结果，或每步一条消息。权限分只读、可改工作目录、完全放开，超出档位要主人审批。电脑离线时调用会排队。Agent 之间可以互调，也可以定时调用。管理员可以关掉整个功能，或按用户允许、禁止
+- 桌面端：关掉窗口留在系统托盘继续收消息；开机自启在「我」页打开，默认关
+- 机器人（webhook bot）：任何人可在「我」页建 bot。外部程序往入站地址 POST 就以 bot 身份发消息；填了回调地址，私聊 bot 或在群里 @ 它时服务器把消息 POST 过去，回复的文字发回原会话
 - 实时：WebSocket（一次性 ticket 鉴权）、多设备同时在线、在线状态、正在输入、未读数、已读同步
 - 部署：`docker compose up -d` 一条命令（Postgres + 服务端托管前端，主机端口 28080）
 
@@ -72,7 +73,7 @@ pnpm test    # cargo test：auth/好友流/会话权限/seq/WS/群规则 集成�
 # 避免「非管理员 403」整批误报。管理员流程和注册开关需要 E2E_ADMIN_USER / E2E_ADMIN_PASS。
 E2E_ADMIN_USER=<管理员用户名> E2E_ADMIN_PASS=<密码> node scripts/e2e.mjs
 docker compose down && docker compose up -d --wait
-node scripts/e2e.mjs phase2   # phase2：验证数据持久化（含头像、文件传输助手、公告、置顶、Agent）
+node scripts/e2e.mjs phase2   # phase2：验证数据持久化（含头像、文件传输助手、公告、置顶、bot）
 ```
 
 ## 推送（ntfy）
@@ -196,35 +197,25 @@ git push origin v0.2.0
 
 第一个能在线更新的版本需要手动安装一次：之前装的版本里没有更新功能。
 
-## Agent
+## 机器人（webhook bot）
 
-桌面端登录后，这台电脑会自动上线。关掉窗口后留在系统托盘里继续跑。开机自启在「我」页打开，默认关。
+在「我」页 → 机器人里新建。bot 会出现在你的联系人和会话里，可以拉进你所在的群。
 
-添加 Agent 要在桌面端上完成，而且只加到这台电脑。手机和网页可以管理、调用已有的 Agent。
-
-添加时先选程序：
-
-- 从登记表选择（Claude Code、Codex 等）。这台电脑上还没装的，确认后由这台电脑安装。
-- 自定义命令：登记表里没有的程序，手填启动命令和参数。
-
-每个 Agent 固定在添加时的那台电脑上。权限档位决定什么可以自动做：
-
-- 只读：读取、搜索一类操作自动放行，其余要审批。往其他会话发消息也要审批。
-- 可改工作目录：在只读之上，工作目录和额外目录里的修改自动放行。执行命令，以及目录外的写入，要审批。往其他会话发消息自动放行。
-- 完全放开：全部自动放行。
-
-超出档位时，审批卡片发到该 Agent 的专属会话，原会话只显示「等待主人批准」。
-
-真 agent 冒烟默认不跑。需要本机已登录 Claude Code 和 Codex，并且 PATH 上有 Node.js（登记表条目若走 npx，会装到临时目录），会消耗 token：
+入站：外部程序以 bot 身份发消息。默认发到和你的私聊，带 `conversation_id` 发到 bot 所在的其他会话。
 
 ```bash
-cd agent-host
-CHAT_REAL_AGENT_SMOKE=1 cargo test -p agent-host --test smoke -- --nocapture --test-threads=1
+curl -X POST http://<服务器>/v1/hooks/<令牌> -H 'Content-Type: application/json' -d '{"content":"部署完成"}'
 ```
 
-每个适配器发一次「只回复 pong」，再发一次往工作目录外写文件的指令。冒烟里权限请求一律拒绝，断言至少拒绝过一次且文件没有写出来。只跑其中一个：`CHAT_REAL_AGENT_SMOKE=codex`（或 `claude`）。
+出站：填了回调地址时，bot 在私聊里收到消息、或在群里被 @ 时，服务器 POST：
 
-已知限制：Agent 的环境变量和密钥以明文存在服务器上，管理员和备份都能看到。档位只能管到 agent 来请求批准的操作：Codex 的沙箱总是允许写它自己的工作目录，所以 Codex 在「只读」档位下仍能改工作目录里的文件（目录外的写入和联网照样要审批）。macOS / Linux 的桌面安装包要在对应系统上编译，仓库里不附带现成的包。
+```json
+{"bot_id": "…", "conversation_id": "…", "conversation_type": "dm", "message": { "id": "…", "sender_id": "…", "sender_name": "…", "content": "…", "mentions": [] }}
+```
+
+请求头 `X-Chat-Signature: sha256=<hex>`，值是用令牌对请求体做的 HMAC-SHA256。10 秒内回 `{"content": "..."}` 就作为 bot 的回复发回原会话，回别的内容不回复。bot 自己发的消息不会触发任何回调。
+
+已知限制：令牌明文存在服务器上，管理员和备份都能看到；服务器会向用户填的任意地址发请求，包括局域网地址。
 
 ## 局域网访问
 
@@ -238,12 +229,10 @@ CHAT_REAL_AGENT_SMOKE=1 cargo test -p agent-host --test smoke -- --nocapture --t
 
 ```
 app/              React + TS + Vite（Web/Tauri 共用 UI）
-  src/ui/         chat/ agent/ admin/ me/ 按页面分组；Avatar、icons 等公用件在根下
+  src/ui/         chat/ admin/ me/ 按页面分组；Avatar、icons 等公用件在根下
   src-tauri/      Tauri v2 壳（Windows/Android）
-agent-host/       宿主运行时库（ACP 客户端；桌面端拉起，测试也可直接驱动）
 server/           axum + sqlx + PostgreSQL
-  src/api/        REST：account/users/friends/conversations/messages/avatar/files/admin
-  src/agents/     Agent REST、设置、调用派发、宿主事件流、登记表
+  src/api/        REST：account/users/friends/conversations/messages/avatar/files/admin/bots
   src/domain/     membership / seq / 发消息 / 消息生命周期 / 投票 / 转发
   src/ws.rs       WS：连接注册、消息广播、presence、typing、read、sync
   migrations/     SQL 迁移（sqlx::migrate! 编译期嵌入）

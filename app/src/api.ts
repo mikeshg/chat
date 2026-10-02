@@ -4,6 +4,7 @@ import type {
   AdminUserView,
   AttachmentView,
   AuthResponse,
+  BotView,
   BackupCreated,
   BackupList,
   BackupTicket,
@@ -393,6 +394,23 @@ export const convs = {
   unpin: (id: string, messageId: string) => del<void>(`/conversations/${id}/pins/${messageId}`),
   ticket: () => get<{ ticket: string; expires_in: number }>("/ws/ticket"),
 };
+
+// ---------- webhook bot ----------
+export const bots = {
+  list: () => get<BotView[]>("/bots"),
+  /** 409 用户名已被占用；400 用户名格式 / 地址不对 / 数量上限 */
+  create: (body: { username: string; display_name?: string; webhook_url?: string }) =>
+    post<BotView>("/bots", body),
+  patch: (id: string, body: { display_name?: string; webhook_url?: string }) =>
+    patch<BotView>(`/bots/${id}`, body),
+  resetToken: (id: string) => post<BotView>(`/bots/${id}/token`),
+  remove: (id: string) => del<void>(`/bots/${id}`),
+};
+
+/** bot 的入站地址：POST JSON {"content": "..."} 即以 bot 身份发消息 */
+export function hookUrl(token: string): string {
+  return `${getServer() || location.origin}/v1/hooks/${token}`;
+}
 
 // ---------- 消息生命周期 ----------
 // mutation 全部服务端确认后更新（不乐观回滚）；client_op_id 为 UUID 幂等键，

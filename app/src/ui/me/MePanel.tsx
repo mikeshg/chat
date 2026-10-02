@@ -9,6 +9,7 @@ import ThemeSetting from "./ThemeSetting";
 import SecuritySettings from "./SecuritySettings";
 import StorageUsage from "./StorageUsage";
 import AvatarSetting from "./AvatarSetting";
+import BotSettings from "./BotSettings";
 import UpdateSetting from "./UpdateSetting";
 
 export default function MePanel() {
@@ -64,6 +65,7 @@ export default function MePanel() {
 
       <NotifySettings />
       <PushSettings />
+      <BotSettings />
       <StorageUsage />
       <ThemeSetting />
       <SecuritySettings />

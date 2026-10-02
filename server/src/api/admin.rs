@@ -267,7 +267,7 @@ pub(super) async fn admin_reset_password(
     let mut tx = st.pool.begin().await?;
     let res = sqlx::query(
         "UPDATE users SET password_hash = $2, session_version = session_version + 1
-         WHERE id = $1",
+         WHERE id = $1 AND bot_owner_id IS NULL",
     )
     .bind(target)
     .bind(&hash)

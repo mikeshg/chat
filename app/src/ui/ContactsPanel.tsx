@@ -146,7 +146,7 @@ export default function ContactsPanel() {
             <div className="grow">
               <div>{f.user.display_name}</div>
               <div className="muted">
-                @{f.user.username} · {s.online[f.user.id] ? "在线" : "离线"}
+                @{f.user.username} · {f.user.is_bot ? "机器人" : s.online[f.user.id] ? "在线" : "离线"}
               </div>
             </div>
             <button className="primary" onClick={() => openDm(f.user)}>

@@ -8,6 +8,19 @@ export interface UserPublic {
   /** 头像版本（拼进 /users/{id}/avatar?v=）；旧服务端缺省 */
   avatar_version?: number;
   has_avatar?: boolean;
+  /** webhook bot 账号（旧服务端缺省） */
+  is_bot?: boolean;
+}
+
+/** GET /bots 单条：只有主人看得到 token */
+export interface BotView {
+  id: string;
+  username: string;
+  display_name: string;
+  /** 空串 = 不回调 */
+  webhook_url: string;
+  token: string;
+  created_at: string;
 }
 
 export interface AuthResponse {

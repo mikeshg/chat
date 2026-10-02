@@ -934,3 +934,6 @@ button.icon-btn.chat-head-btn { flex: 0 0 auto; width: auto; height: 32px; white
 .am-adv { border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
 .am-adv summary { padding: 10px 12px; cursor: pointer; font-weight: 600; font-size: 13px; }
 .am-adv-in { padding: 0 12px 12px; display: flex; flex-direction: column; gap: 8px; }
+
+/* 「我」页机器人 */
+.bot-row { display: flex; flex-direction: column; gap: 6px; padding: 10px 0; border-top: 1px solid var(--line); }

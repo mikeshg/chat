@@ -12,6 +12,7 @@ pub(super) struct FriendRow {
     since: DateTime<Utc>,
     avatar_version: i32,
     has_avatar: bool,
+    is_bot: bool,
 }
 
 pub(super) async fn list_friends(
@@ -21,7 +22,8 @@ pub(super) async fn list_friends(
     let uid = uid_of(&headers, &st).await?;
     let rows = sqlx::query_as::<_, FriendRow>(
         "SELECT u.id, u.username::text AS username, u.display_name, u.role, u.last_seen_at,
-                f.created_at AS since, u.avatar_version, u.avatar_path IS NOT NULL AS has_avatar
+                f.created_at AS since, u.avatar_version, u.avatar_path IS NOT NULL AS has_avatar,
+                u.bot_owner_id IS NOT NULL AS is_bot
            FROM friendships f
            JOIN users u ON u.id = CASE WHEN f.user_a = $1 THEN f.user_b ELSE f.user_a END
           WHERE f.user_a = $1 OR f.user_b = $1
@@ -41,6 +43,7 @@ pub(super) async fn list_friends(
                     last_seen_at: r.last_seen_at,
                     avatar_version: r.avatar_version,
                     has_avatar: r.has_avatar,
+                    is_bot: r.is_bot,
                 },
                 since: r.since,
             })
@@ -124,6 +127,7 @@ pub(super) async fn list_requests(
                     last_seen_at: r.cp_last_seen,
                     avatar_version: r.cp_avatar_version,
                     has_avatar: r.cp_has_avatar,
+                    is_bot: false,
                 },
                 message: r.message,
                 direction: dir,
@@ -144,7 +148,7 @@ pub(super) async fn create_request(
 ) -> AppResult<Json<Value>> {
     let uid = uid_of(&headers, &st).await?;
     let to = sqlx::query_as::<_, UserRow>(
-        "SELECT * FROM users WHERE username = $1 AND disabled_at IS NULL",
+        "SELECT * FROM users WHERE username = $1 AND disabled_at IS NULL AND bot_owner_id IS NULL",
     )
     .bind(req.username.trim())
     .fetch_optional(&st.pool)

@@ -464,3 +464,16 @@ pub(crate) async fn admin_put_settings(
         .await
         .unwrap()
 }
+
+pub(crate) async fn conv_messages(base: &str, u: &TestUser, conv: &str) -> Vec<Value> {
+    let page: Value = http()
+        .get(format!("{base}/v1/conversations/{conv}/messages"))
+        .header("authorization", authz(&u.access))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    page["messages"].as_array().cloned().unwrap_or_default()
+}
