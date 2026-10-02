@@ -520,7 +520,28 @@ async fn refresh(
     .await?;
 
     let Some(user_id) = user_id else {
-        // 统一 401：不区分「从未签发」与「已撤销/过期」，避免令牌状态探测。
+        // 重放检测：已轮换掉超过宽限期的令牌又被拿来刷新，说明令牌被别人拿到过。
+        // 整个登录会话作废（正主和窃取者手里的新令牌一起失效），设备连接踢下线。
+        // 宽限期留给「刷新响应丢了、客户端拿旧令牌重试」的正常情况。
+        let reused = sqlx::query_as::<_, (Uuid, Uuid)>(
+            "SELECT s.user_id, s.id FROM refresh_tokens t
+               JOIN sessions s ON s.id = t.session_id
+              WHERE t.token_hash = $1 AND t.revoked_at < now() - interval '60 seconds'
+                AND s.revoked_at IS NULL",
+        )
+        .bind(&hash)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((uid, sid)) = reused {
+            crate::sessions::revoke_session_row(&mut tx, sid).await?;
+            crate::sessions::revoke_session_tokens(&mut tx, sid).await?;
+            tx.commit().await?;
+            tracing::warn!(user_id = %uid, session_id = %sid, "refresh token 重放，会话已撤销");
+            if let Some(epoch) = st.kick_session(uid, sid, "session_revoked") {
+                ws::publish_offline(&st, uid, epoch).await;
+            }
+        }
+        // 统一 401：不区分「从未签发」「已撤销/过期」「重放」，避免令牌状态探测。
         // 失败路径不再向 pool 借第二个连接（本函数只持有这一个事务连接），
         // 并发非法 refresh 不会把连接池拖死。
         return Err(AppError::unauthorized("invalid refresh token"));

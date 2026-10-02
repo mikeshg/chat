@@ -26,6 +26,9 @@ const LIST_DEPTH_MAX: u32 = 5;
 /// shell 超时（秒）：默认 120，上限 600。
 const SHELL_TIMEOUT_DEFAULT: u64 = 120;
 const SHELL_TIMEOUT_MAX: u64 = 600;
+/// shell 收集输出时最多留的字节数。比 OUTPUT_LIMIT 个 4 字节字符多一点：
+/// 一旦丢过输出，留下的一定超过 OUTPUT_LIMIT 字符，capped 必然截断并注明。
+const SHELL_KEEP_BYTES: usize = OUTPUT_LIMIT * 4 + 4;
 /// 递归遍历时跳过的目录名。
 const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target"];
 
@@ -544,26 +547,28 @@ impl Tool for ShellTool {
         let mut child = cmd.spawn().map_err(|e| err(format!("命令启动失败: {e}")))?;
 
         // stdout / stderr 各起一个读任务，按到达顺序合并进一个缓冲。
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
         if let Some(io) = child.stdout.take() {
             spawn_pipe_reader(io, tx.clone());
         }
         if let Some(io) = child.stderr.take() {
             spawn_pipe_reader(io, tx);
         }
-        let collect = async {
+        // 读输出和等退出共用一个截止时间：先关管道再继续跑的进程也逃不过超时。
+        // 只留前 SHELL_KEEP_BYTES，再多的边读边丢：刷屏的命令占不了多少内存，管道照样读空不卡子进程。
+        // ponytail: 留的是开头，报错常在结尾；需要时改成保留首尾各一段。
+        let run = async {
             let mut buf = Vec::new();
             while let Some(chunk) = rx.recv().await {
-                buf.extend_from_slice(&chunk);
+                let room = SHELL_KEEP_BYTES.saturating_sub(buf.len());
+                buf.extend_from_slice(&chunk[..chunk.len().min(room)]);
             }
-            buf
+            (buf, child.wait().await)
         };
-        match tokio::time::timeout(Duration::from_secs(timeout), collect).await {
-            Ok(output) => {
-                let status = child
-                    .wait()
-                    .await
-                    .map_err(|e| err(format!("等进程退出失败: {e}")))?;
+        let res = tokio::time::timeout(Duration::from_secs(timeout), run).await;
+        match res {
+            Ok((output, status)) => {
+                let status = status.map_err(|e| err(format!("等进程退出失败: {e}")))?;
                 let code = status.code().unwrap_or(-1);
                 let text = String::from_utf8_lossy(&output);
                 let text = text.trim_end();
@@ -584,7 +589,7 @@ impl Tool for ShellTool {
 }
 
 /// 把子进程的一条输出管道读进合并缓冲。
-fn spawn_pipe_reader<R>(io: R, tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>)
+fn spawn_pipe_reader<R>(io: R, tx: tokio::sync::mpsc::Sender<Vec<u8>>)
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -596,7 +601,7 @@ where
             match r.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if tx.send(buf[..n].to_vec()).is_err() {
+                    if tx.send(buf[..n].to_vec()).await.is_err() {
                         break;
                     }
                 }
@@ -835,6 +840,36 @@ mod tests {
         assert!(!is_err, "{}", content);
         assert!(content.contains("hi"), "{}", content);
         assert!(content.contains("退出码 3"), "{}", content);
+    }
+
+    /// 超大输出：只留前一段，结果照常返回并注明截断
+    #[tokio::test]
+    async fn shell_huge_output_is_capped() {
+        let d = dir();
+        std::fs::write(d.join("big.txt"), "x".repeat(SHELL_KEEP_BYTES * 3)).unwrap();
+        let tool: Arc<dyn Tool> = Arc::new(ShellTool { cwd: d.clone() });
+        let cmd = if cfg!(windows) { "type big.txt" } else { "cat big.txt" };
+        let (content, is_err) =
+            run_tool(tool, "shell", json!({"command": cmd, "timeout_secs": 30})).await;
+        assert!(!is_err, "{}", &content[..200.min(content.len())]);
+        assert!(content.contains("输出过长已截断"));
+        assert!(content.chars().count() < OUTPUT_LIMIT + 100);
+    }
+
+    /// 先关掉输出再继续跑的命令：超时照样生效（以前只限制读输出，等退出不限时）
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_timeout_covers_process_exit() {
+        let tool: Arc<dyn Tool> = Arc::new(ShellTool { cwd: dir() });
+        let started = std::time::Instant::now();
+        let (content, _) = run_tool(
+            tool,
+            "shell",
+            json!({"command": "exec >/dev/null 2>&1; sleep 30", "timeout_secs": 1}),
+        )
+        .await;
+        assert!(content.contains("进程已终止"), "{content}");
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[tokio::test]

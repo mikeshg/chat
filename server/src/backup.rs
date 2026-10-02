@@ -562,6 +562,9 @@ pub async fn restore(
     // 收 multipart：file → FILES_DIR/.restore-upload-*.part；confirm → 串
     let files_dir = PathBuf::from(&st.cfg.files_dir);
     let upload_path = files_dir.join(format!(".restore-upload-{}.part", Uuid::new_v4().simple()));
+    // 路径一定下来就挂上清理：上传中途断开 / 读失败 / 写盘失败都不留 .part。
+    // 恢复开跑后守卫随文件一起移进后台任务，请求被取消也不会提前删掉任务要读的归档。
+    let cleanup_upload = scopeguard(upload_path.clone());
     let mut got_file = false;
     let mut confirm = String::new();
     while let Some(mut field) = mp
@@ -593,8 +596,6 @@ pub async fn restore(
             _ => {}
         }
     }
-    // 整个 handler 期间都可能 bail —— 上传留档统一在出口清
-    let _cleanup_upload = scopeguard(upload_path.clone());
     if !got_file {
         return Err(AppError::bad_request("missing file"));
     }
@@ -611,6 +612,7 @@ pub async fn restore(
     let upload2 = upload_path.clone();
     let task = tokio::spawn(async move {
         let _busy = busy;
+        let _cleanup_upload = cleanup_upload;
         let _maint = MaintGuard::enter(&st2); // 进维护态；Drop 兜底退出（含 panic/取消路径）
                                               // 普通连接和只挂着宿主的用户都踢。kick_user 会连宿主一起断开。
         let mut uids: Vec<Uuid> = st2.conns.iter().map(|e| *e.key()).collect();
@@ -622,9 +624,7 @@ pub async fn restore(
         for uid in uids {
             st2.kick_user(uid, "maintenance");
         }
-        let r = do_restore(&st2, &upload2).await;
-        let _ = tokio::fs::remove_file(&upload2).await;
-        r
+        do_restore(&st2, &upload2).await
     });
     match task.await {
         Ok(res) => Ok(Json(res?)),
@@ -647,7 +647,7 @@ impl Drop for MaintGuard {
 }
 
 /// 出口自动删除的临时文件守卫
-fn scopeguard(path: PathBuf) -> impl Drop {
+fn scopeguard(path: PathBuf) -> impl Drop + Send + 'static {
     struct G(PathBuf);
     impl Drop for G {
         fn drop(&mut self) {

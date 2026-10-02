@@ -8408,6 +8408,91 @@ async fn p41_restore_requires_confirm() {
     assert_eq!(r.status(), 200, "旧 refresh 应仍可用（未发生恢复）");
 }
 
+/// refresh token 重放：宽限期内重试旧令牌只回 401、会话照常；过了宽限期再用旧令牌 = 被盗，整个会话作废
+#[tokio::test]
+async fn refresh_token_reuse_revokes_session() {
+    let (base, st) = spawn_named_state(&format!("chat_it_reuse_{}", uniq())).await;
+    let u = register(&base, &format!("reuse_{}", uniq())).await;
+    let refresh = |rt: String| {
+        let base = base.clone();
+        async move {
+            let r = http()
+                .post(format!("{base}/v1/auth/refresh"))
+                .json(&json!({"refresh_token": rt}))
+                .send()
+                .await
+                .unwrap();
+            let code = r.status().as_u16();
+            (code, r.json::<Value>().await.unwrap_or(json!(null)))
+        }
+    };
+    let (code, b) = refresh(u.refresh.clone()).await;
+    assert_eq!(code, 200, "{b}");
+    let rt2 = b["refresh_token"].as_str().unwrap().to_string();
+
+    // 宽限期内：旧令牌 401，但新令牌仍可用
+    assert_eq!(refresh(u.refresh.clone()).await.0, 401);
+    let (code, b) = refresh(rt2).await;
+    assert_eq!(code, 200, "宽限期内的重试不应撤销会话: {b}");
+    let rt3 = b["refresh_token"].as_str().unwrap().to_string();
+    let access3 = b["access_token"].as_str().unwrap().to_string();
+
+    // 过了宽限期再拿最早的令牌来刷新 → 会话作废，手里最新的令牌也一起失效
+    sqlx::query("UPDATE refresh_tokens SET revoked_at = now() - interval '2 minutes' WHERE revoked_at IS NOT NULL")
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    assert_eq!(refresh(u.refresh.clone()).await.0, 401);
+    assert_eq!(refresh(rt3).await.0, 401, "重放后会话内的令牌都应失效");
+    let me = http()
+        .get(format!("{base}/v1/users/me"))
+        .header("authorization", authz(&access3))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(me.status().as_u16(), 401);
+}
+
+/// 上传读到一半连接出错：不留 .restore-upload-*.part
+#[tokio::test]
+async fn p41_aborted_restore_upload_leaves_no_part_file() {
+    let (base, _st, files_dir) = spawn_backup_env("tr").await;
+    let admin = register(&base, &format!("p41t_{}", uniq())).await;
+    let head = "--XB\r\nContent-Disposition: form-data; name=\"file\"; filename=\"b.tar.gz\"\r\n\r\n";
+    // 先发字段头和一段数据，服务端开始写 .part；随后流出错，连接中断
+    let chunks = futures_util::stream::unfold(0, move |i| async move {
+        match i {
+            0 => Some((Ok::<_, std::io::Error>(format!("{head}{}", "x".repeat(64 * 1024))), 1)),
+            1 => {
+                tokio::time::sleep(A01Dur::from_millis(300)).await;
+                Some((Err(std::io::Error::other("client aborted")), 2))
+            }
+            _ => None,
+        }
+    });
+    let parts = || -> Vec<String> {
+        std::fs::read_dir(&files_dir)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.starts_with(".restore-upload-"))
+            .collect()
+    };
+    let r = http()
+        .post(format!("{base}/v1/admin/restore"))
+        .header("authorization", authz(&admin.access))
+        .header("content-type", "multipart/form-data; boundary=XB")
+        .body(reqwest::Body::wrap_stream(chunks))
+        .send()
+        .await;
+    // 连接中断：客户端拿到错误，或服务端来得及回 400
+    assert!(r.is_err() || r.unwrap().status() == 400);
+    let deadline = std::time::Instant::now() + A01Dur::from_secs(3);
+    while !parts().is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(A01Dur::from_millis(50)).await;
+    }
+    assert!(parts().is_empty(), "残留上传文件: {:?}", parts());
+}
+
 /// 篡改 manifest 的 migration_version → 400「版本不一致」，数据不变。
 #[tokio::test]
 async fn p41_restore_rejects_version_mismatch() {
@@ -13318,6 +13403,57 @@ async fn agent_a17_schedule_crud() {
     .await;
     assert_eq!(list.as_array().unwrap().len(), 49);
     assert!(list.as_array().unwrap().iter().all(|s| s["id"] != sid));
+}
+
+/// 建调用失败时整轮回滚：一次性计划仍启用、仍到点，修好后下一轮照常触发（不会「显示已触发却没调用」）
+#[tokio::test]
+async fn agent_a17_insert_failure_keeps_schedule_due() {
+    let (base, st) = spawn_named_state(&format!("chat_it_a17x_{}", uniq())).await;
+    let a = register(&base, &format!("a17x_{}", uniq())).await;
+    let (host, host_id) = spawn_host(&base, &a, uuid::Uuid::new_v4()).await;
+    let (code, agent) = create_agent(&base, &a, &host_id, "atomic").await;
+    assert_eq!(code, 200, "{agent}");
+    let aid = agent["id"].as_str().unwrap();
+    let at = chrono::Utc::now() + chrono::Duration::hours(2);
+    let (code, once) = a17_send(
+        "POST",
+        &format!("{base}/v1/agents/{aid}/schedules"),
+        &a.access,
+        Some(json!({"name": "一次", "prompt": "echo:x",
+                    "spec": {"type":"once","at": at.to_rfc3339()}, "timezone": "UTC"})),
+    )
+    .await;
+    assert_eq!(code, 200, "{once}");
+    let sid = uuid::Uuid::parse_str(once["id"].as_str().unwrap()).unwrap();
+    a17_due(&st.pool, &sid.to_string()).await;
+
+    // 让定时调用的插入失败（这个测试库独占）
+    sqlx::query("ALTER TABLE agent_invocations ADD CONSTRAINT t_no_sched CHECK (schedule_id IS NULL) NOT VALID")
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    assert!(chat_server::schedules::sweep_due_schedules(&st).await.is_err());
+    let (enabled, due): (bool, bool) = sqlx::query_as(
+        "SELECT enabled, next_run_at <= now() FROM agent_schedules WHERE id = $1",
+    )
+    .bind(sid)
+    .fetch_one(&st.pool)
+    .await
+    .unwrap();
+    assert!(enabled && due, "插入失败不应推进计划");
+
+    sqlx::query("ALTER TABLE agent_invocations DROP CONSTRAINT t_no_sched")
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    assert_eq!(chat_server::schedules::sweep_due_schedules(&st).await.unwrap(), 1);
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_invocations WHERE schedule_id = $1")
+        .bind(sid)
+        .fetch_one(&st.pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+    host.shutdown().await;
 }
 
 /// 2. 到点触发：回复带前缀；once 停用；daily 的下次运行是明天同一钟点。

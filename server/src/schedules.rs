@@ -457,9 +457,14 @@ pub async fn sweep_due_schedules(st: &SharedState) -> Result<usize, sqlx::Error>
     .await?;
     let mut fired = 0usize;
     for id in ids {
-        if let Some(job) = claim_one(st, id).await? {
-            crate::agents::fire_schedule(st, job).await;
-            fired += 1;
+        // 推进计划和建调用在同一事务：中途失败整体回滚，下一轮重试，不会「显示已触发却没调用」
+        if let Some((mut tx, job)) = claim_one(st, id).await? {
+            let ready = crate::agents::insert_schedule_invocation(st, &mut tx, &job).await?;
+            tx.commit().await?;
+            if let Some((host_id, inv)) = ready {
+                crate::agents::dispatch_schedule_invocation(st, host_id, &inv).await;
+                fired += 1;
+            }
         }
     }
     Ok(fired)
@@ -481,11 +486,13 @@ where
     Ok(())
 }
 
-/// 锁住这一行。不满足准入就停用；否则推进 next_run_at（once 直接停用）并返回待派发的调用。
+/// 锁住这一行。不满足准入就停用；否则推进 next_run_at（once 直接停用），
+/// 连同还没提交的事务一起返回——调用方在同一事务里建调用再提交。
 async fn claim_one(
     st: &SharedState,
     id: Uuid,
-) -> Result<Option<crate::agents::ScheduleFire>, sqlx::Error> {
+) -> Result<Option<(sqlx::Transaction<'static, sqlx::Postgres>, crate::agents::ScheduleFire)>, sqlx::Error>
+{
     let mut tx = st.pool.begin().await?;
     let row = sqlx::query_as::<_, DueRow>(
         "SELECT s.id, s.agent_id, s.owner_id, s.prompt, s.target_conversation_id, s.spec, s.timezone,
@@ -556,8 +563,7 @@ async fn claim_one(
         .bind(row.id)
         .execute(&mut *tx)
         .await?;
-        tx.commit().await?;
-        return Ok(Some(job));
+        return Ok(Some((tx, job)));
     }
 
     let Some(next) = schedule::next_run(&spec, tz, Utc::now()) else {
@@ -579,8 +585,7 @@ async fn claim_one(
         tx.rollback().await.ok();
         return Ok(None);
     }
-    tx.commit().await?;
-    Ok(Some(job))
+    Ok(Some((tx, job)))
 }
 
 pub fn spawn_sweeper(st: SharedState) {

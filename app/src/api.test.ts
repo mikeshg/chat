@@ -250,3 +250,26 @@ describe("cross-tab identity", () => {
     expect(onChange).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("refresh failures", () => {
+  it.each([
+    ["503", () => Promise.resolve(new Response("{}", { status: 503 }))],
+    ["network error", () => Promise.reject(new TypeError("Failed to fetch"))],
+  ])("keeps the session when refresh hits %s", async (_label, refreshResponse) => {
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("fetch", vi.fn((url: string) =>
+      url.endsWith("/auth/refresh") ? refreshResponse() : Promise.resolve(new Response("{}", { status: 401 }))));
+    const logout = vi.fn();
+    window.addEventListener("chat:logout", logout);
+    await expect(auth.me()).rejects.toMatchObject({ status: 503 });
+    expect(localStorage.getItem("chat_refresh")).toBe("old-refresh");
+    expect(logout).not.toHaveBeenCalled();
+  });
+
+  it("logs out when the server rejects the refresh token", async () => {
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("{}", { status: 401 }))));
+    await expect(auth.me()).rejects.toMatchObject({ status: 401 });
+    expect(localStorage.getItem("chat_refresh")).toBeNull();
+  });
+});

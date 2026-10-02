@@ -33,7 +33,7 @@ pub(crate) fn user_agent_of(headers: &HeaderMap) -> String {
 }
 
 /// 撤销某个 session 的全部未撤销 refresh token
-async fn revoke_session_tokens(
+pub(crate) async fn revoke_session_tokens(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     session_id: Uuid,
 ) -> AppResult<()> {
@@ -47,7 +47,7 @@ async fn revoke_session_tokens(
 }
 
 /// 撤销某 session 行本身
-async fn revoke_session_row(
+pub(crate) async fn revoke_session_row(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     session_id: Uuid,
 ) -> AppResult<()> {

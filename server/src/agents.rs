@@ -1726,50 +1726,54 @@ pub(crate) struct ScheduleFire {
     pub prompt: String,
 }
 
-pub(crate) async fn fire_schedule(st: &SharedState, job: ScheduleFire) {
-    let agent = match load_cfg(&st.pool, job.agent_id).await {
-        Ok(Some(a)) if a.deleted_at.is_none() => a,
-        _ => {
-            tracing::info!(schedule_id = %job.schedule_id, "定时调用跳过：Agent 已删除");
-            return;
-        }
+/// 定时调用：在推进计划的同一事务里建一条排队调用（指令存进调用行，计划之后被改被删都不影响）。
+/// Agent 已删除时不建。
+pub(crate) async fn insert_schedule_invocation(
+    st: &SharedState,
+    tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+    job: &ScheduleFire,
+) -> Result<Option<(Uuid, InvocationView)>, sqlx::Error> {
+    let Some(agent) = load_cfg(&st.pool, job.agent_id)
+        .await?
+        .filter(|a| a.deleted_at.is_none())
+    else {
+        tracing::info!(schedule_id = %job.schedule_id, "定时调用跳过：Agent 已删除");
+        return Ok(None);
     };
-    let members = domain::member_ids(&st.pool, job.conversation_id)
+    let timeout = queue_timeout_secs(&st.pool, agent.id).await;
+    let link = InvLink {
+        prompt: Some(job.prompt.clone()),
+        ..InvLink::default()
+    };
+    let inv = insert_queued(
+        &mut **tx,
+        &agent,
+        job.conversation_id,
+        None,
+        Some(job.schedule_id),
+        timeout,
+        &[],
+        &link,
+    )
+    .await?;
+    Ok(Some((agent.host_id, inv)))
+}
+
+/// 提交后派发：宿主在线就走排队派发（和宿主上线清排队同一条路），否则只把排队状态推给成员。
+pub(crate) async fn dispatch_schedule_invocation(
+    st: &SharedState,
+    host_id: Uuid,
+    inv: &InvocationView,
+) {
+    if st.host_online(host_id) {
+        flush_queued(st, host_id).await;
+        return;
+    }
+    let members = domain::member_ids(&st.pool, inv.conversation_id)
         .await
         .unwrap_or_default();
-    let timeout = queue_timeout_secs(&st.pool, agent.id).await;
-    let online = st.host_online(agent.host_id);
-    let link = InvLink::default();
-    let inv = if online {
-        insert_running(
-            &st.pool,
-            &agent,
-            job.conversation_id,
-            None,
-            Some(job.schedule_id),
-            &[],
-            &link,
-        )
-        .await
-    } else {
-        insert_queued(
-            &st.pool,
-            &agent,
-            job.conversation_id,
-            None,
-            Some(job.schedule_id),
-            timeout,
-            &[],
-            &link,
-        )
-        .await
-    };
-    let Ok(inv) = inv else {
-        tracing::error!(schedule_id = %job.schedule_id, "定时调用插入失败");
-        return;
-    };
-    let key = format!("schedule:{}", job.schedule_id);
-    deliver_invocation(st, &agent, inv, &job.prompt, &key, &members).await;
+    let members = with_root_members(st, &members, inv).await;
+    push_invocation(st, &members, inv);
 }
 
 async fn deliver_invocation(
