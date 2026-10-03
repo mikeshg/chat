@@ -1,0 +1,12 @@
+[project]
+name = "chatbot"
+version = "0.1.0"
+description = "聊天服务器 webhook bot 的 Python SDK（只用标准库）"
+requires-python = ">=3.8"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["chatbot"]

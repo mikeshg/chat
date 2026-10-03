@@ -1,0 +1,13 @@
+[package]
+name = "chatbot"
+version = "0.1.0"
+edition = "2021"
+description = "聊天服务器 webhook bot 的 Rust SDK（同步、无 async 运行时）"
+
+[dependencies]
+ureq = { version = "2", features = ["json"] }
+tiny_http = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hmac = "0.12"
+sha2 = "0.10"

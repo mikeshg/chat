@@ -217,6 +217,51 @@ curl -X POST http://<服务器>/v1/hooks -H 'Authorization: Bearer <令牌>' -H 
 
 已知限制：令牌明文存在服务器上，管理员和备份都能看到；服务器会向用户填的任意地址发请求，包括局域网地址。
 
+### SDK
+
+四种语言，接口一样：用令牌 `send` 发消息，注册一个处理函数，`run` 起服务收回调（自动验签，返回的文字就是回复）。已有 web 服务时不用 `run`，在自己的路由里调 `handle(请求体, X-Chat-Signature 头)`，拿到状态码和响应 JSON。令牌和签名密钥在「我」页 → 机器人里复制。回调要在 10 秒内返回，耗时的活在处理函数里另开线程，做完再 `send`。
+
+| 语言 | 位置 | 依赖 | 测试 |
+|---|---|---|---|
+| Python ≥ 3.8 | [sdk/python](sdk/python/chatbot.py) | 只用标准库，单文件 | `cd sdk/python && python -m unittest` |
+| Go ≥ 1.21 | [sdk/go](sdk/go/chatbot.go) | 只用标准库，单文件；`Bot` 本身是 `http.Handler` | `cd sdk/go && go test` |
+| Java ≥ 11 | [sdk/java](sdk/java/chatbot/ChatBot.java) | 只用 JDK，单文件（自带一个小 JSON 解析器） | `cd sdk/java && javac -d out chatbot/ChatBot.java ChatBotTest.java && java -cp out ChatBotTest` |
+| Rust | [sdk/rust](sdk/rust/src/lib.rs) | ureq、tiny_http、serde_json、hmac；同步，不要 async 运行时 | `cd sdk/rust && cargo test` |
+
+Python 可以直接拷文件，或 `pip install "git+<仓库地址>#subdirectory=sdk/python"`；Go 拷文件或在 go.mod 里 `replace chatbot => <路径>`；Rust 用 `chatbot = { git = "<仓库地址>" }` 或 path 依赖。
+
+```python
+from chatbot import Bot
+
+bot = Bot("https://chat.example.com", token="入站令牌", secret="签名密钥")
+bot.send("部署完成")                     # send(文字, conversation_id) 发到别的会话
+
+@bot.on_message
+def reply(event):                       # 私聊它、或在群里 @ 它时调用
+    return "收到：" + event.text        # 返回 None = 不回
+
+bot.run(port=8080)                      # 回调地址填 http://<这台机器>:8080/
+```
+
+```go
+bot := chatbot.New("https://chat.example.com", "入站令牌", "签名密钥")
+bot.Send("部署完成")                     // SendTo(会话 id, 文字)
+bot.OnMessage(func(ev chatbot.Event) string { return "收到：" + ev.Message.Content }) // "" = 不回
+log.Fatal(bot.Run(":8080"))
+```
+
+```java
+ChatBot bot = new ChatBot("https://chat.example.com", "入站令牌", "签名密钥");
+bot.send("部署完成");                    // sendTo(会话 id, 文字)
+bot.onMessage(ev -> "收到：" + ev.text()).run(8080);   // 返回 null = 不回
+```
+
+```rust
+let bot = chatbot::Bot::new("https://chat.example.com", "入站令牌", "签名密钥");
+bot.send("部署完成")?;                   // send_to(Some(会话 id), 文字)
+bot.on_message(|ev| Some(format!("收到：{}", ev.message.content))).run("0.0.0.0:8080")?; // None = 不回
+```
+
 ## 局域网访问
 
 - **同一台机器只跑一个服务端实例**：多实例共享数据库但 WS 连接表各自独立，跨实例的消息只能落库、推不到对端（表现为"必须刷新才看到新消息"）。开发调试也统一用 docker。

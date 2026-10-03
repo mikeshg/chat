@@ -17,3 +17,5 @@ data/
 
 .claude/settings.local.json
 .idea/
+__pycache__/
+sdk/rust/Cargo.lock
