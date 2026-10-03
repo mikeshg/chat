@@ -102,12 +102,11 @@ function ShellUpdate() {
       <h3>应用更新</h3>
       <div className="muted">
         当前版本 {current}
-        {latest && !newer && " · 已是最新"}
-        {newer && !hasNew && ` · 新版本 ${latest.version} 的安装包还在打包，稍后再看`}
+        {/* 安装包还没传完的版本不算「有」 */}
+        {latest && ` · 最新版本 ${hasNew ? latest.version : current}`}
       </div>
       {hasNew && (
         <>
-          <div>发现新版本 {latest.version}</div>
           {notes && <div className="muted" style={{ whiteSpace: "pre-wrap" }}>{notes}</div>}
           <button className="primary" disabled={busy} onClick={() => void install()}>
             {android ? "下载新版" : "更新并重启"}
