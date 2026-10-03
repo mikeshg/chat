@@ -99,6 +99,10 @@ input:focus, textarea:focus { border-color: var(--green); }
 }
 .auth-switch:hover { text-decoration: underline; }
 .auth-err { color: var(--danger); font-size: 12px; }
+.auth-col { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+.auth-server { width: 340px; display: flex; justify-content: center; }
+.auth-server input { width: 100%; }
+.auth-server .auth-switch { color: var(--muted); font-size: 13px; }
 
 /* ---------- 主框架 ---------- */
 .shell { display: flex; height: 100%; }

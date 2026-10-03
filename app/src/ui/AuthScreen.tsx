@@ -26,6 +26,10 @@ export default function AuthScreen() {
     return r ?? "";
   });
   const [busy, setBusy] = useState(false);
+  // 服务器地址收在卡片下方，默认折叠；桌面端未配置时直接展开
+  const [editServer, setEditServer] = useState(
+    () => "__TAURI_INTERNALS__" in window && !getServer(),
+  );
 
   // 挂载时 + 服务器地址输入变化（防抖 ~500ms）探测目标服务器的注册模式；
   // 探测失败按 open（serverInfo 内部已兜底）
@@ -53,6 +57,7 @@ export default function AuthScreen() {
     setErr("");
     if (desktop && !server.trim()) {
       setErr("请填写服务器地址，如 http://192.168.1.5:28080");
+      setEditServer(true);
       return;
     }
     setBusy(true);
@@ -86,64 +91,87 @@ export default function AuthScreen() {
 
   return (
     <div className="auth-wrap">
-      <form className="auth-card" onSubmit={submit}>
-        <div className="auth-head">
-          <h1 className="auth-title">Chat</h1>
-          {regMode !== "closed" && (
+      <div className="auth-col">
+        <form className="auth-card" onSubmit={submit}>
+          <div className="auth-head">
+            <h1 className="auth-title">Chat</h1>
+            {regMode !== "closed" && (
+              <button
+                type="button"
+                className="auth-switch"
+                onClick={() => setMode(mode === "login" ? "register" : "login")}
+              >
+                {mode === "login" ? "注册 →" : "← 登录"}
+              </button>
+            )}
+          </div>
+          <input
+            placeholder="用户名（3-20 位字母数字下划线）"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            autoComplete="username"
+            required
+          />
+          {effMode === "register" && (
+            <input
+              placeholder="昵称（可留空，之后可改）"
+              value={displayName}
+              onChange={(e) => setDisplayName(e.target.value)}
+            />
+          )}
+          {effMode === "register" && regMode === "invite" && (
+            <input
+              placeholder="邀请码"
+              value={inviteCode}
+              onChange={(e) => setInviteCode(e.target.value)}
+              required
+            />
+          )}
+          <input
+            type="password"
+            placeholder="密码（至少 6 位）"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            autoComplete={
+              effMode === "login" ? "current-password" : "new-password"
+            }
+            required
+          />
+          {regMode === "closed" && (
+            <div className="auth-note">管理员已关闭注册</div>
+          )}
+          {err && <div className="auth-err">{err}</div>}
+          <button className="primary" disabled={busy}>
+            {busy ? "请稍候…" : effMode === "login" ? "登录" : "注册并登录"}
+          </button>
+        </form>
+        <div className="auth-server">
+          {editServer ? (
+            <input
+              autoFocus
+              placeholder={
+                desktop
+                  ? "服务器地址，如 http://192.168.1.5:28080"
+                  : "服务器地址（同源部署可留空，如 http://192.168.1.5:28080）"
+              }
+              value={server}
+              onChange={(e) => setServerUrl(e.target.value)}
+              onBlur={() => {
+                setServer(server); // 不点登录也记住
+                if (server.trim()) setEditServer(false);
+              }}
+            />
+          ) : (
             <button
               type="button"
               className="auth-switch"
-              onClick={() => setMode(mode === "login" ? "register" : "login")}
+              onClick={() => setEditServer(true)}
             >
-              {mode === "login" ? "注册 →" : "← 登录"}
+              服务器：{server.trim() || "同源"} · 修改
             </button>
           )}
         </div>
-        <input
-          placeholder="用户名（3-20 位字母数字下划线）"
-          value={username}
-          onChange={(e) => setUsername(e.target.value)}
-          autoComplete="username"
-          required
-        />
-        {effMode === "register" && (
-          <input
-            placeholder="昵称（可留空，之后可改）"
-            value={displayName}
-            onChange={(e) => setDisplayName(e.target.value)}
-          />
-        )}
-        {effMode === "register" && regMode === "invite" && (
-          <input
-            placeholder="邀请码"
-            value={inviteCode}
-            onChange={(e) => setInviteCode(e.target.value)}
-            required
-          />
-        )}
-        <input
-          type="password"
-          placeholder="密码（至少 6 位）"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          autoComplete={effMode === "login" ? "current-password" : "new-password"}
-          required
-        />
-        <input
-          placeholder={
-            desktop
-              ? "服务器地址，如 http://192.168.1.5:28080"
-              : "服务器地址（同源部署可留空，如 http://192.168.1.5:28080）"
-          }
-          value={server}
-          onChange={(e) => setServerUrl(e.target.value)}
-        />
-        {regMode === "closed" && <div className="auth-note">管理员已关闭注册</div>}
-        {err && <div className="auth-err">{err}</div>}
-        <button className="primary" disabled={busy}>
-          {busy ? "请稍候…" : effMode === "login" ? "登录" : "注册并登录"}
-        </button>
-      </form>
+      </div>
     </div>
   );
 }

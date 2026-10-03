@@ -38,8 +38,11 @@ const LS_USER = "chat_user";
 
 // ---------- 服务器地址 ----------
 // 空 = 同源（vite dev proxy / 服务端托管静态文件时）；Tauri/LAN 场景填 http://host:28080
+// 桌面端没有同源服务器，未配置时用正式部署地址
+const DEFAULT_DESKTOP_SERVER = "https://chat.287152.xyz";
 export function getServer(): string {
-  return (localStorage.getItem(LS_SERVER) ?? "").replace(/\/+$/, "");
+  const fallback = "__TAURI_INTERNALS__" in globalThis ? DEFAULT_DESKTOP_SERVER : "";
+  return (localStorage.getItem(LS_SERVER) || fallback).replace(/\/+$/, "");
 }
 export function setServer(url: string) {
   const next = url.trim().replace(/\/+$/, "");
