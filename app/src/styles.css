@@ -228,6 +228,8 @@ button.ctx-item:hover { background: var(--bg); }
 }
 .msg-row.mine .bubble { background: var(--bubble-mine); }
 .bubble.pending { opacity: 0.6; }
+.send-fail { display: flex; align-items: center; gap: 8px; margin-top: 4px; font-size: 12px; color: var(--danger); }
+.send-fail button { font-size: 12px; padding: 1px 8px; }
 .msg-img { display: block; max-width: 240px; max-height: 240px; border-radius: 4px; cursor: zoom-in; }
 .msg-file {
   display: flex; align-items: center; gap: 10px; min-width: 180px;

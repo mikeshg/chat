@@ -60,6 +60,8 @@ pub(super) struct HookReq {
     content: String,
     /// 缺省 = bot 和主人的私聊
     conversation_id: Option<Uuid>,
+    /// 幂等键（1–80 字符）：同一 bot 同一会话重发同一个值，返回第一次那条消息、不重复发
+    client_msg_id: Option<String>,
 }
 
 fn new_token() -> String {
@@ -168,13 +170,15 @@ pub(super) async fn create_bot(
         .execute(&mut *tx)
         .await?;
     domain::ensure_dm(&mut tx, uid, bot).await?;
-    sqlx::query("INSERT INTO bots (user_id, owner_id, webhook_url, secret) VALUES ($1, $2, $3, $4)")
-        .bind(bot)
-        .bind(uid)
-        .bind(&webhook)
-        .bind(new_token())
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "INSERT INTO bots (user_id, owner_id, webhook_url, secret) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(bot)
+    .bind(uid)
+    .bind(&webhook)
+    .bind(new_token())
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     notify(&st, &[uid], "friends");
     notify(&st, &[uid], "conversations");
@@ -352,9 +356,15 @@ pub(super) async fn post_hook(
                 .ok_or_else(|| AppError::not_found("conversation not found"))?
         }
     };
-    let posted = ws::post_and_broadcast(&st, domain::PostMessage::text(conv, bot, &req.content))
-        .await
-        .map_err(post_err)?;
+    let posted = ws::post_and_broadcast(
+        &st,
+        domain::PostMessage {
+            client_msg_id: req.client_msg_id.as_deref(),
+            ..domain::PostMessage::text(conv, bot, &req.content)
+        },
+    )
+    .await
+    .map_err(post_err)?;
     Ok(Json(json!({
         "id": posted.message.id,
         "conversation_id": conv,

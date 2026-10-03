@@ -119,13 +119,18 @@ public class ChatBot {
 
     /** 以 bot 身份发到和主人的私聊。 */
     public Sent send(String content) throws IOException, InterruptedException {
-        return sendTo(null, content);
+        return send(content, null, null);
     }
 
-    /** 以 bot 身份发到指定会话；conversationId 为 null = 和主人的私聊。 */
-    public Sent sendTo(String conversationId, String content) throws IOException, InterruptedException {
+    /**
+     * 以 bot 身份发一条文字。conversationId 为 null = 和主人的私聊；
+     * clientMsgId 是幂等键（1–80 字符），重试时传同一个值不会重复发，不需要就传 null。
+     */
+    public Sent send(String content, String conversationId, String clientMsgId)
+            throws IOException, InterruptedException {
         String body = "{\"content\":" + Json.quote(content)
-                + (conversationId == null ? "" : ",\"conversation_id\":" + Json.quote(conversationId)) + "}";
+                + (conversationId == null ? "" : ",\"conversation_id\":" + Json.quote(conversationId))
+                + (clientMsgId == null ? "" : ",\"client_msg_id\":" + Json.quote(clientMsgId)) + "}";
         HttpRequest req = HttpRequest.newBuilder(URI.create(server + "/v1/hooks"))
                 .timeout(Duration.ofSeconds(10))
                 .header("Authorization", "Bearer " + token)

@@ -39,11 +39,14 @@ func TestSend(t *testing.T) {
 			io.WriteString(w, `{"error":"invalid bot token"}`)
 			return
 		}
-		conv := body["conversation_id"]
+		conv, id := body["conversation_id"], body["client_msg_id"]
 		if conv == "" {
 			conv = "dm"
 		}
-		json.NewEncoder(w).Encode(map[string]any{"id": "m1", "conversation_id": conv, "seq": 1})
+		if id == "" {
+			id = "m1"
+		}
+		json.NewEncoder(w).Encode(map[string]any{"id": id, "conversation_id": conv, "seq": 1})
 	}))
 	defer srv.Close()
 
@@ -51,9 +54,9 @@ func TestSend(t *testing.T) {
 	if err != nil || s.ConversationID != "dm" || s.Seq != 1 {
 		t.Fatalf("send: %v %+v", err, s)
 	}
-	s, err = New(srv.URL, "good", "").SendTo("c9", "hi")
-	if err != nil || s.ConversationID != "c9" {
-		t.Fatalf("sendTo: %v %+v", err, s)
+	s, err = New(srv.URL, "good", "").SendWith("hi", SendOptions{ConversationID: "c9", ClientMsgID: "k1"})
+	if err != nil || s.ConversationID != "c9" || s.ID != "k1" {
+		t.Fatalf("sendWith: %v %+v", err, s)
 	}
 	_, err = New(srv.URL, "bad", "").Send("hi")
 	var ce *ChatError

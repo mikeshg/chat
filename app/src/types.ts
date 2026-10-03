@@ -168,6 +168,8 @@ export interface MessageView {
   sender_has_avatar?: boolean;
   /** 转发消息：原发送者展示名 */
   forwarded_from?: string | null;
+  /** 仅客户端：乐观消息被服务端永久拒绝的原因（显示失败气泡，可重试/删除） */
+  send_error?: string;
 }
 
 /** 会话偏好（用户维度；旧服务端无此字段 → 视为全默认） */
@@ -423,6 +425,8 @@ export interface BackupItem {
   name: string;
   size: number;
   created_at: string;
+  /** 数据库引用、却没能打进包的文件数（备份期间被删）；清单在包内 manifest.json */
+  missing_files?: number;
 }
 
 export interface BackupList {

@@ -297,6 +297,63 @@ async fn p41_backup_list_download_manifest() {
     assert!(files_dir.join(".backups").join(&name).exists());
 }
 
+/// 数据库引用、磁盘上却没有的文件（备份期间被删）：备份照常完成，但缺失清单进 manifest、列表显示数量；
+/// 删除备份时清单一起删。
+#[tokio::test]
+async fn backup_reports_missing_referenced_files() {
+    let (base, _st, files_dir) = spawn_backup_env("miss").await;
+    let admin = register(&base, &format!("bma_{}", uniq())).await;
+    let bob = register(&base, &format!("bmb_{}", uniq())).await;
+    befriend(&base, &admin, &bob).await;
+    let conv = dm_conv(&base, &admin).await;
+    let (st, att) = upload_att(
+        &base,
+        &conv,
+        &admin.access,
+        "gone.bin",
+        "application/octet-stream",
+        b"soon gone".to_vec(),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let att_id = att["id"].as_str().unwrap().to_string();
+    std::fs::remove_file(files_dir.join(&att_id)).unwrap();
+
+    let name = create_and_wait_backup(&base, &admin.access).await;
+    let list: Value = http()
+        .get(format!("{base}/v1/admin/backups"))
+        .header("authorization", authz(&admin.access))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let item = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["name"] == name.as_str())
+        .unwrap();
+    assert_eq!(item["missing_files"], 1);
+
+    let entries = read_backup(&download_backup(&base, &admin.access, &name).await);
+    let manifest: Value = serde_json::from_slice(&entries["manifest.json"]).unwrap();
+    assert_eq!(manifest["missing_files"], json!([att_id]));
+
+    let r = http()
+        .delete(format!("{base}/v1/admin/backups/{name}"))
+        .header("authorization", authz(&admin.access))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    assert!(!files_dir
+        .join(".backups")
+        .join(format!("{name}.missing"))
+        .exists());
+}
+
 /// 恢复：备份后改数据（新消息/删消息/改昵称/删附件文件）→ 上传恢复 →
 /// 数据回到备份时刻、附件字节一致（PG sha256 复核）、头像可访问；
 /// 恢复前的 access/refresh 全部失效，原密码可重新登录。

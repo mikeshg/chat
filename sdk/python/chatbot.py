@@ -64,14 +64,17 @@ class Bot:
         self.timeout = timeout
         self._handler = None
 
-    def send(self, content, conversation_id=None):
+    def send(self, content, conversation_id=None, client_msg_id=None):
         """以 bot 身份发一条文字。不带 conversation_id 就发到和主人的私聊。
+        client_msg_id：幂等键，重试时传同一个值不会重复发。
         返回 {"id", "conversation_id", "seq"}。"""
         if not self.token:
             raise ValueError("send() 需要 token")
         body = {"content": content}
         if conversation_id:
             body["conversation_id"] = conversation_id
+        if client_msg_id:
+            body["client_msg_id"] = client_msg_id
         req = urllib.request.Request(
             self.server + "/v1/hooks",
             data=json.dumps(body).encode(),

@@ -24,7 +24,7 @@ import type {
   PinEntry,
   ReplyPreview,
 } from "../../types";
-import { sendChat, sendTyping } from "../../ws";
+import { discardSend, retrySend, sendChat, sendTyping } from "../../ws";
 import RichText from "../../richText";
 import AnnouncementBar from "./AnnouncementBar";
 import AudioBubble from "./AudioBubble";
@@ -1049,6 +1049,17 @@ export default function ChatView() {
                             <span className="rx-count">{r.count}</span>
                           </button>
                         ))}
+                      </div>
+                    )}
+                    {pending && m.send_error && (
+                      <div className="send-fail">
+                        <span>发送失败：{m.send_error}</span>
+                        <button type="button" onClick={() => retrySend(m.id.slice("client:".length))}>
+                          重试
+                        </button>
+                        <button type="button" onClick={() => discardSend(m.id.slice("client:".length))}>
+                          删除
+                        </button>
                       </div>
                     )}
                   </div>

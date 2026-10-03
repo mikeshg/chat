@@ -90,14 +90,23 @@ func New(server, token, secret string) *Bot {
 	}
 }
 
-// Send 以 bot 身份发到和主人的私聊。
-func (b *Bot) Send(content string) (*Sent, error) { return b.SendTo("", content) }
+// SendOptions 是 SendWith 的可选项，零值 = 发到和主人的私聊、不带幂等键。
+type SendOptions struct {
+	ConversationID string // 空 = 和主人的私聊
+	ClientMsgID    string // 幂等键（1–80 字符）：重试时传同一个值不会重复发
+}
 
-// SendTo 以 bot 身份发到指定会话；conversationID 为空 = 和主人的私聊。
-func (b *Bot) SendTo(conversationID, content string) (*Sent, error) {
+// Send 以 bot 身份发到和主人的私聊。
+func (b *Bot) Send(content string) (*Sent, error) { return b.SendWith(content, SendOptions{}) }
+
+// SendWith 以 bot 身份发一条文字，可指定会话和幂等键。
+func (b *Bot) SendWith(content string, o SendOptions) (*Sent, error) {
 	payload := map[string]string{"content": content}
-	if conversationID != "" {
-		payload["conversation_id"] = conversationID
+	if o.ConversationID != "" {
+		payload["conversation_id"] = o.ConversationID
+	}
+	if o.ClientMsgID != "" {
+		payload["client_msg_id"] = o.ClientMsgID
 	}
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequest("POST", b.Server+"/v1/hooks", bytes.NewReader(body))

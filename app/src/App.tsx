@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { auth, loadSession } from "./api";
+import { ApiError, auth, loadSession } from "./api";
 import { readDrafts } from "./drafts";
 import { syncWindowTitle, unreadTitle } from "./notify";
 import { flushDrafts, setState, useApp } from "./store";
@@ -45,8 +45,14 @@ export default function App() {
         const me = await auth.me();
         setState({ me, drafts: readDrafts(localStorage, me.id) });
         void startWs();
-      } catch {
-        // session 已失效
+      } catch (e) {
+        // 连不上服务器（不是凭据失效）：用本地缓存的身份先进去，WS 自己重连，待发消息照常显示
+        const offline = !(e instanceof ApiError) || e.status >= 500;
+        const cached = offline ? loadSession()?.user : undefined;
+        if (cached) {
+          setState({ me: cached, drafts: readDrafts(localStorage, cached.id) });
+          void startWs();
+        }
       } finally {
         setBooting(false);
       }

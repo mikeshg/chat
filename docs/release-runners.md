@@ -90,14 +90,24 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now gitea-runner
 ```
 
-### 1.5 自检
+### 1.5 测试用 PostgreSQL
+
+推 main 和推标签都会先在这台机器上跑 `cargo test`，测试会自己建删 `chat_test` 等库，所以账号要有建库权限。只监听本机。
+
+```bash
+sudo apt install -y postgresql
+sudo -u postgres psql -c "CREATE ROLE chat LOGIN CREATEDB PASSWORD 'chat'"
+```
+
+### 1.6 自检
 
 ```bash
 sudo -u gitea-runner -H bash -lc 'cargo -V && node -v && pnpm -v && git --version && python3 -V'
+sudo -u gitea-runner -H psql postgres://chat:chat@localhost:5432/postgres -c 'select 1'
 systemctl status gitea-runner --no-pager
 ```
 
-四个版本号都能打印出来，服务状态是 `active (running)`，就装好了。刷新第 0 步的 Runners 页面，能看到 `ubuntu-builder`，状态为空闲。
+五个版本号都能打印出来，`select 1` 有结果，服务状态是 `active (running)`，就装好了。刷新第 0 步的 Runners 页面，能看到 `ubuntu-builder`，状态为空闲。
 
 ---
 

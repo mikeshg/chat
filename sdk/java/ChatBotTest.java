@@ -39,7 +39,8 @@ public class ChatBotTest {
             boolean ok = ex.getRequestURI().getPath().equals("/v1/hooks")
                     && "Bearer good".equals(ex.getRequestHeaders().getFirst("Authorization"));
             String conv = body.contains("\"conversation_id\":\"c9\"") ? "c9" : "dm";
-            String out = ok ? "{\"id\":\"m1\",\"conversation_id\":\"" + conv + "\",\"seq\":1}"
+            String id = body.contains("\"client_msg_id\":\"k1\"") ? "k1" : "m1";
+            String out = ok ? "{\"id\":\"" + id + "\",\"conversation_id\":\"" + conv + "\",\"seq\":1}"
                     : "{\"error\":\"invalid bot token\"}";
             byte[] b = out.getBytes(StandardCharsets.UTF_8);
             ex.sendResponseHeaders(ok ? 200 : 401, b.length);
@@ -52,7 +53,8 @@ public class ChatBotTest {
         try {
             ChatBot.Sent s = new ChatBot(url + "/", "good", null).send("hi \"quoted\" 中文\n");
             check(s.conversationId.equals("dm") && s.seq == 1, "send to owner DM");
-            check(new ChatBot(url, "good", null).sendTo("c9", "hi").conversationId.equals("c9"), "sendTo");
+            ChatBot.Sent s2 = new ChatBot(url, "good", null).send("hi", "c9", "k1");
+            check(s2.conversationId.equals("c9") && s2.id.equals("k1"), "send to conversation with idempotency key");
             try {
                 new ChatBot(url, "bad", null).send("hi");
                 check(false, "bad token should throw");

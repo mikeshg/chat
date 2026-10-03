@@ -44,6 +44,16 @@ const MIGRATION_VERSION_SQL: &str =
     "SELECT COALESCE(MAX(version), 0) FROM _sqlx_migrations WHERE success";
 
 /// 备份/恢复过程中 FILES_DIR 里需要排除的顶层前缀
+/// 快照里数据库引用的文件（相对 FILES_DIR）：附件原文件、缩略图、头像
+const REFERENCED_FILES_SQL: &str = "SELECT storage_path FROM attachments
+    UNION SELECT thumb_path FROM attachments WHERE thumb_path IS NOT NULL
+    UNION SELECT 'avatars/' || avatar_path FROM users WHERE avatar_path IS NOT NULL";
+
+/// 备份旁的缺失清单：`<备份名>.missing`，每行一个相对路径；完整的备份没有这个文件
+fn missing_list_path(bdir: &Path, name: &str) -> PathBuf {
+    bdir.join(format!("{name}.missing"))
+}
+
 const EXCLUDE_PREFIXES: &[&str] = &[".backups", ".restore-", ".spool-", ".upload-"];
 
 fn qi(name: &str) -> String {
@@ -192,10 +202,15 @@ pub async fn list_backups(
                 continue; // .part 与杂项一律不出现在列表
             }
             let size = e.metadata().await.map(|m| m.len()).unwrap_or(0);
+            let missing = tokio::fs::read_to_string(missing_list_path(&dir, &name))
+                .await
+                .map(|t| t.lines().count())
+                .unwrap_or(0);
             items.push(json!({
                 "name": name,
                 "size": size,
                 "created_at": backup_ts_to_rfc3339(&name),
+                "missing_files": missing,
             }));
         }
     }
@@ -308,7 +323,9 @@ pub async fn delete_backup(
     if !valid_backup_name(&name) {
         return Err(AppError::bad_request("invalid backup name"));
     }
-    match tokio::fs::remove_file(backups_dir(&st).join(&name)).await {
+    let dir = backups_dir(&st);
+    let _ = tokio::fs::remove_file(missing_list_path(&dir, &name)).await;
+    match tokio::fs::remove_file(dir.join(&name)).await {
         Ok(()) => Ok(StatusCode::NO_CONTENT),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             Err(AppError::not_found("backup not found"))
@@ -336,7 +353,7 @@ async fn current_tables(st: &SharedState) -> AppResult<Vec<String>> {
 async fn export_db(
     st: &SharedState,
     spool_dir: &Path,
-) -> Result<(Vec<ManifestTable>, i64), String> {
+) -> Result<(Vec<ManifestTable>, i64, Vec<String>), String> {
     let mut conn = st.pool.acquire().await.map_err(|e| e.to_string())?;
     sqlx::query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .execute(&mut *conn)
@@ -380,7 +397,11 @@ async fn export_db(
                 rows,
             });
         }
-        Ok::<_, AppError>((out, migration_version))
+        let referenced: Vec<String> = sqlx::query_scalar(REFERENCED_FILES_SQL)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(AppError::internal)?;
+        Ok::<_, AppError>((out, migration_version, referenced))
     }
     .await;
     let _ = sqlx::query("COMMIT").execute(&mut *conn).await;
@@ -390,7 +411,8 @@ async fn export_db(
     })
 }
 
-/// 打包阶段（blocking）：manifest + db/*.csv + files/* → *.part
+/// 打包阶段（blocking）：manifest + db/*.csv + files/* → *.part。
+/// 返回快照引用了、却没能入包的文件（备份期间被删的头像/附件），由调用方记成缺失清单。
 fn pack_archive(
     files_dir: &Path,
     spool_dir: &Path,
@@ -398,7 +420,8 @@ fn pack_archive(
     tables: &[ManifestTable],
     migration_version: i64,
     created_at: DateTime<Utc>,
-) -> Result<(), String> {
+    referenced: &[String],
+) -> Result<Vec<String>, String> {
     // 先枚举文件清单（manifest 需要 files/files_bytes）
     let files = enumerate_files(files_dir)?;
 
@@ -423,19 +446,25 @@ fn pack_archive(
         }
     }
 
-    // 文件：枚举后可能消失/变化 —— 消失跳过（缺文件可接受），
+    // 文件：枚举后消失的跳过（备份期间被删），最后与快照引用对账；
+    // 读不了（权限/IO）直接失败，不产出悄悄缺东西的包。
     // ponytail: 导出期间文件仍在被读写，半途变化的文件宁可失败重试，也不产出含坏条目的包。
-    let mut appended = 0u64;
+    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    let mut packed = std::collections::HashSet::new();
     let mut appended_bytes = 0u64;
     for (rel, _size, abs) in &files {
-        let Ok(meta) = std::fs::metadata(abs) else {
-            continue;
+        let meta = match std::fs::metadata(abs) {
+            Ok(m) => m,
+            Err(e) if gone(&e) => continue,
+            Err(e) => return Err(format!("read {rel}: {e}")),
         };
         if !meta.is_file() {
             continue;
         }
-        let Ok(f) = std::fs::File::open(abs) else {
-            continue; // 枚举后消失：按「缺文件可接受」跳过
+        let f = match std::fs::File::open(abs) {
+            Ok(f) => f,
+            Err(e) if gone(&e) => continue,
+            Err(e) => return Err(format!("open {rel}: {e}")),
         };
         let mut h = tar::Header::new_gnu();
         h.set_size(meta.len());
@@ -447,9 +476,15 @@ fn pack_archive(
         if cr.n != meta.len() {
             return Err(format!("file {rel} changed during backup"));
         }
-        appended += 1;
         appended_bytes += cr.n;
+        packed.insert(rel.as_str());
     }
+    let mut missing: Vec<String> = referenced
+        .iter()
+        .filter(|r| !packed.contains(r.as_str()))
+        .cloned()
+        .collect();
+    missing.sort();
 
     // manifest 最后写：files/files_bytes 以实际入包为准
     let manifest = json!({
@@ -457,8 +492,9 @@ fn pack_archive(
         "created_at": created_at.to_rfc3339_opts(SecondsFormat::Secs, true),
         "migration_version": migration_version,
         "tables": tables,
-        "files": appended,
+        "files": packed.len(),
         "files_bytes": appended_bytes,
+        "missing_files": missing,
     });
     let mbytes = serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?;
     let mut h = tar::Header::new_gnu();
@@ -471,7 +507,7 @@ fn pack_archive(
     let gz = ar.into_inner().map_err(|e| e.to_string())?;
     let f = gz.finish().map_err(|e| e.to_string())?;
     f.sync_all().map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(missing)
 }
 
 /// 递归枚举 FILES_DIR 下所有普通文件（跳过 .backups/.restore-*/.spool-* 顶层前缀），
@@ -480,16 +516,18 @@ fn enumerate_files(files_dir: &Path) -> Result<Vec<(String, u64, PathBuf)>, Stri
     let mut out = Vec::new();
     let mut stack = vec![files_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for e in rd.flatten() {
+        // 读不了的目录不能静默跳过：那样整个目录都不会进备份
+        let rd = std::fs::read_dir(&dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
+        for e in rd {
+            let e = e.map_err(|e| format!("read {}: {e}", dir.display()))?;
             let name = e.file_name().to_string_lossy().into_owned();
             let p = e.path();
             if dir == files_dir && EXCLUDE_PREFIXES.iter().any(|x| name.starts_with(x)) {
                 continue;
             }
-            let Ok(ft) = e.file_type() else { continue };
+            let ft = e
+                .file_type()
+                .map_err(|e| format!("stat {}: {e}", p.display()))?;
             if ft.is_symlink() {
                 continue;
             }
@@ -524,16 +562,34 @@ async fn run_backup(st: &SharedState, name: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
 
     let res = async {
-        let (tables, mv) = export_db(st, &spool).await?;
+        let (tables, mv, referenced) = export_db(st, &spool).await?;
         let files_dir = PathBuf::from(&st.cfg.files_dir);
         let spool2 = spool.clone();
         let part2 = part.clone();
         let created = Utc::now();
-        tokio::task::spawn_blocking(move || {
-            pack_archive(&files_dir, &spool2, &part2, &tables, mv, created)
+        let missing = tokio::task::spawn_blocking(move || {
+            pack_archive(
+                &files_dir,
+                &spool2,
+                &part2,
+                &tables,
+                mv,
+                created,
+                &referenced,
+            )
         })
         .await
         .map_err(|e| e.to_string())??;
+        if !missing.is_empty() {
+            tracing::warn!(
+                name,
+                missing = missing.len(),
+                "backup is missing referenced files"
+            );
+            tokio::fs::write(missing_list_path(&bdir, name), missing.join("\n"))
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         tokio::fs::rename(&part, bdir.join(name))
             .await
             .map_err(|e| e.to_string())?;

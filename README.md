@@ -201,10 +201,10 @@ git push origin v0.2.0
 
 在「我」页 → 机器人里新建。bot 会出现在你的联系人和会话里，可以拉进你所在的群。
 
-入站：先给 bot 加令牌（可以加多个，分给不同程序，单独删除）。外部程序带令牌以 bot 身份发消息，默认发到和你的私聊，带 `conversation_id` 发到 bot 所在的其他会话。令牌不对返回 401。
+入站：先给 bot 加令牌（可以加多个，分给不同程序，单独删除）。外部程序带令牌以 bot 身份发消息，默认发到和你的私聊，带 `conversation_id` 发到 bot 所在的其他会话。令牌不对返回 401。要安全重试（比如 CI 超时重发）就带上 `client_msg_id`（1–80 字符）：同一会话里重发同一个值，只会有一条消息，返回的也是第一次那条。
 
 ```bash
-curl -X POST http://<服务器>/v1/hooks -H 'Authorization: Bearer <令牌>' -H 'Content-Type: application/json' -d '{"content":"部署完成"}'
+curl -X POST http://<服务器>/v1/hooks -H 'Authorization: Bearer <令牌>' -H 'Content-Type: application/json' -d '{"content":"部署完成","client_msg_id":"deploy-1234"}'
 ```
 
 出站：填了回调地址时，bot 在私聊里收到消息、或在群里被 @ 时，服务器 POST：
@@ -234,7 +234,7 @@ Python 可以直接拷文件，或 `pip install "git+<仓库地址>#subdirectory
 from chatbot import Bot
 
 bot = Bot("https://chat.example.com", token="入站令牌", secret="签名密钥")
-bot.send("部署完成")                     # send(文字, conversation_id) 发到别的会话
+bot.send("部署完成")                     # send(文字, conversation_id=, client_msg_id=)
 
 @bot.on_message
 def reply(event):                       # 私聊它、或在群里 @ 它时调用
@@ -245,20 +245,20 @@ bot.run(port=8080)                      # 回调地址填 http://<这台机器>:
 
 ```go
 bot := chatbot.New("https://chat.example.com", "入站令牌", "签名密钥")
-bot.Send("部署完成")                     // SendTo(会话 id, 文字)
+bot.Send("部署完成")                     // SendWith(文字, chatbot.SendOptions{ConversationID, ClientMsgID})
 bot.OnMessage(func(ev chatbot.Event) string { return "收到：" + ev.Message.Content }) // "" = 不回
 log.Fatal(bot.Run(":8080"))
 ```
 
 ```java
 ChatBot bot = new ChatBot("https://chat.example.com", "入站令牌", "签名密钥");
-bot.send("部署完成");                    // sendTo(会话 id, 文字)
+bot.send("部署完成");                    // send(文字, 会话 id, client_msg_id)，不要的传 null
 bot.onMessage(ev -> "收到：" + ev.text()).run(8080);   // 返回 null = 不回
 ```
 
 ```rust
 let bot = chatbot::Bot::new("https://chat.example.com", "入站令牌", "签名密钥");
-bot.send("部署完成")?;                   // send_to(Some(会话 id), 文字)
+bot.send("部署完成")?;                   // send_with(文字, SendOptions { conversation_id, client_msg_id })
 bot.on_message(|ev| Some(format!("收到：{}", ev.message.content))).run("0.0.0.0:8080")?; // None = 不回
 ```
 

@@ -4,6 +4,7 @@ import {
   clearSession,
   convs,
   friends as friendsApi,
+  getServer,
   msgs,
   session,
   wsBase,
@@ -28,6 +29,7 @@ import {
   resolveAck,
   setState,
   shouldNotify,
+  upsertMessage,
 } from "./store";
 import type { AttachmentView, MessageView, WsOut } from "./types";
 
@@ -49,11 +51,57 @@ type Outgoing = {
   content: string;
   attachment?: AttachmentView;
   replyToId?: string;
+  /** 乐观消息原样存：刷新/重启后照它放回列表 */
+  optimistic: MessageView;
+  /** 永久失败的原因：不再自动重发，等用户重试或删除 */
+  error?: string;
   sentOn?: WebSocket;
 };
 
-/** 未收到 ack 的发送。重连后按原 client_msg_id 重放，服务端幂等。 */
+/** 未收到 ack 的发送。重连后按原 client_msg_id 重放，服务端幂等。
+ * 持久化到 localStorage（按服务器 + 账号），刷新、退出、手机杀进程都不丢。 */
 const outbox: Outgoing[] = [];
+let outboxKey = "";
+
+// ponytail: 同账号多标签页共用一个键、互相覆写；最坏是某页的待发记录没存上（发送本身幂等不重复），需要时按标签页分键再合并
+function saveOutbox() {
+  if (!outboxKey) return;
+  try {
+    if (outbox.length === 0) localStorage.removeItem(outboxKey);
+    else localStorage.setItem(outboxKey, JSON.stringify(outbox.map(({ sentOn: _, ...item }) => item)));
+  } catch {}
+}
+
+/** 登录后取回本账号未发出的消息，放回各会话列表；连上后 flushOutbox 按原 client_msg_id 重发 */
+function restoreOutbox() {
+  const me = getState().me;
+  outboxKey = me ? `chat_outbox:${getServer() || location.origin}:${me.id}` : "";
+  outbox.length = 0;
+  try {
+    const saved: unknown = JSON.parse(localStorage.getItem(outboxKey) || "[]");
+    if (Array.isArray(saved)) outbox.push(...saved.filter((x) => x?.clientMsgId && x.optimistic));
+  } catch {}
+  if (outbox.length === 0) return;
+  setState((s) => {
+    const messages = { ...s.messages };
+    for (const item of outbox) {
+      messages[item.convId] = upsertMessage(messages[item.convId] ?? [], {
+        ...item.optimistic,
+        send_error: item.error,
+      });
+    }
+    return { messages };
+  });
+}
+
+const SEND_ERROR_TEXT: Record<string, string> = {
+  bad_message: "内容不合法（1–4000 字）",
+  forbidden: "没有权限",
+  not_friends: "对方已不是你的好友",
+  bad_attachment: "附件无效",
+  not_found: "会话不存在",
+  bad_frame: "客户端版本过旧",
+};
 
 const PERMANENT_SEND_ERRORS = new Set([
   "bad_message",
@@ -68,7 +116,9 @@ export function stopWs() {
   stopped = true;
   wsGen = -1; // 使在途连接/回调全部失效（P1-10）
   catalogGen++; // 使在途目录刷新失效
+  // 只清内存：本地存的待发记录留给该账号下次登录
   outbox.length = 0;
+  outboxKey = "";
   // P2-7：清理重连定时器并复位计数/水位，避免新会话继承旧状态
   if (reconnectTimer != null) {
     clearTimeout(reconnectTimer);
@@ -89,6 +139,7 @@ export function stopWs() {
 export async function startWs() {
   stopped = false;
   wsGen = session(); // P1-10：绑定当前登录会话
+  restoreOutbox();
   await connect();
 }
 
@@ -403,8 +454,7 @@ function dispatch(f: WsOut) {
     }
     case "error":
       if (f.client_msg_id && PERMANENT_SEND_ERRORS.has(f.code)) {
-        const item = takeOutbox(f.client_msg_id);
-        if (item) setState((cur) => dropOptimistic(cur, item.convId, item.clientMsgId));
+        markFailed(f.client_msg_id, SEND_ERROR_TEXT[f.code] ?? f.message);
       }
       console.warn("ws error", f.code, f.message);
       break;
@@ -476,13 +526,52 @@ function takeOutbox(clientMsgId: string | null): Outgoing | undefined {
   if (!clientMsgId) return;
   const i = outbox.findIndex((item) => item.clientMsgId === clientMsgId);
   if (i < 0) return;
-  return outbox.splice(i, 1)[0];
+  const [item] = outbox.splice(i, 1);
+  saveOutbox();
+  return item;
+}
+
+function setOptimisticError(item: Outgoing, sendError: string | undefined) {
+  const id = `client:${item.clientMsgId}`;
+  setState((s) => ({
+    messages: {
+      ...s.messages,
+      [item.convId]: (s.messages[item.convId] ?? []).map((m) =>
+        m.id === id ? { ...m, send_error: sendError } : m,
+      ),
+    },
+  }));
+}
+
+function markFailed(clientMsgId: string, reason: string) {
+  const item = outbox.find((x) => x.clientMsgId === clientMsgId);
+  if (!item) return;
+  item.error = reason;
+  item.sentOn = undefined;
+  saveOutbox();
+  setOptimisticError(item, reason);
+}
+
+/** 失败气泡「重试」：同一 client_msg_id 再发（失败的那次没落库，服务端不会重复） */
+export function retrySend(clientMsgId: string) {
+  const item = outbox.find((x) => x.clientMsgId === clientMsgId);
+  if (!item) return;
+  item.error = undefined;
+  saveOutbox();
+  setOptimisticError(item, undefined);
+  flushOutbox();
+}
+
+/** 失败气泡「删除」：放弃这条 */
+export function discardSend(clientMsgId: string) {
+  const item = takeOutbox(clientMsgId);
+  if (item) setState((s) => dropOptimistic(s, item.convId, clientMsgId));
 }
 
 function flushOutbox() {
   if (wsGen !== session() || ws?.readyState !== WebSocket.OPEN) return;
   for (const item of outbox) {
-    if (item.sentOn === ws) continue;
+    if (item.sentOn === ws || item.error) continue;
     ws.send(
       JSON.stringify({
         type: "send_message",
@@ -550,7 +639,9 @@ export function sendChat(
     content,
     attachment,
     replyToId: replyTo?.id,
+    optimistic,
   });
+  saveOutbox();
   setState((s) => ({
     messages: {
       ...s.messages,

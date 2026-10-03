@@ -1,4 +1,4 @@
-# 推 v* 标签 → 建 Release → Windows runner 打 Windows 安装包和 Android APK、
+# 推 main / v* 标签都先跑测试；只有标签才继续：建 Release → Windows runner 打 Windows 安装包和 Android APK、
 # Linux runner 打 deb 和 AppImage，都传到这个 Release。
 # Chat 服务端读最新 Release 给客户端做在线更新（server/src/client_update.rs）。
 # runner 安装见 docs/release-runners.md。
@@ -8,6 +8,7 @@ name: release
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
 
 env:
@@ -15,7 +16,28 @@ env:
   TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
 
 jobs:
+  test:
+    runs-on: linux
+    env:
+      # 测试库：runner 机器上的本地 PostgreSQL（安装见 docs/release-runners.md 1.5）
+      DATABASE_URL: postgres://chat:chat@localhost:5432/postgres
+      CARGO_TARGET_DIR: /var/lib/gitea-runner/chat-server-target
+    steps:
+      - name: 检出
+        run: |
+          git init -q . && git fetch -q --depth 1 "${{ gitea.server_url }}/${{ gitea.repository }}.git" "+${{ gitea.ref }}:${{ gitea.ref }}"
+          git checkout -q "${{ gitea.ref_name }}"
+      - run: pnpm install --frozen-lockfile
+      - name: 前端类型检查与单测
+        working-directory: app
+        run: pnpm exec tsc -b && pnpm test
+      - name: 服务端集成与迁移测试
+        working-directory: server
+        run: cargo test --locked
+
   release:
+    needs: test
+    if: startsWith(gitea.ref, 'refs/tags/')
     runs-on: linux
     outputs:
       id: ${{ steps.create.outputs.id }}

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearSession, saveSession } from "./api";
 import { getState, setState } from "./store";
 import type { ConversationView, MessageView } from "./types";
-import { kickReasonText, sendChat, startWs, stopWs } from "./ws";
+import { discardSend, kickReasonText, retrySend, sendChat, startWs, stopWs } from "./ws";
 
 const me = { id: "me", username: "me", display_name: "Me", role: "user" as const, last_seen_at: null };
 const message = (seq: number, mentions: string[] = []): MessageView => ({ id: `m${seq}`, seq, conversation_id: "c", sender_id: "other", sender_username: "other", sender_name: "Other", content: "hello", kind: "text", attachment: null, mentions, created_at: "2026-01-01T00:00:00Z" });
@@ -68,6 +68,40 @@ describe("WebSocket delivery", () => {
     expect(second.sent.filter((f) => f.type === "send_message").map((f) => f.client_msg_id)).toEqual(sent.slice(1).map((f) => f.client_msg_id));
     sendChat("c", "four");
     expect(second.sent.filter((f) => f.type === "send_message")).toHaveLength(3);
+  });
+
+  it("keeps unsent messages across a reload and resends them with the same client_msg_id", async () => {
+    (await open()).close(); // 断网
+    sendChat("c", "offline"); // 连接不在：只进队列
+    const id = getState().messages.c[0].id;
+    stopWs(); // 模拟刷新：内存清空，只剩本地存储
+    setState({ messages: {} });
+    const sock = await open();
+    expect(getState().messages.c.map((m) => m.id)).toEqual([id]);
+    const sent = sock.sent.filter((f) => f.type === "send_message");
+    expect(sent.map((f) => f.client_msg_id)).toEqual([id.slice("client:".length)]);
+    sock.frame({ type: "message_ack", client_msg_id: sent[0].client_msg_id, message: message(1) });
+    stopWs();
+    setState({ messages: {} });
+    await open();
+    expect(getState().messages.c ?? []).toEqual([]); // ack 后不再恢复
+  });
+
+  it("keeps a permanently rejected message as a failed bubble that can be retried or discarded", async () => {
+    const sock = await open();
+    sendChat("c", "nope");
+    const [frame] = sock.sent.filter((f) => f.type === "send_message");
+    const cid = frame.client_msg_id as string;
+    sock.frame({ type: "error", code: "not_friends", message: "x", client_msg_id: cid });
+    expect(getState().messages.c[0].send_error).toBe("对方已不是你的好友");
+    retrySend(cid);
+    expect(getState().messages.c[0].send_error).toBeUndefined();
+    sock.frame({ type: "error", code: "not_friends", message: "x", client_msg_id: cid });
+    discardSend(cid);
+    expect(getState().messages.c).toEqual([]);
+    stopWs();
+    await open();
+    expect(getState().messages.c).toEqual([]); // 删掉的不会被恢复
   });
 
   it("does not toast or count a duplicate message twice", async () => {

@@ -54,6 +54,15 @@ pub struct Event {
     pub message: Message,
 }
 
+/// `send_with` 的可选项；默认 = 发到和主人的私聊、不带幂等键。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SendOptions<'a> {
+    /// None = 和主人的私聊
+    pub conversation_id: Option<&'a str>,
+    /// 幂等键（1–80 字符）：重试时传同一个值不会重复发
+    pub client_msg_id: Option<&'a str>,
+}
+
 /// `send` 的结果。
 #[derive(Debug, Clone, Deserialize)]
 pub struct Sent {
@@ -136,14 +145,17 @@ impl Bot {
 
     /// 以 bot 身份发到和主人的私聊。
     pub fn send(&self, content: &str) -> Result<Sent, Error> {
-        self.send_to(None, content)
+        self.send_with(content, SendOptions::default())
     }
 
-    /// 以 bot 身份发到指定会话；None = 和主人的私聊。
-    pub fn send_to(&self, conversation_id: Option<&str>, content: &str) -> Result<Sent, Error> {
+    /// 以 bot 身份发一条文字，可指定会话和幂等键。
+    pub fn send_with(&self, content: &str, opts: SendOptions) -> Result<Sent, Error> {
         let mut body = json!({ "content": content });
-        if let Some(c) = conversation_id {
+        if let Some(c) = opts.conversation_id {
             body["conversation_id"] = c.into();
+        }
+        if let Some(k) = opts.client_msg_id {
+            body["client_msg_id"] = k.into();
         }
         let resp = self
             .agent
@@ -251,8 +263,29 @@ mod tests {
         let status = status.to_string();
         let h = std::thread::spawn(move || {
             let (mut s, _) = l.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let n = s.read(&mut buf).unwrap();
+            // 请求头和请求体可能分两次到：读到 Content-Length 那么长为止
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = s.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).to_lowercase();
+                let Some(end) = text.find("\r\n\r\n") else {
+                    continue;
+                };
+                let len = text
+                    .split("content-length:")
+                    .nth(1)
+                    .and_then(|v| v.lines().next()?.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if buf.len() >= end + 4 + len {
+                    break;
+                }
+            }
+            let n = buf.len();
             let resp = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -267,10 +300,17 @@ mod tests {
     fn send_posts_bearer_and_parses_errors() {
         let (url, h) = fake_chat("200 OK", r#"{"id":"m1","conversation_id":"c9","seq":1}"#);
         let sent = Bot::new(&format!("{url}/"), "good", "")
-            .send_to(Some("c9"), "hi")
+            .send_with(
+                "hi",
+                SendOptions {
+                    conversation_id: Some("c9"),
+                    client_msg_id: Some("k1"),
+                },
+            )
             .unwrap();
         assert_eq!((sent.conversation_id.as_str(), sent.seq), ("c9", 1));
         let raw = h.join().unwrap().to_lowercase();
+        assert!(raw.contains(r#""client_msg_id":"k1""#), "{raw}");
         assert!(raw.starts_with("post /v1/hooks "), "{raw}");
         assert!(raw.contains("authorization: bearer good"), "{raw}");
 

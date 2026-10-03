@@ -139,6 +139,11 @@ export default function BackupPanel() {
             </span>
             <span className="muted">{fmtBytes(b.size)}</span>
             <span className="muted">{fmtTime(b.created_at)}</span>
+            {!!b.missing_files && (
+              <span className="mut-err" title="备份期间这些文件被删除，清单见包内 manifest.json">
+                缺 {b.missing_files} 个文件
+              </span>
+            )}
             <span className="bk-actions">
               <button
                 disabled={busy !== null}

@@ -155,6 +155,25 @@ async fn bot_lifecycle_and_inbound_hook() {
     );
     let m = wait_message(&base, &owner, &dm, |m| m["content"] == "build ok").await;
     assert_eq!(m["sender_id"], bot_id);
+
+    // 带 client_msg_id 重试：返回同一条消息，不重复发
+    let send_idem = || async {
+        http()
+            .post(format!("{base}/v1/hooks"))
+            .header("authorization", format!("Bearer {token}"))
+            .json(&json!({"content": "deploy done", "client_msg_id": "deploy-1"}))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()
+    };
+    let first = send_idem().await;
+    let again = send_idem().await;
+    assert_eq!(first["id"], again["id"]);
+    assert_eq!(first["seq"], again["seq"]);
+
     assert_eq!(hook(&base, "nope", json!({"content": "x"})).await, 401);
     let no_auth = http()
         .post(format!("{base}/v1/hooks"))
@@ -205,7 +224,10 @@ async fn bot_lifecycle_and_inbound_hook() {
 
     // 多个令牌各自可用；删掉一个只影响它自己
     let (_, token2) = add_token(&base, &owner, bot_id, "cron").await;
-    assert_eq!(hook(&base, &token2, json!({"content": "from cron"})).await, 200);
+    assert_eq!(
+        hook(&base, &token2, json!({"content": "from cron"})).await,
+        200
+    );
     let r = http()
         .delete(format!("{base}/v1/bots/{bot_id}/tokens/{token_id}"))
         .header("authorization", authz(&other.access))
@@ -224,7 +246,10 @@ async fn bot_lifecycle_and_inbound_hook() {
         .unwrap();
     assert_eq!(after["tokens"].as_array().unwrap().len(), 1);
     assert_eq!(hook(&base, &token, json!({"content": "x"})).await, 401);
-    assert_eq!(hook(&base, &token2, json!({"content": "still ok"})).await, 200);
+    assert_eq!(
+        hook(&base, &token2, json!({"content": "still ok"})).await,
+        200
+    );
 
     // 换签名密钥
     let reset: Value = http()
