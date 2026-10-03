@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { isDesktopShell } from "../../api";
+import SetRow from "./SetRow";
 
 /** 「我」页开机自动启动。只在桌面壳显示，默认关闭（不在这里调用 enable）。 */
 export default function AutostartSetting() {
@@ -50,19 +51,14 @@ export default function AutostartSetting() {
   };
 
   return (
-    <section className="card">
-      <h3>开机自动启动</h3>
-      <label className="row pick">
-        <input
-          type="checkbox"
-          checked={enabled}
-          disabled={!ready || busy}
-          onChange={() => void toggle()}
-        />
-        <span>登录系统后自动打开 Chat</span>
-      </label>
-      <div className="muted">默认关闭。关闭窗口后 Chat 会留在托盘里继续接收消息。</div>
-      {hint && <div className="muted">{hint}</div>}
-    </section>
+    <SetRow
+      label="开机自动启动"
+      desc={hint || "关闭窗口后 Chat 会留在托盘里继续接收消息"}
+      toggle={{
+        checked: enabled,
+        disabled: !ready || busy,
+        onChange: () => void toggle(),
+      }}
+    />
   );
 }

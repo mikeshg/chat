@@ -11,6 +11,7 @@ import StorageUsage from "./StorageUsage";
 import AvatarSetting from "./AvatarSetting";
 import BotSettings from "./BotSettings";
 import UpdateSetting from "./UpdateSetting";
+import SetRow, { SetGroup } from "./SetRow";
 
 export default function MePanel() {
   const s = useApp();
@@ -35,54 +36,64 @@ export default function MePanel() {
 
   return (
     <main className="contacts">
-      <h2>我</h2>
-      <section className="card">
-        <div className="row me-head">
+      <div className="me-page">
+        <h2>我</h2>
+        <section className="card me-profile">
           <AvatarSetting />
           <div className="grow">
-            <div>
-              <b>{s.me?.display_name}</b>
-            </div>
+            <div className="me-name">{s.me?.display_name}</div>
             <div className="muted">@{s.me?.username}</div>
+            <div className="row">
+              <input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="昵称"
+                maxLength={50}
+              />
+              <button
+                className="primary"
+                disabled={!name.trim() || name.trim() === s.me?.display_name}
+                onClick={save}
+              >
+                保存昵称
+              </button>
+            </div>
+            {hint && <div className="muted">{hint}</div>}
           </div>
-        </div>
-        <div className="row">
-          <input
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="昵称"
-            maxLength={50}
-          />
-          <button className="primary" onClick={save}>
-            保存昵称
+        </section>
+
+        <SetGroup title="通用">
+          <UpdateSetting />
+          <AutostartSetting />
+          <ThemeSetting />
+          <StorageUsage />
+          <SetRow label="服务器" desc={getServer() || "同源"}>
+            <span className="set-value">
+              <span className={`dot${s.wsReady ? " on" : ""}`} />
+              {s.wsReady ? "已连接" : "未连接"}
+            </span>
+          </SetRow>
+        </SetGroup>
+
+        <SetGroup title="通知">
+          <NotifySettings />
+          <PushSettings />
+        </SetGroup>
+
+        <SetGroup title="机器人">
+          <BotSettings />
+        </SetGroup>
+
+        <SetGroup title="账号与安全">
+          <SecuritySettings />
+        </SetGroup>
+
+        <section className="card set-group set-logout-card">
+          <button className="set-logout" onClick={logout}>
+            退出登录
           </button>
-        </div>
-        {hint && <div className="muted">{hint}</div>}
-      </section>
-
-      <UpdateSetting />
-      <AutostartSetting />
-
-      <NotifySettings />
-      <PushSettings />
-      <BotSettings />
-      <StorageUsage />
-      <ThemeSetting />
-      <SecuritySettings />
-
-      <section className="card">
-        <h3>连接</h3>
-        <div className="muted">
-          服务器：{getServer() || "同源"} · 实时通道：{s.wsReady ? "已连接" : "未连接"}
-        </div>
-      </section>
-
-      <section className="card">
-        <button className="danger" onClick={logout}>
-          退出登录
-        </button>
-      </section>
-
+        </section>
+      </div>
     </main>
   );
 }

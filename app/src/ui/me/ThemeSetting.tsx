@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { applyTheme, readThemeChoice, THEME_KEY, type ThemeChoice } from "../../theme";
+import SetRow from "./SetRow";
 
 const OPTIONS: { v: ThemeChoice; label: string }[] = [
   { v: "system", label: "跟随系统" },
@@ -21,21 +22,15 @@ export default function ThemeSetting() {
   };
 
   return (
-    <section className="card">
-      <h3>外观</h3>
-      <div className="theme-opts" role="radiogroup" aria-label="外观">
+    <SetRow label="外观">
+      <div className="seg" role="radiogroup" aria-label="外观">
         {OPTIONS.map((o) => (
-          <label key={o.v} className="theme-opt">
-            <input
-              type="radio"
-              name="theme"
-              checked={choice === o.v}
-              onChange={() => pick(o.v)}
-            />
+          <label key={o.v} className={`seg-opt${choice === o.v ? " on" : ""}`}>
+            <input type="radio" name="theme" checked={choice === o.v} onChange={() => pick(o.v)} />
             {o.label}
           </label>
         ))}
       </div>
-    </section>
+    </SetRow>
   );
 }

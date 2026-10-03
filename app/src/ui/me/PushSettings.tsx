@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { auth } from "../../api";
 import type { PushState } from "../../types";
+import SetRow from "./SetRow";
 
 /**
  * ===== V2 P3-3 ===== 「我」页手机推送卡片（ntfy）。
@@ -63,69 +64,59 @@ export default function PushSettings() {
       return v;
     });
 
+  if (info == null)
+    return (
+      <SetRow label="手机推送" desc={err ? <span className="auth-err">{err}</span> : "加载中…"} />
+    );
+  if (!info.available) return <SetRow label="手机推送" desc="管理员未配置推送服务" />;
+
   return (
-    <section className="card">
-      <h3>手机推送</h3>
-      {info == null ? (
-        err ? (
-          <div className="auth-err">{err}</div>
-        ) : (
-          <div className="muted">加载中…</div>
-        )
-      ) : !info.available ? (
-        <div className="muted">管理员未配置推送服务</div>
-      ) : (
-        <>
-          <label className="row pick">
-            <input
-              type="checkbox"
-              checked={info.enabled}
-              disabled={busy !== ""}
-              onChange={() =>
-                void run("toggle", () => auth.updatePush({ enabled: !info.enabled }))
-              }
-            />
-            <span>手机推送（应用退到后台后通过 ntfy 提醒新消息）</span>
-          </label>
-          <label className="row pick">
-            <input
-              type="checkbox"
-              checked={info.preview}
-              disabled={busy !== "" || !info.enabled}
-              onChange={(e) =>
-                void run("preview", () => auth.updatePush({ preview: e.target.checked }))
-              }
-            />
-            <span>推送显示消息内容</span>
-          </label>
-          <div className="muted">
-            公共 ntfy 服务器上订阅了同一主题的人可能看到推送内容
+    <>
+      <SetRow
+        label="手机推送"
+        desc="应用在后台时通过 ntfy 提醒新消息"
+        toggle={{
+          checked: info.enabled,
+          disabled: busy !== "",
+          onChange: () => void run("toggle", () => auth.updatePush({ enabled: !info.enabled })),
+        }}
+      />
+      {info.enabled && (
+        <SetRow
+          label="推送显示消息内容"
+          desc="公共 ntfy 服务器上订阅了同一主题的人可能看到推送内容"
+          toggle={{
+            checked: info.preview,
+            disabled: busy !== "",
+            onChange: (v) => void run("preview", () => auth.updatePush({ preview: v })),
+          }}
+        />
+      )}
+      {info.enabled && info.subscribe_url && (
+        <div className="set-block">
+          <div className="muted">在手机上安装 ntfy App → 订阅主题 → 粘贴这个地址</div>
+          <div className="row push-url">
+            <code className="push-url-text">{info.subscribe_url}</code>
+            <button onClick={() => void copy(info.subscribe_url!)}>
+              {copied ? "已复制" : "复制"}
+            </button>
           </div>
-          {info.enabled && info.subscribe_url && (
-            <>
-              <div className="row push-url">
-                <code className="push-url-text">{info.subscribe_url}</code>
-                <button onClick={() => void copy(info.subscribe_url!)}>
-                  {copied ? "已复制" : "复制"}
-                </button>
-              </div>
-              <div className="muted">
-                在手机上安装 ntfy App → 订阅主题 → 粘贴这个地址
-              </div>
-              <div className="row push-actions">
-                <button disabled={busy !== ""} onClick={test}>
-                  {busy === "test" ? "发送中…" : "发送测试推送"}
-                </button>
-                <button disabled={busy !== ""} onClick={rotate}>
-                  {busy === "rotate" ? "更换中…" : "更换主题"}
-                </button>
-              </div>
-            </>
-          )}
+          <div className="row push-actions">
+            <button disabled={busy !== ""} onClick={test}>
+              {busy === "test" ? "发送中…" : "发送测试推送"}
+            </button>
+            <button disabled={busy !== ""} onClick={rotate}>
+              {busy === "rotate" ? "更换中…" : "更换主题"}
+            </button>
+          </div>
+        </div>
+      )}
+      {(err || hint) && (
+        <div className="set-block">
           {err && <div className="auth-err">{err}</div>}
           {hint && <div className="muted">{hint}</div>}
-        </>
+        </div>
       )}
-    </section>
+    </>
   );
 }

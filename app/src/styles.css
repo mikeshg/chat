@@ -602,10 +602,6 @@ button.ctx-item:hover { background: var(--bg); }
 /* 会话列表草稿标记（[有人@我] 之后、草稿首行之前） */
 .draft-tag { color: var(--danger); font-weight: 500; margin-right: 2px; }
 
-/* 「我」页外观设置卡片 */
-.theme-opts { display: flex; gap: 14px; }
-.theme-opt { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
-
 /* 兜底：不支持 light-dark() 的旧 WebView（Chromium < 123，如未更新的 Android 系统 WebView）
    整套变量会失效成透明。这里回落到浅色值；ponytail: 旧 WebView 无暗色模式，需要时改用 data-theme 双份变量 */
 @supports not (color: light-dark(#000, #fff)) {
@@ -681,7 +677,6 @@ button.ctx-item:hover { background: var(--bg); }
 /* ===== V2 P2-1 ===== */
 /* 图片气泡占位：.msg-img 原有 max 上限保留作无尺寸回退；有尺寸时 inline style 精确预留 */
 .pf-err { color: var(--danger); font-size: 12px; margin: 4px 0; }
-.storage-usage { font-size: 13px; }
 .ad-quota { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
 .ad-quota-input { width: 120px; }
 /* 用户表加「存储」列 → 六列 */
@@ -703,7 +698,6 @@ button.ctx-item:hover { background: var(--bg); }
   cursor: pointer;
 }
 .avatar-pick:disabled { cursor: default; }
-.me-head { align-items: flex-start; }
 .avatar-setting { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
 .avatar-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .avatar-actions button { font-size: 12px; padding: 4px 8px; }
@@ -936,4 +930,51 @@ button.icon-btn.chat-head-btn { flex: 0 0 auto; width: auto; height: 32px; white
 .am-adv-in { padding: 0 12px 12px; display: flex; flex-direction: column; gap: 8px; }
 
 /* 「我」页机器人 */
-.bot-row { display: flex; flex-direction: column; gap: 6px; padding: 10px 0; border-top: 1px solid var(--line); }
+
+/* 「我」页：分组列表（组名在卡片外，卡片里一行一项，左文字右控件） */
+.me-page { max-width: 640px; margin: 0 auto; }
+.me-profile { display: flex; gap: 16px; align-items: flex-start; }
+.me-name { font-size: 16px; font-weight: 600; }
+.me-profile input { min-width: 0; }
+.me-profile button, .set-row > button, .set-row > a.btn { white-space: nowrap; }
+@media (max-width: 720px) { .contacts { padding: 16px; } }
+.set-title { margin: 22px 4px 8px; font-size: 13px; font-weight: 500; color: var(--muted); }
+.card.set-group { padding: 0; overflow: hidden; }
+.set-row, .set-block { padding: 12px 16px; border-top: 1px solid var(--line); }
+.set-group > :first-child { border-top: none; }
+.set-row { display: flex; align-items: center; gap: 12px; min-height: 52px; }
+.set-row > button, .set-row > a.btn { flex-shrink: 0; align-self: center; }
+.set-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.set-main > .muted { overflow-wrap: anywhere; }
+.set-value { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; flex-shrink: 0; }
+.set-block { display: flex; flex-direction: column; gap: 8px; }
+.set-block > .row { margin: 0; }
+.set-form > * { max-width: 360px; }
+.set-more summary { cursor: pointer; margin-top: 4px; }
+.set-more a { color: var(--link); }
+.bot-new { flex-wrap: wrap; }
+.bot-new input { min-width: 160px; }
+.set-logout-card { margin-top: 22px; }
+button.set-logout { width: 100%; border: none; border-radius: 0; padding: 14px; color: var(--danger); font-size: 14px; }
+
+/* 开关 */
+input.switch {
+  appearance: none; -webkit-appearance: none; flex-shrink: 0; margin: 0; padding: 0; border: none;
+  width: 40px; height: 24px; border-radius: 12px; background: var(--line);
+  position: relative; cursor: pointer; transition: background 0.15s;
+}
+input.switch::after {
+  content: ""; position: absolute; top: 2px; left: 2px; width: 20px; height: 20px; border-radius: 50%;
+  background: #fff; box-shadow: 0 1px 2px var(--shadow); transition: transform 0.15s;
+}
+input.switch:checked { background: var(--green); }
+input.switch:checked::after { transform: translateX(16px); }
+input.switch:disabled { opacity: 0.5; cursor: default; }
+input.switch:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
+
+/* 分段选择（外观） */
+.seg { display: inline-flex; flex-shrink: 0; padding: 2px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); }
+.seg-opt { padding: 4px 12px; border-radius: 4px; font-size: 13px; color: var(--muted); cursor: pointer; }
+.seg-opt.on { background: var(--panel); color: var(--text); box-shadow: 0 1px 2px var(--shadow-soft); }
+.seg-opt input { position: absolute; opacity: 0; width: 0; height: 0; margin: 0; }
+.seg-opt:has(input:focus-visible) { outline: 2px solid var(--green); }

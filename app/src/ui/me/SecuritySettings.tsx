@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { auth, saveSession } from "../../api";
 import type { SessionView } from "../../types";
 import { startWs, stopWs } from "../../ws";
+import SetRow from "./SetRow";
 
 const fmtTime = (s: string) => new Date(s).toLocaleString();
 
@@ -10,6 +11,7 @@ export default function SecuritySettings() {
   const [oldPw, setOldPw] = useState("");
   const [newPw, setNewPw] = useState("");
   const [newPw2, setNewPw2] = useState("");
+  const [pwOpen, setPwOpen] = useState(false);
   const [pwBusy, setPwBusy] = useState(false);
   const [pwMsg, setPwMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [sessions, setSessions] = useState<SessionView[] | null>(null);
@@ -50,10 +52,14 @@ export default function SecuritySettings() {
       setOldPw("");
       setNewPw("");
       setNewPw2("");
+      setPwOpen(false);
       setPwMsg({ ok: true, text: "密码已修改，其他设备已退出" });
       void loadSessions();
     } catch (ex) {
-      setPwMsg({ ok: false, text: ex instanceof Error ? ex.message : "修改失败" });
+      setPwMsg({
+        ok: false,
+        text: ex instanceof Error ? ex.message : "修改失败",
+      });
     } finally {
       setPwBusy(false);
     }
@@ -88,82 +94,92 @@ export default function SecuritySettings() {
 
   return (
     <>
-      <section className="card">
-        <h3>修改密码</h3>
-        <form onSubmit={changePw}>
-          <div className="row">
-            <input
-              type="password"
-              placeholder="当前密码"
-              value={oldPw}
-              onChange={(e) => setOldPw(e.target.value)}
-              autoComplete="current-password"
-              required
-            />
-          </div>
-          <div className="row">
-            <input
-              type="password"
-              placeholder="新密码（6-72 位）"
-              value={newPw}
-              onChange={(e) => setNewPw(e.target.value)}
-              autoComplete="new-password"
-              required
-            />
-          </div>
-          <div className="row">
-            <input
-              type="password"
-              placeholder="再输一遍新密码"
-              value={newPw2}
-              onChange={(e) => setNewPw2(e.target.value)}
-              autoComplete="new-password"
-              required
-            />
-          </div>
-          {pwMsg && <div className={pwMsg.ok ? "ok-hint" : "auth-err"}>{pwMsg.text}</div>}
+      <SetRow
+        label="密码"
+        desc={
+          pwMsg?.ok ? <span className="ok-hint">{pwMsg.text}</span> : "修改后其他设备会退出登录"
+        }
+      >
+        <button
+          onClick={() => {
+            setPwOpen((o) => !o);
+            setPwMsg(null);
+          }}
+        >
+          {pwOpen ? "取消" : "修改密码"}
+        </button>
+      </SetRow>
+      {pwOpen && (
+        <form className="set-block set-form" onSubmit={changePw}>
+          <input
+            type="password"
+            placeholder="当前密码"
+            value={oldPw}
+            onChange={(e) => setOldPw(e.target.value)}
+            autoComplete="current-password"
+            required
+          />
+          <input
+            type="password"
+            placeholder="新密码（6-72 位）"
+            value={newPw}
+            onChange={(e) => setNewPw(e.target.value)}
+            autoComplete="new-password"
+            required
+          />
+          <input
+            type="password"
+            placeholder="再输一遍新密码"
+            value={newPw2}
+            onChange={(e) => setNewPw2(e.target.value)}
+            autoComplete="new-password"
+            required
+          />
+          {pwMsg && !pwMsg.ok && <div className="auth-err">{pwMsg.text}</div>}
           <button className="primary" disabled={pwBusy}>
-            {pwBusy ? "提交中…" : "修改密码"}
+            {pwBusy ? "提交中…" : "确认修改"}
           </button>
         </form>
-      </section>
+      )}
 
-      <section className="card">
-        <h3>登录设备</h3>
-        {listMsg && <div className="auth-err">{listMsg}</div>}
-        {!sessions && !listMsg && <div className="muted">加载中…</div>}
-        {sessions?.map((sv) => (
-          <div className="row between sess-row" key={sv.id}>
-            <div className="grow sess-info">
-              <div className="sess-head">
-                <span className={`dot${sv.online ? " on" : ""}`} />
-                <b>{sv.device_label || "未命名设备"}</b>
-                {sv.current && <span className="sess-current">本设备</span>}
-              </div>
-              <div className="muted sess-ua" title={sv.user_agent}>
-                {sv.user_agent || "未知 UA"}
-              </div>
-              <div className="muted">最近活动 {fmtTime(sv.last_used_at)}</div>
-            </div>
-            {!sv.current && (
-              <button
-                className="danger"
-                disabled={busyId === sv.id}
-                onClick={() => void revoke(sv.id)}
-              >
-                {busyId === sv.id ? "移出中…" : "移出"}
-              </button>
-            )}
-          </div>
-        ))}
+      <SetRow
+        label="登录设备"
+        desc={listMsg ? <span className="auth-err">{listMsg}</span> : !sessions && "加载中…"}
+      >
         {sessions?.some((sv) => !sv.current) && (
-          <div className="row end">
-            <button className="danger" disabled={busyId === "others"} onClick={() => void revokeOthers()}>
-              {busyId === "others" ? "处理中…" : "退出其他所有设备"}
-            </button>
-          </div>
+          <button
+            className="danger"
+            disabled={busyId === "others"}
+            onClick={() => void revokeOthers()}
+          >
+            {busyId === "others" ? "处理中…" : "退出其他设备"}
+          </button>
         )}
-      </section>
+      </SetRow>
+      {sessions?.map((sv) => (
+        <div className="set-row sess-row" key={sv.id}>
+          <div className="set-main">
+            <div className="sess-head">
+              <span className={`dot${sv.online ? " on" : ""}`} />
+              <b>{sv.device_label || "未命名设备"}</b>
+              {sv.current && <span className="sess-current">本设备</span>}
+            </div>
+            <div className="muted sess-ua" title={sv.user_agent}>
+              {sv.user_agent || "未知 UA"}
+            </div>
+            <div className="muted">最近活动 {fmtTime(sv.last_used_at)}</div>
+          </div>
+          {!sv.current && (
+            <button
+              className="danger"
+              disabled={busyId === sv.id}
+              onClick={() => void revoke(sv.id)}
+            >
+              {busyId === sv.id ? "移出中…" : "移出"}
+            </button>
+          )}
+        </div>
+      ))}
     </>
   );
 }

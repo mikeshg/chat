@@ -10,6 +10,7 @@ import {
   isNewer,
   type ClientLatest,
 } from "../../update";
+import SetRow from "./SetRow";
 
 /** 「我」页：Tauri 壳里是应用更新；浏览器里是下载客户端（浏览器端刷新就是新版，不需要更新）。 */
 export default function UpdateSetting() {
@@ -29,28 +30,32 @@ function DownloadClient() {
   const all = names.filter((n) => assetLabel(n));
   if (!all.length) return null;
   return (
-    <section className="card">
-      <h3>下载客户端</h3>
-      <div className="muted">最新版本 {latest.version}</div>
-      {mine ? (
+    <SetRow
+      label="下载客户端"
+      desc={
+        <>
+          最新版本 {latest.version}
+          {!mine && ` · 暂时没有 ${os} 版`}
+          <details className="set-more">
+            <summary>其他平台</summary>
+            {all.map((n) => (
+              <div key={n}>
+                <a href={downloadUrl(n)} download>
+                  {assetLabel(n)}
+                </a>
+                <span> · {n}</span>
+              </div>
+            ))}
+          </details>
+        </>
+      }
+    >
+      {mine && (
         <a className="btn primary" href={downloadUrl(mine)} download>
           下载 {assetLabel(mine)} 版
         </a>
-      ) : (
-        <div className="muted">暂时没有 {os} 版，可以在下面选其他平台</div>
       )}
-      <details className="am-adv">
-        <summary>更多</summary>
-        {all.map((n) => (
-          <div key={n}>
-            <a href={downloadUrl(n)} download>
-              {assetLabel(n)}
-            </a>
-            <span className="muted"> · {n}</span>
-          </div>
-        ))}
-      </details>
-    </section>
+    </SetRow>
   );
 }
 
@@ -69,7 +74,11 @@ function ShellUpdate() {
   if (!current) return null;
   const newer = !!latest && isNewer(latest.version, current);
   const hasNew =
-    newer && hasInstaller(osOfUa(navigator.userAgent), latest.assets.map((a) => a.name));
+    newer &&
+    hasInstaller(
+      osOfUa(navigator.userAgent),
+      latest.assets.map((a) => a.name),
+    );
   // tag 说明第一行常就是版本号，不重复显示
   const notes = latest?.notes.replace(new RegExp(`^v?${latest.version}\\s*\\n`), "").trim();
 
@@ -87,7 +96,9 @@ function ShellUpdate() {
       } else {
         setHint("正在下载，完成后会自动安装并重启…");
         const { invoke } = await import("@tauri-apps/api/core");
-        const updated = await invoke<boolean>("install_update", { server: getServer() });
+        const updated = await invoke<boolean>("install_update", {
+          server: getServer(),
+        });
         if (!updated) setHint("这个平台暂时没有可用的安装包");
       }
     } catch (e) {
@@ -98,22 +109,23 @@ function ShellUpdate() {
   };
 
   return (
-    <section className="card">
-      <h3>应用更新</h3>
-      <div className="muted">
-        当前版本 {current}
-        {/* 安装包还没传完的版本不算「有」 */}
-        {latest && ` · 最新版本 ${hasNew ? latest.version : current}`}
-      </div>
-      {hasNew && (
+    <SetRow
+      label="应用更新"
+      desc={
         <>
-          {notes && <div className="muted" style={{ whiteSpace: "pre-wrap" }}>{notes}</div>}
-          <button className="primary" disabled={busy} onClick={() => void install()}>
-            {android ? "下载新版" : "更新并重启"}
-          </button>
+          当前版本 {current}
+          {/* 安装包还没传完的版本不算「有」 */}
+          {latest && ` · 最新版本 ${hasNew ? latest.version : current}`}
+          {hasNew && notes && <div style={{ whiteSpace: "pre-wrap" }}>{notes}</div>}
+          {hint && <div>{hint}</div>}
         </>
+      }
+    >
+      {hasNew && (
+        <button className="primary" disabled={busy} onClick={() => void install()}>
+          {android ? "下载新版" : "更新并重启"}
+        </button>
       )}
-      {hint && <div className="muted">{hint}</div>}
-    </section>
+    </SetRow>
   );
 }

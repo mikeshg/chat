@@ -10,6 +10,7 @@ import {
   showSystemNotification,
   type NotifyPermission,
 } from "../../notify";
+import SetRow from "./SetRow";
 
 /** ===== V2 P1-1 ===== 「我」页通知设置卡片（桌面通知开关 / 预览开关 / 测试通知） */
 export default function NotifySettings() {
@@ -22,7 +23,9 @@ export default function NotifySettings() {
 
   useEffect(() => {
     if (support === "none") return;
-    void notifyPermission().then(setPerm).catch(() => {});
+    void notifyPermission()
+      .then(setPerm)
+      .catch(() => {});
   }, [support]);
 
   const toggleEnabled = async () => {
@@ -67,44 +70,33 @@ export default function NotifySettings() {
     setHint("已发送（窗口在前台时部分系统不弹出，可切走再试）");
   };
 
+  if (support === "none") return <SetRow label="桌面通知" desc="当前环境不支持系统通知" />;
+
   return (
-    <section className="card">
-      <h3>通知</h3>
-      {support === "none" ? (
-        <div className="muted">当前环境不支持系统通知</div>
-      ) : (
-        <>
-          <label className="row pick">
-            <input
-              type="checkbox"
-              checked={enabled}
-              disabled={busy}
-              onChange={() => void toggleEnabled()}
-            />
-            <span>桌面通知（窗口不在前台时弹出系统通知）</span>
-          </label>
-          <label className="row pick">
-            <input
-              type="checkbox"
-              checked={preview}
-              onChange={(e) => togglePreview(e.target.checked)}
-            />
-            <span>通知显示消息内容</span>
-          </label>
-          <div className="row">
-            <button
-              disabled={!enabled || perm !== "granted"}
-              onClick={() => void sendTest()}
-            >
-              发送测试通知
-            </button>
-            <span className="muted">
-              权限：{perm === "granted" ? "已允许" : perm === "denied" ? "已拒绝" : "未请求"}
-            </span>
-          </div>
-        </>
+    <>
+      <SetRow
+        label="桌面通知"
+        desc={!enabled && hint ? hint : "窗口不在前台时弹出系统通知"}
+        toggle={{
+          checked: enabled,
+          disabled: busy,
+          onChange: () => void toggleEnabled(),
+        }}
+      />
+      <SetRow label="通知显示消息内容" toggle={{ checked: preview, onChange: togglePreview }} />
+      {enabled && (
+        <SetRow
+          label="测试通知"
+          desc={
+            hint ||
+            `权限：${perm === "granted" ? "已允许" : perm === "denied" ? "已拒绝" : "未请求"}`
+          }
+        >
+          <button disabled={perm !== "granted"} onClick={() => void sendTest()}>
+            发送
+          </button>
+        </SetRow>
       )}
-      {hint && <div className="muted">{hint}</div>}
-    </section>
+    </>
   );
 }
