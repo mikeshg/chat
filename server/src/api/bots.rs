@@ -1,13 +1,16 @@
 //! Webhook bot：主人名下的特殊账号（users.bot_owner_id）。不能登录、搜不到、收不了好友申请。
-//! 入站：POST /v1/hooks/{token} 以 bot 身份发消息（默认发到和主人的私聊）。
+//! 入站：POST /v1/hooks 带 Authorization: Bearer <令牌>，以 bot 身份发消息（默认发到和主人的私聊）。
+//! 一个 bot 可以有多个令牌，分给不同程序、单独删除。
 //! 出站：bot 在私聊里收到消息、或在群里被 @ 时，服务端把消息 POST 到 webhook_url，
-//! 响应 JSON 里的 content 作为 bot 的回复发回同一会话。
+//! 用 secret 签名；响应 JSON 里的 content 作为 bot 的回复发回同一会话。
 
 use super::*;
 use sha2::{Digest, Sha256};
 
 /// 每人最多这么多 bot（防手滑刷号）
 const MAX_BOTS: i64 = 20;
+/// 每个 bot 最多这么多入站令牌
+const MAX_TOKENS: i64 = 20;
 const WEBHOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// 回调响应只读这么多字节；超出当作无回复
 const REPLY_MAX_BYTES: usize = 64 * 1024;
@@ -18,13 +21,19 @@ pub(super) struct BotView {
     username: String,
     display_name: String,
     webhook_url: String,
-    /// 只有主人看得到。入站地址是 /v1/hooks/{token}，出站请求用它签名
-    token: String,
+    /// 只有主人看得到。回调请求用它签名
+    secret: String,
+    /// 入站令牌 [{id, name, token, created_at}]，按创建时间排
+    tokens: sqlx::types::Json<Value>,
     created_at: DateTime<Utc>,
 }
 
 const BOT_SELECT: &str = "SELECT u.id, u.username::text AS username, u.display_name,
-        b.webhook_url, b.token, b.created_at
+        b.webhook_url, b.secret, b.created_at,
+        COALESCE((SELECT json_agg(json_build_object(
+                    'id', t.id, 'name', t.name, 'token', t.token, 'created_at', t.created_at)
+                  ORDER BY t.created_at)
+                    FROM bot_tokens t WHERE t.bot_id = b.user_id), '[]') AS tokens
    FROM bots b JOIN users u ON u.id = b.user_id";
 
 #[derive(Deserialize)]
@@ -39,6 +48,11 @@ pub(super) struct CreateBotReq {
 pub(super) struct PatchBotReq {
     display_name: Option<String>,
     webhook_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct CreateTokenReq {
+    name: String,
 }
 
 #[derive(Deserialize)]
@@ -154,7 +168,7 @@ pub(super) async fn create_bot(
         .execute(&mut *tx)
         .await?;
     domain::ensure_dm(&mut tx, uid, bot).await?;
-    sqlx::query("INSERT INTO bots (user_id, owner_id, webhook_url, token) VALUES ($1, $2, $3, $4)")
+    sqlx::query("INSERT INTO bots (user_id, owner_id, webhook_url, secret) VALUES ($1, $2, $3, $4)")
         .bind(bot)
         .bind(uid)
         .bind(&webhook)
@@ -194,19 +208,75 @@ pub(super) async fn patch_bot(
     Ok(Json(load_bot(&st, uid, bot).await?))
 }
 
-/// POST /bots/{id}/token：换令牌，旧的入站地址立即失效
-pub(super) async fn reset_bot_token(
+/// POST /bots/{id}/secret：换签名密钥
+pub(super) async fn reset_bot_secret(
     State(st): State<SharedState>,
     headers: HeaderMap,
     Path(bot): Path<Uuid>,
 ) -> AppResult<Json<BotView>> {
     let uid = uid_of(&headers, &st).await?;
     load_bot(&st, uid, bot).await?;
-    sqlx::query("UPDATE bots SET token = $2 WHERE user_id = $1")
+    sqlx::query("UPDATE bots SET secret = $2 WHERE user_id = $1")
         .bind(bot)
         .bind(new_token())
         .execute(&st.pool)
         .await?;
+    Ok(Json(load_bot(&st, uid, bot).await?))
+}
+
+/// POST /bots/{id}/tokens：加一个入站令牌
+pub(super) async fn create_bot_token(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(bot): Path<Uuid>,
+    Json(req): Json<CreateTokenReq>,
+) -> AppResult<Json<BotView>> {
+    let uid = uid_of(&headers, &st).await?;
+    load_bot(&st, uid, bot).await?;
+    let name = req.name.trim();
+    if name.is_empty() || name.chars().count() > 50 {
+        return Err(AppError::bad_request("令牌名称 1-50 个字"));
+    }
+    let mut tx = st.pool.begin().await?;
+    // bot 行锁：并发添加也数得准上限
+    sqlx::query("SELECT 1 FROM bots WHERE user_id = $1 FOR UPDATE")
+        .bind(bot)
+        .execute(&mut *tx)
+        .await?;
+    let n = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM bot_tokens WHERE bot_id = $1")
+        .bind(bot)
+        .fetch_one(&mut *tx)
+        .await?;
+    if n >= MAX_TOKENS {
+        return Err(AppError::bad_request("令牌数量已达上限"));
+    }
+    sqlx::query("INSERT INTO bot_tokens (bot_id, name, token) VALUES ($1, $2, $3)")
+        .bind(bot)
+        .bind(name)
+        .bind(new_token())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Json(load_bot(&st, uid, bot).await?))
+}
+
+/// DELETE /bots/{id}/tokens/{token_id}：删令牌，立即失效
+pub(super) async fn delete_bot_token(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path((bot, token_id)): Path<(Uuid, Uuid)>,
+) -> AppResult<Json<BotView>> {
+    let uid = uid_of(&headers, &st).await?;
+    load_bot(&st, uid, bot).await?;
+    let n = sqlx::query("DELETE FROM bot_tokens WHERE id = $1 AND bot_id = $2")
+        .bind(token_id)
+        .bind(bot)
+        .execute(&st.pool)
+        .await?
+        .rows_affected();
+    if n == 0 {
+        return Err(AppError::not_found("token not found"));
+    }
     Ok(Json(load_bot(&st, uid, bot).await?))
 }
 
@@ -252,18 +322,25 @@ pub(super) async fn delete_bot(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// POST /hooks/{token}：以 bot 身份发一条文字消息。令牌即凭据，不走用户鉴权。
+/// POST /hooks：Authorization: Bearer <bot 令牌>，以 bot 身份发一条文字消息。不走用户鉴权。
 pub(super) async fn post_hook(
     State(st): State<SharedState>,
-    Path(token): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<HookReq>,
 ) -> AppResult<Json<Value>> {
-    let (bot, owner) =
-        sqlx::query_as::<_, (Uuid, Uuid)>("SELECT user_id, owner_id FROM bots WHERE token = $1")
-            .bind(&token)
-            .fetch_optional(&st.pool)
-            .await?
-            .ok_or_else(|| AppError::not_found("bot not found"))?;
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or_else(|| AppError::unauthorized("expected bearer token"))?;
+    let (bot, owner) = sqlx::query_as::<_, (Uuid, Uuid)>(
+        "SELECT b.user_id, b.owner_id FROM bot_tokens t JOIN bots b ON b.user_id = t.bot_id
+          WHERE t.token = $1",
+    )
+    .bind(token)
+    .fetch_optional(&st.pool)
+    .await?
+    .ok_or_else(|| AppError::unauthorized("invalid bot token"))?;
     let conv = match req.conversation_id {
         Some(c) => c,
         None => {
@@ -292,7 +369,7 @@ pub(crate) fn dispatch(st: &SharedState, conv: Uuid, msg: &MessageView) {
     let msg = msg.clone();
     tokio::spawn(async move {
         let targets = match sqlx::query_as::<_, (Uuid, String, String, String)>(
-            "SELECT b.user_id, b.webhook_url, b.token, c.type
+            "SELECT b.user_id, b.webhook_url, b.secret, c.type
                FROM bots b
                JOIN memberships m ON m.user_id = b.user_id AND m.conversation_id = $1
                JOIN conversations c ON c.id = $1
@@ -312,11 +389,11 @@ pub(crate) fn dispatch(st: &SharedState, conv: Uuid, msg: &MessageView) {
                 return;
             }
         };
-        for (bot, url, token, kind) in targets {
+        for (bot, url, secret, kind) in targets {
             let st = st.clone();
             let msg = msg.clone();
             tokio::spawn(async move {
-                match call_webhook(&url, &token, bot, conv, &kind, &msg).await {
+                match call_webhook(&url, &secret, bot, conv, &kind, &msg).await {
                     Ok(Some(reply)) => {
                         let r = ws::post_and_broadcast(
                             &st,
@@ -352,7 +429,7 @@ fn client() -> &'static reqwest::Client {
 /// POST 消息给 bot；返回响应 JSON 里非空的 content
 async fn call_webhook(
     url: &str,
-    token: &str,
+    secret: &str,
     bot: Uuid,
     conv: Uuid,
     kind: &str,
@@ -365,7 +442,7 @@ async fn call_webhook(
         "message": msg,
     }))
     .map_err(|e| e.to_string())?;
-    let sig = hex::encode(hmac_sha256(token.as_bytes(), &body));
+    let sig = hex::encode(hmac_sha256(secret.as_bytes(), &body));
     let mut resp = client()
         .post(url)
         .header("content-type", "application/json")

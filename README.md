@@ -31,7 +31,7 @@
 - 手机推送：管理员配置 ntfy 后，用户在「我」页开启
 - 备份与恢复：管理后台一键生成备份（数据库全部表 + 附件 / 头像文件，tar.gz）、下载到本地；上传备份文件恢复（需键入 RESTORE 确认，恢复后所有用户需重新登录）
 - 桌面端：关掉窗口留在系统托盘继续收消息；开机自启在「我」页打开，默认关
-- 机器人（webhook bot）：任何人可在「我」页建 bot。外部程序往入站地址 POST 就以 bot 身份发消息；填了回调地址，私聊 bot 或在群里 @ 它时服务器把消息 POST 过去，回复的文字发回原会话
+- 机器人（webhook bot）：任何人可在「我」页建 bot，给它加一个或多个令牌。外部程序带令牌往入站地址 POST 就以 bot 身份发消息；填了回调地址，私聊 bot 或在群里 @ 它时服务器把消息 POST 过去，回复的文字发回原会话
 - 实时：WebSocket（一次性 ticket 鉴权）、多设备同时在线、在线状态、正在输入、未读数、已读同步
 - 部署：`docker compose up -d` 一条命令（Postgres + 服务端托管前端，主机端口 28080）
 
@@ -201,10 +201,10 @@ git push origin v0.2.0
 
 在「我」页 → 机器人里新建。bot 会出现在你的联系人和会话里，可以拉进你所在的群。
 
-入站：外部程序以 bot 身份发消息。默认发到和你的私聊，带 `conversation_id` 发到 bot 所在的其他会话。
+入站：先给 bot 加令牌（可以加多个，分给不同程序，单独删除）。外部程序带令牌以 bot 身份发消息，默认发到和你的私聊，带 `conversation_id` 发到 bot 所在的其他会话。令牌不对返回 401。
 
 ```bash
-curl -X POST http://<服务器>/v1/hooks/<令牌> -H 'Content-Type: application/json' -d '{"content":"部署完成"}'
+curl -X POST http://<服务器>/v1/hooks -H 'Authorization: Bearer <令牌>' -H 'Content-Type: application/json' -d '{"content":"部署完成"}'
 ```
 
 出站：填了回调地址时，bot 在私聊里收到消息、或在群里被 @ 时，服务器 POST：
@@ -213,7 +213,7 @@ curl -X POST http://<服务器>/v1/hooks/<令牌> -H 'Content-Type: application/
 {"bot_id": "…", "conversation_id": "…", "conversation_type": "dm", "message": { "id": "…", "sender_id": "…", "sender_name": "…", "content": "…", "mentions": [] }}
 ```
 
-请求头 `X-Chat-Signature: sha256=<hex>`，值是用令牌对请求体做的 HMAC-SHA256。10 秒内回 `{"content": "..."}` 就作为 bot 的回复发回原会话，回别的内容不回复。bot 自己发的消息不会触发任何回调。
+请求头 `X-Chat-Signature: sha256=<hex>`，值是用签名密钥（「我」页可复制、可更换）对请求体做的 HMAC-SHA256。10 秒内回 `{"content": "..."}` 就作为 bot 的回复发回原会话，回别的内容不回复。bot 自己发的消息不会触发任何回调。
 
 已知限制：令牌明文存在服务器上，管理员和备份都能看到；服务器会向用户填的任意地址发请求，包括局域网地址。
 

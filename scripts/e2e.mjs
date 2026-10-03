@@ -500,7 +500,7 @@ async function phase2() {
     const msgs = await api(t, 'GET', `/conversations/${b.dmId}/messages`);
     const hit = (msgs.json?.messages || []).some((m) => m.sender_id === b.id && m.content === b.text);
     ok('bot message persisted', hit);
-    const again = await api(null, 'POST', `/hooks/${bot?.token}`, { content: 'after restart' });
+    const again = await api(b.token, 'POST', '/hooks', { content: 'after restart' });
     ok('bot hook works after restart', again.status === 200, `got ${again.status}`);
   }
 }
@@ -787,17 +787,20 @@ async function runBot(A) {
   const ta = relog.json?.access_token;
   const username = `e2ebot${rid}`.slice(0, 20);
   const created = await api(ta, 'POST', '/bots', { username });
-  ok('create bot', created.status === 200 && !!created.json?.token, `got ${created.status}`);
+  ok('create bot', created.status === 200 && !!created.json?.secret, `got ${created.status}`);
   const bot = created.json || {};
+  const added = await api(ta, 'POST', `/bots/${bot.id}/tokens`, { name: 'e2e' });
+  const token = added.json?.tokens?.[0]?.token;
+  ok('add bot token', added.status === 200 && !!token, `got ${added.status}`);
   const convs = await api(ta, 'GET', '/conversations');
   const dm = (convs.json || []).find((c) => c.kind === 'dm' && c.peer?.id === bot.id);
   ok('bot DM listed', dm?.peer?.is_bot === true, `peer=${JSON.stringify(dm?.peer)}`);
   const text = `deploy ${rid}`;
-  const hook = await api(null, 'POST', `/hooks/${bot.token}`, { content: text });
+  const hook = await api(token, 'POST', '/hooks', { content: text });
   ok('hook posts as bot', hook.status === 200, `got ${hook.status}`);
-  const bad = await api(null, 'POST', '/hooks/not-a-token', { content: 'x' });
-  ok('unknown hook token 404', bad.status === 404, `got ${bad.status}`);
-  return { id: bot.id, username, dmId: dm?.id, text };
+  const bad = await api('not-a-token', 'POST', '/hooks', { content: 'x' });
+  ok('unknown hook token 401', bad.status === 401, `got ${bad.status}`);
+  return { id: bot.id, username, dmId: dm?.id, text, token };
 }
 
 (PHASE === 'phase2' ? phase2() : phase1())

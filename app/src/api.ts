@@ -406,13 +406,16 @@ export const bots = {
     post<BotView>("/bots", body),
   patch: (id: string, body: { display_name?: string; webhook_url?: string }) =>
     patch<BotView>(`/bots/${id}`, body),
-  resetToken: (id: string) => post<BotView>(`/bots/${id}/token`),
+  resetSecret: (id: string) => post<BotView>(`/bots/${id}/secret`),
+  addToken: (id: string, name: string) => post<BotView>(`/bots/${id}/tokens`, { name }),
+  removeToken: (id: string, tokenId: string) =>
+    del<BotView>(`/bots/${id}/tokens/${tokenId}`),
   remove: (id: string) => del<void>(`/bots/${id}`),
 };
 
-/** bot 的入站地址：POST JSON {"content": "..."} 即以 bot 身份发消息 */
-export function hookUrl(token: string): string {
-  return `${getServer() || location.origin}/v1/hooks/${token}`;
+/** bot 的入站地址：带 Authorization: Bearer <令牌> POST JSON {"content": "..."} 即以 bot 身份发消息 */
+export function hookUrl(): string {
+  return `${getServer() || location.origin}/v1/hooks`;
 }
 
 // ---------- 消息生命周期 ----------

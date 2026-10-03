@@ -127,8 +127,10 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
         .route("/conversations/{id}/transfer", post(transfer_ownership))
         .route("/bots", get(list_bots).post(create_bot))
         .route("/bots/{id}", patch(patch_bot).delete(delete_bot))
-        .route("/bots/{id}/token", post(reset_bot_token))
-        .route("/hooks/{token}", post(post_hook))
+        .route("/bots/{id}/secret", post(reset_bot_secret))
+        .route("/bots/{id}/tokens", post(create_bot_token))
+        .route("/bots/{id}/tokens/{token_id}", delete(delete_bot_token))
+        .route("/hooks", post(post_hook))
         .route(
             "/files",
             post(upload_file).layer(DefaultBodyLimit::max(

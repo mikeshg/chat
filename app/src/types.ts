@@ -12,13 +12,23 @@ export interface UserPublic {
   is_bot?: boolean;
 }
 
-/** GET /bots 单条：只有主人看得到 token */
+/** GET /bots 单条：只有主人看得到 secret 和 tokens */
 export interface BotView {
   id: string;
   username: string;
   display_name: string;
   /** 空串 = 不回调 */
   webhook_url: string;
+  /** 回调请求的签名密钥 */
+  secret: string;
+  /** 入站令牌：POST /v1/hooks 带 Authorization: Bearer <token> */
+  tokens: BotToken[];
+  created_at: string;
+}
+
+export interface BotToken {
+  id: string;
+  name: string;
   token: string;
   created_at: string;
 }

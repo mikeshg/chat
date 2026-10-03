@@ -12,9 +12,29 @@ async fn create_bot(base: &str, u: &TestUser, name: &str, webhook: &str) -> Valu
     r.json().await.unwrap()
 }
 
+/// 加一个入站令牌，返回 (令牌 id, 令牌)
+async fn add_token(base: &str, u: &TestUser, bot: &str, name: &str) -> (String, String) {
+    let r = http()
+        .post(format!("{base}/v1/bots/{bot}/tokens"))
+        .header("authorization", authz(&u.access))
+        .json(&json!({ "name": name }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let v: Value = r.json().await.unwrap();
+    let t = v["tokens"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(t["name"], name);
+    (
+        t["id"].as_str().unwrap().to_string(),
+        t["token"].as_str().unwrap().to_string(),
+    )
+}
+
 async fn hook(base: &str, token: &str, body: Value) -> u16 {
     http()
-        .post(format!("{base}/v1/hooks/{token}"))
+        .post(format!("{base}/v1/hooks"))
+        .header("authorization", format!("Bearer {token}"))
         .json(&body)
         .send()
         .await
@@ -96,7 +116,8 @@ async fn bot_lifecycle_and_inbound_hook() {
     let name = format!("bot{}", uniq());
     let bot = create_bot(&base, &owner, &name, "").await;
     let bot_id = bot["id"].as_str().unwrap();
-    let token = bot["token"].as_str().unwrap().to_string();
+    assert_eq!(bot["tokens"].as_array().unwrap().len(), 0);
+    let (token_id, token) = add_token(&base, &owner, bot_id, "ci").await;
 
     // 同名再建 → 409
     let dup = http()
@@ -134,7 +155,14 @@ async fn bot_lifecycle_and_inbound_hook() {
     );
     let m = wait_message(&base, &owner, &dm, |m| m["content"] == "build ok").await;
     assert_eq!(m["sender_id"], bot_id);
-    assert_eq!(hook(&base, "nope", json!({"content": "x"})).await, 404);
+    assert_eq!(hook(&base, "nope", json!({"content": "x"})).await, 401);
+    let no_auth = http()
+        .post(format!("{base}/v1/hooks"))
+        .json(&json!({"content": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_auth.status().as_u16(), 401);
 
     // 别人搜不到、加不了；bot 也登录不了
     let found: Value = http()
@@ -175,9 +203,18 @@ async fn bot_lifecycle_and_inbound_hook() {
         403
     );
 
-    // 换令牌：旧的立即失效
-    let reset: Value = http()
-        .post(format!("{base}/v1/bots/{bot_id}/token"))
+    // 多个令牌各自可用；删掉一个只影响它自己
+    let (_, token2) = add_token(&base, &owner, bot_id, "cron").await;
+    assert_eq!(hook(&base, &token2, json!({"content": "from cron"})).await, 200);
+    let r = http()
+        .delete(format!("{base}/v1/bots/{bot_id}/tokens/{token_id}"))
+        .header("authorization", authz(&other.access))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 404, "only the owner can delete tokens");
+    let after: Value = http()
+        .delete(format!("{base}/v1/bots/{bot_id}/tokens/{token_id}"))
         .header("authorization", authz(&owner.access))
         .send()
         .await
@@ -185,8 +222,21 @@ async fn bot_lifecycle_and_inbound_hook() {
         .json()
         .await
         .unwrap();
-    assert_ne!(reset["token"], token.as_str());
-    assert_eq!(hook(&base, &token, json!({"content": "x"})).await, 404);
+    assert_eq!(after["tokens"].as_array().unwrap().len(), 1);
+    assert_eq!(hook(&base, &token, json!({"content": "x"})).await, 401);
+    assert_eq!(hook(&base, &token2, json!({"content": "still ok"})).await, 200);
+
+    // 换签名密钥
+    let reset: Value = http()
+        .post(format!("{base}/v1/bots/{bot_id}/secret"))
+        .header("authorization", authz(&owner.access))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_ne!(reset["secret"], bot["secret"]);
 
     // 别人删不了；主人删掉后入站失效、私聊只读
     let r = http()
@@ -203,8 +253,7 @@ async fn bot_lifecycle_and_inbound_hook() {
         .await
         .unwrap();
     assert_eq!(r.status().as_u16(), 204);
-    let new_token = reset["token"].as_str().unwrap();
-    assert_eq!(hook(&base, new_token, json!({"content": "x"})).await, 404);
+    assert_eq!(hook(&base, &token2, json!({"content": "x"})).await, 401);
     let list: Value = http()
         .get(format!("{base}/v1/bots"))
         .header("authorization", authz(&owner.access))
@@ -299,11 +348,11 @@ async fn group_with_only_bots_dissolves_when_last_human_leaves() {
         .await
         .unwrap();
     assert_eq!(r.status().as_u16(), 204);
-    let token = bot["token"].as_str().unwrap();
+    let (_, token) = add_token(&base, &owner, &bot_id, "t").await;
     assert_eq!(
         hook(
             &base,
-            token,
+            &token,
             json!({"content": "x", "conversation_id": group})
         )
         .await,
