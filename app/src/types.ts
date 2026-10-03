@@ -187,12 +187,6 @@ export interface PrefUpdate {
   mute?: { mode: "none" | "until" | "forever"; until?: string };
 }
 
-/** GET /conversations/preferences 条目：与 preference_updated 帧同构 */
-export interface ConversationPrefEntry {
-  conversation_id: string;
-  preference: ConversationPref;
-}
-
 export interface ConversationView {
   id: string;
   kind: string; // "dm" | "group" | "self"（文件传输助手）
@@ -280,7 +274,6 @@ export type WsOut =
       message: MessageView;
       edit_version: number;
     }
-  | { type: "op_ack"; client_op_id: string }
   | {
       /** 会话偏好变更：服务端只发给本人全部连接 */
       type: "preference_updated";
@@ -295,8 +288,6 @@ export type WsOut =
       code: string;
       message: string;
       client_msg_id?: string | null;
-      /** 非发送类 mutation 的回执关联；与 client_msg_id 不混用 */
-      client_op_id?: string | null;
     };
 
 // ---------- 后台管理 ----------
@@ -365,15 +356,23 @@ export interface AdminSettings {
   update_repo_url?: string;
 }
 
-/** GET/PUT /users/me/push 与 rotate/test 返回（V2 P3-3） */
+/** 一台登记了推送的手机：各自一个 ntfy 主题 */
+export interface PushDevice {
+  id: string;
+  name: string;
+  /** {push_ntfy_base}/{topic}；available=false 时为 null */
+  subscribe_url: string | null;
+  created_at: string;
+}
+
+/** /users/me/push 及设备增删、测试的返回（V2 P3-3） */
 export interface PushState {
   /** 服务端已配置 ntfy（管理员侧） */
   available: boolean;
   enabled: boolean;
   /** 通知正文是否带消息内容 */
   preview: boolean;
-  /** {push_ntfy_base}/{topic}；available=false 时为 null */
-  subscribe_url: string | null;
+  devices: PushDevice[];
 }
 
 export interface InviteView {

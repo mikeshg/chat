@@ -78,8 +78,15 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
             "/users/me/push",
             get(crate::push::get_push).put(crate::push::put_push),
         )
-        .route("/users/me/push/rotate", post(crate::push::rotate_push))
-        .route("/users/me/push/test", post(crate::push::test_push))
+        .route("/users/me/push/devices", post(crate::push::add_device))
+        .route(
+            "/users/me/push/devices/{id}",
+            delete(crate::push::delete_device),
+        )
+        .route(
+            "/users/me/push/devices/{id}/test",
+            post(crate::push::test_device),
+        )
         .route("/users/search", get(search_user))
         .route("/search", get(global_search))
         .route("/friends", get(list_friends))
@@ -88,7 +95,6 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
         .route("/friends/requests/{id}/accept", post(accept_request))
         .route("/friends/requests/{id}/decline", post(decline_request))
         .route("/conversations", get(list_conversations))
-        .route("/conversations/preferences", get(list_preferences))
         .route("/conversations/group", post(create_group))
         .route(
             "/conversations/{id}",

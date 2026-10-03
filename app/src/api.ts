@@ -11,7 +11,6 @@ import type {
   RestoreResult,
   ConversationDetail,
   ConversationPref,
-  ConversationPrefEntry,
   ConversationView,
   CreateInviteReq,
   CreatePollReq,
@@ -334,15 +333,17 @@ export const auth = {
   revokeOtherSessions: () => post<void>("/users/me/sessions/revoke-others"),
   /** 本人附件用量与配额（V2 P2-1） */
   storage: () => get<StorageView>("/users/me/storage"),
-  /** ntfy 推送设置（V2 P3-3）；首次访问时服务端生成随机主题 */
+  /** ntfy 推送设置（V2 P3-3） */
   push: () => get<PushState>("/users/me/push"),
   /** 部分更新：只传要改的字段；服务器未配置时 enabled=true 返回 400 */
   updatePush: (patch: { enabled?: boolean; preview?: boolean }) =>
     put<PushState>("/users/me/push", patch),
-  /** 换主题：旧主题作废，需在 ntfy App 重新订阅 */
-  rotatePush: () => post<PushState>("/users/me/push/rotate"),
-  /** 立即发一条测试推送（不受 30s 合并限制）；失败 502 */
-  testPush: () => post<PushState>("/users/me/push/test"),
+  /** 登记一台手机，服务端给它生成订阅主题 */
+  addPushDevice: (name: string) => post<PushState>("/users/me/push/devices", { name }),
+  /** 移除一台手机，它的主题立即不再收到推送 */
+  removePushDevice: (id: string) => del<PushState>(`/users/me/push/devices/${id}`),
+  /** 给这台手机立即发一条测试推送；失败 502 */
+  testPushDevice: (id: string) => post<PushState>(`/users/me/push/devices/${id}/test`),
   searchUser: async (q: string) => {
     const r = await get<unknown>(`/users/search?q=${encodeURIComponent(q)}`);
     // 兼容旧服务端返回单对象的形态
@@ -384,8 +385,6 @@ export const convs = {
   dissolve: (id: string) => del<void>(`/conversations/${id}`),
   transfer: (id: string, uid: string) =>
     post(`/conversations/${id}/transfer`, { user_id: uid }),
-  /** 全量偏好（列表已带 preference，一般无需单独拉） */
-  preferences: () => get<ConversationPrefEntry[]>("/conversations/preferences"),
   /** 更新本人偏好：只传要改的字段；返回最新偏好（幂等覆写） */
   setPref: (id: string, body: PrefUpdate) =>
     put<ConversationPref>(`/conversations/${id}/preferences`, body),

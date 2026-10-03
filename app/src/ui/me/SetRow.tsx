@@ -1,13 +1,8 @@
 import type { ReactNode } from "react";
 
-/** 「我」页分组：组名在卡片外，卡片里是一条条 SetRow / .set-block */
-export function SetGroup({ title, children }: { title: string; children: ReactNode }) {
-  return (
-    <>
-      <h3 className="set-title">{title}</h3>
-      <section className="card set-group">{children}</section>
-    </>
-  );
+/** 「我」页分组卡片：里面是一条条 SetRow / .set-block */
+export function SetGroup({ children }: { children: ReactNode }) {
+  return <section className="card set-group">{children}</section>;
 }
 
 type Toggle = {

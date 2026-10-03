@@ -2,14 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearSession, saveSession } from "./api";
 import { getState, setState } from "./store";
 import type { ConversationView, MessageView } from "./types";
-import {
-  clientActive,
-  kickReasonText,
-  reportClientState,
-  sendChat,
-  startWs,
-  stopWs,
-} from "./ws";
+import { kickReasonText, sendChat, startWs, stopWs } from "./ws";
 
 const me = { id: "me", username: "me", display_name: "Me", role: "user" as const, last_seen_at: null };
 const message = (seq: number, mentions: string[] = []): MessageView => ({ id: `m${seq}`, seq, conversation_id: "c", sender_id: "other", sender_username: "other", sender_name: "Other", content: "hello", kind: "text", attachment: null, mentions, created_at: "2026-01-01T00:00:00Z" });
@@ -102,68 +95,6 @@ describe("WebSocket delivery", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(getState().messages.c).toEqual([message(1)]);
     expect(getState().historyLoaded.c).toBe(true);
-  });
-});
-
-// ===== V2 P3-3 =====
-describe("client_state reporting", () => {
-  const stubDoc = (hidden: boolean, focus: boolean) =>
-    vi.stubGlobal("document", {
-      hidden,
-      hasFocus: () => focus,
-      addEventListener: vi.fn(),
-    });
-  const states = (sock: Socket) => sock.sent.filter((f) => f.type === "client_state");
-
-  it("clientActive = 页面可见且窗口有焦点", () => {
-    stubDoc(false, true);
-    expect(clientActive()).toBe(true);
-    stubDoc(true, true);
-    expect(clientActive()).toBe(false);
-    stubDoc(false, false);
-    expect(clientActive()).toBe(false);
-  });
-
-  it("reports current state once immediately on connect", async () => {
-    stubDoc(false, true);
-    const sock = await open();
-    expect(states(sock)).toEqual([{ type: "client_state", active: true }]);
-  });
-
-  it("debounces rapid changes into one frame with the latest value", async () => {
-    stubDoc(false, true);
-    const sock = await open();
-    stubDoc(true, false); // 切到后台
-    reportClientState();
-    reportClientState();
-    reportClientState();
-    await vi.advanceTimersByTimeAsync(499);
-    expect(states(sock)).toHaveLength(1); // 去抖窗口内不重复发
-    await vi.advanceTimersByTimeAsync(1);
-    expect(states(sock)).toHaveLength(2);
-    expect(states(sock)[1]).toEqual({ type: "client_state", active: false });
-  });
-
-  it("does not resend an unchanged value", async () => {
-    stubDoc(false, true);
-    const sock = await open();
-    reportClientState();
-    reportClientState();
-    await vi.advanceTimersByTimeAsync(600);
-    expect(states(sock)).toHaveLength(1); // 只有连接建立时的那一帧
-  });
-
-  it("reports again on a new connection", async () => {
-    stubDoc(true, false);
-    const first = await open();
-    expect(states(first)).toEqual([{ type: "client_state", active: false }]);
-    first.close();
-    await vi.advanceTimersByTimeAsync(1000);
-    const second = Socket.all[Socket.all.length - 1];
-    stubDoc(false, true); // 重连时已回前台
-    second.onopen?.();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(states(second)).toEqual([{ type: "client_state", active: true }]);
   });
 });
 

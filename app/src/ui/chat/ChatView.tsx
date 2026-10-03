@@ -21,6 +21,7 @@ import type {
   ConversationView,
   MemberView,
   MessageView,
+  PinEntry,
   ReplyPreview,
 } from "../../types";
 import { sendChat, sendTyping } from "../../ws";
@@ -174,20 +175,16 @@ export default function ChatView() {
   const [pollBusy, setPollBusy] = useState<Record<string, boolean>>({});
   // V2 P2-4：转发弹窗的源消息（收藏不走弹窗，直接调接口到 self 会话）
   const [fwdMsg, setFwdMsg] = useState<MessageView | null>(null);
-  const [pinReload, setPinReload] = useState(0);
-  const [pinnedIds, setPinnedIds] = useState<Set<string>>(new Set());
+  const [pins, setPins] = useState<PinEntry[]>([]);
+  const pinnedIds = new Set(pins.map((p) => p.message.id));
+  const pinsRequest = useRef(0);
   const [meetingBase, setMeetingBase] = useState("");
   const gen = session();
   const viewOwner = useRef<object | null>(null);
   const mutation = useRef<object | null>(null);
   const editSubmission = useRef<EditSubmission | null>(null);
   const draftRevision = useRef(0);
-  const uploadOwner = useRef<object | null>(null);
-  const moreOwner = useRef<object | null>(null);
-  const searchRequest = useRef(0);
-  const previewRequest = useRef(0);
   const jumpRequest = useRef(0);
-  const jumpTimers = useRef<ReturnType<typeof setTimeout>[]>([]);
 
   const conv = s.conversations.find((c) => c.id === s.activeConv) ?? null;
   const msgs = conv ? (s.messages[conv.id] ?? []) : [];
@@ -230,29 +227,30 @@ export default function ChatView() {
     setText(conv ? (getState().drafts[conv.id] ?? "") : "");
   }, [conv?.id]);
 
+  // 只认最后一次请求，换会话后旧会话的响应作废
+  const loadPins = (convId: string) => {
+    const req = ++pinsRequest.current;
+    convs
+      .pins(convId)
+      .then((rows) => {
+        if (req === pinsRequest.current) setPins(rows);
+      })
+      .catch(() => {
+        if (req === pinsRequest.current) setPins([]);
+      });
+  };
+
   // 打开会话，以及收到 pins_updated 时，刷新置顶列表与菜单状态
   useEffect(() => {
     if (!conv) return;
-    let alive = true;
-    setPinnedIds(new Set());
-    const load = () => {
-      convs
-        .pins(conv.id)
-        .then((rows) => {
-          if (alive) setPinnedIds(new Set(rows.map((p) => p.message.id)));
-        })
-        .catch(() => {
-          if (alive) setPinnedIds(new Set());
-        });
-      setPinReload((n) => n + 1);
-    };
-    load();
+    setPins([]);
+    loadPins(conv.id);
     const onPins = (e: Event) => {
-      if ((e as CustomEvent<string>).detail === conv.id) load();
+      if ((e as CustomEvent<string>).detail === conv.id) loadPins(conv.id);
     };
     window.addEventListener("chat:pins", onPins);
     return () => {
-      alive = false;
+      pinsRequest.current++;
       window.removeEventListener("chat:pins", onPins);
     };
   }, [conv?.id]);
@@ -346,20 +344,21 @@ export default function ChatView() {
   // 投票可置顶；已删除、乐观消息、只读会话不显示入口
   const canPinMsg = (m: MessageView) => canActMsg(m);
 
+  const unpinMsg = async (messageId: string) => {
+    await convs.unpin(conv.id, messageId);
+    setPins((rows) => rows.filter((p) => p.message.id !== messageId));
+  };
+
   const doPin = async (m: MessageView) => {
     setMsgMenu(null);
     setMutErr(null);
     const pinned = pinnedIds.has(m.id);
     try {
-      if (pinned) await convs.unpin(conv.id, m.id);
-      else await convs.pin(conv.id, m.id);
-      setPinnedIds((prev) => {
-        const next = new Set(prev);
-        if (pinned) next.delete(m.id);
-        else next.add(m.id);
-        return next;
-      });
-      setPinReload((n) => n + 1);
+      if (pinned) await unpinMsg(m.id);
+      else {
+        await convs.pin(conv.id, m.id);
+        loadPins(conv.id);
+      }
     } catch (e) {
       setMutErr(e instanceof Error ? e.message : "置顶失败");
     }
@@ -800,8 +799,9 @@ export default function ChatView() {
       )}
       <PinnedBar
         convId={conv.id}
+        pins={pins}
         readonly={!!readonly}
-        reloadKey={pinReload}
+        onUnpin={unpinMsg}
         onJump={jumpToRef}
       />
 

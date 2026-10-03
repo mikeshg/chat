@@ -307,13 +307,6 @@ pub async fn broadcast_posted(st: &SharedState, conv: Uuid, posted: &domain::Pos
     }
 }
 
-/// mutation 回执：只回发起连接，与 client_msg_id 严格区分。
-fn op_ack(tx: &mpsc::Sender<ConnMsg>, client_op_id: Option<Uuid>) {
-    if let Some(id) = client_op_id {
-        let _ = tx.try_send(ConnMsg::Frame(frame(&WsOut::OpAck { client_op_id: id })));
-    }
-}
-
 /// 每帧复核：账号未禁用、凭据版本未变、所属登录会话未撤销（老连接无 sid 不查 session）
 async fn connection_valid(
     st: &SharedState,
@@ -339,7 +332,7 @@ async fn on_text(
         return false;
     }
     let parsed: Result<WsIn, _> = serde_json::from_str(text);
-    let (res, client_msg_id, client_op_id) = match parsed {
+    let (res, client_msg_id) = match parsed {
         Ok(WsIn::SendMessage {
             conversation_id,
             client_msg_id,
@@ -359,76 +352,26 @@ async fn on_text(
                 reply_to_id,
             )
             .await;
-            (res, client_msg_id, None)
+            (res, client_msg_id)
         }
-        Ok(WsIn::EditMessage {
-            message_id,
-            content,
-            expected_version,
-            client_op_id,
-        }) => {
-            let res = edit_message(
-                st,
-                uid,
-                tx,
-                message_id,
-                &content,
-                expected_version,
-                client_op_id.clone(),
-            )
-            .await;
-            (res, None, client_op_id)
-        }
-        Ok(WsIn::DeleteMessage {
-            message_id,
-            client_op_id,
-        }) => {
-            let res = delete_message(st, uid, tx, message_id, client_op_id.clone()).await;
-            (res, None, client_op_id)
-        }
-        Ok(WsIn::ReactionUpsert {
-            message_id,
-            emoji,
-            client_op_id,
-        }) => {
-            let res = reaction(st, uid, tx, message_id, &emoji, true, client_op_id.clone()).await;
-            (res, None, client_op_id)
-        }
-        Ok(WsIn::ReactionRemove {
-            message_id,
-            emoji,
-            client_op_id,
-        }) => {
-            let res = reaction(st, uid, tx, message_id, &emoji, false, client_op_id.clone()).await;
-            (res, None, client_op_id)
-        }
-        Ok(WsIn::ClientState { active }) => {
-            st.set_conn_active(uid, conn_id, active);
-            (Ok(()), None, None)
-        }
-        Ok(WsIn::Typing { conversation_id }) => {
-            (typing(st, uid, conversation_id).await, None, None)
-        }
+        // 旧客户端仍会上报前台状态；推送已不再看它，收下即可
+        Ok(WsIn::ClientState { .. }) => (Ok(()), None),
+        Ok(WsIn::Typing { conversation_id }) => (typing(st, uid, conversation_id).await, None),
         Ok(WsIn::Read {
             conversation_id,
             seq,
-        }) => (mark_read(st, uid, conversation_id, seq).await, None, None),
+        }) => (mark_read(st, uid, conversation_id, seq).await, None),
         Ok(WsIn::Sync {
             conversation_id,
             last_seq,
-        }) => (
-            sync(st, uid, tx, conversation_id, last_seq).await,
-            None,
-            None,
-        ),
-        Err(_) => (Err(ws_err("bad_frame", "unrecognized frame")), None, None),
+        }) => (sync(st, uid, tx, conversation_id, last_seq).await, None),
+        Err(_) => (Err(ws_err("bad_frame", "unrecognized frame")), None),
     };
     if let Err((code, message)) = res {
         let _ = tx.try_send(ConnMsg::Frame(frame(&WsOut::Error {
             code,
             message,
             client_msg_id,
-            client_op_id,
         })));
     }
     true
@@ -463,63 +406,6 @@ async fn send_message(
         client_msg_id,
         message: posted.message,
     })));
-    Ok(())
-}
-
-async fn edit_message(
-    st: &SharedState,
-    uid: Uuid,
-    tx: &mpsc::Sender<ConnMsg>,
-    message_id: Uuid,
-    content: &str,
-    expected_version: i32,
-    client_op_id: Option<Uuid>,
-) -> WsResult {
-    let ed = domain::edit_message(
-        &st.pool,
-        message_id,
-        uid,
-        content,
-        expected_version,
-        client_op_id,
-    )
-    .await
-    .map_err(domain::PostError::into_ws)?;
-    broadcast_message_updated(st, &ed).await;
-    op_ack(tx, client_op_id);
-    Ok(())
-}
-
-async fn delete_message(
-    st: &SharedState,
-    uid: Uuid,
-    tx: &mpsc::Sender<ConnMsg>,
-    message_id: Uuid,
-    client_op_id: Option<Uuid>,
-) -> WsResult {
-    let d = domain::delete_message(&st.pool, message_id, uid)
-        .await
-        .map_err(domain::PostError::into_ws)?;
-    broadcast_message_deleted(st, &d);
-    op_ack(tx, client_op_id);
-    crate::api::spawn_file_cleanup(st, d.orphan_files);
-    Ok(())
-}
-
-async fn reaction(
-    st: &SharedState,
-    uid: Uuid,
-    tx: &mpsc::Sender<ConnMsg>,
-    message_id: Uuid,
-    emoji: &str,
-    add: bool,
-    client_op_id: Option<Uuid>,
-) -> WsResult {
-    let ch = domain::set_reaction(&st.pool, message_id, uid, emoji, add)
-        .await
-        .map_err(domain::PostError::into_ws)?;
-    broadcast_reaction_update(st, &ch);
-    op_ack(tx, client_op_id);
     Ok(())
 }
 
@@ -570,6 +456,8 @@ async fn mark_read(st: &SharedState, uid: Uuid, conv: Uuid, seq: i64) -> WsResul
     .await
     .map_err(|_| ws_err("internal", "db error"))?;
     if let Some(applied) = applied {
+        // 读过了：清掉手机上这个会话的推送通知
+        crate::push::clear(st, uid, conv);
         // 同步到我的其他设备（清除未读角标）
         st.send_to_user(
             uid,

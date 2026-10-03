@@ -280,14 +280,6 @@ pub struct ConversationView {
     pub created_at: DateTime<Utc>,
 }
 
-/// GET /conversations/preferences 的条目：{conversation_id, preference}
-/// 与 WS preference_updated 帧同构（嵌套而非扁平），便于前端同一合并路径处理。
-#[derive(Debug, Serialize)]
-pub struct PrefEntry {
-    pub conversation_id: Uuid,
-    pub preference: ConversationPref,
-}
-
 /// PUT /conversations/{id}/preferences：只更新显式字段，缺省字段保持不变；
 /// JSON null 与缺省等价（null 不作为 forever）。
 #[derive(Debug, Deserialize)]
@@ -362,33 +354,12 @@ pub enum WsIn {
         #[serde(default)]
         reply_to_id: Option<Uuid>,
     },
-    EditMessage {
-        message_id: Uuid,
-        content: String,
-        /// 乐观并发控制：必须等于当前 edit_version，否则冲突
-        expected_version: i32,
-        client_op_id: Option<Uuid>,
-    },
-    DeleteMessage {
-        message_id: Uuid,
-        client_op_id: Option<Uuid>,
-    },
-    ReactionUpsert {
-        message_id: Uuid,
-        emoji: String,
-        client_op_id: Option<Uuid>,
-    },
-    ReactionRemove {
-        message_id: Uuid,
-        emoji: String,
-        client_op_id: Option<Uuid>,
-    },
     Typing {
         conversation_id: Uuid,
     },
-    /// 客户端前台状态上报（V2 P3-3）：连接建立 / 可见性 / 焦点变化时发送；
-    /// 服务端按「至少一条 active 连接」判定是否还有必要发离线推送
+    /// 旧客户端的前台状态上报（V2 P3-3）。推送已不再看它，只为不回 bad_frame 而保留解析
     ClientState {
+        #[allow(dead_code)]
         active: bool,
     },
     Read {
@@ -453,10 +424,6 @@ pub enum WsOut {
         message: MessageView,
         edit_version: i32,
     },
-    /// 非发送类 mutation 的最小回执：与 client_msg_id 严格区分，只回发起连接
-    OpAck {
-        client_op_id: Uuid,
-    },
     /// 会话偏好变更：只发给当前 uid 的全部连接（偏好仅本人可见，不广播给其他成员）
     PreferenceUpdated {
         conversation_id: Uuid,
@@ -473,8 +440,6 @@ pub enum WsOut {
         code: &'static str,
         message: String,
         client_msg_id: Option<String>,
-        /// 非发送类 mutation 的回执关联；与 client_msg_id 不混用
-        client_op_id: Option<Uuid>,
     },
 }
 

@@ -24,9 +24,6 @@ pub const CONN_QUEUE: usize = 1024;
 pub struct Conn {
     pub tx: mpsc::Sender<ConnMsg>,
     pub sid: Option<Uuid>,
-    /// 客户端经 client_state 帧上报的前台活跃态（V2 P3-3）；
-    /// 不上报的旧客户端默认 true（保守视为活跃，不误推）
-    pub active: AtomicBool,
     /// 出站队列满（或已关）时置位，会话循环看到后断开
     pub stalled: Arc<AtomicBool>,
 }
@@ -61,9 +58,12 @@ pub struct AppState {
     pub rate: DashMap<String, Vec<Instant>>,
     /// 每次在线/离线翻转加一。广播前再核对，避免连上和断开交错时把状态写反。
     epochs: DashMap<Uuid, u64>,
-    /// V2 P3-3：(user_id, conversation_id) -> 最近一次离线推送时刻（30s 合并窗口）。
-    /// ponytail: 单实例内存状态，重启即丢；重启后短时间内重复推送可接受。
+    /// (user_id, conversation_id) -> 最近一次推送时刻。既是合并窗口，也标记「手机上还挂着这会话的通知」，
+    /// 已读时据此去 ntfy 清通知并移除。
+    /// ponytail: 单实例内存状态，重启即丢：重启前推的通知读了也不会被自动清，需在手机上手动划掉。
     pub push_last: DashMap<(Uuid, Uuid), Instant>,
+    /// 推送合并窗口（毫秒），默认 30s；测试可调小
+    pub push_coalesce_ms: AtomicU64,
     /// V2 P3-3：WS 入站静默超时（毫秒），默认 75s ≈ 2.5 个 ping 周期；测试可调小
     pub ws_idle_timeout_ms: AtomicU64,
     /// V2 P3-3：WS ping 周期（毫秒），默认 30s；与超时一起调小做心跳测试
@@ -84,6 +84,7 @@ impl AppState {
             rate: DashMap::new(),
             epochs: DashMap::new(),
             push_last: DashMap::new(),
+            push_coalesce_ms: AtomicU64::new(30_000),
             ws_idle_timeout_ms: AtomicU64::new(75_000),
             ws_ping_interval_ms: AtomicU64::new(30_000),
             maintenance: AtomicBool::new(false),
@@ -118,7 +119,6 @@ impl AppState {
                 Conn {
                     tx,
                     sid,
-                    active: AtomicBool::new(true),
                     stalled,
                 },
             );
@@ -253,22 +253,6 @@ impl AppState {
         self.conns
             .get(&uid)
             .is_some_and(|m| m.contains_key(&conn_id))
-    }
-
-    /// client_state 帧更新连接的前台活跃标记（V2 P3-3）
-    pub fn set_conn_active(&self, uid: Uuid, conn_id: Uuid, active: bool) {
-        if let Some(m) = self.conns.get(&uid) {
-            if let Some(c) = m.get(&conn_id) {
-                c.active.store(active, Ordering::Relaxed);
-            }
-        }
-    }
-
-    /// 是否至少一条连接处于前台活跃（决定离线推送是否触发；无连接 = false）
-    pub fn has_active_conn(&self, uid: Uuid) -> bool {
-        self.conns
-            .get(&uid)
-            .is_some_and(|m| m.iter().any(|c| c.active.load(Ordering::Relaxed)))
     }
 
     pub fn conn_count(&self, uid: Uuid) -> usize {

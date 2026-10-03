@@ -17,8 +17,6 @@ pub enum AppError {
     PayloadTooLarge(String),
     /// 上游服务（如 ntfy）不可达/拒绝——推送测试端点用
     BadGateway(String),
-    /// 等宿主回包超时（登记表列表 20 秒）
-    GatewayTimeout(String),
     Internal(String),
 }
 
@@ -47,9 +45,6 @@ impl AppError {
     pub fn bad_gateway(m: impl Into<String>) -> Self {
         Self::BadGateway(m.into())
     }
-    pub fn gateway_timeout(m: impl Into<String>) -> Self {
-        Self::GatewayTimeout(m.into())
-    }
 }
 
 impl IntoResponse for AppError {
@@ -62,7 +57,6 @@ impl IntoResponse for AppError {
             Self::Conflict(m) => (StatusCode::CONFLICT, m),
             Self::PayloadTooLarge(m) => (StatusCode::PAYLOAD_TOO_LARGE, m),
             Self::BadGateway(m) => (StatusCode::BAD_GATEWAY, m),
-            Self::GatewayTimeout(m) => (StatusCode::GATEWAY_TIMEOUT, m),
             Self::Internal(m) => {
                 tracing::error!(error = %m, "internal error");
                 (

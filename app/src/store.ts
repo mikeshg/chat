@@ -156,19 +156,6 @@ export function senderAvatar(
   return mergeAvatar(stored, { version: version ?? 0, has: !!has });
 }
 
-/** 从任意 UserPublic（本人、好友、会话 peer、群成员）合并进 avatars。 */
-export function noteUserAvatar(user: UserPublic | null | undefined): void {
-  if (!user?.id) return;
-  setState((s) => {
-    const next = mergeAvatar(s.avatars[user.id], {
-      version: user.avatar_version ?? 0,
-      has: !!user.has_avatar,
-    });
-    if (s.avatars[user.id]?.version === next.version && s.avatars[user.id]?.has === next.has) return {};
-    return { avatars: { ...s.avatars, [user.id]: next } };
-  });
-}
-
 /** 图片 404：该版本记为无头像，避免反复请求。 */
 export function noteAvatarMiss(userId: string, version: number): void {
   setState((s) => ({

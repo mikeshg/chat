@@ -31,7 +31,7 @@ pub(super) async fn lock_message_for_mutation(
     tx: &mut Transaction<'_, Postgres>,
     message_id: Uuid,
     uid: Uuid,
-) -> Result<LockedMessage, WriteError> {
+) -> Result<LockedMessage, PostError> {
     let conv_id =
         sqlx::query_scalar::<_, Uuid>("SELECT conversation_id FROM messages WHERE id = $1")
             .bind(message_id)
@@ -114,7 +114,7 @@ pub async fn edit_message(
         ));
     }
     let mut tx = pool.begin().await.map_err(PostError::Db)?;
-    match edit_in_tx(
+    let ed = edit_in_tx(
         &mut tx,
         message_id,
         editor,
@@ -122,19 +122,9 @@ pub async fn edit_message(
         expected_version,
         op_id,
     )
-    .await
-    {
-        Ok(ed) => {
-            tx.commit().await.map_err(PostError::Db)?;
-            Ok(ed)
-        }
-        Err(WriteError::Fail(e)) => {
-            let _ = tx.rollback().await;
-            Err(e)
-        }
-        // client_msg_id 冲突只发生在发消息路径
-        Err(WriteError::IdempotentHit) => unreachable!(),
-    }
+    .await?;
+    tx.commit().await?;
+    Ok(ed)
 }
 
 pub(super) async fn edit_in_tx(
@@ -144,7 +134,7 @@ pub(super) async fn edit_in_tx(
     content: &str,
     expected_version: i32,
     op_id: Option<Uuid>,
-) -> Result<Edited, WriteError> {
+) -> Result<Edited, PostError> {
     let m = lock_message_for_mutation(tx, message_id, editor).await?;
     let op_key = op_id.map(|u| u.to_string());
 
@@ -212,7 +202,7 @@ pub(super) async fn finish_edit(
     tx: &mut Transaction<'_, Postgres>,
     conv: Uuid,
     message_id: Uuid,
-) -> Result<Edited, WriteError> {
+) -> Result<Edited, PostError> {
     let row = sqlx::query_as::<_, MsgViewRow>("SELECT * FROM message_views WHERE id = $1")
         .bind(message_id)
         .fetch_one(&mut **tx)
@@ -260,24 +250,16 @@ pub async fn delete_message(
     uid: Uuid,
 ) -> Result<Deleted, PostError> {
     let mut tx = pool.begin().await.map_err(PostError::Db)?;
-    match delete_in_tx(&mut tx, message_id, uid).await {
-        Ok(d) => {
-            tx.commit().await.map_err(PostError::Db)?;
-            Ok(d)
-        }
-        Err(WriteError::Fail(e)) => {
-            let _ = tx.rollback().await;
-            Err(e)
-        }
-        Err(WriteError::IdempotentHit) => unreachable!(),
-    }
+    let d = delete_in_tx(&mut tx, message_id, uid).await?;
+    tx.commit().await?;
+    Ok(d)
 }
 
 pub(super) async fn delete_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     message_id: Uuid,
     uid: Uuid,
-) -> Result<Deleted, WriteError> {
+) -> Result<Deleted, PostError> {
     let m = lock_message_for_mutation(tx, message_id, uid).await?;
     let member_ids = member_ids(&mut **tx, m.conversation_id).await?;
 
@@ -388,8 +370,8 @@ pub async fn pin_message(
     uid: Uuid,
 ) -> Result<PinChange, PostError> {
     let mut tx = pool.begin().await.map_err(PostError::Db)?;
-    let result = pin_in_tx(&mut tx, conv, message_id, uid).await;
-    finish_pin(tx, conv, result).await
+    let changed = pin_in_tx(&mut tx, conv, message_id, uid).await?;
+    finish_pin(tx, conv, changed).await
 }
 
 pub(super) async fn pin_in_tx(
@@ -397,7 +379,7 @@ pub(super) async fn pin_in_tx(
     conv: Uuid,
     message_id: Uuid,
     uid: Uuid,
-) -> Result<bool, WriteError> {
+) -> Result<bool, PostError> {
     ensure_pin_writable(tx, conv, uid).await?;
     let msg = sqlx::query_as::<_, (Uuid, Option<DateTime<Utc>>)>(
         "SELECT conversation_id, deleted_at FROM messages WHERE id = $1",
@@ -451,8 +433,8 @@ pub async fn unpin_message(
     uid: Uuid,
 ) -> Result<PinChange, PostError> {
     let mut tx = pool.begin().await.map_err(PostError::Db)?;
-    let result = unpin_in_tx(&mut tx, conv, message_id, uid).await;
-    finish_pin(tx, conv, result).await
+    let changed = unpin_in_tx(&mut tx, conv, message_id, uid).await?;
+    finish_pin(tx, conv, changed).await
 }
 
 pub(super) async fn unpin_in_tx(
@@ -460,7 +442,7 @@ pub(super) async fn unpin_in_tx(
     conv: Uuid,
     message_id: Uuid,
     uid: Uuid,
-) -> Result<bool, WriteError> {
+) -> Result<bool, PostError> {
     ensure_pin_writable(tx, conv, uid).await?;
     let res =
         sqlx::query("DELETE FROM conversation_pins WHERE conversation_id = $1 AND message_id = $2")
@@ -475,7 +457,7 @@ pub(super) async fn ensure_pin_writable(
     tx: &mut Transaction<'_, Postgres>,
     conv: Uuid,
     uid: Uuid,
-) -> Result<(), WriteError> {
+) -> Result<(), PostError> {
     let Some((kind, _, dissolved)) = lock_conversation(tx, conv).await? else {
         return Err(PostError::deny("forbidden", "not a member of this conversation").into());
     };
@@ -519,24 +501,15 @@ pub async fn pinned_message_views(
 pub(super) async fn finish_pin(
     mut tx: Transaction<'_, Postgres>,
     conv: Uuid,
-    result: Result<bool, WriteError>,
+    changed: bool,
 ) -> Result<PinChange, PostError> {
-    match result {
-        Ok(changed) => {
-            let member_ids = member_ids(&mut *tx, conv).await.map_err(PostError::Db)?;
-            tx.commit().await.map_err(PostError::Db)?;
-            Ok(PinChange {
-                conversation_id: conv,
-                member_ids,
-                changed,
-            })
-        }
-        Err(WriteError::Fail(e)) => {
-            let _ = tx.rollback().await;
-            Err(e)
-        }
-        Err(WriteError::IdempotentHit) => unreachable!(),
-    }
+    let member_ids = member_ids(&mut *tx, conv).await?;
+    tx.commit().await?;
+    Ok(PinChange {
+        conversation_id: conv,
+        member_ids,
+        changed,
+    })
 }
 
 pub struct ReactionChange {
@@ -559,17 +532,9 @@ pub async fn set_reaction(
         return Err(PostError::deny("bad_request", "invalid emoji"));
     }
     let mut tx = pool.begin().await.map_err(PostError::Db)?;
-    match reaction_in_tx(&mut tx, message_id, uid, emoji, add).await {
-        Ok(r) => {
-            tx.commit().await.map_err(PostError::Db)?;
-            Ok(r)
-        }
-        Err(WriteError::Fail(e)) => {
-            let _ = tx.rollback().await;
-            Err(e)
-        }
-        Err(WriteError::IdempotentHit) => unreachable!(),
-    }
+    let r = reaction_in_tx(&mut tx, message_id, uid, emoji, add).await?;
+    tx.commit().await?;
+    Ok(r)
 }
 
 pub(super) async fn reaction_in_tx(
@@ -578,7 +543,7 @@ pub(super) async fn reaction_in_tx(
     uid: Uuid,
     emoji: &str,
     add: bool,
-) -> Result<ReactionChange, WriteError> {
+) -> Result<ReactionChange, PostError> {
     let m = lock_message_for_mutation(tx, message_id, uid).await?;
     if m.deleted_at.is_some() {
         return Err(PostError::deny("conflict", "message already deleted").into());

@@ -82,7 +82,7 @@ pub(super) async fn lock_poll_in_tx(
         Option<DateTime<Utc>>,
         Option<DateTime<Utc>>,
     ),
-    WriteError,
+    PostError,
 > {
     let m = lock_message_for_mutation(tx, message_id, uid).await?;
     if m.kind != "poll" {
@@ -98,26 +98,6 @@ pub(super) async fn lock_poll_in_tx(
     Ok((m, row.0, row.1, row.2))
 }
 
-/// 读回完整读模型行并组装广播载荷（与编辑同形，走 message_updated 帧）。
-pub(super) async fn finish_poll_change(
-    tx: &mut Transaction<'_, Postgres>,
-    conv: Uuid,
-    message_id: Uuid,
-) -> Result<Edited, WriteError> {
-    let row = sqlx::query_as::<_, MsgViewRow>("SELECT * FROM message_views WHERE id = $1")
-        .bind(message_id)
-        .fetch_one(&mut **tx)
-        .await?;
-    let edit_version = row.edit_version;
-    let member_ids = member_ids(&mut **tx, conv).await?;
-    Ok(Edited {
-        conversation_id: conv,
-        row,
-        member_ids,
-        edit_version,
-    })
-}
-
 /// 投票：替换本人选择集合。单选至多 1 项、多选至多选项数；空集合撤票；
 /// 相同集合幂等（不升版本）。闭票/过期/软删除一律拒绝；非成员在锁内 403。
 pub async fn vote_poll(
@@ -127,17 +107,9 @@ pub async fn vote_poll(
     option_ids: &[Uuid],
 ) -> Result<Edited, PostError> {
     let mut tx = pool.begin().await.map_err(PostError::Db)?;
-    match vote_in_tx(&mut tx, message_id, uid, option_ids).await {
-        Ok(ed) => {
-            tx.commit().await.map_err(PostError::Db)?;
-            Ok(ed)
-        }
-        Err(WriteError::Fail(e)) => {
-            let _ = tx.rollback().await;
-            Err(e)
-        }
-        Err(WriteError::IdempotentHit) => unreachable!(),
-    }
+    let ed = vote_in_tx(&mut tx, message_id, uid, option_ids).await?;
+    tx.commit().await?;
+    Ok(ed)
 }
 
 pub(super) async fn vote_in_tx(
@@ -145,7 +117,7 @@ pub(super) async fn vote_in_tx(
     message_id: Uuid,
     uid: Uuid,
     option_ids: &[Uuid],
-) -> Result<Edited, WriteError> {
+) -> Result<Edited, PostError> {
     let (m, allow_multiple, closed_at, expires_at) = lock_poll_in_tx(tx, message_id, uid).await?;
     if m.deleted_at.is_some() {
         return Err(PostError::deny("conflict", "message already deleted").into());
@@ -219,30 +191,22 @@ pub(super) async fn vote_in_tx(
             .await?;
     }
 
-    finish_poll_change(tx, m.conversation_id, message_id).await
+    finish_edit(tx, m.conversation_id, message_id).await
 }
 
 /// 关闭投票：创建者或群主；重复关票幂等返回现状（不升版本）。
 pub async fn close_poll(pool: &PgPool, message_id: Uuid, uid: Uuid) -> Result<Edited, PostError> {
     let mut tx = pool.begin().await.map_err(PostError::Db)?;
-    match close_in_tx(&mut tx, message_id, uid).await {
-        Ok(ed) => {
-            tx.commit().await.map_err(PostError::Db)?;
-            Ok(ed)
-        }
-        Err(WriteError::Fail(e)) => {
-            let _ = tx.rollback().await;
-            Err(e)
-        }
-        Err(WriteError::IdempotentHit) => unreachable!(),
-    }
+    let ed = close_in_tx(&mut tx, message_id, uid).await?;
+    tx.commit().await?;
+    Ok(ed)
 }
 
 pub(super) async fn close_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     message_id: Uuid,
     uid: Uuid,
-) -> Result<Edited, WriteError> {
+) -> Result<Edited, PostError> {
     let (m, _allow_multiple, closed_at, _expires_at) = lock_poll_in_tx(tx, message_id, uid).await?;
     if m.deleted_at.is_some() {
         return Err(PostError::deny("conflict", "message already deleted").into());
@@ -268,5 +232,5 @@ pub(super) async fn close_in_tx(
             .execute(&mut **tx)
             .await?;
     }
-    finish_poll_change(tx, m.conversation_id, message_id).await
+    finish_edit(tx, m.conversation_id, message_id).await
 }

@@ -22,7 +22,8 @@ function inviteStatus(i: InviteView): { text: string; usable: boolean } {
   return { text: "可用", usable: i.usable };
 }
 
-export default function AdminSettings() {
+/** 后台设置。part = "register"：注册模式 + 邀请码；"server"：配额、推送、会议、在线更新 */
+export default function AdminSettings({ part }: { part: "register" | "server" }) {
   const [mode, setMode] = useState<RegistrationMode>("open");
   const [invites, setInvites] = useState<InviteView[]>([]);
   const [err, setErr] = useState("");
@@ -232,6 +233,108 @@ export default function AdminSettings() {
     }
   };
 
+  if (part === "server")
+    return (
+      <div className="card ad-settings">
+        {err && <div className="auth-err">{err}</div>}
+        <h3>存储配额</h3>
+        <div className="row ad-quota">
+          <input
+            className="ad-quota-input"
+            type="number"
+            min={0}
+            max={1048576}
+            step={1}
+            value={quota}
+            disabled={quotaSaving}
+            onChange={(e) => setQuota(e.target.value)}
+          />
+          <span className="muted">MB / 用户（0 = 不限，上限 1048576）</span>
+          <button
+            className="primary"
+            disabled={quotaSaving}
+            onClick={() => void saveQuota()}
+          >
+            {quotaSaving ? "保存中…" : "保存配额"}
+          </button>
+        </div>
+
+        <h3>推送服务（ntfy）</h3>
+        <div className="ad-push">
+          <input
+            placeholder="ntfy 服务器地址，如 https://ntfy.sh（空 = 关闭推送）"
+            value={ntfyBase}
+            disabled={pushSaving}
+            onChange={(e) => setNtfyBase(e.target.value)}
+          />
+          <div className="row">
+            <input
+              className="grow"
+              type="password"
+              placeholder={ntfyTokenSet ? "访问令牌（已设置，输入新值以更换）" : "访问令牌（未设置，自建开鉴权时填）"}
+              value={ntfyToken}
+              disabled={pushSaving}
+              onChange={(e) => setNtfyToken(e.target.value)}
+            />
+            {ntfyTokenSet && (
+              <button disabled={pushSaving} onClick={() => void clearPushToken()}>
+                清除令牌
+              </button>
+            )}
+          </div>
+          <input
+            placeholder="本服务对外访问地址（可选，推送通知点击跳转）"
+            value={publicUrl}
+            disabled={pushSaving}
+            onChange={(e) => setPublicUrl(e.target.value)}
+          />
+          <div className="row">
+            <button className="primary" disabled={pushSaving} onClick={() => void savePush()}>
+              {pushSaving ? "保存中…" : "保存推送设置"}
+            </button>
+            <span className="muted">令牌只写不读；用户只拿到随机订阅地址</span>
+          </div>
+        </div>
+
+        <h3>视频会议地址</h3>
+        <div className="row ad-quota">
+          <input
+            className="grow"
+            value={meetingUrl}
+            disabled={meetingSaving}
+            placeholder="https://meet.jit.si（留空 = 关闭）"
+            onChange={(e) => setMeetingUrl(e.target.value)}
+          />
+          <button
+            className="primary"
+            disabled={meetingSaving}
+            onClick={() => void saveMeeting()}
+          >
+            {meetingSaving ? "保存中…" : "保存"}
+          </button>
+        </div>
+
+        <h3>客户端在线更新</h3>
+        <div className="row ad-quota">
+          <input
+            className="grow"
+            value={updateRepo}
+            disabled={updateSaving}
+            placeholder="Gitea 仓库地址，如 http://192.168.6.210:3000/xiefan/chat（留空 = 关闭）"
+            onChange={(e) => setUpdateRepo(e.target.value)}
+          />
+          <button
+            className="primary"
+            disabled={updateSaving}
+            onClick={() => void saveUpdateRepo()}
+          >
+            {updateSaving ? "保存中…" : "保存"}
+          </button>
+        </div>
+        <div className="muted">客户端从这个仓库的最新 Release 获取安装包，下载经本服务中转</div>
+      </div>
+    );
+
   return (
     <div className="card ad-settings">
       <h3>注册设置</h3>
@@ -252,102 +355,6 @@ export default function AdminSettings() {
         {switching && <span className="muted">保存中…</span>}
         {saved && <span className="muted ad-saved">已保存</span>}
       </div>
-
-      <h3>存储配额</h3>
-      <div className="row ad-quota">
-        <input
-          className="ad-quota-input"
-          type="number"
-          min={0}
-          max={1048576}
-          step={1}
-          value={quota}
-          disabled={quotaSaving}
-          onChange={(e) => setQuota(e.target.value)}
-        />
-        <span className="muted">MB / 用户（0 = 不限，上限 1048576）</span>
-        <button
-          className="primary"
-          disabled={quotaSaving}
-          onClick={() => void saveQuota()}
-        >
-          {quotaSaving ? "保存中…" : "保存配额"}
-        </button>
-      </div>
-
-      <h3>推送服务（ntfy）</h3>
-      <div className="ad-push">
-        <input
-          placeholder="ntfy 服务器地址，如 https://ntfy.sh（空 = 关闭推送）"
-          value={ntfyBase}
-          disabled={pushSaving}
-          onChange={(e) => setNtfyBase(e.target.value)}
-        />
-        <div className="row">
-          <input
-            className="grow"
-            type="password"
-            placeholder={ntfyTokenSet ? "访问令牌（已设置，输入新值以更换）" : "访问令牌（未设置，自建开鉴权时填）"}
-            value={ntfyToken}
-            disabled={pushSaving}
-            onChange={(e) => setNtfyToken(e.target.value)}
-          />
-          {ntfyTokenSet && (
-            <button disabled={pushSaving} onClick={() => void clearPushToken()}>
-              清除令牌
-            </button>
-          )}
-        </div>
-        <input
-          placeholder="本服务对外访问地址（可选，推送通知点击跳转）"
-          value={publicUrl}
-          disabled={pushSaving}
-          onChange={(e) => setPublicUrl(e.target.value)}
-        />
-        <div className="row">
-          <button className="primary" disabled={pushSaving} onClick={() => void savePush()}>
-            {pushSaving ? "保存中…" : "保存推送设置"}
-          </button>
-          <span className="muted">令牌只写不读；用户只拿到随机订阅地址</span>
-        </div>
-      </div>
-
-      <h3>视频会议地址</h3>
-      <div className="row ad-quota">
-        <input
-          className="grow"
-          value={meetingUrl}
-          disabled={meetingSaving}
-          placeholder="https://meet.jit.si（留空 = 关闭）"
-          onChange={(e) => setMeetingUrl(e.target.value)}
-        />
-        <button
-          className="primary"
-          disabled={meetingSaving}
-          onClick={() => void saveMeeting()}
-        >
-          {meetingSaving ? "保存中…" : "保存"}
-        </button>
-      </div>
-
-      <h3>客户端在线更新</h3>
-      <div className="row ad-quota">
-        <input
-          className="grow"
-          value={updateRepo}
-          disabled={updateSaving}
-          placeholder="Gitea 仓库地址，如 http://192.168.6.210:3000/xiefan/chat（留空 = 关闭）"
-          onChange={(e) => setUpdateRepo(e.target.value)}
-        />
-        <button
-          className="primary"
-          disabled={updateSaving}
-          onClick={() => void saveUpdateRepo()}
-        >
-          {updateSaving ? "保存中…" : "保存"}
-        </button>
-      </div>
-      <div className="muted">客户端从这个仓库的最新 Release 获取安装包，下载经本服务中转</div>
 
       <h3>邀请码</h3>
       <div className="row ad-invite-form">

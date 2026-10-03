@@ -547,33 +547,35 @@ impl PostError {
     }
 }
 
+/// 仅发消息路径用：client_msg_id 冲突需回滚后读已提交行，其余操作直接用 PostError。
 enum WriteError {
     Fail(PostError),
     /// 并发插入撞上同一 client_msg_id，事务已失败，需要回滚后读取已提交行。
     IdempotentHit,
 }
 
+impl From<sqlx::Error> for PostError {
+    fn from(e: sqlx::Error) -> Self {
+        if let sqlx::Error::Database(ref db) = e {
+            if db.constraint() == Some("uq_messages_attachment") {
+                return Self::deny("bad_attachment", "attachment already sent");
+            }
+            if db.code().as_deref() == Some("23514") {
+                return Self::deny("bad_message", "message must be 1-4000 chars");
+            }
+        }
+        Self::Db(e)
+    }
+}
+
 impl From<sqlx::Error> for WriteError {
     fn from(e: sqlx::Error) -> Self {
         if let sqlx::Error::Database(ref db) = e {
-            match db.constraint() {
-                Some("uq_messages_client_msg") => return Self::IdempotentHit,
-                Some("uq_messages_attachment") => {
-                    return Self::Fail(PostError::deny(
-                        "bad_attachment",
-                        "attachment already sent",
-                    ));
-                }
-                _ => {}
-            }
-            if db.code().as_deref() == Some("23514") {
-                return Self::Fail(PostError::deny(
-                    "bad_message",
-                    "message must be 1-4000 chars",
-                ));
+            if db.constraint() == Some("uq_messages_client_msg") {
+                return Self::IdempotentHit;
             }
         }
-        Self::Fail(PostError::Db(e))
+        Self::Fail(e.into())
     }
 }
 

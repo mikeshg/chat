@@ -148,9 +148,9 @@ async fn prefs_crud_and_order() {
     assert!(p["pinned_at"].is_string());
     assert!(p["archived_at"].is_string());
 
-    // GET /conversations/preferences：返回本人的偏好行
-    let prefs: Value = http()
-        .get(format!("{base}/v1/conversations/preferences"))
+    // 会话列表带本人偏好
+    let convs: Value = http()
+        .get(format!("{base}/v1/conversations"))
         .header("authorization", authz(&a.access))
         .send()
         .await
@@ -158,12 +158,12 @@ async fn prefs_crud_and_order() {
         .json()
         .await
         .unwrap();
-    let entry = prefs
+    let entry = convs
         .as_array()
         .unwrap()
         .iter()
-        .find(|e| e["conversation_id"] == dm)
-        .expect("pref entry for dm");
+        .find(|c| c["id"] == dm)
+        .expect("dm in conversation list");
     assert!(entry["preference"]["pinned_at"].is_string());
     assert!(entry["preference"]["archived_at"].is_string());
 }
@@ -293,24 +293,10 @@ async fn prefs_permissions_and_fanout() {
         }
     }
 
-    // 非成员 → 403；且 GET 列表不暴露他人偏好
+    // 非成员 → 403
     let outsider = register(&base, &format!("qc_{}", uniq())).await;
     let r = put_pref(&base, &outsider, &gid, json!({"pinned": true})).await;
     assert_eq!(r.status(), 403);
-    let prefs: Value = c
-        .get(format!("{base}/v1/conversations/preferences"))
-        .header("authorization", authz(&outsider.access))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(prefs
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|e| e["conversation_id"] != gid));
 
     // 被移出群 → 403
     let r = c

@@ -1,18 +1,19 @@
 import { useEffect, useRef, useState } from "react";
 import { auth } from "../../api";
-import type { PushState } from "../../types";
+import type { PushDevice, PushState } from "../../types";
 import SetRow from "./SetRow";
 
 /**
  * ===== V2 P3-3 ===== 「我」页手机推送卡片（ntfy）。
- * 推送服务器地址只能由管理员配置；用户拿到的是服务端生成的随机订阅地址。
+ * 推送服务器地址只能由管理员配置；每台手机登记后拿到自己的随机订阅地址，可单独移除。
  */
 export default function PushSettings() {
   const [info, setInfo] = useState<PushState | null>(null);
   const [err, setErr] = useState("");
   const [hint, setHint] = useState("");
   const [busy, setBusy] = useState("");
-  const [copied, setCopied] = useState(false);
+  const [copied, setCopied] = useState("");
+  const [name, setName] = useState("");
   const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -38,29 +39,34 @@ export default function PushSettings() {
     }
   };
 
-  const copy = async (text: string) => {
+  const copy = async (d: PushDevice) => {
     try {
-      await navigator.clipboard.writeText(text);
-      setCopied(true);
+      await navigator.clipboard.writeText(d.subscribe_url!);
+      setCopied(d.id);
       if (copiedTimer.current) clearTimeout(copiedTimer.current);
-      copiedTimer.current = setTimeout(() => setCopied(false), 2000);
+      copiedTimer.current = setTimeout(() => setCopied(""), 2000);
     } catch {
       // 剪贴板不可用（非安全上下文/权限被拒）→ 弹出手动复制
-      window.prompt("复制失败，请手动复制：", text);
+      window.prompt("复制失败，请手动复制：", d.subscribe_url!);
     }
   };
 
-  const rotate = () => {
-    if (!confirm("更换订阅主题？旧主题立即作废，需要在 ntfy App 里重新订阅新地址。")) return;
-    void run("rotate", () => auth.rotatePush()).then(
-      (ok) => ok && setHint("已更换主题，请在 ntfy App 重新订阅上面的新地址"),
-    );
+  const add = () =>
+    void run("add", () => auth.addPushDevice(name.trim())).then((ok) => {
+      if (!ok) return;
+      setName("");
+      setHint("已添加，在这台手机的 ntfy App 里订阅它的地址");
+    });
+
+  const remove = (d: PushDevice) => {
+    if (!confirm(`移除「${d.name}」？它将不再收到推送。`)) return;
+    void run(`rm-${d.id}`, () => auth.removePushDevice(d.id));
   };
 
-  const test = () =>
-    void run("test", async () => {
-      const v = await auth.testPush();
-      setHint("已发送测试推送，请查看 ntfy App");
+  const test = (d: PushDevice) =>
+    void run(`test-${d.id}`, async () => {
+      const v = await auth.testPushDevice(d.id);
+      setHint(`已向「${d.name}」发送测试推送，请查看 ntfy App`);
       return v;
     });
 
@@ -74,7 +80,7 @@ export default function PushSettings() {
     <>
       <SetRow
         label="手机推送"
-        desc="应用在后台时通过 ntfy 提醒新消息"
+        desc="新消息通过 ntfy 推到手机；在任一端读过后自动消除"
         toggle={{
           checked: info.enabled,
           disabled: busy !== "",
@@ -92,21 +98,38 @@ export default function PushSettings() {
           }}
         />
       )}
-      {info.enabled && info.subscribe_url && (
+      {info.enabled && (
         <div className="set-block">
-          <div className="muted">在手机上安装 ntfy App → 订阅主题 → 粘贴这个地址</div>
-          <div className="row push-url">
-            <code className="push-url-text">{info.subscribe_url}</code>
-            <button onClick={() => void copy(info.subscribe_url!)}>
-              {copied ? "已复制" : "复制"}
-            </button>
-          </div>
-          <div className="row push-actions">
-            <button disabled={busy !== ""} onClick={test}>
-              {busy === "test" ? "发送中…" : "发送测试推送"}
-            </button>
-            <button disabled={busy !== ""} onClick={rotate}>
-              {busy === "rotate" ? "更换中…" : "更换主题"}
+          <div className="muted">每台手机添加一项 → 在它的 ntfy App 里订阅对应地址</div>
+          {info.devices.map((d) => (
+            <div key={d.id} className="set-block">
+              <div className="row push-actions">
+                <span className="grow">{d.name}</span>
+                <button disabled={busy !== ""} onClick={() => test(d)}>
+                  {busy === `test-${d.id}` ? "发送中…" : "测试"}
+                </button>
+                <button className="danger" disabled={busy !== ""} onClick={() => remove(d)}>
+                  移除
+                </button>
+              </div>
+              {d.subscribe_url && (
+                <div className="row push-url">
+                  <code className="push-url-text">{d.subscribe_url}</code>
+                  <button onClick={() => void copy(d)}>{copied === d.id ? "已复制" : "复制"}</button>
+                </div>
+              )}
+            </div>
+          ))}
+          <div className="row">
+            <input
+              className="grow"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="手机名称（如 我的 iPhone）"
+              maxLength={50}
+            />
+            <button disabled={busy !== "" || !name.trim()} onClick={add}>
+              {busy === "add" ? "添加中…" : "添加手机"}
             </button>
           </div>
         </div>

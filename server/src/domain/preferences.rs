@@ -80,18 +80,9 @@ pub async fn set_preferences(
     };
 
     let mut tx = pool.begin().await.map_err(PostError::Db)?;
-    let res = set_preferences_in_tx(&mut tx, conv, uid, req, mute).await;
-    match res {
-        Ok(pref) => {
-            tx.commit().await.map_err(PostError::Db)?;
-            Ok(pref)
-        }
-        Err(WriteError::Fail(e)) => {
-            let _ = tx.rollback().await;
-            Err(e)
-        }
-        Err(WriteError::IdempotentHit) => unreachable!(),
-    }
+    let pref = set_preferences_in_tx(&mut tx, conv, uid, req, mute).await?;
+    tx.commit().await?;
+    Ok(pref)
 }
 
 pub(super) async fn set_preferences_in_tx(
@@ -100,7 +91,7 @@ pub(super) async fn set_preferences_in_tx(
     uid: Uuid,
     req: &PrefUpdateReq,
     mute: Option<MuteSet>,
-) -> Result<ConversationPref, WriteError> {
+) -> Result<ConversationPref, PostError> {
     let conv_row = lock_conversation(tx, conv)
         .await?
         .ok_or_else(|| PostError::deny("forbidden", "not a member of this conversation"))?;

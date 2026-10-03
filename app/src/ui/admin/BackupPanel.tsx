@@ -116,7 +116,6 @@ export default function BackupPanel() {
 
   return (
     <div className="card bk-panel">
-      <h3>数据备份 / 恢复</h3>
       {err && <div className="auth-err">{err}</div>}
 
       <div className="row bk-toolbar">

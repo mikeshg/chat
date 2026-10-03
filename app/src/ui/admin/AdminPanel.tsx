@@ -5,6 +5,8 @@ import type { AdminOverview, AdminUserView } from "../../types";
 import AdminSettings from "./AdminSettings";
 import Avatar from "../Avatar";
 import BackupPanel from "./BackupPanel";
+import SettingsShell from "../SettingsShell";
+import { ArchiveIcon, PollIcon, ServerIcon, TicketIcon, UsersIcon } from "../icons";
 
 const PAGE = 50;
 
@@ -64,11 +66,11 @@ export default function AdminPanel() {
     </div>
   );
 
-  return (
-    <div className="contacts admin-panel">
-      <h2>后台管理</h2>
-      {err && <div className="auth-err">{err}</div>}
+  const errLine = err && <div className="auth-err">{err}</div>;
 
+  const overview = (
+    <>
+      {errLine}
       {ov && (
         <div className="ad-cards">
           {stat("用户总数", ov.user_count)}
@@ -80,10 +82,12 @@ export default function AdminPanel() {
           {stat("附件", `${ov.attachment_count}（${fmtBytes(ov.attachment_bytes)}）`)}
         </div>
       )}
+    </>
+  );
 
-      <AdminSettings />
-      <BackupPanel />
-
+  const userList = (
+    <>
+      {errLine}
       <div className="card">
         <div className="ad-toolbar">
           <input
@@ -176,6 +180,29 @@ export default function AdminPanel() {
           </button>
         </div>
       </div>
-    </div>
+    </>
+  );
+
+  return (
+    <SettingsShell
+      sections={[
+        { id: "overview", label: "概览", icon: PollIcon, render: () => overview },
+        { id: "users", label: "用户", icon: UsersIcon, wide: true, render: () => userList },
+        {
+          id: "register",
+          label: "注册与邀请",
+          icon: TicketIcon,
+          wide: true,
+          render: () => <AdminSettings part="register" />,
+        },
+        {
+          id: "server",
+          label: "服务器设置",
+          icon: ServerIcon,
+          render: () => <AdminSettings part="server" />,
+        },
+        { id: "backup", label: "备份与恢复", icon: ArchiveIcon, render: () => <BackupPanel /> },
+      ]}
+    />
   );
 }

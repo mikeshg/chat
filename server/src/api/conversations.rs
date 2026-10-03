@@ -239,47 +239,6 @@ pub(super) async fn list_conversations(
 
 // ---------- 会话偏好（仅本人可见、同步本人全部设备） ----------
 
-/// 全量偏好列表：仅供需要时单独拉取；会话列表本身已带 preference 字段，无需 N+1。
-pub(super) async fn list_preferences(
-    State(st): State<SharedState>,
-    headers: HeaderMap,
-) -> AppResult<Json<Vec<PrefEntry>>> {
-    let uid = uid_of(&headers, &st).await?;
-    let rows = sqlx::query_as::<
-        _,
-        (
-            Uuid,
-            Option<DateTime<Utc>>,
-            Option<DateTime<Utc>>,
-            Option<DateTime<Utc>>,
-            bool,
-            DateTime<Utc>,
-        ),
-    >(
-        "SELECT conversation_id, pinned_at, archived_at, muted_until, mute_forever, updated_at
-           FROM conversation_preferences WHERE user_id = $1",
-    )
-    .bind(uid)
-    .fetch_all(&st.pool)
-    .await?;
-    Ok(Json(
-        rows.into_iter()
-            .map(
-                |(cid, pinned_at, archived_at, muted_until, mute_forever, t)| PrefEntry {
-                    conversation_id: cid,
-                    preference: ConversationPref {
-                        pinned_at,
-                        archived_at,
-                        muted_until,
-                        mute_forever,
-                        updated_at: Some(t),
-                    },
-                },
-            )
-            .collect(),
-    ))
-}
-
 /// 更新本人偏好：缺省字段不改；mute 形状/时间在领域层校验；解散/非成员 403。
 /// client_op_id 仅作契约参数（状态覆写天然幂等，无需持久化 op_id）。
 /// 成功后给本人全部连接发 preference_updated（含发起连接，幂等收敛）。

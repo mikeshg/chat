@@ -2,6 +2,8 @@ import { useState } from "react";
 import { auth, getServer } from "../../api";
 import { setState, useApp } from "../../store";
 import { stopWs } from "../../ws";
+import { BellIcon, BotIcon, SlidersIcon, UserIcon } from "../icons";
+import SettingsShell from "../SettingsShell";
 import AutostartSetting from "./AutostartSetting";
 import NotifySettings from "./NotifySettings";
 import PushSettings from "./PushSettings";
@@ -13,7 +15,40 @@ import BotSettings from "./BotSettings";
 import UpdateSetting from "./UpdateSetting";
 import SetRow, { SetGroup } from "./SetRow";
 
+/** 「我」页：账号、通用、通知、机器人 */
 export default function MePanel() {
+  return (
+    <SettingsShell
+      sections={[
+        { id: "general", label: "通用", icon: SlidersIcon, render: () => <GeneralSection /> },
+        { id: "account", label: "账号与安全", icon: UserIcon, render: () => <AccountSection /> },
+        {
+          id: "notify",
+          label: "通知",
+          icon: BellIcon,
+          render: () => (
+            <SetGroup>
+              <NotifySettings />
+              <PushSettings />
+            </SetGroup>
+          ),
+        },
+        {
+          id: "bots",
+          label: "机器人",
+          icon: BotIcon,
+          render: () => (
+            <SetGroup>
+              <BotSettings />
+            </SetGroup>
+          ),
+        },
+      ]}
+    />
+  );
+}
+
+function AccountSection() {
   const s = useApp();
   const [name, setName] = useState(s.me?.display_name ?? "");
   const [hint, setHint] = useState("");
@@ -35,65 +70,58 @@ export default function MePanel() {
   };
 
   return (
-    <main className="contacts">
-      <div className="me-page">
-        <h2>我</h2>
-        <section className="card me-profile">
-          <AvatarSetting />
-          <div className="grow">
-            <div className="me-name">{s.me?.display_name}</div>
-            <div className="muted">@{s.me?.username}</div>
-            <div className="row">
-              <input
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="昵称"
-                maxLength={50}
-              />
-              <button
-                className="primary"
-                disabled={!name.trim() || name.trim() === s.me?.display_name}
-                onClick={save}
-              >
-                保存昵称
-              </button>
-            </div>
-            {hint && <div className="muted">{hint}</div>}
+    <>
+      <section className="card me-profile">
+        <AvatarSetting />
+        <div className="grow">
+          <div className="me-name">{s.me?.display_name}</div>
+          <div className="muted">@{s.me?.username}</div>
+          <div className="row">
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="昵称"
+              maxLength={50}
+            />
+            <button
+              className="primary"
+              disabled={!name.trim() || name.trim() === s.me?.display_name}
+              onClick={save}
+            >
+              保存昵称
+            </button>
           </div>
-        </section>
+          {hint && <div className="muted">{hint}</div>}
+        </div>
+      </section>
 
-        <SetGroup title="通用">
-          <UpdateSetting />
-          <AutostartSetting />
-          <ThemeSetting />
-          <StorageUsage />
-          <SetRow label="服务器" desc={getServer() || "同源"}>
-            <span className="set-value">
-              <span className={`dot${s.wsReady ? " on" : ""}`} />
-              {s.wsReady ? "已连接" : "未连接"}
-            </span>
-          </SetRow>
-        </SetGroup>
+      <SetGroup>
+        <SecuritySettings />
+      </SetGroup>
 
-        <SetGroup title="通知">
-          <NotifySettings />
-          <PushSettings />
-        </SetGroup>
+      <section className="card set-group set-logout-card">
+        <button className="set-logout" onClick={logout}>
+          退出登录
+        </button>
+      </section>
+    </>
+  );
+}
 
-        <SetGroup title="机器人">
-          <BotSettings />
-        </SetGroup>
-
-        <SetGroup title="账号与安全">
-          <SecuritySettings />
-        </SetGroup>
-
-        <section className="card set-group set-logout-card">
-          <button className="set-logout" onClick={logout}>
-            退出登录
-          </button>
-        </section>
-      </div>
-    </main>
+function GeneralSection() {
+  const s = useApp();
+  return (
+    <SetGroup>
+      <UpdateSetting />
+      <AutostartSetting />
+      <ThemeSetting />
+      <StorageUsage />
+      <SetRow label="服务器" desc={getServer() || "同源"}>
+        <span className="set-value">
+          <span className={`dot${s.wsReady ? " on" : ""}`} />
+          {s.wsReady ? "已连接" : "未连接"}
+        </span>
+      </SetRow>
+    </SetGroup>
   );
 }

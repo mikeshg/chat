@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react";
-import { convs } from "../../api";
 import type { MessageView, PinEntry } from "../../types";
 
 /** 置顶条摘要：有正文用第一行，否则用类型占位。 */
@@ -16,16 +15,18 @@ export function pinExcerpt(m: MessageView): string {
 
 export default function PinnedBar({
   convId,
+  pins,
   readonly,
-  reloadKey,
+  onUnpin,
   onJump,
 }: {
   convId: string;
+  /** 列表由 ChatView 持有（菜单的置顶状态也从它派生） */
+  pins: PinEntry[];
   readonly: boolean;
-  reloadKey: number;
+  onUnpin: (messageId: string) => Promise<void>;
   onJump: (id: string, seq: number) => void;
 }) {
-  const [pins, setPins] = useState<PinEntry[]>([]);
   const [open, setOpen] = useState(false);
   const [err, setErr] = useState("");
 
@@ -33,23 +34,7 @@ export default function PinnedBar({
   useEffect(() => {
     setOpen(false);
     setErr("");
-    setPins([]);
   }, [convId]);
-
-  useEffect(() => {
-    let alive = true;
-    convs
-      .pins(convId)
-      .then((rows) => {
-        if (alive) setPins(rows);
-      })
-      .catch(() => {
-        if (alive) setPins([]);
-      });
-    return () => {
-      alive = false;
-    };
-  }, [convId, reloadKey]);
 
   if (pins.length === 0) return null;
   const latest = pins[0];
@@ -57,8 +42,7 @@ export default function PinnedBar({
   const unpin = async (messageId: string) => {
     setErr("");
     try {
-      await convs.unpin(convId, messageId);
-      setPins((rows) => rows.filter((p) => p.message.id !== messageId));
+      await onUnpin(messageId);
     } catch (e) {
       setErr(e instanceof Error ? e.message : "取消置顶失败");
     }

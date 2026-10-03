@@ -29,11 +29,6 @@ export function voiceTooShort(ms: number): boolean {
   return ms < 1_000;
 }
 
-/** 有 duration_ms 即语音条；普通音频文件仍按文件展示。 */
-export function isVoiceAttachment(att: { duration_ms?: number | null } | null | undefined): boolean {
-  return att?.duration_ms != null;
-}
-
 export const VOICE_MAX_MS = 120_000;
 export const MIC_UNAVAILABLE = "需要 HTTPS 或 localhost 才能录音";
 export const MIC_DENIED = "麦克风权限被拒绝";

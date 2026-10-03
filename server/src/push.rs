@@ -1,7 +1,9 @@
 //! ntfy 离线推送（V2 P3-3）。
-//! 触发点收敛在 ws::broadcast_posted：新消息落库后对每个成员判定是否补一条 ntfy 通知。
-//! 推送服务器地址只能由管理员配置（server_settings），用户只持有服务端生成的随机主题——
+//! 触发点：ws::broadcast_posted（新消息 → 推）与已读推进（→ 清掉手机上的通知）。
+//! 推送服务器地址只能由管理员配置（server_settings）；用户的每台手机持有一个服务端生成的随机主题——
 //! 不接受用户提供的 URL，防 SSRF。
+//! 每条通知带 sequence_id = 会话 id：同一会话在手机上只占一条通知，新消息原地更新；
+//! 任一端读过该会话就按 sequence_id 清掉（ntfy 服务端 ≥ 2.16、Android App ≥ 1.22.2，旧版忽略）。
 
 use crate::auth;
 use crate::domain;
@@ -9,12 +11,16 @@ use crate::error::{is_unique_violation, AppError, AppResult};
 use crate::model::MessageView;
 use crate::settings::{self, ServerSettings};
 use crate::state::SharedState;
-use axum::{extract::State, http::HeaderMap, Json};
+use axum::{
+    extract::{Path, State},
+    http::HeaderMap,
+    Json,
+};
 use chrono::{DateTime, Utc};
 use dashmap::mapref::entry::Entry;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -23,8 +29,8 @@ use uuid::Uuid;
 const TOPIC_ALPHABET: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 const TOPIC_LEN: usize = 24;
 
-/// 同一 (用户, 会话) 的推送合并窗口
-const COALESCE: Duration = Duration::from_secs(30);
+/// 每人最多登记的手机数
+const MAX_DEVICES: i64 = 10;
 
 /// 推送 HTTP 超时
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -48,10 +54,13 @@ fn gen_topic() -> String {
     out
 }
 
-struct PushRow {
-    enabled: bool,
-    preview: bool,
-    topic: String,
+#[derive(Debug, Serialize)]
+pub struct PushDeviceView {
+    pub id: Uuid,
+    pub name: String,
+    /// {push_ntfy_base}/{topic}；未配置推送时为 null
+    pub subscribe_url: Option<String>,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize)]
@@ -61,66 +70,55 @@ pub struct PushView {
     pub enabled: bool,
     /// 通知是否带消息内容（公共 ntfy 服务器上主题可被猜到的人看到，默认关）
     pub preview: bool,
-    /// {push_ntfy_base}/{topic}；未配置推送时为 null
-    pub subscribe_url: Option<String>,
+    pub devices: Vec<PushDeviceView>,
 }
 
-async fn fetch_row(pool: &PgPool, uid: Uuid) -> AppResult<Option<PushRow>> {
-    let row = sqlx::query_as::<_, (bool, bool, String)>(
-        "SELECT enabled, preview, topic FROM push_settings WHERE user_id = $1",
+async fn view_of(st: &SharedState, uid: Uuid) -> AppResult<Json<PushView>> {
+    let s = settings::load(&st.pool).await?;
+    let available = !s.push_ntfy_base.is_empty();
+    let (enabled, preview) = sqlx::query_as::<_, (bool, bool)>(
+        "SELECT enabled, preview FROM push_settings WHERE user_id = $1",
     )
     .bind(uid)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|(enabled, preview, topic)| PushRow {
+    .fetch_optional(&st.pool)
+    .await?
+    .unwrap_or((false, false));
+    let devices = sqlx::query_as::<_, (Uuid, String, String, DateTime<Utc>)>(
+        "SELECT id, name, topic, created_at FROM push_devices WHERE user_id = $1 ORDER BY created_at",
+    )
+    .bind(uid)
+    .fetch_all(&st.pool)
+    .await?
+    .into_iter()
+    .map(|(id, name, topic, created_at)| PushDeviceView {
+        id,
+        name,
+        subscribe_url: available.then(|| format!("{}/{}", s.push_ntfy_base, topic)),
+        created_at,
+    })
+    .collect();
+    Ok(Json(PushView {
+        available,
         enabled,
         preview,
-        topic,
+        devices,
     }))
 }
 
-/// 首次访问生成主题建行；并发/主题撞车（唯一键）时重试
-async fn ensure_row(pool: &PgPool, uid: Uuid) -> AppResult<PushRow> {
-    for _ in 0..5 {
-        let res = sqlx::query(
-            "INSERT INTO push_settings (user_id, topic) VALUES ($1, $2)
-             ON CONFLICT (user_id) DO NOTHING",
-        )
-        .bind(uid)
-        .bind(gen_topic())
-        .execute(pool)
-        .await;
-        match res {
-            Err(e) if is_unique_violation(&e) => continue,
-            Err(e) => return Err(e.into()),
-            Ok(_) => {}
-        }
-        if let Some(row) = fetch_row(pool, uid).await? {
-            return Ok(row);
-        }
+fn require_configured(s: &ServerSettings) -> AppResult<()> {
+    if s.push_ntfy_base.is_empty() {
+        return Err(AppError::bad_request("管理员未配置推送服务"));
     }
-    Err(AppError::internal("push_settings insert failed"))
+    Ok(())
 }
 
-async fn view_of(st: &SharedState, row: &PushRow) -> AppResult<PushView> {
-    let s = settings::load(&st.pool).await?;
-    let available = !s.push_ntfy_base.is_empty();
-    Ok(PushView {
-        available,
-        enabled: row.enabled,
-        preview: row.preview,
-        subscribe_url: available.then(|| format!("{}/{}", s.push_ntfy_base, row.topic)),
-    })
-}
-
-/// GET /users/me/push：无行时建默认行（生成主题）
+/// GET /users/me/push
 pub async fn get_push(
     State(st): State<SharedState>,
     headers: HeaderMap,
 ) -> AppResult<Json<PushView>> {
     let uid = auth::require_user(&st, &headers).await?.id;
-    let row = ensure_row(&st.pool, uid).await?;
-    Ok(Json(view_of(&st, &row).await?))
+    view_of(&st, uid).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -136,77 +134,113 @@ pub async fn put_push(
     Json(req): Json<PutPushReq>,
 ) -> AppResult<Json<PushView>> {
     let uid = auth::require_user(&st, &headers).await?.id;
-    if req.enabled == Some(true) && settings::load(&st.pool).await?.push_ntfy_base.is_empty() {
-        return Err(AppError::bad_request("管理员未配置推送服务"));
+    if req.enabled == Some(true) {
+        require_configured(&settings::load(&st.pool).await?)?;
     }
-    ensure_row(&st.pool, uid).await?;
     sqlx::query(
-        "UPDATE push_settings
-            SET enabled = COALESCE($2, enabled),
-                preview = COALESCE($3, preview),
-                updated_at = now()
-          WHERE user_id = $1",
+        "INSERT INTO push_settings (user_id, enabled, preview)
+         VALUES ($1, COALESCE($2, false), COALESCE($3, false))
+         ON CONFLICT (user_id) DO UPDATE
+            SET enabled = COALESCE($2, push_settings.enabled),
+                preview = COALESCE($3, push_settings.preview),
+                updated_at = now()",
     )
     .bind(uid)
     .bind(req.enabled)
     .bind(req.preview)
     .execute(&st.pool)
     .await?;
-    let row = fetch_row(&st.pool, uid).await?.unwrap();
-    Ok(Json(view_of(&st, &row).await?))
+    view_of(&st, uid).await
 }
 
-/// POST /users/me/push/rotate：换新主题（旧主题作废，用户需在 ntfy App 里重新订阅）
-pub async fn rotate_push(
+#[derive(Debug, Deserialize)]
+pub struct AddDeviceReq {
+    pub name: String,
+}
+
+/// POST /users/me/push/devices：登记一台手机，生成它自己的订阅主题
+pub async fn add_device(
     State(st): State<SharedState>,
     headers: HeaderMap,
+    Json(req): Json<AddDeviceReq>,
 ) -> AppResult<Json<PushView>> {
     let uid = auth::require_user(&st, &headers).await?.id;
-    for _ in 0..5 {
-        let res = sqlx::query(
-            "UPDATE push_settings SET topic = $2, updated_at = now() WHERE user_id = $1",
-        )
+    require_configured(&settings::load(&st.pool).await?)?;
+    let name = req.name.trim();
+    if name.is_empty() || name.chars().count() > 50 {
+        return Err(AppError::bad_request("设备名 1-50 个字"));
+    }
+    // ponytail: 先数再插，并发连点可能多出一台；无害
+    let n = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM push_devices WHERE user_id = $1")
         .bind(uid)
-        .bind(gen_topic())
-        .execute(&st.pool)
-        .await;
+        .fetch_one(&st.pool)
+        .await?;
+    if n >= MAX_DEVICES {
+        return Err(AppError::bad_request(format!("最多 {MAX_DEVICES} 台设备")));
+    }
+    // 主题撞车（唯一键）时换一个重试
+    for _ in 0..5 {
+        let res = sqlx::query("INSERT INTO push_devices (user_id, name, topic) VALUES ($1, $2, $3)")
+            .bind(uid)
+            .bind(name)
+            .bind(gen_topic())
+            .execute(&st.pool)
+            .await;
         match res {
-            Ok(r) if r.rows_affected() == 0 => {
-                // 从未访问过推送设置：先建行，下一轮再 UPDATE
-                ensure_row(&st.pool, uid).await?;
-            }
-            Ok(_) => break,
             Err(e) if is_unique_violation(&e) => continue,
             Err(e) => return Err(e.into()),
+            Ok(_) => return view_of(&st, uid).await,
         }
     }
-    let row = fetch_row(&st.pool, uid)
-        .await?
-        .ok_or_else(|| AppError::internal("push_settings rotate failed"))?;
-    Ok(Json(view_of(&st, &row).await?))
+    Err(AppError::internal("push_devices insert failed"))
 }
 
-/// POST /users/me/push/test：立即发一条测试推送（不受 30s 合并限制），失败 502 带原因
-pub async fn test_push(
+/// DELETE /users/me/push/devices/{id}：移除一台手机，它的主题立即不再收到推送
+pub async fn delete_device(
     State(st): State<SharedState>,
     headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<PushView>> {
+    let uid = auth::require_user(&st, &headers).await?.id;
+    let r = sqlx::query("DELETE FROM push_devices WHERE id = $1 AND user_id = $2")
+        .bind(id)
+        .bind(uid)
+        .execute(&st.pool)
+        .await?;
+    if r.rows_affected() == 0 {
+        return Err(AppError::not_found("设备不存在"));
+    }
+    view_of(&st, uid).await
+}
+
+/// POST /users/me/push/devices/{id}/test：给这台手机立即发一条测试推送，失败 502 带原因
+pub async fn test_device(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
 ) -> AppResult<Json<PushView>> {
     let uid = auth::require_user(&st, &headers).await?.id;
     let s = settings::load(&st.pool).await?;
-    if s.push_ntfy_base.is_empty() {
-        return Err(AppError::bad_request("管理员未配置推送服务"));
-    }
-    let row = ensure_row(&st.pool, uid).await?;
+    require_configured(&s)?;
+    let topic = sqlx::query_scalar::<_, String>(
+        "SELECT topic FROM push_devices WHERE id = $1 AND user_id = $2",
+    )
+    .bind(id)
+    .bind(uid)
+    .fetch_optional(&st.pool)
+    .await?
+    .ok_or_else(|| AppError::not_found("设备不存在"))?;
     let payload = NtfyPayload {
-        topic: &row.topic,
+        topic: &topic,
         title: "Chat",
         message: "测试推送：看到这条通知说明推送通道已连通",
         priority: 4,
         tags: &["speech_balloon"],
         click: public_url(&s),
+        sequence_id: None,
     };
     send(&s, &payload).await.map_err(AppError::bad_gateway)?;
-    Ok(Json(view_of(&st, &row).await?))
+    view_of(&st, uid).await
 }
 
 // ---------- 发送 ----------
@@ -222,6 +256,8 @@ struct NtfyPayload<'a> {
     tags: &'a [&'a str],
     #[serde(skip_serializing_if = "Option::is_none")]
     click: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sequence_id: Option<&'a str>,
 }
 
 fn public_url(s: &ServerSettings) -> Option<&str> {
@@ -240,9 +276,8 @@ fn client() -> &'static reqwest::Client {
     })
 }
 
-/// 投递一条 ntfy 通知；失败返回原因串（调用方记日志或转 502），不重试。
-async fn send(s: &ServerSettings, p: &NtfyPayload<'_>) -> Result<(), String> {
-    let mut req = client().post(&s.push_ntfy_base).json(p);
+/// 发请求（带管理员配置的令牌）；失败返回原因串（调用方记日志或转 502），不重试。
+async fn deliver(s: &ServerSettings, mut req: reqwest::RequestBuilder) -> Result<(), String> {
     if !s.push_ntfy_token.is_empty() {
         req = req.bearer_auth(&s.push_ntfy_token);
     }
@@ -251,6 +286,10 @@ async fn send(s: &ServerSettings, p: &NtfyPayload<'_>) -> Result<(), String> {
         return Err(format!("ntfy 返回 {}", resp.status()));
     }
     Ok(())
+}
+
+async fn send(s: &ServerSettings, p: &NtfyPayload<'_>) -> Result<(), String> {
+    deliver(s, client().post(&s.push_ntfy_base).json(p)).await
 }
 
 // ---------- 新消息触发（挂在 ws::broadcast_posted） ----------
@@ -276,8 +315,10 @@ fn excerpt(msg: &MessageView) -> String {
     }
 }
 
-/// 新消息离线推送入：整个判定与发送都在 spawned 任务里，绝不在广播路径上等待。
+/// 新消息离线推送入口：整个判定与发送都在 spawned 任务里，绝不在广播路径上等待。
 pub fn schedule(st: &SharedState, conv: Uuid, posted: &domain::Posted) {
+    // 发送者的已读已推进到这条：清掉他手机上这个会话的通知
+    clear(st, posted.message.sender_id, conv);
     let st = st.clone();
     let message = posted.message.clone();
     tokio::spawn(async move {
@@ -292,25 +333,32 @@ async fn dispatch(st: &SharedState, conv: Uuid, msg: &MessageView) -> AppResult<
     if s.push_ntfy_base.is_empty() {
         return Ok(());
     }
-    // 候选成员一条 SQL 取齐：已开推送（排除发送者）+ 会话偏好（无行 = 未静音未归档）。
+    // 候选成员一条 SQL 取齐：已开推送且有手机（排除发送者）+ 未读数 + 会话偏好（无行 = 未静音未归档）。
+    // 不看对方是否在线/前台：读过后会把通知清掉。
     let rows = sqlx::query_as::<
         _,
         (
             Uuid,
-            String,
             bool,
+            i64,
             bool,
             Option<DateTime<Utc>>,
             Option<DateTime<Utc>>,
+            Vec<String>,
         ),
     >(
-        "SELECT ps.user_id, ps.topic, ps.preview,
-                COALESCE(cp.mute_forever, false), cp.muted_until, cp.archived_at
+        "SELECT ps.user_id, ps.preview, c.last_seq - m.last_read_seq,
+                COALESCE(cp.mute_forever, false), cp.muted_until, cp.archived_at,
+                array_agg(pd.topic)
            FROM push_settings ps
+           JOIN push_devices pd ON pd.user_id = ps.user_id
            JOIN memberships m ON m.user_id = ps.user_id AND m.conversation_id = $1
+           JOIN conversations c ON c.id = $1
            LEFT JOIN conversation_preferences cp
              ON cp.conversation_id = $1 AND cp.user_id = ps.user_id
-          WHERE ps.enabled AND ps.user_id <> $2",
+          WHERE ps.enabled AND ps.user_id <> $2
+          GROUP BY ps.user_id, ps.preview, c.last_seq, m.last_read_seq,
+                   cp.mute_forever, cp.muted_until, cp.archived_at",
     )
     .bind(conv)
     .bind(msg.sender_id)
@@ -319,14 +367,15 @@ async fn dispatch(st: &SharedState, conv: Uuid, msg: &MessageView) -> AppResult<
     if rows.is_empty() {
         return Ok(());
     }
-    // ponytail: 合并窗口是单实例内存状态，重启丢失（重启后可能多推一次，可接受）；
-    // 超阈值时惰性清理防无界增长
+    // 读过的会话已从表里移除；超阈值时清掉一天前的陈旧记录防无界增长
     if st.push_last.len() > 4096 {
-        st.push_last.retain(|_, t| t.elapsed() < COALESCE * 4);
+        st.push_last
+            .retain(|_, t| t.elapsed() < Duration::from_secs(86_400));
     }
+    let window = Duration::from_millis(st.push_coalesce_ms.load(Ordering::Relaxed));
 
     let sender_display = msg.sender_name.clone();
-    let title = match domain::conv_kind(&st.pool, conv).await?.as_deref() {
+    let name = match domain::conv_kind(&st.pool, conv).await?.as_deref() {
         Some("group") => {
             sqlx::query_scalar::<_, Option<String>>("SELECT name FROM conversations WHERE id = $1")
                 .bind(conv)
@@ -336,22 +385,19 @@ async fn dispatch(st: &SharedState, conv: Uuid, msg: &MessageView) -> AppResult<
         }
         _ => sender_display.clone(),
     };
+    let seq_id = conv.to_string();
 
     let now = Utc::now();
-    for (uid, topic, preview, mute_forever, muted_until, archived_at) in rows {
-        // 至少一条活跃连接 = 用户在线且在前台，不需要离线推送
-        if st.has_active_conn(uid) {
-            continue;
-        }
+    for (uid, preview, unread, mute_forever, muted_until, archived_at, topics) in rows {
         let mentioned = msg.mentions.contains(&uid);
         // 静音/归档只放行 @本人（@已在写消息事务内解除归档，能走到这里主要靠静音判断）
         let muted = mute_forever || muted_until.is_some_and(|t| t > now);
         if (muted || archived_at.is_some()) && !mentioned {
             continue;
         }
-        // 30s 合并：entry 原子占位，并发任务只有一个赢家
+        // 合并窗口内同一 (用户, 会话) 只响一次；entry 原子占位，并发任务只有一个赢家
         match st.push_last.entry((uid, conv)) {
-            Entry::Occupied(e) if e.get().elapsed() < COALESCE => continue,
+            Entry::Occupied(e) if e.get().elapsed() < window => continue,
             Entry::Occupied(mut e) => {
                 e.insert(Instant::now());
             }
@@ -359,6 +405,11 @@ async fn dispatch(st: &SharedState, conv: Uuid, msg: &MessageView) -> AppResult<
                 e.insert(Instant::now());
             }
         }
+        let title = if unread > 1 {
+            format!("{name} ({unread}条)")
+        } else {
+            name.clone()
+        };
         let body = if preview {
             format!(
                 "{}{}: {}",
@@ -369,18 +420,56 @@ async fn dispatch(st: &SharedState, conv: Uuid, msg: &MessageView) -> AppResult<
         } else if mentioned {
             "有人@了你".to_string()
         } else {
-            "你收到一条新消息".to_string()
+            "你收到新消息".to_string()
         };
-        let p = NtfyPayload {
-            topic: &topic,
-            title: &title,
-            message: &body,
-            priority: if mentioned { 4 } else { 3 },
-            tags: &["speech_balloon"],
-            click: public_url(&s),
-        };
-        if let Err(e) = send(&s, &p).await {
-            tracing::warn!(user = %uid, error = %e, "ntfy push failed");
+        for topic in &topics {
+            let p = NtfyPayload {
+                topic,
+                title: &title,
+                message: &body,
+                priority: if mentioned { 4 } else { 3 },
+                tags: &["speech_balloon"],
+                click: public_url(&s),
+                sequence_id: Some(&seq_id),
+            };
+            if let Err(e) = send(&s, &p).await {
+                tracing::warn!(user = %uid, error = %e, "ntfy push failed");
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------- 已读触发：清掉手机上的通知 ----------
+
+/// 已读推进时调用：这个会话推过通知就去 ntfy 把该用户每台手机上的那条清掉，并重置合并窗口
+/// （读完后的下一条消息立即提醒）。没推过（无记录）不发请求。
+pub fn clear(st: &SharedState, uid: Uuid, conv: Uuid) {
+    if st.push_last.remove(&(uid, conv)).is_none() {
+        return;
+    }
+    let st = st.clone();
+    tokio::spawn(async move {
+        if let Err(e) = clear_devices(&st, uid, conv).await {
+            tracing::warn!(user = %uid, conv = %conv, error = ?e, "push clear failed");
+        }
+    });
+}
+
+async fn clear_devices(st: &SharedState, uid: Uuid, conv: Uuid) -> AppResult<()> {
+    let s = settings::load(&st.pool).await?;
+    if s.push_ntfy_base.is_empty() {
+        return Ok(());
+    }
+    let topics =
+        sqlx::query_scalar::<_, String>("SELECT topic FROM push_devices WHERE user_id = $1")
+            .bind(uid)
+            .fetch_all(&st.pool)
+            .await?;
+    for topic in topics {
+        let url = format!("{}/{}/{}/clear", s.push_ntfy_base, topic, conv);
+        if let Err(e) = deliver(&s, client().put(url)).await {
+            tracing::warn!(user = %uid, error = %e, "ntfy clear failed");
         }
     }
     Ok(())

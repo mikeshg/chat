@@ -528,7 +528,7 @@ pub(crate) fn urlencoded(s: &str) -> String {
     s.bytes().map(|b| format!("%{b:02X}")).collect()
 }
 
-/// WS 生命周期帧：broadcast 个性化 + op_ack 与 client_msg_id 隔离
+/// REST mutation 的 WS 广播：双端都收到，reaction 按接收者个性化
 #[tokio::test]
 async fn lifecycle_ws_frames() {
     let base = spawn().await;
@@ -536,6 +536,7 @@ async fn lifecycle_ws_frames() {
     let b = register(&base, &format!("fb_{}", uniq())).await;
     befriend(&base, &a, &b).await;
     let conv = dm_conv(&base, &a).await;
+    let c = http();
 
     let (mut sa, _) = tokio_tungstenite::connect_async(ws_url(&base, &a).await)
         .await
@@ -555,46 +556,26 @@ async fn lifecycle_ws_frames() {
     let mid = m1["id"].as_str().unwrap();
     next_of(&mut sb, "message").await; // b 收到原始消息
 
-    // b 编辑 a 的消息 → error 帧带 client_op_id、不带 client_msg_id（op/outbox 隔离）
-    let bad_op = uuid::Uuid::new_v4();
-    sb.send(WsMsg::Text(
-        json!({"type":"edit_message","message_id":mid,"content":"x",
-               "expected_version":0,"client_op_id":bad_op})
-        .to_string()
-        .into(),
-    ))
-    .await
-    .unwrap();
-    let err = next_of(&mut sb, "error").await;
-    assert_eq!(err["code"], "forbidden");
-    assert_eq!(err["client_op_id"].as_str().unwrap(), bad_op.to_string());
-    assert!(err["client_msg_id"].is_null());
-
-    // a 正常编辑 → 双端 message_updated + 发起连接 op_ack
-    let op = uuid::Uuid::new_v4();
-    sa.send(WsMsg::Text(
-        json!({"type":"edit_message","message_id":mid,"content":"edited",
-               "expected_version":0,"client_op_id":op})
-        .to_string()
-        .into(),
-    ))
-    .await
-    .unwrap();
+    // 编辑 → 双端 message_updated
+    c.patch(format!("{base}/v1/messages/{mid}"))
+        .header("authorization", authz(&a.access))
+        .json(&json!({"content":"edited","expected_version":0}))
+        .send()
+        .await
+        .unwrap();
     let upd_a = next_of(&mut sa, "message_updated").await;
     let upd_b = next_of(&mut sb, "message_updated").await;
     assert_eq!(upd_a["message"]["content"], "edited");
     assert_eq!(upd_a["edit_version"].as_i64().unwrap(), 1);
     assert_eq!(upd_b["message"]["content"], "edited");
-    let ack = next_of(&mut sa, "op_ack").await;
-    assert_eq!(ack["client_op_id"].as_str().unwrap(), op.to_string());
 
-    // reaction_upsert：双端 reaction_update，reacted_by_me 逐接收者个性化
-    let op2 = uuid::Uuid::new_v4();
-    sa.send(WsMsg::Text(
-        json!({"type":"reaction_upsert","message_id":mid,"emoji":"👍","client_op_id":op2})
-            .to_string()
-            .into(),
+    // a 加 reaction → 双端 reaction_update，reacted_by_me 逐接收者个性化
+    c.put(format!(
+        "{base}/v1/messages/{mid}/reactions/{}",
+        urlencoded("👍")
     ))
+    .header("authorization", authz(&a.access))
+    .send()
     .await
     .unwrap();
     let rx_a = next_of(&mut sa, "reaction_update").await;
@@ -605,17 +586,13 @@ async fn lifecycle_ws_frames() {
         rx_a["message"]["reactions"][0]["count"].as_i64().unwrap(),
         1
     );
-    next_of(&mut sa, "op_ack").await;
 
-    // delete_message：双端墓碑帧（完整视图，seq/id 保留、正文已掩蔽）
-    let op3 = uuid::Uuid::new_v4();
-    sa.send(WsMsg::Text(
-        json!({"type":"delete_message","message_id":mid,"client_op_id":op3})
-            .to_string()
-            .into(),
-    ))
-    .await
-    .unwrap();
+    // 删除 → 双端墓碑帧（完整视图，seq/id 保留、正文已掩蔽）
+    c.delete(format!("{base}/v1/messages/{mid}"))
+        .header("authorization", authz(&a.access))
+        .send()
+        .await
+        .unwrap();
     let del_a = next_of(&mut sa, "message_deleted").await;
     let del_b = next_of(&mut sb, "message_deleted").await;
     assert_eq!(del_a["message"]["id"], mid);
@@ -624,7 +601,6 @@ async fn lifecycle_ws_frames() {
     assert_eq!(del_a["message"]["seq"].as_i64().unwrap(), 1);
     assert!(del_a["message"]["deleted_at"].is_string());
     assert!(del_a["edit_version"].as_i64().unwrap() >= 2);
-    next_of(&mut sa, "op_ack").await;
 }
 
 /// §8 反序安全回归：每个 mutation 帧都携带完整视图——
