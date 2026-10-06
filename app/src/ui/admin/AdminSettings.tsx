@@ -22,8 +22,10 @@ function inviteStatus(i: InviteView): { text: string; usable: boolean } {
   return { text: "可用", usable: i.usable };
 }
 
-/** 后台设置。part = "register"：注册模式 + 邀请码；"server"：配额、推送、会议、在线更新 */
-export default function AdminSettings({ part }: { part: "register" | "server" }) {
+export type AdminPart = "register" | "invites" | "quota" | "push" | "meeting" | "update";
+
+/** 后台设置的一页，对应后台菜单的一个子项 */
+export default function AdminSettings({ part }: { part: AdminPart }) {
   const [mode, setMode] = useState<RegistrationMode>("open");
   const [invites, setInvites] = useState<InviteView[]>([]);
   const [err, setErr] = useState("");
@@ -233,11 +235,12 @@ export default function AdminSettings({ part }: { part: "register" | "server" })
     }
   };
 
-  if (part === "server")
+  const errLine = err && <div className="auth-err">{err}</div>;
+
+  if (part === "quota")
     return (
       <div className="card ad-settings">
-        {err && <div className="auth-err">{err}</div>}
-        <h3>存储配额</h3>
+        {errLine}
         <div className="row ad-quota">
           <input
             className="ad-quota-input"
@@ -257,9 +260,15 @@ export default function AdminSettings({ part }: { part: "register" | "server" })
           >
             {quotaSaving ? "保存中…" : "保存配额"}
           </button>
+          {saved && <span className="muted ad-saved">已保存</span>}
         </div>
+      </div>
+    );
 
-        <h3>推送服务（ntfy）</h3>
+  if (part === "push")
+    return (
+      <div className="card ad-settings">
+        {errLine}
         <div className="ad-push">
           <input
             placeholder="ntfy 服务器地址，如 https://ntfy.sh（空 = 关闭推送）"
@@ -293,10 +302,16 @@ export default function AdminSettings({ part }: { part: "register" | "server" })
               {pushSaving ? "保存中…" : "保存推送设置"}
             </button>
             <span className="muted">令牌只写不读；用户只拿到随机订阅地址</span>
+            {saved && <span className="muted ad-saved">已保存</span>}
           </div>
         </div>
+      </div>
+    );
 
-        <h3>视频会议地址</h3>
+  if (part === "meeting")
+    return (
+      <div className="card ad-settings">
+        {errLine}
         <div className="row ad-quota">
           <input
             className="grow"
@@ -312,9 +327,15 @@ export default function AdminSettings({ part }: { part: "register" | "server" })
           >
             {meetingSaving ? "保存中…" : "保存"}
           </button>
+          {saved && <span className="muted ad-saved">已保存</span>}
         </div>
+      </div>
+    );
 
-        <h3>客户端在线更新</h3>
+  if (part === "update")
+    return (
+      <div className="card ad-settings">
+        {errLine}
         <div className="row ad-quota">
           <input
             className="grow"
@@ -330,33 +351,38 @@ export default function AdminSettings({ part }: { part: "register" | "server" })
           >
             {updateSaving ? "保存中…" : "保存"}
           </button>
+          {saved && <span className="muted ad-saved">已保存</span>}
         </div>
         <div className="muted">客户端从这个仓库的最新 Release 获取安装包，下载经本服务中转</div>
       </div>
     );
 
+  if (part === "register")
+    return (
+      <div className="card ad-settings">
+        {errLine}
+        <div className="row ad-mode">
+          {MODES.map((m) => (
+            <label key={m.v} className="ad-radio">
+              <input
+                type="radio"
+                name="reg-mode"
+                checked={mode === m.v}
+                disabled={switching}
+                onChange={() => void switchMode(m.v)}
+              />
+              {m.label}
+            </label>
+          ))}
+          {switching && <span className="muted">保存中…</span>}
+          {saved && <span className="muted ad-saved">已保存</span>}
+        </div>
+      </div>
+    );
+
   return (
     <div className="card ad-settings">
-      <h3>注册设置</h3>
-      {err && <div className="auth-err">{err}</div>}
-      <div className="row ad-mode">
-        {MODES.map((m) => (
-          <label key={m.v} className="ad-radio">
-            <input
-              type="radio"
-              name="reg-mode"
-              checked={mode === m.v}
-              disabled={switching}
-              onChange={() => void switchMode(m.v)}
-            />
-            {m.label}
-          </label>
-        ))}
-        {switching && <span className="muted">保存中…</span>}
-        {saved && <span className="muted ad-saved">已保存</span>}
-      </div>
-
-      <h3>邀请码</h3>
+      {errLine}
       <div className="row ad-invite-form">
         <select
           value={maxUses === null ? "inf" : String(maxUses)}

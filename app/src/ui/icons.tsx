@@ -22,6 +22,5 @@ export const BotIcon = () => svg("M12 8V4H8M4 8h16v12H4zM9 13v2M15 13v2");
 // 后台管理分类导航
 export const UsersIcon = () =>
   svg("M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M13 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0zM23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75");
-export const TicketIcon = () => svg("M3 7h18v4a2 2 0 0 0 0 4v4H3v-4a2 2 0 0 0 0-4zM13 7v12");
 export const ServerIcon = () => svg("M2 3h20v7H2zM2 14h20v7H2zM6 6.5h.01M6 17.5h.01");
 export const ArchiveIcon = () => svg("M21 8v13H3V8M1 3h22v5H1zM10 12h4");

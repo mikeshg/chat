@@ -6,7 +6,7 @@ import AdminSettings from "./AdminSettings";
 import Avatar from "../Avatar";
 import BackupPanel from "./BackupPanel";
 import SettingsShell from "../SettingsShell";
-import { ArchiveIcon, PollIcon, ServerIcon, TicketIcon, UsersIcon } from "../icons";
+import { ArchiveIcon, PollIcon, ServerIcon, UsersIcon } from "../icons";
 
 const PAGE = 50;
 
@@ -187,19 +187,31 @@ export default function AdminPanel() {
     <SettingsShell
       sections={[
         { id: "overview", label: "概览", icon: PollIcon, render: () => overview },
-        { id: "users", label: "用户", icon: UsersIcon, wide: true, render: () => userList },
         {
-          id: "register",
-          label: "注册与邀请",
-          icon: TicketIcon,
-          wide: true,
-          render: () => <AdminSettings part="register" />,
+          id: "user-mgmt",
+          label: "用户管理",
+          icon: UsersIcon,
+          children: [
+            { id: "users", label: "用户列表", wide: true, render: () => userList },
+            { id: "register", label: "注册模式", render: () => <AdminSettings part="register" /> },
+            {
+              id: "invites",
+              label: "邀请码",
+              wide: true,
+              render: () => <AdminSettings part="invites" />,
+            },
+          ],
         },
         {
           id: "server",
           label: "服务器设置",
           icon: ServerIcon,
-          render: () => <AdminSettings part="server" />,
+          children: [
+            { id: "quota", label: "存储配额", render: () => <AdminSettings part="quota" /> },
+            { id: "push", label: "推送服务（ntfy）", render: () => <AdminSettings part="push" /> },
+            { id: "meeting", label: "视频会议", render: () => <AdminSettings part="meeting" /> },
+            { id: "update", label: "客户端在线更新", render: () => <AdminSettings part="update" /> },
+          ],
         },
         { id: "backup", label: "备份与恢复", icon: ArchiveIcon, render: () => <BackupPanel /> },
       ]}
