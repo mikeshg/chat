@@ -1010,3 +1010,23 @@ input.switch:focus-visible { outline: 2px solid var(--green); outline-offset: 2p
 .seg-opt.on { background: var(--panel); color: var(--text); box-shadow: 0 1px 2px var(--shadow-soft); }
 .seg-opt input { position: absolute; opacity: 0; width: 0; height: 0; margin: 0; }
 .seg-opt:has(input:focus-visible) { outline: 2px solid var(--green); }
+
+/* ===== T2：菜单视口夹紧 / 会话列表让位 / 窄屏消息工具栏 ===== */
+/* 右键菜单比视口高时改为内部滚动，保证底部项可点（定位夹紧见 ui/chat/menuPos.ts） */
+.ctx-menu { max-height: calc(100vh - 8px); overflow-y: auto; }
+
+/* 会话列表：悬停/键盘聚焦显出 ⋯ 按钮时，右侧时间与未读数左移让位，不再被按钮盖住 */
+.conv-item:hover .conv-right,
+.conv-item:focus-within .conv-right { margin-right: 30px; }
+
+/* 窄屏：悬停工具栏会盖住上一条消息，改为不显示；操作走长按/右键菜单。
+   表情选择器（.open 由「表情」菜单项显式打开，不靠悬停）改为在气泡内侧占行，
+   不遮任何消息。 */
+@media (max-width: 720px) {
+  .bubble-wrap:hover > .msg-actions:not(.open),
+  .msg-actions:focus-within:not(.open) { display: none; }
+  .msg-actions.open {
+    position: static; display: flex; flex-wrap: wrap; max-width: 100%;
+    margin-bottom: 4px;
+  }
+}

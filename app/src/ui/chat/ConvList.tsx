@@ -13,6 +13,7 @@ import {
 import type { ConversationView, PrefUpdate } from "../../types";
 import { openConversation } from "../../ws";
 import { convPreview } from "./convPreview";
+import CtxMenu from "./CtxMenu";
 import NewGroupModal from "./NewGroupModal";
 import SearchPanel from "./SearchPanel";
 import Avatar from "../Avatar";
@@ -63,12 +64,8 @@ export default function ConvList() {
     e.preventDefault();
     e.stopPropagation();
     setMenuErr(null);
-    // 窄屏收敛：菜单不超出右/下边缘
-    setMenu({
-      x: Math.min(e.clientX, window.innerWidth - 140),
-      y: Math.min(e.clientY, window.innerHeight - 200),
-      c,
-    });
+    // 菜单位置交给 CtxMenu 按真实尺寸翻转/夹紧
+    setMenu({ x: e.clientX, y: e.clientY, c });
   };
 
   /** 偏好提交：服务端确认后合并（不乐观回滚）；同会话一次一个 */
@@ -233,66 +230,60 @@ export default function ConvList() {
 
       {/* 会话偏好菜单：置顶 / 静音 / 归档（右键或 ⋯ 按钮打开） */}
       {menu && (
-        <div
-          className="ctx-mask"
-          onClick={() => setMenu(null)}
-          onContextMenu={(e) => e.preventDefault()}
-        >
-          <div className="ctx-menu" style={{ left: menu.x, top: menu.y }}>
+        <CtxMenu x={menu.x} y={menu.y} onClose={() => setMenu(null)}>
+          <button
+            className="ctx-item"
+            disabled={menuBusy}
+            onClick={() => void submitPref(menu.c.id, { pinned: !isPinned(menu.c) })}
+          >
+            {isPinned(menu.c) ? "取消置顶" : "置顶"}
+          </button>
+          {isMuted(menu.c) ? (
             <button
               className="ctx-item"
               disabled={menuBusy}
-              onClick={() => void submitPref(menu.c.id, { pinned: !isPinned(menu.c) })}
+              onClick={() => void submitPref(menu.c.id, { mute: { mode: "none" } })}
             >
-              {isPinned(menu.c) ? "取消置顶" : "置顶"}
+              取消静音{menu.c.preference?.mute_forever ? "（永久）" : ""}
             </button>
-            {isMuted(menu.c) ? (
+          ) : (
+            <>
               <button
                 className="ctx-item"
                 disabled={menuBusy}
-                onClick={() => void submitPref(menu.c.id, { mute: { mode: "none" } })}
+                onClick={() =>
+                  void submitPref(menu.c.id, { mute: { mode: "until", until: muteOneHour() } })
+                }
               >
-                取消静音{menu.c.preference?.mute_forever ? "（永久）" : ""}
+                静音 1 小时
               </button>
-            ) : (
-              <>
-                <button
-                  className="ctx-item"
-                  disabled={menuBusy}
-                  onClick={() =>
-                    void submitPref(menu.c.id, { mute: { mode: "until", until: muteOneHour() } })
-                  }
-                >
-                  静音 1 小时
-                </button>
-                <button
-                  className="ctx-item"
-                  disabled={menuBusy}
-                  onClick={() =>
-                    void submitPref(menu.c.id, { mute: { mode: "until", until: muteToday() } })
-                  }
-                >
-                  静音至明天
-                </button>
-                <button
-                  className="ctx-item"
-                  disabled={menuBusy}
-                  onClick={() => void submitPref(menu.c.id, { mute: { mode: "forever" } })}
-                >
-                  永久静音
-                </button>
-              </>
-            )}
-            <button
-              className="ctx-item"
-              disabled={menuBusy}
-              onClick={() => void submitPref(menu.c.id, { archived: !isArchived(menu.c) })}
-            >
-              {isArchived(menu.c) ? "取消归档" : "归档"}
-            </button>
-            {menuErr && <div className="ctx-err">{menuErr}</div>}
-          </div>
-        </div>
+              <button
+                className="ctx-item"
+                disabled={menuBusy}
+                onClick={() =>
+                  void submitPref(menu.c.id, { mute: { mode: "until", until: muteToday() } })
+                }
+              >
+                静音至明天
+              </button>
+              <button
+                className="ctx-item"
+                disabled={menuBusy}
+                onClick={() => void submitPref(menu.c.id, { mute: { mode: "forever" } })}
+              >
+                永久静音
+              </button>
+            </>
+          )}
+          <button
+            className="ctx-item"
+            disabled={menuBusy}
+            onClick={() => void submitPref(menu.c.id, { archived: !isArchived(menu.c) })}
+          >
+            {isArchived(menu.c) ? "取消归档" : "归档"}
+          </button>
+          {menuErr && <div className="ctx-err">{menuErr}</div>}
+        </CtxMenu>
       )}
     </aside>
   );
