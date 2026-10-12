@@ -1,0 +1,294 @@
+// ===== T5：多服务器本地存储 =====
+// 一个浏览器里可以保存多个服务器地址，各自的登录凭据、会话快照、待发消息、草稿
+// 完全隔离。键名一律用 encodeURIComponent(规范化地址) 作一段，保证「服务器」
+// 部分不含 : 或 /，键名分段永不串位：
+//   chat_servers                  → ServerEntry[]（最近使用在前）
+//   chat_auth:<enc>               → StoredAuth（该服务器的登录凭据）
+//   chat_cache:<enc>:<uid>        → 会话/消息快照（localCache.ts）
+//   chat_outbox:<enc>:<uid>       → 未发出的消息（ws.ts）
+//   chat_drafts:<enc>:<uid>       → 输入草稿（drafts.ts）
+//   sessionStorage chat_cur_server        → 本标签页当前服务器（规范化地址）
+//   sessionStorage chat_kick_reason:<enc> → 该服务器的被踢提示（一次性）
+
+import type { UserPublic } from "./types";
+
+/** localStorage 最小接口；真实 Storage 与内存替身都满足 */
+export interface Stor {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+  readonly length?: number;
+  key?(index: number): string | null;
+}
+
+// ---------- 地址规范化 ----------
+// 无协议补 http://；主机小写；去默认端口（:80 对 http、:443 对 https）；
+// 去尾斜杠、保留路径；http 与 https 是不同条目；localhost 与 127.0.0.1 不合并。
+const SCHEME_RE = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//;
+
+export function normalizeServerUrl(input: string | null | undefined): string | null {
+  let s = (input ?? "").trim();
+  if (!s) return null;
+  if (!SCHEME_RE.test(s)) s = `http://${s}`;
+  let u: URL;
+  try {
+    u = new URL(s);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+  // URL 解析已小写主机名、去默认端口；这里只收尾斜杠（路径保留）
+  const path = u.pathname.replace(/\/+$/, "");
+  return `${u.protocol}//${u.host}${path}`;
+}
+
+/** 键名里的服务器段：编码后不含 : 或 /，与 :uid 分段永不冲突 */
+export function encServer(normalized: string): string {
+  return encodeURIComponent(normalized);
+}
+
+// ---------- 服务器列表 ----------
+export interface ServerEntry {
+  /** 规范化地址，唯一键 */
+  url: string;
+  /** 显示名（可选；Web 同源条目由 UI 显示「本站」） */
+  name?: string;
+  /** 最近登录成功的用户名 */
+  username?: string;
+  /** 最近使用时间戳；列表按它倒序 */
+  lastUsedAt: number;
+}
+
+const LS_SERVERS = "chat_servers";
+
+/** 读服务器列表（最近使用在前）；损坏数据按空处理 */
+export function listServers(storage: Stor): ServerEntry[] {
+  try {
+    const raw = storage.getItem(LS_SERVERS);
+    if (!raw) return [];
+    const v: unknown = JSON.parse(raw);
+    if (!Array.isArray(v)) return [];
+    const out: ServerEntry[] = [];
+    for (const e of v) {
+      if (e && typeof e === "object" && typeof (e as ServerEntry).url === "string") {
+        out.push({
+          url: (e as ServerEntry).url,
+          name: typeof (e as ServerEntry).name === "string" ? (e as ServerEntry).name : undefined,
+          username:
+            typeof (e as ServerEntry).username === "string"
+              ? (e as ServerEntry).username
+              : undefined,
+          lastUsedAt:
+            typeof (e as ServerEntry).lastUsedAt === "number"
+              ? (e as ServerEntry).lastUsedAt
+              : 0,
+        });
+      }
+    }
+    out.sort((a, b) => b.lastUsedAt - a.lastUsedAt);
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+function saveServers(storage: Stor, list: ServerEntry[]) {
+  try {
+    storage.setItem(LS_SERVERS, JSON.stringify(list));
+  } catch {}
+}
+
+/** 新增/更新条目并顶到最近使用最前；patch 里未给的字段保留原值 */
+export function upsertServer(
+  storage: Stor,
+  url: string,
+  patch: Partial<Omit<ServerEntry, "url">>,
+): ServerEntry[] {
+  const list = listServers(storage);
+  const i = list.findIndex((s) => s.url === url);
+  const entry: ServerEntry = {
+    ...(i >= 0 ? list[i] : { url }),
+    ...patch,
+    url,
+    lastUsedAt: patch.lastUsedAt ?? Date.now(),
+  };
+  if (i >= 0) list.splice(i, 1);
+  list.unshift(entry);
+  saveServers(storage, list);
+  return list;
+}
+
+export function removeServerEntry(storage: Stor, url: string) {
+  saveServers(storage, listServers(storage).filter((s) => s.url !== url));
+}
+
+// ---------- 凭据 chat_auth:<enc> ----------
+export interface StoredAuth {
+  access: string;
+  refresh: string;
+  user: UserPublic;
+}
+
+export function authKey(scope: string): string {
+  return `chat_auth:${scope}`;
+}
+
+export function kickReasonKey(scope: string): string {
+  return `chat_kick_reason:${scope}`;
+}
+
+/** 读某服务器的登录凭据；缺失/损坏/形态不对一律 null */
+export function readAuth(storage: Stor, scope: string): StoredAuth | null {
+  try {
+    const raw = storage.getItem(authKey(scope));
+    if (!raw) return null;
+    const v: unknown = JSON.parse(raw);
+    const o = v as Partial<StoredAuth> | null;
+    if (!o || typeof o !== "object") return null;
+    if (typeof o.refresh !== "string" || !o.refresh) return null;
+    if (!o.user || typeof o.user !== "object" || typeof o.user.id !== "string") return null;
+    return {
+      access: typeof o.access === "string" ? o.access : "",
+      refresh: o.refresh,
+      user: o.user,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function writeAuth(storage: Stor, scope: string, auth: StoredAuth) {
+  try {
+    storage.setItem(authKey(scope), JSON.stringify(auth));
+  } catch {}
+}
+
+export function clearAuth(storage: Stor, scope: string) {
+  try {
+    storage.removeItem(authKey(scope));
+  } catch {}
+}
+
+// ---------- 删除服务器：清掉它名下的全部本地数据 ----------
+// 只认 `<prefix>:<enc>:`（带尾冒号）开头的键：enc 本身无冒号，
+// 别的服务器的 enc 即使以它为前缀也接不上冒号，不会误匹配。
+const DATA_PREFIXES = ["chat_cache:", "chat_outbox:", "chat_drafts:"];
+
+export function removeServerData(storage: Stor, scope: string) {
+  try {
+    storage.removeItem(authKey(scope));
+    const doomed = [authKey(scope)];
+    const prefixes = DATA_PREFIXES.map((p) => `${p}${scope}:`);
+    for (let i = 0; i < (storage.length ?? 0); i++) {
+      const k = storage.key?.(i);
+      if (k && prefixes.some((p) => k.startsWith(p))) doomed.push(k);
+    }
+    doomed.forEach((k) => storage.removeItem(k));
+  } catch {}
+}
+
+// ---------- 旧版键一次性迁移 ----------
+// 旧版（多服务器支持之前）布局：
+//   chat_access / chat_refresh / chat_user   全局凭据，属于当时的 chat_server_url
+//   chat_server_url                          已配置的服务器地址（未规范化）
+//   chat_cache:<raw>:<uid> / chat_outbox:<raw>:<uid>   服务器段是未编码原始地址
+//   chat_drafts:<uid>                        无服务器段，属于当时的服务器
+// 迁移：凭据与无服务器段的草稿归到「当前服务器」（调用方已解析好，同源部署时
+// 必须等于 location.origin）；cache/outbox 按各自内嵌的原始服务器地址规范化
+// 重编码——它们的 convId/userId 只属于原服务器，搬到别的服务器会串号，未发出的
+// outbox 更是会发错地方。迁移后旧键一律删除；重跑幂等。
+const LEGACY_KEYS = ["chat_access", "chat_refresh", "chat_user", "chat_server_url"];
+
+function enumKeys(storage: Stor): string[] {
+  const keys: string[] = [];
+  for (let i = 0; i < (storage.length ?? 0); i++) {
+    const k = storage.key?.(i);
+    if (k) keys.push(k);
+  }
+  return keys;
+}
+
+function moveKey(storage: Stor, oldKey: string, newKey: string) {
+  try {
+    if (newKey !== oldKey) {
+      const v = storage.getItem(oldKey);
+      // 新键已有值时以新键为准，不覆盖
+      if (v != null && storage.getItem(newKey) == null) storage.setItem(newKey, v);
+    }
+  } catch {
+  } finally {
+    try {
+      storage.removeItem(oldKey);
+    } catch {}
+  }
+}
+
+export function migrateLegacyStorage(storage: Stor, current: string): void {
+  try {
+    const keys = enumKeys(storage);
+    const discovered = new Set<string>([current]);
+
+    // 1) 全局凭据 → chat_auth:<enc(current)>（只迁齐 refresh+user 的，残缺直接丢）
+    const refresh = storage.getItem("chat_refresh");
+    const userRaw = storage.getItem("chat_user");
+    if (refresh && userRaw) {
+      try {
+        const u = JSON.parse(userRaw) as UserPublic;
+        if (u && typeof u.id === "string") {
+          const scope = encServer(current);
+          if (readAuth(storage, scope) == null) {
+            writeAuth(storage, scope, {
+              access: storage.getItem("chat_access") ?? "",
+              refresh,
+              user: u,
+            });
+          }
+        }
+      } catch {}
+    }
+
+    // 2) cache / outbox：按内嵌的原始服务器重编码归位
+    for (const key of keys) {
+      for (const prefix of ["chat_cache:", "chat_outbox:"]) {
+        if (!key.startsWith(prefix)) continue;
+        const rest = key.slice(prefix.length);
+        const cut = rest.lastIndexOf(":");
+        if (cut <= 0) break; // 形态不对，不动它
+        const srv = rest.slice(0, cut);
+        const uid = rest.slice(cut + 1);
+        // 服务器段含 / 或 : → 旧版未编码地址；无 → 已是 enc 新键
+        if (!/[/:]/.test(srv)) break;
+        const norm = normalizeServerUrl(srv);
+        if (!norm) {
+          storage.removeItem(key); // 地址救不回，快照留着也归不了档
+          break;
+        }
+        discovered.add(norm);
+        moveKey(storage, key, `${prefix}${encServer(norm)}:${uid}`);
+        break;
+      }
+      if (key.startsWith("chat_drafts:")) {
+        const rest = key.slice("chat_drafts:".length);
+        if (!rest.includes(":")) {
+          // 无服务器段的旧草稿 → 当前服务器
+          moveKey(storage, key, `chat_drafts:${encServer(current)}:${rest}`);
+        }
+      }
+    }
+
+    // 3) 服务器列表：发现的地址补进列表（当前服务器最后 upsert → 排在最前）
+    const now = Date.now();
+    for (const url of [...discovered].filter((u) => u !== current).concat(current)) {
+      if (!listServers(storage).some((s) => s.url === url)) {
+        upsertServer(storage, url, { lastUsedAt: now });
+      }
+    }
+
+    // 4) 删旧键
+    LEGACY_KEYS.forEach((k) => {
+      try {
+        storage.removeItem(k);
+      } catch {}
+    });
+  } catch {}
+}

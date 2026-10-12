@@ -5,27 +5,12 @@ import {
   getRecent,
   readLocalCache,
   removeLocalCache,
-  removeLocalCacheForUser,
   seedRecent,
   touchRecent,
   writeLocalCache,
 } from "./localCache";
 import type { ConversationView, MessageView } from "./types";
-
-/** 内存版 localStorage（可按需注入坏数据/抛错） */
-function memStorage(initial: Record<string, string> = {}) {
-  const m = new Map(Object.entries(initial));
-  return {
-    getItem: (k: string) => (m.has(k) ? m.get(k)! : null),
-    setItem: (k: string, v: string) => void m.set(k, v),
-    removeItem: (k: string) => void m.delete(k),
-    get length() {
-      return m.size;
-    },
-    key: (i: number) => [...m.keys()][i] ?? null,
-    raw: m,
-  };
-}
+import { memStorage } from "./testStorage";
 
 const conv = (id: string): ConversationView => ({
   id,
@@ -61,11 +46,11 @@ const msg = (id: string, seq: number, content = "hello"): MessageView => ({
   created_at: "2026-01-01T00:00:00Z",
 });
 
-describe("本地会话缓存（localStorage chat_cache:<server>:<userId>）", () => {
+describe("本地会话缓存（localStorage chat_cache:<enc(server)>:<userId>）", () => {
   it("键名按服务器 + 用户隔离", () => {
-    expect(cacheKey("http://a", "u1")).toBe("chat_cache:http://a:u1");
-    expect(cacheKey("http://a", "u1")).not.toBe(cacheKey("http://b", "u1"));
-    expect(cacheKey("http://a", "u1")).not.toBe(cacheKey("http://a", "u2"));
+    expect(cacheKey("http%3A%2F%2Fa", "u1")).toBe("chat_cache:http%3A%2F%2Fa:u1");
+    expect(cacheKey("enc-a", "u1")).not.toBe(cacheKey("enc-b", "u1"));
+    expect(cacheKey("enc-a", "u1")).not.toBe(cacheKey("enc-a", "u2"));
   });
 
   it("写入→读回：会话列表与消息往返一致", () => {
@@ -148,13 +133,13 @@ describe("本地会话缓存（localStorage chat_cache:<server>:<userId>）", ()
     expect(readLocalCache(st, key)).toBeNull();
   });
 
-  it("removeLocalCacheForUser 删除该用户在全部服务器键下的快照", () => {
+  it("removeLocalCache 只删精确键，不跨服务器误删（T5：清理按服务器隔离）", () => {
     const st = memStorage();
-    const keys = [cacheKey("http://a", "u1"), cacheKey("http://b", "u1"), cacheKey("http://a", "u2")];
+    const keys = [cacheKey("enc-a", "u1"), cacheKey("enc-b", "u1"), cacheKey("enc-a", "u2")];
     for (const k of keys) writeLocalCache(st, k, { conversations: [conv("c")], messages: {}, recent: [] });
-    removeLocalCacheForUser(st, "u1");
+    removeLocalCache(st, keys[0]);
     expect(st.raw.has(keys[0])).toBe(false);
-    expect(st.raw.has(keys[1])).toBe(false);
+    expect(st.raw.has(keys[1])).toBe(true); // 别的服务器不受影响
     expect(st.raw.has(keys[2])).toBe(true); // 别的用户不受影响
   });
 

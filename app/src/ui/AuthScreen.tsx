@@ -1,7 +1,23 @@
 import { useEffect, useState } from "react";
-import { auth, getServer, saveSession, serverInfo, setServer } from "../api";
+import {
+  auth,
+  confirmServerRemove,
+  getServer,
+  inTauri,
+  isSameOriginServer,
+  listServers,
+  normalizeServerUrl,
+  removeServer,
+  saveSession,
+  serverInfo,
+  serverLabel,
+  serverScope,
+  setServer,
+  takeKickReason,
+} from "../api";
 import { readDrafts } from "../drafts";
 import { parseInviteParam } from "../invite";
+import type { ServerEntry } from "../servers";
 import { setState } from "../store";
 import type { RegistrationMode } from "../types";
 import { startWs } from "../ws";
@@ -19,17 +35,11 @@ export default function AuthScreen() {
   const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
   const [server, setServerUrl] = useState(getServer());
-  const [err, setErr] = useState(() => {
-    // 被踢下线（禁用/改密）的提示只显示一次
-    const r = sessionStorage.getItem("chat_kick_reason");
-    if (r) sessionStorage.removeItem("chat_kick_reason");
-    return r ?? "";
-  });
+  const [servers, setServers] = useState<ServerEntry[]>(() => listServers());
+  const [err, setErr] = useState(takeKickReason);
   const [busy, setBusy] = useState(false);
-  // 服务器地址收在卡片下方，默认折叠；桌面端未配置时直接展开
-  const [editServer, setEditServer] = useState(
-    () => "__TAURI_INTERNALS__" in window && !getServer(),
-  );
+  // 服务器地址收在卡片下方，默认折叠
+  const [editServer, setEditServer] = useState(false);
 
   // 挂载时 + 服务器地址输入变化（防抖 ~500ms）探测目标服务器的注册模式；
   // 探测失败按 open（serverInfo 内部已兜底）
@@ -50,19 +60,60 @@ export default function AuthScreen() {
   const effMode = regMode === "closed" ? "login" : mode;
 
   // 桌面壳的页面来自 tauri://localhost，没有「同源服务器」，地址留空只会连到自己
-  const desktop = "__TAURI_INTERNALS__" in window;
+  const desktop = inTauri();
+  const cur = getServer();
+
+  /** 选中列表里的服务器（本标签页换到它；登录成功才会进列表顶部排序） */
+  const pick = (url: string) => {
+    setServer(url);
+    setServerUrl(getServer());
+    setErr("");
+    setEditServer(false);
+  };
+
+  /** 删除已保存的服务器条目：凭据/缓存/未发出的消息一并清掉 */
+  const drop = (sv: ServerEntry) => {
+    if (!confirmServerRemove(sv)) return;
+    const fallback = removeServer(sv.url);
+    setServers(listServers());
+    if (sv.url === cur) {
+      // 删的是当前选中的：换到最近使用的另一个（没有则默认）
+      setServer(fallback);
+      setServerUrl(getServer());
+    }
+  };
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErr("");
-    if (desktop && !server.trim()) {
-      setErr("请填写服务器地址，如 http://192.168.1.5:28080");
+    // Web 端地址留空 = 本站；桌面端必须显式填地址
+    const input = server.trim();
+    const norm = input
+      ? normalizeServerUrl(input)
+      : desktop
+        ? null
+        : normalizeServerUrl(location.origin);
+    if (!norm) {
+      setErr(
+        input
+          ? "服务器地址格式不对，如 http://192.168.1.5:28080"
+          : "请填写服务器地址，如 http://192.168.1.5:28080",
+      );
       setEditServer(true);
+      return;
+    }
+    // https 页面连 http 服务器会被浏览器拦截，先说清楚再放行
+    if (
+      !desktop &&
+      location.protocol === "https:" &&
+      norm.startsWith("http://") &&
+      !window.confirm("浏览器会阻止 https 页面访问 http 服务器，仍要继续吗？")
+    ) {
       return;
     }
     setBusy(true);
     try {
-      setServer(server);
+      setServer(norm);
       const r =
         effMode === "login"
           ? await auth.login(username.trim(), password)
@@ -73,13 +124,13 @@ export default function AuthScreen() {
               inviteCode.trim() || undefined,
             );
       saveSession(r);
-      setState({ me: r.user, drafts: readDrafts(localStorage, r.user.id) });
+      setState({ me: r.user, drafts: readDrafts(localStorage, serverScope(), r.user.id) });
       void startWs();
     } catch (ex) {
       // fetch 连不上时只抛 TypeError（Safari 写作 "Load failed"），带上地址才好排查
       setErr(
         ex instanceof TypeError
-          ? `连不上服务器 ${server.trim() || location.origin}`
+          ? `连不上服务器 ${norm}`
           : ex instanceof Error
             ? ex.message
             : "请求失败",
@@ -147,27 +198,66 @@ export default function AuthScreen() {
         </form>
         <div className="auth-server">
           {editServer ? (
-            <input
-              autoFocus
-              placeholder={
-                desktop
-                  ? "服务器地址，如 http://192.168.1.5:28080"
-                  : "服务器地址（同源部署可留空，如 http://192.168.1.5:28080）"
-              }
-              value={server}
-              onChange={(e) => setServerUrl(e.target.value)}
-              onBlur={() => {
-                setServer(server); // 不点登录也记住
+            <div
+              className="auth-server-form"
+              onBlur={(e) => {
+                // 焦点移到表单内（列表选择/删除按钮）不收起；点出表单才收起并记住地址
+                if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+                const n = normalizeServerUrl(server);
+                if (n) setServer(n); // 不点登录也记住
                 if (server.trim()) setEditServer(false);
               }}
-            />
+            >
+              <input
+                autoFocus
+                placeholder={
+                  desktop
+                    ? "服务器地址，如 http://192.168.1.5:28080"
+                    : "服务器地址（留空用本站，如 http://192.168.1.5:28080）"
+                }
+                value={server}
+                onChange={(e) => setServerUrl(e.target.value)}
+              />
+              {servers.length > 0 && (
+                <div className="auth-server-list">
+                  {servers.map((sv) => (
+                    <div className="auth-server-item" key={sv.url}>
+                      <button
+                        type="button"
+                        className="auth-server-pick"
+                        onClick={() => pick(sv.url)}
+                      >
+                        <span>
+                          {serverLabel(sv.url, sv)}
+                          {sv.url === cur && <span className="muted">（当前）</span>}
+                        </span>
+                        <span className="muted">
+                          {serverLabel(sv.url, sv) !== sv.url && `${sv.url} · `}
+                          {sv.username ? `@${sv.username}` : "未登录"}
+                        </span>
+                      </button>
+                      {!isSameOriginServer(sv.url) && (
+                        <button
+                          type="button"
+                          className="auth-server-del"
+                          title={`删除 ${sv.url}`}
+                          onClick={() => drop(sv)}
+                        >
+                          ×
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           ) : (
             <button
               type="button"
               className="auth-switch"
               onClick={() => setEditServer(true)}
             >
-              服务器：{server.trim() || "同源"} · 修改
+              服务器：{serverLabel(cur, servers.find((s) => s.url === cur))} · 修改
             </button>
           )}
         </div>

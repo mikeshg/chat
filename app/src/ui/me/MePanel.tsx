@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { auth, getServer } from "../../api";
+import { auth } from "../../api";
 import { setState, useApp } from "../../store";
 import { stopWs } from "../../ws";
 import { BellIcon, BotIcon, SlidersIcon, UserIcon } from "../icons";
@@ -13,7 +13,8 @@ import StorageUsage from "./StorageUsage";
 import AvatarSetting from "./AvatarSetting";
 import BotSettings from "./BotSettings";
 import UpdateSetting from "./UpdateSetting";
-import SetRow, { SetGroup } from "./SetRow";
+import ServerSetting from "./ServerSetting";
+import { SetGroup } from "./SetRow";
 
 /** 「我」页：账号、通用、通知、机器人 */
 export default function MePanel() {
@@ -109,19 +110,13 @@ function AccountSection() {
 }
 
 function GeneralSection() {
-  const s = useApp();
   return (
     <SetGroup>
       <UpdateSetting />
       <AutostartSetting />
       <ThemeSetting />
       <StorageUsage />
-      <SetRow label="服务器" desc={getServer() || "同源"}>
-        <span className="set-value">
-          <span className={`dot${s.wsReady ? " on" : ""}`} />
-          {s.wsReady ? "已连接" : "未连接"}
-        </span>
-      </SetRow>
+      <ServerSetting />
     </SetGroup>
   );
 }

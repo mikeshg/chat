@@ -1,20 +1,25 @@
 // ===== V2 P1-3 =====
-// 按会话草稿的本地持久化：localStorage 键 chat_drafts:<userId>，JSON 对象 {convId: text}。
-// 读写都吞异常（隐私模式/损坏数据按空处理），换账号天然隔离。
+// 按会话草稿的本地持久化：localStorage 键 chat_drafts:<enc(server)>:<userId>，
+// JSON 对象 {convId: text}。读写都吞异常（隐私模式/损坏数据按空处理），
+// 换服务器/换账号天然隔离。
 
 export interface DraftStorage {
   getItem(key: string): string | null;
   setItem(key: string, value: string): void;
 }
 
-export function draftsKey(userId: string): string {
-  return `chat_drafts:${userId}`;
+export function draftsKey(scope: string, userId: string): string {
+  return `chat_drafts:${scope}:${userId}`;
 }
 
-/** 读取某用户的草稿表；缺失/损坏/类型不对一律返回 {} */
-export function readDrafts(storage: DraftStorage, userId: string): Record<string, string> {
+/** 读取某用户在某服务器上的草稿表；缺失/损坏/类型不对一律返回 {} */
+export function readDrafts(
+  storage: DraftStorage,
+  scope: string,
+  userId: string,
+): Record<string, string> {
   try {
-    const raw = storage.getItem(draftsKey(userId));
+    const raw = storage.getItem(draftsKey(scope, userId));
     if (!raw) return {};
     const v: unknown = JSON.parse(raw);
     if (!v || typeof v !== "object" || Array.isArray(v)) return {};
@@ -28,14 +33,15 @@ export function readDrafts(storage: DraftStorage, userId: string): Record<string
   }
 }
 
-/** 覆写某用户的草稿表（失败静默，不阻塞输入） */
+/** 覆写某用户在某服务器上的草稿表（失败静默，不阻塞输入） */
 export function writeDrafts(
   storage: DraftStorage,
+  scope: string,
   userId: string,
   drafts: Record<string, string>,
 ): void {
   try {
-    storage.setItem(draftsKey(userId), JSON.stringify(drafts));
+    storage.setItem(draftsKey(scope, userId), JSON.stringify(drafts));
   } catch {}
 }
 

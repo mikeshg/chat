@@ -378,7 +378,9 @@ export function flushDrafts() {
     draftTimer = null;
   }
   const { me, drafts } = getState();
-  if (me && typeof localStorage !== "undefined") writeDrafts(localStorage, me.id, drafts);
+  if (me && typeof localStorage !== "undefined") {
+    writeDrafts(localStorage, serverScope(), me.id, drafts);
+  }
 }
 
 /** 置顶优先：置顶块内按 pinned_at DESC，其余按原活动时间 DESC，id 兜底保序 */

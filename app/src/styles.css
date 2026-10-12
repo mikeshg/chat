@@ -103,6 +103,22 @@ input:focus, textarea:focus { border-color: var(--green); }
 .auth-server { width: 340px; display: flex; justify-content: center; }
 .auth-server input { width: 100%; }
 .auth-server .auth-switch { color: var(--muted); font-size: 13px; }
+/* T5：已保存服务器列表（登录页） */
+.auth-server-form { width: 100%; display: flex; flex-direction: column; gap: 8px; }
+.auth-server-list { display: flex; flex-direction: column; gap: 2px; }
+.auth-server-item { display: flex; align-items: center; gap: 4px; }
+.auth-server-pick {
+  flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start;
+  gap: 2px; padding: 6px 8px; border: none; background: transparent; border-radius: 6px;
+  font-size: 13px; text-align: left; cursor: pointer;
+}
+.auth-server-pick:hover { background: var(--bg); }
+.auth-server-pick .muted { font-size: 12px; overflow-wrap: anywhere; }
+.auth-server-del {
+  border: none; background: transparent; color: var(--muted); font-size: 16px;
+  padding: 4px 8px; border-radius: 6px; cursor: pointer; flex-shrink: 0;
+}
+.auth-server-del:hover { color: var(--danger); background: var(--bg); }
 
 /* ---------- 主框架 ---------- */
 .shell { display: flex; height: 100%; }
@@ -996,6 +1012,14 @@ button.st-nav-item.sub { padding-left: 40px; font-size: 13px; }
 .bot-help p { margin: 0; }
 .set-logout-card { margin-top: 22px; }
 button.set-logout { width: 100%; border: none; border-radius: 0; padding: 14px; color: var(--danger); font-size: 14px; }
+/* T5：切换服务器面板（「我」页通用） */
+.srv-panel { gap: 4px; }
+.srv-item { display: flex; align-items: center; gap: 10px; padding: 6px 0; }
+.srv-item .grow { flex: 1; min-width: 0; }
+.srv-item .muted { font-size: 12px; overflow-wrap: anywhere; }
+.srv-item button { flex-shrink: 0; }
+.srv-add { display: flex; gap: 8px; margin-top: 6px; }
+.srv-add input { flex: 1; min-width: 0; }
 
 /* 开关 */
 input.switch {

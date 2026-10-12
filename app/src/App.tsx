@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { auth, loadSession, serverScope } from "./api";
+import { auth, clearSkipAutoLogin, hasSkipAutoLogin, loadSession, serverScope } from "./api";
 import { readDrafts } from "./drafts";
 import { cacheKey, clearRecent, readLocalCache, seedRecent } from "./localCache";
 import { syncWindowTitle, unreadTitle } from "./notify";
@@ -10,7 +10,9 @@ import ChatScreen from "./ui/ChatScreen";
 
 export default function App() {
   const s = useApp();
-  const [booting, setBooting] = useState(!!loadSession());
+  // 删了当前服务器的重载要停在登录页（标记到挂载后才消费，防初始化器重跑吃掉它）
+  const [booting, setBooting] = useState(() => !hasSkipAutoLogin() && !!loadSession());
+  useEffect(() => clearSkipAutoLogin(), []);
 
   useEffect(() => {
     const onLogout = () => {
@@ -45,7 +47,7 @@ export default function App() {
     (async () => {
       try {
         const me = await auth.me();
-        setState({ me, drafts: readDrafts(localStorage, me.id) });
+        setState({ me, drafts: readDrafts(localStorage, serverScope(), me.id) });
         void startWs();
       } catch {
         // 凭据被明确拒绝时 api 层已清掉会话（loadSession 为空）→ 回登录页；
@@ -57,7 +59,7 @@ export default function App() {
           if (snap) seedRecent(snap.recent);
           setState({
             me: cached,
-            drafts: readDrafts(localStorage, cached.id),
+            drafts: readDrafts(localStorage, serverScope(), cached.id),
             conversations: snap?.conversations ?? [],
             messages: snap?.messages ?? {},
           });

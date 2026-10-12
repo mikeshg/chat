@@ -10,6 +10,7 @@ import {
   wsBase,
 } from "./api";
 import { notifyIncoming } from "./notify";
+import { kickReasonKey } from "./servers";
 import {
   absorbAvatarUsers,
   applyLiveMessage,
@@ -453,8 +454,8 @@ function dispatch(f: WsOut) {
       );
       break;
     case "force_logout": {
-      // 被踢下线（禁用/重置密码/改密/移出设备）：记录原因 → 停连接 → 回登录页
-      sessionStorage.setItem("chat_kick_reason", kickReasonText(f.reason));
+      // 被踢下线（禁用/重置密码/改密/移出设备）：记本服务器的原因 → 停连接 → 回登录页
+      sessionStorage.setItem(kickReasonKey(serverScope()), kickReasonText(f.reason));
       stopWs();
       clearSession();
       window.dispatchEvent(new Event("chat:logout"));

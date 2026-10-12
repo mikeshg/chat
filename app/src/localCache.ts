@@ -1,6 +1,6 @@
 // ===== T1 =====
-// 会话/消息的本地快照：localStorage 键 chat_cache:<server>:<userId>
-// （同源部署 server 为页面 origin，见 api.serverScope()）。
+// 会话/消息的本地快照：localStorage 键 chat_cache:<enc(server)>:<userId>
+// （enc = encodeURIComponent(规范化地址)，见 api.serverScope()）。
 // 服务端暂时连不上时回放（会话列表 + 最近打开会话的最后 50 条消息），登出/换号清除。
 // 读写都吞异常（隐私模式/损坏数据按空处理），总量约 1MB，超限丢最旧。
 
@@ -23,6 +23,7 @@ export interface LocalCacheData {
 }
 
 const PREFIX = "chat_cache:";
+// 键名第二段是 encServer(规范化地址)，不含 : 或 /；第三段才是 userId
 const MAX_BYTES = 1024 * 1024; // 总量上限 ~1MB（按 UTF-8 字节数，CJK 也按实际占用）
 const MAX_MSG_PER_CONV = 50; // 每个会话只留最近 50 条
 const MAX_CACHED_CONVS = 5; // 最多为最近 5 个会话留消息
@@ -95,19 +96,6 @@ export function writeLocalCache(
 export function removeLocalCache(storage: CacheStorage, key: string): void {
   try {
     storage.removeItem(key);
-  } catch {}
-}
-
-/** 删某用户在全部服务器键下的快照（登出/换号）；storage 不支持枚举时静默跳过 */
-export function removeLocalCacheForUser(storage: CacheStorage, userId: string): void {
-  try {
-    const suffix = `:${userId}`;
-    const doomed: string[] = [];
-    for (let i = 0; i < (storage.length ?? 0); i++) {
-      const k = storage.key?.(i);
-      if (k && k.startsWith(PREFIX) && k.endsWith(suffix)) doomed.push(k);
-    }
-    doomed.forEach((k) => storage.removeItem(k));
   } catch {}
 }
 
