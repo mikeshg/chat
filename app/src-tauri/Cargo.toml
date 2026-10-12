@@ -23,10 +23,3 @@ serde_json = "1"
 tauri-plugin-autostart = "2"
 # 在线更新（Windows 安装包；Android 走下载 APK）
 tauri-plugin-updater = "2"
-
-# Linux 托盘直连 tray-icon/libayatana-appindicator，拿 AppIndicator* 绑定中键激活目标
-[target.'cfg(target_os = "linux")'.dependencies]
-tray-icon = "0.24"
-muda = "0.19"
-gtk = "0.18"
-libloading = "0.7"
