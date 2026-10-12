@@ -3,6 +3,7 @@
 // 恢复 = 上传 tar.gz + 键入 RESTORE 确认 → 服务端整库回灌（所有人被登出）。
 import { useCallback, useEffect, useRef, useState } from "react";
 import { admin, clearSession, getServer } from "../../api";
+import { getState } from "../../store";
 import { stopWs } from "../../ws";
 import { fmtBytes } from "../mediaFormat";
 import type { BackupItem } from "../../types";
@@ -102,6 +103,9 @@ export default function BackupPanel() {
     setErr("");
     try {
       await admin.restore(file, setPct);
+      // 发起者会话的服务端连接在恢复期间被保留，正常走到这里时本页仍在线；
+      // 若已被踢下线（极端时序），登录页已显示踢人提示，不再覆写以免残留到下次
+      if (!getState().me) return;
       // 服务端已吊销全部凭据（含自己）：走 force_logout 同款出口回登录页
       sessionStorage.setItem("chat_kick_reason", "恢复完成，请重新登录");
       stopWs();

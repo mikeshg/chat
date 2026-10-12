@@ -3,7 +3,7 @@
 //! 备份 = Postgres 全部业务表（REPEATABLE READ 只读事务里 COPY 出 CSV）
 //!      + FILES_DIR 全量文件，打成 tar.gz 存到 FILES_DIR/.backups/；
 //!      先写 *.part 再原子改名，列表只出成品。
-//! 恢复 = 上传留档 → 只读校验 → 维护模式踢掉全部在线连接
+//! 恢复 = 上传留档 → 只读校验 → 维护模式踢掉在线连接（restoring，发起者会话除外）
 //!      → 单事务 TRUNCATE+COPY 回灌 → 原子换文件目录 → 全量吊销凭据。
 //! 同一把 backup_busy 锁保证备份生成与恢复互不重叠。
 
@@ -664,16 +664,16 @@ pub async fn restore(
 
     // 第二步：恢复挪进独立任务执行——客户端中断连接（浏览器登出/断网）后恢复必须继续
     // 跑完并把维护闸放下，否则服务会永久卡在 503。锁/旗标/清理都由任务的 Drop 守卫兜底。
+    // 踢下线原因 restoring（区别于「维护中」：前端提示恢复完成后重新登录）；
+    // 发起者的会话连接保留——它的恢复请求还在等结果，踢掉会先弹出踢下线文案。
+    let keep_sid = ctx.sid;
     let st2 = st.clone();
     let upload2 = upload_path.clone();
     let task = tokio::spawn(async move {
         let _busy = busy;
         let _cleanup_upload = cleanup_upload;
         let _maint = MaintGuard::enter(&st2); // 进维护态；Drop 兜底退出（含 panic/取消路径）
-        let uids: Vec<Uuid> = st2.conns.iter().map(|e| *e.key()).collect();
-        for uid in uids {
-            st2.kick_user(uid, "maintenance");
-        }
+        st2.kick_all_except_session(keep_sid, "restoring");
         do_restore(&st2, &upload2).await
     });
     match task.await {

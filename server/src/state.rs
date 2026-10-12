@@ -241,6 +241,16 @@ impl AppState {
         self.kick_matching(uid, reason, |s| s == keep)
     }
 
+    /// 恢复备份时踢掉全部用户的在线连接，但保留发起恢复的登录会话：
+    /// 它的恢复请求还在等结果，被踢会先看到踢下线文案，盖住恢复结果。
+    /// keep=None（sid 缺失的老 token）：没有可标识的发起者连接，全踢。
+    pub fn kick_all_except_session(&self, keep: Option<Uuid>, reason: &str) {
+        let uids: Vec<Uuid> = self.conns.iter().map(|e| *e.key()).collect();
+        for uid in uids {
+            self.kick_matching(uid, reason, |s| keep.is_some() && s == keep);
+        }
+    }
+
     /// 某个登录会话当前是否有在线连接（设备列表的 online 点）
     pub fn session_online(&self, uid: Uuid, sid: Uuid) -> bool {
         self.conns

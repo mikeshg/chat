@@ -139,6 +139,8 @@ describe("force_logout reason copy", () => {
     ["password_reset", "密码已被管理员重置，请重新登录"],
     ["password_changed", "密码已在其他设备修改，请重新登录"],
     ["session_revoked", "该设备已被移出登录，请重新登录"],
+    ["maintenance", "服务器维护中，请稍后重新登录"],
+    ["restoring", "正在恢复备份，完成后请重新登录"],
     ["unknown_reason", "登录已失效，请重新登录"],
   ])("kickReasonText(%j) → %s", (reason, want) => {
     expect(kickReasonText(reason)).toBe(want);

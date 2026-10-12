@@ -334,6 +334,8 @@ export function kickReasonText(reason: string): string {
       return "该设备已被移出登录，请重新登录";
     case "maintenance":
       return "服务器维护中，请稍后重新登录";
+    case "restoring":
+      return "正在恢复备份，完成后请重新登录";
     default:
       return "登录已失效，请重新登录";
   }
