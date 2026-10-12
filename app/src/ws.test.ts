@@ -33,6 +33,7 @@ beforeEach(() => {
   refreshStatus = 200;
   vi.stubGlobal("fetch", vi.fn(async (url: string) => {
     if (url.endsWith("/ws/ticket")) return Response.json({ ticket: "t" });
+    if (url.endsWith("/users/me")) return Response.json(me);
     if (url.endsWith("/messages/refresh")) return new Response(refreshStatus === 200 ? JSON.stringify({ messages: [], has_more: false }) : "", { status: refreshStatus });
     if (url.endsWith("/conversations/c")) return Response.json({ id: "c" });
     if (url.endsWith("/conversations")) return Response.json(getState().conversations);

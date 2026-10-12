@@ -122,6 +122,8 @@ export default function ConvList() {
           +
         </button>
       </div>
+      {/* 断线时挂在列表顶部的横幅；WS 重连会自动恢复，无需刷新 */}
+      {!s.wsReady && <div className="offline-banner">离线，正在重连…</div>}
       <div className="conv-tabs" role="tablist">
         <button
           role="tab"

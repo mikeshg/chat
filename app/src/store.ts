@@ -1,5 +1,7 @@
 import { useSyncExternalStore } from "react";
+import { loadSession, serverScope } from "./api";
 import { writeDrafts } from "./drafts";
+import { cacheKey, getRecent, touchRecent, writeLocalCache } from "./localCache";
 import type {
   ConversationPref,
   ConversationView,
@@ -91,6 +93,38 @@ export function setState(patch: Partial<AppState> | ((s: AppState) => Partial<Ap
   const absorbed = me === state.me ? avatars : absorbAvatarUsers(avatars, [me]);
   state = { ...state, ...p, ...(absorbed === avatars ? {} : { avatars: absorbed }) };
   listeners.forEach((l) => l());
+  // 本地快照只关心会话数据变化；typing/online/toast 这类高频变更不落盘
+  if (p.activeConv) touchRecent(p.activeConv);
+  if (
+    p.me !== undefined ||
+    p.conversations !== undefined ||
+    p.messages !== undefined ||
+    p.activeConv !== undefined
+  ) {
+    scheduleCachePersist();
+  }
+}
+
+// ---------- 本地快照（T1：离线启动回放用） ----------
+
+let cacheTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleCachePersist() {
+  if (cacheTimer != null) clearTimeout(cacheTimer);
+  cacheTimer = setTimeout(() => {
+    cacheTimer = null;
+    const s = state;
+    // 凭据已清（登出/被踢/换号）就不得再写：防抖窗口里清过的快照不能被救活
+    if (!s.me || typeof localStorage === "undefined" || loadSession()?.user.id !== s.me.id) return;
+    // 已打开过的会话排前（touchRecent 顺序），仅被别的路径加载过消息的排后——丢消息时也先丢后者
+    const recent = getRecent().filter((id) => s.messages[id]?.length);
+    const ids = [...recent, ...Object.keys(s.messages).filter((id) => !recent.includes(id))];
+    writeLocalCache(localStorage, cacheKey(serverScope(), s.me.id), {
+      conversations: s.conversations,
+      recent: ids,
+      messages: Object.fromEntries(ids.map((id) => [id, s.messages[id]])),
+    });
+  }, 500);
 }
 
 export function useApp(): AppState {

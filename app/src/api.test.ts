@@ -196,7 +196,10 @@ describe("cross-tab refresh", () => {
 
   it("clears the session and emits chat:logout when the token is untouched and the server rejects", async () => {
     vi.stubGlobal("navigator", {});
-    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("{}", { status: 401 }))));
+    vi.stubGlobal("fetch", vi.fn((url: string) =>
+      url.endsWith("/auth/refresh")
+        ? Promise.resolve(Response.json({ error: "invalid refresh token" }, { status: 401 }))
+        : Promise.resolve(new Response("{}", { status: 401 }))));
     const logout = vi.fn();
     window.addEventListener("chat:logout", logout);
 
@@ -255,6 +258,11 @@ describe("refresh failures", () => {
   it.each([
     ["503", () => Promise.resolve(new Response("{}", { status: 503 }))],
     ["network error", () => Promise.reject(new TypeError("Failed to fetch"))],
+    ["429", () => Promise.resolve(Response.json({ error: "too many requests" }, { status: 429 }))],
+    ["404 (旧服务端/代理)", () => Promise.resolve(Response.json({ error: "unknown_api" }, { status: 404 }))],
+    ["代理 401（非 JSON）", () => Promise.resolve(new Response("Unauthorized", { status: 401 }))],
+    ["陌生 JSON 401", () => Promise.resolve(Response.json({ error: "sso required" }, { status: 401 }))],
+    ["其他 403", () => Promise.resolve(Response.json({ error: "forbidden" }, { status: 403 }))],
   ])("keeps the session when refresh hits %s", async (_label, refreshResponse) => {
     vi.stubGlobal("navigator", {});
     vi.stubGlobal("fetch", vi.fn((url: string) =>
@@ -266,10 +274,138 @@ describe("refresh failures", () => {
     expect(logout).not.toHaveBeenCalled();
   });
 
-  it("logs out when the server rejects the refresh token", async () => {
+  it.each([
+    ["invalid refresh token", 401, "登录已失效，请重新登录"],
+    ["session expired, please login again", 401, "登录已失效，请重新登录"],
+    ["账号已被禁用", 403, "账号已被禁用，请联系管理员"],
+  ])("logs out with a hint when refresh is explicitly rejected: %s", async (err, status, reason) => {
     vi.stubGlobal("navigator", {});
-    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("{}", { status: 401 }))));
+    const mem = new Map<string, string>();
+    vi.stubGlobal("sessionStorage", {
+      getItem: (k: string) => mem.get(k) ?? null,
+      setItem: (k: string, v: string) => void mem.set(k, v),
+      removeItem: (k: string) => void mem.delete(k),
+    });
+    vi.stubGlobal("fetch", vi.fn((url: string) =>
+      url.endsWith("/auth/refresh")
+        ? Promise.resolve(Response.json({ error: err }, { status }))
+        : Promise.resolve(new Response("{}", { status: 401 }))));
+    const logout = vi.fn();
+    window.addEventListener("chat:logout", logout);
     await expect(auth.me()).rejects.toMatchObject({ status: 401 });
     expect(localStorage.getItem("chat_refresh")).toBeNull();
+    expect(logout).toHaveBeenCalledTimes(1);
+    expect(mem.get("chat_kick_reason")).toBe(reason);
+  });
+
+  it("logs out when the server rejects the refresh token", async () => {
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("fetch", vi.fn((url: string) =>
+      url.endsWith("/auth/refresh")
+        ? Promise.resolve(Response.json({ error: "invalid refresh token" }, { status: 401 }))
+        : Promise.resolve(new Response("{}", { status: 401 }))));
+    await expect(auth.me()).rejects.toMatchObject({ status: 401 });
+    expect(localStorage.getItem("chat_refresh")).toBeNull();
+  });
+
+  it("keeps the session when a middlebox 401s the retried request after a successful refresh", async () => {
+    vi.stubGlobal("navigator", {});
+    let calls = 0;
+    vi.stubGlobal("fetch", vi.fn((url: string) => {
+      if (url.endsWith("/auth/refresh"))
+        return Promise.resolve(Response.json({ ...login("old"), access_token: "a2", refresh_token: "r2" }));
+      calls++;
+      // 初次 401 触发 refresh；换新 token 重试时被代理拦下（非本服务 JSON 报文）
+      return Promise.resolve(new Response("Unauthorized", { status: 401 }));
+    }));
+    const logout = vi.fn();
+    window.addEventListener("chat:logout", logout);
+    await expect(auth.me()).rejects.toMatchObject({ status: 503 });
+    expect(calls).toBe(2);
+    expect(localStorage.getItem("chat_refresh")).toBe("r2");
+    expect(logout).not.toHaveBeenCalled();
+  });
+
+  it("logs out when the retried request is rejected by the server after a successful refresh", async () => {
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("fetch", vi.fn((url: string) => {
+      if (url.endsWith("/auth/refresh"))
+        return Promise.resolve(Response.json({ ...login("old"), access_token: "a2", refresh_token: "r2" }));
+      return Promise.resolve(
+        Response.json({ error: "session expired, please login again" }, { status: 401 }),
+      );
+    }));
+    const logout = vi.fn();
+    window.addEventListener("chat:logout", logout);
+    await expect(auth.me()).rejects.toMatchObject({ status: 401 });
+    expect(localStorage.getItem("chat_refresh")).toBeNull();
+    expect(logout).toHaveBeenCalledTimes(1);
+  });
+
+  it("logs out with the disabled hint when any endpoint answers 「账号已被禁用」", async () => {
+    vi.stubGlobal("navigator", {});
+    const mem = new Map<string, string>();
+    vi.stubGlobal("sessionStorage", {
+      getItem: (k: string) => mem.get(k) ?? null,
+      setItem: (k: string, v: string) => void mem.set(k, v),
+      removeItem: (k: string) => void mem.delete(k),
+    });
+    vi.stubGlobal("fetch", vi.fn(() =>
+      Promise.resolve(Response.json({ error: "账号已被禁用" }, { status: 403 }))));
+    const logout = vi.fn();
+    window.addEventListener("chat:logout", logout);
+    await expect(convs.list()).rejects.toMatchObject({ status: 403 });
+    expect(localStorage.getItem("chat_refresh")).toBeNull();
+    expect(logout).toHaveBeenCalledTimes(1);
+    expect(mem.get("chat_kick_reason")).toBe("账号已被禁用，请联系管理员");
+  });
+});
+
+// ===== T1：登录/注册错误不触发刷新与登出 =====
+describe("login/register errors", () => {
+  it("maps a wrong-password 401 to 「用户名或密码错误」 without refreshing or clearing the session", async () => {
+    const fetcher = vi.fn((_url: string, _init?: RequestInit) =>
+      Promise.resolve(Response.json({ error: "invalid credentials" }, { status: 401 })));
+    vi.stubGlobal("fetch", fetcher);
+    const logout = vi.fn();
+    window.addEventListener("chat:logout", logout);
+    await expect(auth.login("old", "wrong")).rejects.toMatchObject({
+      status: 401,
+      message: "用户名或密码错误",
+    });
+    // 登录接口返回 401 时不得尝试刷新令牌（只调了一次接口）
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(String(fetcher.mock.calls[0][0])).toContain("/auth/login");
+    // 已有会话凭据原样保留
+    expect(localStorage.getItem("chat_refresh")).toBe("old-refresh");
+    expect(logout).not.toHaveBeenCalled();
+  });
+
+  it("surfaces register errors as-is without refreshing", async () => {
+    const fetcher = vi.fn((_url: string, _init?: RequestInit) =>
+      Promise.resolve(Response.json({ error: "username already taken" }, { status: 409 })));
+    vi.stubGlobal("fetch", fetcher);
+    await expect(auth.register("old", "secret123")).rejects.toMatchObject({
+      status: 409,
+      message: "username already taken",
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(localStorage.getItem("chat_refresh")).toBe("old-refresh");
+  });
+});
+
+// ===== T1：请求超时，不可达时不挂在「加载中…」 =====
+describe("request timeout", () => {
+  it("aborts a hanging request and rejects as transient (status 0)", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+      }),
+    ));
+    const request = auth.me();
+    const rejected = expect(request).rejects.toMatchObject({ status: 0 });
+    await vi.advanceTimersByTimeAsync(10_000);
+    await rejected;
   });
 });

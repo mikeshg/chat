@@ -1,3 +1,4 @@
+import { removeLocalCacheForUser } from "./localCache";
 import type {
   AdminOverview,
   AdminSettings,
@@ -43,6 +44,10 @@ export function getServer(): string {
   const fallback = "__TAURI_INTERNALS__" in globalThis ? DEFAULT_DESKTOP_SERVER : "";
   return (localStorage.getItem(LS_SERVER) || fallback).replace(/\/+$/, "");
 }
+/** 本地快照/外发队列的分键域：同源部署没有显式服务器地址，用页面 origin */
+export function serverScope(): string {
+  return getServer() || (typeof location !== "undefined" ? location.origin : "");
+}
 export function setServer(url: string) {
   const next = url.trim().replace(/\/+$/, "");
   if (next !== getServer()) {
@@ -66,12 +71,15 @@ export function session(): number {
 // localStorage 是所有标签页共享的：别的标签页换账号 / 换服务器 / 登出后，存储里的凭据就不再属于本页。
 // 本页记住自己的身份（服务器 + 用户 id），对不上时一律不发请求，等页面重载换成新身份。
 // 同一账号的令牌轮换不改身份，照常使用。
-function storedIdentity(): string {
-  let id = "";
+function storedUserId(): string {
   try {
-    id = JSON.parse(localStorage.getItem(LS_USER) ?? "null")?.id ?? "";
-  } catch {}
-  return `${getServer()}|${id}`;
+    return JSON.parse(localStorage.getItem(LS_USER) ?? "null")?.id ?? "";
+  } catch {
+    return "";
+  }
+}
+function storedIdentity(): string {
+  return `${getServer()}|${storedUserId()}`;
 }
 let boundIdentity: string | null = null;
 function identityMatches(): boolean {
@@ -90,6 +98,9 @@ export function watchIdentity(onChange: () => void) {
 }
 
 export function saveSession(r: AuthResponse) {
+  const prev = storedUserId();
+  // 换号：清掉上一个账号在本地所有服务器键下的快照，防串号
+  if (prev && prev !== r.user.id) removeLocalCacheForUser(localStorage, prev);
   localStorage.setItem(LS_ACCESS, r.access_token);
   localStorage.setItem(LS_REFRESH, r.refresh_token);
   localStorage.setItem(LS_USER, JSON.stringify(r.user));
@@ -106,6 +117,9 @@ export function loadSession(): { user: UserPublic } | null {
   }
 }
 export function clearSession() {
+  // 登出/换号/被踢：清掉本账号在本地所有服务器键下的快照
+  const uid = storedUserId();
+  if (uid) removeLocalCacheForUser(localStorage, uid);
   localStorage.removeItem(LS_ACCESS);
   localStorage.removeItem(LS_REFRESH);
   localStorage.removeItem(LS_USER);
@@ -123,8 +137,10 @@ export class ApiError extends Error {
 
 // 刷新结果：凭据确实失效才登出；断网、5xx、维护中只是暂时不可用，保留凭据等下次
 type Refreshed = "ok" | "invalid" | "transient";
+// 明确拒绝时的登出提示（invalid 才可能有）
+type RefreshOutcome = { r: Refreshed; reason?: string };
 
-let refreshing: { gen: number; promise: Promise<Refreshed> } | null = null;
+let refreshing: { gen: number; promise: Promise<RefreshOutcome> } | null = null;
 
 function requireSession(gen: number) {
   if (gen !== session()) throw new ApiError(0, "session changed");
@@ -133,47 +149,113 @@ function requireSession(gen: number) {
 // Web Locks 锁名：跨标签页串行化刷新，避免并发轮换互相消费掉对方的刷新令牌
 const REFRESH_LOCK = "chat_token_refresh";
 
+// refresh 的明确拒绝（核对响应体，代理/WAF 拦下的 4xx 不得误判成凭据失效）：
+// 401 invalid refresh token / session expired…（无效、吊销、被挤下线）；
+// 403 账号已被禁用。其余响应一律按暂时失败处理。
+const REFRESH_DENIED_401 = new Set([
+  "invalid refresh token",
+  "session expired, please login again",
+]);
+const REFRESH_DENIED_403 = "账号已被禁用";
+const LOGOUT_EXPIRED = "登录已失效，请重新登录";
+const LOGOUT_DISABLED = "账号已被禁用，请联系管理员"; // 与 ws.ts kickReasonText("disabled") 同文案
+
+/** 服务端明确拒收 refresh token 时的登出文案；非明确拒绝返回 null（按暂时失败） */
+async function refreshDeniedReason(res: Response): Promise<string | null> {
+  if (res.status !== 401 && res.status !== 403) return null;
+  let err: unknown;
+  try {
+    err = (await res.json())?.error;
+  } catch {
+    return null; // 非 JSON 响应（代理/网关拦下）：只是连不上，不动凭据
+  }
+  if (res.status === 403) return err === REFRESH_DENIED_403 ? LOGOUT_DISABLED : null;
+  return REFRESH_DENIED_401.has(String(err)) ? LOGOUT_EXPIRED : null;
+}
+
+/** 业务接口 401（已换新 access token 仍被拒）：本服务的 JSON 报文才算会话级拒绝，代理/WAF 的不算 */
+async function serverDenied(res: Response): Promise<boolean> {
+  try {
+    const j = await res.clone().json();
+    return !!j && typeof j.error === "string";
+  } catch {
+    return false;
+  }
+}
+
+/** 服务端明确踢下线：清会话、记登录页提示、广播登出。别的标签页已换账号时不替它登出 */
+function denySession(status: number, reason: string): never {
+  requireIdentity();
+  clearSession();
+  try {
+    sessionStorage.setItem("chat_kick_reason", reason);
+  } catch {}
+  window.dispatchEvent(new Event("chat:logout"));
+  throw new ApiError(status, reason);
+}
+
+// 单次请求超时：服务端不可达（IP 不通/防火墙丢包）时不能无限挂起，否则启动页一直停在「加载中…」
+const REQUEST_TIMEOUT_MS = 10_000;
+
+function timedFetch(url: string, init?: RequestInit, timeoutMs = REQUEST_TIMEOUT_MS): Promise<Response> {
+  if (timeoutMs <= 0 || typeof AbortController === "undefined") return fetch(url, init);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(new ApiError(0, "连接超时，请稍后再试")), timeoutMs);
+  const outer = init?.signal ?? null;
+  const onOuter = () => ctrl.abort(outer!.reason);
+  if (outer) {
+    if (outer.aborted) ctrl.abort(outer.reason);
+    else outer.addEventListener("abort", onOuter, { once: true });
+  }
+  return fetch(url, { ...init, signal: ctrl.signal }).finally(() => {
+    clearTimeout(timer);
+    outer?.removeEventListener("abort", onOuter);
+  });
+}
+
 // 单次刷新（在 Web Locks 内执行）：localStorage 是所有标签页共享的，
 // 刷新令牌已被换成别的值 = 别的标签页刚刷新成功（或新登录），直接当作成功、
 // 用存储里的新访问令牌重试即可，不再请求服务端也不清空会话
-async function refreshOnce(gen: number, srv: string, rt: string): Promise<Refreshed> {
+async function refreshOnce(gen: number, srv: string, rt: string): Promise<RefreshOutcome> {
   const swapped = () => {
     const cur = localStorage.getItem(LS_REFRESH);
     return cur !== null && cur !== rt;
   };
-  if (swapped()) return "ok";
+  if (swapped()) return { r: "ok" };
   let r: AuthResponse;
   try {
-    const res = await fetch(`${srv}/v1/auth/refresh`, {
+    const res = await timedFetch(`${srv}/v1/auth/refresh`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ refresh_token: rt }),
     });
     if (!res.ok) {
-      if (swapped()) return "ok";
-      // 4xx（除 429）= 服务端明确不认这个刷新令牌；其余是暂时的
-      return res.status >= 400 && res.status < 500 && res.status !== 429 ? "invalid" : "transient";
+      if (swapped()) return { r: "ok" };
+      const reason = await refreshDeniedReason(res);
+      // 只有服务端明确拒绝（核对过响应体）才判 invalid，其余全部按暂时失败
+      return reason ? { r: "invalid", reason } : { r: "transient" };
     }
     r = await res.json();
   } catch {
-    return swapped() ? "ok" : "transient";
+    return { r: swapped() ? "ok" : "transient" };
   }
   // 期间发生了登录/登出/换服务器：不能把旧凭据写回新会话
-  if (gen !== session() || getServer() !== srv) return "invalid";
-  if (localStorage.getItem(LS_REFRESH) !== rt) return swapped() ? "ok" : "invalid";
+  if (gen !== session() || getServer() !== srv) return { r: "invalid" };
+  if (localStorage.getItem(LS_REFRESH) !== rt) return { r: swapped() ? "ok" : "invalid" };
   localStorage.setItem(LS_ACCESS, r.access_token);
   localStorage.setItem(LS_REFRESH, r.refresh_token);
   localStorage.setItem(LS_USER, JSON.stringify(r.user));
-  return "ok";
+  return { r: "ok" };
 }
 
-async function tryRefresh(gen: number, srv: string): Promise<Refreshed> {
+async function tryRefresh(gen: number, srv: string): Promise<RefreshOutcome> {
   requireSession(gen);
   requireIdentity();
+  // 单飞：同一代会话的并发 401 共用一次刷新，避免旧令牌被重复提交触发盗用判定
   if (refreshing?.gen === gen) return refreshing.promise;
   const rt = localStorage.getItem(LS_REFRESH);
-  if (!rt) return "invalid";
-  const owner = { gen, promise: Promise.resolve<Refreshed>("invalid") };
+  if (!rt) return { r: "invalid" };
+  const owner = { gen, promise: Promise.resolve<RefreshOutcome>({ r: "invalid" }) };
   refreshing = owner;
   const run = () => refreshOnce(gen, srv, rt);
   owner.promise = (async () => {
@@ -188,7 +270,7 @@ async function tryRefresh(gen: number, srv: string): Promise<Refreshed> {
       }
       return await run();
     } catch {
-      return "transient";
+      return { r: "transient" } as RefreshOutcome;
     } finally {
       setTimeout(() => { if (refreshing === owner) refreshing = null; }, 0);
     }
@@ -196,7 +278,7 @@ async function tryRefresh(gen: number, srv: string): Promise<Refreshed> {
   return owner.promise;
 }
 
-async function raw(srv: string, path: string, init?: RequestInit): Promise<Response> {
+async function raw(srv: string, path: string, init?: RequestInit, timeoutMs?: number): Promise<Response> {
   requireIdentity();
   const headers: Record<string, string> = {
     ...(init?.headers as Record<string, string>),
@@ -204,28 +286,35 @@ async function raw(srv: string, path: string, init?: RequestInit): Promise<Respo
   const at = localStorage.getItem(LS_ACCESS);
   if (at) headers["authorization"] = `Bearer ${at}`;
   if (typeof init?.body === "string") headers["Content-Type"] = "application/json";
-  return fetch(`${srv}/v1${path}`, { ...init, headers });
+  return timedFetch(`${srv}/v1${path}`, { ...init, headers }, timeoutMs);
 }
 
-async function call<T>(path: string, init?: RequestInit): Promise<T> {
+// 登录/注册的 401 是业务错误（密码错/邀请码无效），与会话凭据无关：不触发刷新、不登出
+const NO_REFRESH_PATHS = new Set(["/auth/login", "/auth/register"]);
+
+async function call<T>(path: string, init?: RequestInit, opts?: { timeoutMs?: number }): Promise<T> {
   const gen = session();
   const srv = getServer();
-  let res = await raw(srv, path, init);
+  let res = await raw(srv, path, init, opts?.timeoutMs);
   requireSession(gen);
-  if (res.status === 401) {
+  if (res.status === 401 && !NO_REFRESH_PATHS.has(path)) {
     const refreshed = await tryRefresh(gen, srv);
     requireSession(gen);
-    if (refreshed === "transient") throw new ApiError(503, "暂时连不上服务器，请稍后再试");
-    if (refreshed === "ok") {
-      res = await raw(srv, path, init);
+    if (refreshed.r === "transient") throw new ApiError(503, "暂时连不上服务器，请稍后再试");
+    if (refreshed.r === "ok") {
+      res = await raw(srv, path, init, opts?.timeoutMs);
       requireSession(gen);
     }
-    if (refreshed === "invalid" || res.status === 401) {
-      requireIdentity(); // 别的标签页已换账号：那是它的会话，不能替它登出
-      clearSession();
-      window.dispatchEvent(new Event("chat:logout"));
-      throw new ApiError(401, "unauthorized");
-    }
+    // 只有服务端明确拒绝 refresh 或新 access token 才登出；
+    // 代理/网关拦下的 401（非本服务报文）按暂时失败保留会话
+    const reason =
+      refreshed.r === "invalid"
+        ? refreshed.reason ?? LOGOUT_EXPIRED
+        : res.status === 401 && (await serverDenied(res))
+          ? LOGOUT_EXPIRED
+          : null;
+    if (reason) denySession(401, reason);
+    if (res.status === 401) throw new ApiError(503, "暂时连不上服务器，请稍后再试");
   }
   if (res.status === 204) return undefined as T;
   const text = await res.text();
@@ -235,6 +324,12 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
     try {
       msg = JSON.parse(text).error ?? text;
     } catch {}
+    // 账号被禁用：服务端对本会话一切 API 一律 403——与 refresh 被拒同等对待，踢回登录页
+    if (res.status === 403 && msg === REFRESH_DENIED_403 && !NO_REFRESH_PATHS.has(path)) {
+      denySession(403, LOGOUT_DISABLED);
+    }
+    // 登录失败统一口语文案（服务端报文是英文代号 invalid credentials）
+    if (path === "/auth/login" && res.status === 401) msg = "用户名或密码错误";
     // 服务端没有这个接口（客户端更新了、服务端还没更新）
     if (res.status === 404 && msg === "unknown_api") msg = "服务端版本较旧，不支持这个操作，请更新服务端";
     throw new ApiError(res.status, msg);
@@ -319,7 +414,7 @@ export const auth = {
     const fd = new FormData();
     const ext = file.type === "image/png" ? "png" : file.type === "image/webp" ? "webp" : "jpg";
     fd.append("file", file, `avatar.${ext}`);
-    return call<UserPublic>("/users/me/avatar", { method: "PUT", body: fd });
+    return call<UserPublic>("/users/me/avatar", { method: "PUT", body: fd }, { timeoutMs: 0 });
   },
   removeAvatar: () => call<UserPublic>("/users/me/avatar", { method: "DELETE" }),
   /** 自助改密：返回为当前 session 新签发的凭据（其他 session 已被服务端撤销） */
@@ -504,7 +599,7 @@ export const files = {
     fd.append("conversation_id", conversationId);
     fd.append("file", file, file.name);
     if (opts?.durationMs != null) fd.append("duration_ms", String(opts.durationMs));
-    return call<AttachmentView>("/files", { method: "POST", body: fd });
+    return call<AttachmentView>("/files", { method: "POST", body: fd }, { timeoutMs: 0 });
   },
 };
 
@@ -513,7 +608,7 @@ export const files = {
 export async function serverInfo(server?: string): Promise<ServerInfo> {
   const srv = (server ?? getServer()).trim().replace(/\/+$/, "");
   try {
-    const res = await fetch(`${srv}/v1/server-info`);
+    const res = await timedFetch(`${srv}/v1/server-info`);
     if (!res.ok) return { registration_mode: "open" };
     const j = (await res.json()) as Partial<ServerInfo>;
     const m = j.registration_mode;
