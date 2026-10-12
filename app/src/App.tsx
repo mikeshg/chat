@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { ApiError, auth, loadSession } from "./api";
+import { auth, loadSession, serverScope } from "./api";
 import { readDrafts } from "./drafts";
+import { cacheKey, clearRecent, readLocalCache, seedRecent } from "./localCache";
 import { syncWindowTitle, unreadTitle } from "./notify";
 import { flushDrafts, setState, useApp } from "./store";
 import { startWs, stopWs } from "./ws";
@@ -14,6 +15,7 @@ export default function App() {
   useEffect(() => {
     const onLogout = () => {
       flushDrafts(); // 先把在途草稿落盘（本地存储保留，同账号下次登录恢复）
+      clearRecent(); // MRU 是账号数据：别让下一个登录的用户继承
       stopWs();
       setState({
         me: null,
@@ -45,12 +47,20 @@ export default function App() {
         const me = await auth.me();
         setState({ me, drafts: readDrafts(localStorage, me.id) });
         void startWs();
-      } catch (e) {
-        // 连不上服务器（不是凭据失效）：用本地缓存的身份先进去，WS 自己重连，待发消息照常显示
-        const offline = !(e instanceof ApiError) || e.status >= 500;
-        const cached = offline ? loadSession()?.user : undefined;
+      } catch {
+        // 凭据被明确拒绝时 api 层已清掉会话（loadSession 为空）→ 回登录页；
+        // 其余一切失败（断网/超时/5xx/429/代理拦下的 4xx）都按离线进入：
+        // 用本地缓存的身份与数据快照先进去，WS 自动重连，恢复后自动拉数据。
+        const cached = loadSession()?.user;
         if (cached) {
-          setState({ me: cached, drafts: readDrafts(localStorage, cached.id) });
+          const snap = readLocalCache(localStorage, cacheKey(serverScope(), cached.id));
+          if (snap) seedRecent(snap.recent);
+          setState({
+            me: cached,
+            drafts: readDrafts(localStorage, cached.id),
+            conversations: snap?.conversations ?? [],
+            messages: snap?.messages ?? {},
+          });
           void startWs();
         }
       } finally {
