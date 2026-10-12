@@ -42,6 +42,40 @@ export function normalizeServerUrl(input: string | null | undefined): string | n
   return `${u.protocol}//${u.host}${path}`;
 }
 
+// ---------- 登录提交时的地址解析 ----------
+// 地址输入框是「未提交的草稿」：登录/注册提交、地址框内回车一律用当前输入解析，
+// 不依赖 blur 先落盘——否则改完直接回车/点登录会连到旧地址（T6）。
+export type ServerInputResult = { ok: true; url: string } | { ok: false; err: string };
+
+/**
+ * 解析地址框当前输入：非空规范化，非法给文案；空 = Web 同源（origin）、桌面端必填。
+ */
+export function resolveServerInput(
+  input: string,
+  opts: { desktop: boolean; origin?: string },
+): ServerInputResult {
+  const s = input.trim();
+  if (s) {
+    const n = normalizeServerUrl(s);
+    return n
+      ? { ok: true, url: n }
+      : { ok: false, err: "服务器地址格式不对，如 http://192.168.1.5:28080" };
+  }
+  const n = opts.desktop ? null : normalizeServerUrl(opts.origin ?? "");
+  return n
+    ? { ok: true, url: n }
+    : { ok: false, err: "请填写服务器地址，如 http://192.168.1.5:28080" };
+}
+
+/** https 页面连 http 服务器会被浏览器拦，先确认再放行；桌面端无此限制 */
+export function needsInsecureConfirm(
+  desktop: boolean,
+  pageProtocol: string,
+  serverUrl: string,
+): boolean {
+  return !desktop && pageProtocol === "https:" && serverUrl.startsWith("http://");
+}
+
 /** 键名里的服务器段：编码后不含 : 或 /，与 :uid 分段永不冲突 */
 export function encServer(normalized: string): string {
   return encodeURIComponent(normalized);

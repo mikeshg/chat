@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   auth,
   confirmServerRemove,
@@ -17,7 +17,7 @@ import {
 } from "../api";
 import { readDrafts } from "../drafts";
 import { parseInviteParam } from "../invite";
-import type { ServerEntry } from "../servers";
+import { needsInsecureConfirm, resolveServerInput, type ServerEntry } from "../servers";
 import { setState } from "../store";
 import type { RegistrationMode } from "../types";
 import { startWs } from "../ws";
@@ -40,6 +40,7 @@ export default function AuthScreen() {
   const [busy, setBusy] = useState(false);
   // 服务器地址收在卡片下方，默认折叠
   const [editServer, setEditServer] = useState(false);
+  const formRef = useRef<HTMLFormElement>(null);
 
   // 挂载时 + 服务器地址输入变化（防抖 ~500ms）探测目标服务器的注册模式；
   // 探测失败按 open（serverInfo 内部已兜底）
@@ -83,37 +84,38 @@ export default function AuthScreen() {
     }
   };
 
+  /** 地址框输入合法时保存为当前服务器并把输入框刷成规范化地址 */
+  const commitServer = (url: string) => {
+    setServer(url);
+    setServerUrl(url);
+    setEditServer(false);
+  };
+
+  /** 解析地址框当前输入；非法时提示并保持面板展开（不藏起错误） */
+  const resolveInput = () =>
+    resolveServerInput(server, { desktop, origin: location.origin });
+
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (busy) return;
     setErr("");
-    // Web 端地址留空 = 本站；桌面端必须显式填地址
-    const input = server.trim();
-    const norm = input
-      ? normalizeServerUrl(input)
-      : desktop
-        ? null
-        : normalizeServerUrl(location.origin);
-    if (!norm) {
-      setErr(
-        input
-          ? "服务器地址格式不对，如 http://192.168.1.5:28080"
-          : "请填写服务器地址，如 http://192.168.1.5:28080",
-      );
-      setEditServer(true);
+    // 提交一律用地址框当前输入：有未保存的改动先提交再登录，不等 blur
+    const r0 = resolveInput();
+    if (!r0.ok) {
+      setErr(r0.err);
       return;
     }
-    // https 页面连 http 服务器会被浏览器拦截，先说清楚再放行
+    const norm = r0.url;
+    // https 页面连 http 服务器会被浏览器拦截，先说清楚再放行；取消则不保存地址
     if (
-      !desktop &&
-      location.protocol === "https:" &&
-      norm.startsWith("http://") &&
+      needsInsecureConfirm(desktop, location.protocol, norm) &&
       !window.confirm("浏览器会阻止 https 页面访问 http 服务器，仍要继续吗？")
     ) {
       return;
     }
     setBusy(true);
     try {
-      setServer(norm);
+      commitServer(norm);
       const r =
         effMode === "login"
           ? await auth.login(username.trim(), password)
@@ -140,16 +142,35 @@ export default function AuthScreen() {
     }
   };
 
+  // 鼠标按下就拦下默认的焦点转移：地址框不失焦→面板不收起→卡片不位移，
+  // mouseup 时按钮还在原处，点击不会落空（T6 桌面端登录按钮失灵）
+  const keepFocus = (e: React.MouseEvent) => e.preventDefault();
+
+  /** 地址框回车 = 提交地址（规范化+保存+收起），用户名密码已填则顺势登录 */
+  const onServerEnter = (e: React.KeyboardEvent) => {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    const r = resolveInput();
+    if (!r.ok) {
+      setErr(r.err); // 非法：提示并保持面板展开
+      return;
+    }
+    // 需要 https→http 确认时不先保存：提交里确认取消 = 不保存
+    if (!needsInsecureConfirm(desktop, location.protocol, r.url)) commitServer(r.url);
+    formRef.current?.requestSubmit();
+  };
+
   return (
     <div className="auth-wrap">
       <div className="auth-col">
-        <form className="auth-card" onSubmit={submit}>
+        <form className="auth-card" onSubmit={submit} ref={formRef}>
           <div className="auth-head">
             <h1 className="auth-title">Chat</h1>
             {regMode !== "closed" && (
               <button
                 type="button"
                 className="auth-switch"
+                onMouseDown={keepFocus}
                 onClick={() => setMode(mode === "login" ? "register" : "login")}
               >
                 {mode === "login" ? "注册 →" : "← 登录"}
@@ -192,7 +213,7 @@ export default function AuthScreen() {
             <div className="auth-note">管理员已关闭注册</div>
           )}
           {err && <div className="auth-err">{err}</div>}
-          <button className="primary" disabled={busy}>
+          <button className="primary" disabled={busy} onMouseDown={keepFocus}>
             {busy ? "请稍候…" : effMode === "login" ? "登录" : "注册并登录"}
           </button>
         </form>
@@ -203,13 +224,18 @@ export default function AuthScreen() {
               onBlur={(e) => {
                 // 焦点移到表单内（列表选择/删除按钮）不收起；点出表单才收起并记住地址
                 if (e.currentTarget.contains(e.relatedTarget as Node)) return;
-                const n = normalizeServerUrl(server);
-                if (n) setServer(n); // 不点登录也记住
-                if (server.trim()) setEditServer(false);
+                const s = server.trim();
+                if (!s) return setEditServer(false);
+                const n = normalizeServerUrl(s);
+                if (!n) return setErr("服务器地址格式不对，如 http://192.168.1.5:28080"); // 非法不藏起
+                setServer(n); // 不点登录也记住
+                setServerUrl(n);
+                setEditServer(false);
               }}
             >
               <input
                 autoFocus
+                onKeyDown={onServerEnter}
                 placeholder={
                   desktop
                     ? "服务器地址，如 http://192.168.1.5:28080"
@@ -225,6 +251,7 @@ export default function AuthScreen() {
                       <button
                         type="button"
                         className="auth-server-pick"
+                        onMouseDown={keepFocus}
                         onClick={() => pick(sv.url)}
                       >
                         <span>
@@ -241,6 +268,7 @@ export default function AuthScreen() {
                           type="button"
                           className="auth-server-del"
                           title={`删除 ${sv.url}`}
+                          onMouseDown={keepFocus}
                           onClick={() => drop(sv)}
                         >
                           ×

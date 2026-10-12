@@ -5,8 +5,10 @@ import {
   kickReasonKey,
   listServers,
   migrateLegacyStorage,
+  needsInsecureConfirm,
   normalizeServerUrl,
   readAuth,
+  resolveServerInput,
   removeServerData,
   removeServerEntry,
   upsertServer,
@@ -60,6 +62,49 @@ describe("normalizeServerUrl", () => {
       expect(normalizeServerUrl(input)).toBeNull();
     },
   );
+});
+
+// ===== T6：登录提交时解析地址框输入 =====
+// 地址框里的输入在提交前不必先落盘：提交一律用「当前输入」解析，
+// 保证改完地址直接回车/点登录就连新地址，不靠 blur 保存。
+describe("resolveServerInput", () => {
+  const web = { desktop: false, origin: "http://localhost:29061" };
+
+  it("输入新地址 → 返回规范化后的新地址（未保存的改动也生效）", () => {
+    expect(resolveServerInput("localhost:29062", web)).toEqual({
+      ok: true,
+      url: "http://localhost:29062",
+    });
+    expect(resolveServerInput("  HTTPS://B.Example:443/x/ ", web)).toEqual({
+      ok: true,
+      url: "https://b.example/x",
+    });
+  });
+
+  it("非空但非法 → 报错，不返回地址", () => {
+    for (const bad of ["http://[bad", "ftp://a", "://a", "javascript:x"]) {
+      const r = resolveServerInput(bad, web);
+      expect(r.ok, `input=${bad}`).toBe(false);
+      if (!r.ok) expect(r.err).toContain("服务器地址");
+    }
+  });
+
+  it("Web 端留空 → 同源地址；桌面端留空 → 提示必填", () => {
+    expect(resolveServerInput("", web)).toEqual({ ok: true, url: "http://localhost:29061" });
+    expect(resolveServerInput("   ", web)).toEqual({ ok: true, url: "http://localhost:29061" });
+    const r = resolveServerInput("", { desktop: true });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.err).toContain("请填写服务器地址");
+  });
+});
+
+describe("needsInsecureConfirm", () => {
+  it("仅 Web https 页面连 http 服务器时需要确认", () => {
+    expect(needsInsecureConfirm(false, "https:", "http://a")).toBe(true);
+    expect(needsInsecureConfirm(false, "https:", "https://a")).toBe(false);
+    expect(needsInsecureConfirm(false, "http:", "http://a")).toBe(false);
+    expect(needsInsecureConfirm(true, "https:", "http://a")).toBe(false);
+  });
 });
 
 describe("encServer", () => {
