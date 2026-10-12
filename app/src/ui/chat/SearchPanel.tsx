@@ -12,6 +12,7 @@ import {
   senderOptions,
   snippetOf,
 } from "./searchSnippets";
+import { fmtTime } from "./fmtTime";
 
 // ===== V2 P3-1 =====
 // 会话列表搜索态：上半「会话」本地过滤、下半「聊天记录」走 /v1/search（300ms 防抖）。
@@ -19,14 +20,6 @@ import {
 
 type KindFilter = "" | "image" | "file" | "audio";
 
-function fmtTime(iso: string): string {
-  const d = new Date(iso);
-  const now = new Date();
-  if (d.toDateString() === now.toDateString()) return d.toTimeString().slice(0, 5);
-  const yesterday = new Date(now.getTime() - 86400000);
-  if (d.toDateString() === yesterday.toDateString()) return "昨天";
-  return `${d.getMonth() + 1}/${d.getDate()}`;
-}
 
 /** <input type="date"> 的本地日期 → RFC3339 界：from 当天零点（含），to 次日零点（不含） */
 function dayStart(d: string): string | undefined {
