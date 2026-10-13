@@ -1,4 +1,4 @@
-// 在线更新：服务端转发 Gitea 最新 Release（GET /v1/client/latest）。
+// 在线更新：服务端转发最新 Release（GET /v1/client/latest）。
 // 桌面端交给 Rust 的 install_update（tauri-plugin-updater，校验签名后安装重启）；
 // Android 打开 APK 下载地址，由系统安装器接手。浏览器端每次加载都是服务器上的新版，不需要。
 
