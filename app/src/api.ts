@@ -1,3 +1,21 @@
+import { cacheKey, removeLocalCache } from "./localCache";
+import {
+  authKey,
+  encServer,
+  kickReasonKey,
+  listServers as listServersIn,
+  migrateLegacyStorage,
+  normalizeServerUrl,
+  readAuth,
+  removeServerData,
+  removeServerEntry,
+  upsertServer,
+  writeAuth,
+  type ServerEntry,
+} from "./servers";
+
+export { normalizeServerUrl } from "./servers";
+export type { ServerEntry } from "./servers";
 import type {
   AdminOverview,
   AdminSettings,
@@ -30,30 +48,166 @@ import type {
   UserPublic,
 } from "./types";
 
-const LS_SERVER = "chat_server_url";
-const LS_ACCESS = "chat_access";
-const LS_REFRESH = "chat_refresh";
-const LS_USER = "chat_user";
-
 // ---------- 服务器地址 ----------
-// 空 = 同源（vite dev proxy / 服务端托管静态文件时）；Tauri/LAN 场景填 http://host:28080
+// 「当前服务器」按标签页：sessionStorage chat_cur_server 是本页钉住的服务器；
+// localStorage chat_servers 里最近使用的条目供新标签页/重启兜底。
 // 桌面端没有同源服务器，未配置时用正式部署地址
 const DEFAULT_DESKTOP_SERVER = "https://chat.287152.xyz";
+const SS_CUR_SERVER = "chat_cur_server";
+
+export const inTauri = () => "__TAURI_INTERNALS__" in globalThis || "__TAURI__" in globalThis;
+
+/** 兜底服务器：Web 端 = 同源（规范化后恰为 location.origin）；桌面端 = 正式部署地址 */
+function defaultServer(): string {
+  if (!inTauri() && typeof location !== "undefined") {
+    return normalizeServerUrl(location.origin) ?? DEFAULT_DESKTOP_SERVER;
+  }
+  return DEFAULT_DESKTOP_SERVER;
+}
+
+// 启动时把旧版全局凭据/cache/outbox/drafts 一次性迁到多服务器键名下（幂等）。
+// 迁移目标的「当前服务器」：旧版配置的 chat_server_url；没有则默认（同源时必须等于 location.origin）
+if (typeof localStorage !== "undefined" && typeof sessionStorage !== "undefined") {
+  try {
+    const legacy = normalizeServerUrl(localStorage.getItem("chat_server_url"));
+    migrateLegacyStorage(localStorage, legacy ?? defaultServer());
+    sessionStorage.removeItem("chat_kick_reason"); // 旧版无服务器段的踢人提示
+  } catch {}
+}
+
+let currentServer: string | null = null;
+
+function resolveCurrent(): string {
+  if (currentServer) return currentServer;
+  try {
+    const pinned = normalizeServerUrl(sessionStorage.getItem(SS_CUR_SERVER));
+    if (pinned) return (currentServer = pinned);
+  } catch {}
+  const top =
+    typeof localStorage !== "undefined" ? listServersIn(localStorage)[0]?.url : undefined;
+  currentServer = top ?? defaultServer();
+  try {
+    sessionStorage.setItem(SS_CUR_SERVER, currentServer);
+  } catch {}
+  return currentServer;
+}
+
 export function getServer(): string {
-  const fallback = "__TAURI_INTERNALS__" in globalThis ? DEFAULT_DESKTOP_SERVER : "";
-  return (localStorage.getItem(LS_SERVER) || fallback).replace(/\/+$/, "");
+  return resolveCurrent();
+}
+/** 本地键名的服务器段：encodeURIComponent(规范化地址)，不含 : 或 / */
+export function serverScope(): string {
+  return encServer(getServer());
 }
 export function setServer(url: string) {
-  const next = url.trim().replace(/\/+$/, "");
-  if (next !== getServer()) {
-    localStorage.setItem(LS_SERVER, next);
-    sessionGen++; // 服务器切换：旧服务器的异步结果一律作废
-    boundIdentity = storedIdentity();
-  }
+  const next = normalizeServerUrl(url);
+  if (!next) return;
+  try {
+    sessionStorage.setItem(SS_CUR_SERVER, next); // 每次都重写：清了 sessionStorage 也能补回
+  } catch {}
+  if (next === getServer()) return;
+  currentServer = next;
+  // 已在列表里的服务器顶到最近使用；没登录过的新地址等登录成功才入列
+  try {
+    if (listServersIn(localStorage).some((s) => s.url === next)) {
+      upsertServer(localStorage, next, {});
+    }
+  } catch {}
+  sessionGen++; // 服务器切换：旧服务器的异步结果一律作废
+  boundIdentity = storedIdentity();
 }
 export function wsBase(): string {
-  const s = getServer() || location.origin;
-  return s.replace(/^http/, "ws");
+  return getServer().replace(/^http/, "ws");
+}
+
+// ---------- 服务器列表 / 多服务器管理（T5） ----------
+/** 已保存的服务器（最近使用在前） */
+export function listServers(): ServerEntry[] {
+  return typeof localStorage === "undefined" ? [] : listServersIn(localStorage);
+}
+/** 该服务器是否已有登录凭据（切过去不用重新登录） */
+export function hasServerAuth(url: string): boolean {
+  const n = normalizeServerUrl(url);
+  return (
+    !!n && typeof localStorage !== "undefined" && readAuth(localStorage, encServer(n)) != null
+  );
+}
+/** Web 端「本站」：与页面同源的条目；桌面端没有本站 */
+export function isSameOriginServer(url: string): boolean {
+  if (inTauri() || typeof location === "undefined") return false;
+  return normalizeServerUrl(url) === normalizeServerUrl(location.origin);
+}
+/** 列表显示名：本站 > 自定义名 > 地址本身 */
+export function serverLabel(url: string, entry?: ServerEntry): string {
+  if (isSameOriginServer(url)) return "本站";
+  return entry?.name || url;
+}
+/** 新地址入列（登录成功也走这里）；返回入列条目，地址非法返回 null */
+export function addServerEntry(input: string): ServerEntry | null {
+  const n = normalizeServerUrl(input);
+  if (!n || typeof localStorage === "undefined") return null;
+  upsertServer(localStorage, n, {});
+  return listServers().find((s) => s.url === n) ?? null;
+}
+/** 删除服务器的二次确认（登录页与设置页共用文案；返回 false = 用户取消） */
+export function confirmServerRemove(sv: ServerEntry): boolean {
+  return window.confirm(
+    `删除服务器 ${serverLabel(sv.url, sv)}（${sv.url}）？\n它的登录凭据、本地缓存和未发出的消息都会被清除。`,
+  );
+}
+/**
+ * 删除服务器：尽力调它的 /auth/logout（失败忽略）→ 清本地 auth/cache/outbox/drafts → 移出列表。
+ * 返回建议切到的服务器（最近使用的另一个；没有则默认）。
+ */
+export function removeServer(url: string): string {
+  const norm = normalizeServerUrl(url) ?? url;
+  const scope = encServer(norm);
+  try {
+    const rt = readAuth(localStorage, scope)?.refresh;
+    if (rt) {
+      void timedFetch(`${norm}/v1/auth/logout`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refresh_token: rt }),
+      }).catch(() => {});
+    }
+    removeServerData(localStorage, scope);
+    removeServerEntry(localStorage, norm);
+  } catch {}
+  try {
+    sessionStorage.removeItem(kickReasonKey(scope));
+  } catch {}
+  return listServers()[0]?.url ?? defaultServer();
+}
+// 「删除当前服务器」后重载：即使回退服务器有凭据也停在登录页（一次有效）
+const SS_SKIP_AUTOLOGIN = "chat_skip_autologin";
+export function skipAutoLoginOnce() {
+  try {
+    sessionStorage.setItem(SS_SKIP_AUTOLOGIN, "1");
+  } catch {}
+}
+export function hasSkipAutoLogin(): boolean {
+  try {
+    return !!sessionStorage.getItem(SS_SKIP_AUTOLOGIN);
+  } catch {
+    return false;
+  }
+}
+export function clearSkipAutoLogin() {
+  try {
+    sessionStorage.removeItem(SS_SKIP_AUTOLOGIN);
+  } catch {}
+}
+/** 登录页用的被踢提示：按当前服务器读一次即清 */
+export function takeKickReason(): string {
+  try {
+    const k = kickReasonKey(serverScope());
+    const r = sessionStorage.getItem(k);
+    if (r) sessionStorage.removeItem(k);
+    return r ?? "";
+  } catch {
+    return "";
+  }
 }
 
 // ---------- 会话凭据 ----------
@@ -63,15 +217,15 @@ export function session(): number {
   return sessionGen;
 }
 
-// localStorage 是所有标签页共享的：别的标签页换账号 / 换服务器 / 登出后，存储里的凭据就不再属于本页。
-// 本页记住自己的身份（服务器 + 用户 id），对不上时一律不发请求，等页面重载换成新身份。
+// localStorage 是所有标签页共享的，但凭据按服务器分键：本页只关心自己这台服务器的
+// chat_auth:<enc> 键。别的标签页在同一台服务器上换账号/登出 → 本页身份对不上，
+// 一律不发请求，等页面重载；在别的服务器上的操作与本页无关。
 // 同一账号的令牌轮换不改身份，照常使用。
+function storedUserId(): string {
+  return readAuth(localStorage, serverScope())?.user.id ?? "";
+}
 function storedIdentity(): string {
-  let id = "";
-  try {
-    id = JSON.parse(localStorage.getItem(LS_USER) ?? "null")?.id ?? "";
-  } catch {}
-  return `${getServer()}|${id}`;
+  return `${getServer()}|${storedUserId()}`;
 }
 let boundIdentity: string | null = null;
 function identityMatches(): boolean {
@@ -81,34 +235,43 @@ function identityMatches(): boolean {
 function requireIdentity() {
   if (!identityMatches()) throw new ApiError(0, "session changed");
 }
-/** 别的标签页改了账号或服务器时回调（本页应重载）。 */
+/** 别的标签页改了本页服务器上的账号/凭据时回调（本页应重载）。 */
 export function watchIdentity(onChange: () => void) {
   window.addEventListener("storage", (e) => {
-    if (e.key !== null && e.key !== LS_USER && e.key !== LS_SERVER) return;
+    // e.key === null = 别的标签页 storage.clear()：本页凭据多半也没了，重查身份
+    if (e.key !== null && e.key !== authKey(serverScope())) return;
     if (!identityMatches()) onChange();
   });
 }
 
 export function saveSession(r: AuthResponse) {
-  localStorage.setItem(LS_ACCESS, r.access_token);
-  localStorage.setItem(LS_REFRESH, r.refresh_token);
-  localStorage.setItem(LS_USER, JSON.stringify(r.user));
+  const scope = serverScope();
+  const prev = readAuth(localStorage, scope)?.user.id ?? "";
+  // 换号：清掉上一个账号在本服务器键下的快照，防串号（别的服务器不动）
+  if (prev && prev !== r.user.id) removeLocalCache(localStorage, cacheKey(scope, prev));
+  writeAuth(localStorage, scope, {
+    access: r.access_token,
+    refresh: r.refresh_token,
+    user: r.user,
+  });
+  // 登录成功的服务器才进列表（记最近登录用户名）
+  try {
+    upsertServer(localStorage, getServer(), { username: r.user.username });
+  } catch {}
   sessionGen++; // 新登录 = 新会话
   boundIdentity = storedIdentity();
 }
 export function loadSession(): { user: UserPublic } | null {
-  const u = localStorage.getItem(LS_USER);
-  if (!u || !localStorage.getItem(LS_REFRESH)) return null;
-  try {
-    return { user: JSON.parse(u) };
-  } catch {
-    return null;
-  }
+  const a = readAuth(localStorage, serverScope());
+  return a ? { user: a.user } : null;
+}
+/** 清某服务器名下的凭据与全部本地数据（auth/cache/outbox/drafts）；不广播、不记踢人原因 */
+function clearServerSession(scope: string) {
+  removeServerData(localStorage, scope);
 }
 export function clearSession() {
-  localStorage.removeItem(LS_ACCESS);
-  localStorage.removeItem(LS_REFRESH);
-  localStorage.removeItem(LS_USER);
+  // 登出/换号/被踢：只清本服务器的凭据与数据，其他服务器不受影响
+  clearServerSession(serverScope());
   sessionGen++; // 登出 = 旧会话作废
   boundIdentity = storedIdentity();
 }
@@ -123,57 +286,130 @@ export class ApiError extends Error {
 
 // 刷新结果：凭据确实失效才登出；断网、5xx、维护中只是暂时不可用，保留凭据等下次
 type Refreshed = "ok" | "invalid" | "transient";
+// 明确拒绝时的登出提示（invalid 才可能有）
+type RefreshOutcome = { r: Refreshed; reason?: string };
 
-let refreshing: { gen: number; promise: Promise<Refreshed> } | null = null;
+let refreshing: { gen: number; srv: string; promise: Promise<RefreshOutcome> } | null = null;
 
 function requireSession(gen: number) {
   if (gen !== session()) throw new ApiError(0, "session changed");
 }
 
-// Web Locks 锁名：跨标签页串行化刷新，避免并发轮换互相消费掉对方的刷新令牌
-const REFRESH_LOCK = "chat_token_refresh";
+// Web Locks 锁名按服务器区分：跨标签页串行化刷新，避免并发轮换互相消费掉对方的刷新令牌
+const refreshLock = (srv: string) => `chat_token_refresh:${encServer(srv)}`;
+
+// refresh 的明确拒绝（核对响应体，代理/WAF 拦下的 4xx 不得误判成凭据失效）：
+// 401 invalid refresh token / session expired…（无效、吊销、被挤下线）；
+// 403 账号已被禁用。其余响应一律按暂时失败处理。
+const REFRESH_DENIED_401 = new Set([
+  "invalid refresh token",
+  "session expired, please login again",
+]);
+const REFRESH_DENIED_403 = "账号已被禁用";
+const LOGOUT_EXPIRED = "登录已失效，请重新登录";
+const LOGOUT_DISABLED = "账号已被禁用，请联系管理员"; // 与 ws.ts kickReasonText("disabled") 同文案
+
+/** 服务端明确拒收 refresh token 时的登出文案；非明确拒绝返回 null（按暂时失败） */
+async function refreshDeniedReason(res: Response): Promise<string | null> {
+  if (res.status !== 401 && res.status !== 403) return null;
+  let err: unknown;
+  try {
+    err = (await res.json())?.error;
+  } catch {
+    return null; // 非 JSON 响应（代理/网关拦下）：只是连不上，不动凭据
+  }
+  if (res.status === 403) return err === REFRESH_DENIED_403 ? LOGOUT_DISABLED : null;
+  return REFRESH_DENIED_401.has(String(err)) ? LOGOUT_EXPIRED : null;
+}
+
+/** 业务接口 401（已换新 access token 仍被拒）：本服务的 JSON 报文才算会话级拒绝，代理/WAF 的不算 */
+async function serverDenied(res: Response): Promise<boolean> {
+  try {
+    const j = await res.clone().json();
+    return !!j && typeof j.error === "string";
+  } catch {
+    return false;
+  }
+}
+
+/** 服务端明确踢下线：只清发起时那台服务器的凭据与快照、记它的登录页提示、广播登出。
+ * 别的标签页已换账号时不替它登出；其他服务器的凭据不受影响。 */
+function denySession(status: number, reason: string, srv: string): never {
+  requireIdentity();
+  const scope = encServer(srv);
+  clearServerSession(scope);
+  try {
+    sessionStorage.setItem(kickReasonKey(scope), reason);
+  } catch {}
+  window.dispatchEvent(new Event("chat:logout"));
+  throw new ApiError(status, reason);
+}
+
+// 单次请求超时：服务端不可达（IP 不通/防火墙丢包）时不能无限挂起，否则启动页一直停在「加载中…」
+const REQUEST_TIMEOUT_MS = 10_000;
+
+function timedFetch(url: string, init?: RequestInit, timeoutMs = REQUEST_TIMEOUT_MS): Promise<Response> {
+  if (timeoutMs <= 0 || typeof AbortController === "undefined") return fetch(url, init);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(new ApiError(0, "连接超时，请稍后再试")), timeoutMs);
+  const outer = init?.signal ?? null;
+  const onOuter = () => ctrl.abort(outer!.reason);
+  if (outer) {
+    if (outer.aborted) ctrl.abort(outer.reason);
+    else outer.addEventListener("abort", onOuter, { once: true });
+  }
+  return fetch(url, { ...init, signal: ctrl.signal }).finally(() => {
+    clearTimeout(timer);
+    outer?.removeEventListener("abort", onOuter);
+  });
+}
 
 // 单次刷新（在 Web Locks 内执行）：localStorage 是所有标签页共享的，
 // 刷新令牌已被换成别的值 = 别的标签页刚刷新成功（或新登录），直接当作成功、
 // 用存储里的新访问令牌重试即可，不再请求服务端也不清空会话
-async function refreshOnce(gen: number, srv: string, rt: string): Promise<Refreshed> {
+async function refreshOnce(gen: number, srv: string, rt: string): Promise<RefreshOutcome> {
+  const scope = encServer(srv);
   const swapped = () => {
-    const cur = localStorage.getItem(LS_REFRESH);
-    return cur !== null && cur !== rt;
+    const cur = readAuth(localStorage, scope)?.refresh;
+    return cur !== undefined && cur !== rt;
   };
-  if (swapped()) return "ok";
+  if (swapped()) return { r: "ok" };
   let r: AuthResponse;
   try {
-    const res = await fetch(`${srv}/v1/auth/refresh`, {
+    const res = await timedFetch(`${srv}/v1/auth/refresh`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ refresh_token: rt }),
     });
     if (!res.ok) {
-      if (swapped()) return "ok";
-      // 4xx（除 429）= 服务端明确不认这个刷新令牌；其余是暂时的
-      return res.status >= 400 && res.status < 500 && res.status !== 429 ? "invalid" : "transient";
+      if (swapped()) return { r: "ok" };
+      const reason = await refreshDeniedReason(res);
+      // 只有服务端明确拒绝（核对过响应体）才判 invalid，其余全部按暂时失败
+      return reason ? { r: "invalid", reason } : { r: "transient" };
     }
     r = await res.json();
   } catch {
-    return swapped() ? "ok" : "transient";
+    return { r: swapped() ? "ok" : "transient" };
   }
   // 期间发生了登录/登出/换服务器：不能把旧凭据写回新会话
-  if (gen !== session() || getServer() !== srv) return "invalid";
-  if (localStorage.getItem(LS_REFRESH) !== rt) return swapped() ? "ok" : "invalid";
-  localStorage.setItem(LS_ACCESS, r.access_token);
-  localStorage.setItem(LS_REFRESH, r.refresh_token);
-  localStorage.setItem(LS_USER, JSON.stringify(r.user));
-  return "ok";
+  if (gen !== session() || getServer() !== srv) return { r: "invalid" };
+  if (readAuth(localStorage, scope)?.refresh !== rt) return { r: swapped() ? "ok" : "invalid" };
+  writeAuth(localStorage, scope, {
+    access: r.access_token,
+    refresh: r.refresh_token,
+    user: r.user,
+  });
+  return { r: "ok" };
 }
 
-async function tryRefresh(gen: number, srv: string): Promise<Refreshed> {
+async function tryRefresh(gen: number, srv: string): Promise<RefreshOutcome> {
   requireSession(gen);
   requireIdentity();
-  if (refreshing?.gen === gen) return refreshing.promise;
-  const rt = localStorage.getItem(LS_REFRESH);
-  if (!rt) return "invalid";
-  const owner = { gen, promise: Promise.resolve<Refreshed>("invalid") };
+  // 单飞：同一代会话的并发 401 共用一次刷新，避免旧令牌被重复提交触发盗用判定
+  if (refreshing?.gen === gen && refreshing.srv === srv) return refreshing.promise;
+  const rt = readAuth(localStorage, encServer(srv))?.refresh;
+  if (!rt) return { r: "invalid" };
+  const owner = { gen, srv, promise: Promise.resolve<RefreshOutcome>({ r: "invalid" }) };
   refreshing = owner;
   const run = () => refreshOnce(gen, srv, rt);
   owner.promise = (async () => {
@@ -181,14 +417,14 @@ async function tryRefresh(gen: number, srv: string): Promise<Refreshed> {
       const locks = typeof navigator !== "undefined" ? navigator.locks : undefined;
       if (locks) {
         try {
-          return await locks.request(REFRESH_LOCK, run);
+          return await locks.request(refreshLock(srv), run);
         } catch {
           // 锁服务本身异常：退化为无锁刷新
         }
       }
       return await run();
     } catch {
-      return "transient";
+      return { r: "transient" } as RefreshOutcome;
     } finally {
       setTimeout(() => { if (refreshing === owner) refreshing = null; }, 0);
     }
@@ -196,36 +432,43 @@ async function tryRefresh(gen: number, srv: string): Promise<Refreshed> {
   return owner.promise;
 }
 
-async function raw(srv: string, path: string, init?: RequestInit): Promise<Response> {
+async function raw(srv: string, path: string, init?: RequestInit, timeoutMs?: number): Promise<Response> {
   requireIdentity();
   const headers: Record<string, string> = {
     ...(init?.headers as Record<string, string>),
   };
-  const at = localStorage.getItem(LS_ACCESS);
+  const at = readAuth(localStorage, encServer(srv))?.access;
   if (at) headers["authorization"] = `Bearer ${at}`;
   if (typeof init?.body === "string") headers["Content-Type"] = "application/json";
-  return fetch(`${srv}/v1${path}`, { ...init, headers });
+  return timedFetch(`${srv}/v1${path}`, { ...init, headers }, timeoutMs);
 }
 
-async function call<T>(path: string, init?: RequestInit): Promise<T> {
+// 登录/注册的 401 是业务错误（密码错/邀请码无效），与会话凭据无关：不触发刷新、不登出
+const NO_REFRESH_PATHS = new Set(["/auth/login", "/auth/register"]);
+
+async function call<T>(path: string, init?: RequestInit, opts?: { timeoutMs?: number }): Promise<T> {
   const gen = session();
   const srv = getServer();
-  let res = await raw(srv, path, init);
+  let res = await raw(srv, path, init, opts?.timeoutMs);
   requireSession(gen);
-  if (res.status === 401) {
+  if (res.status === 401 && !NO_REFRESH_PATHS.has(path)) {
     const refreshed = await tryRefresh(gen, srv);
     requireSession(gen);
-    if (refreshed === "transient") throw new ApiError(503, "暂时连不上服务器，请稍后再试");
-    if (refreshed === "ok") {
-      res = await raw(srv, path, init);
+    if (refreshed.r === "transient") throw new ApiError(503, "暂时连不上服务器，请稍后再试");
+    if (refreshed.r === "ok") {
+      res = await raw(srv, path, init, opts?.timeoutMs);
       requireSession(gen);
     }
-    if (refreshed === "invalid" || res.status === 401) {
-      requireIdentity(); // 别的标签页已换账号：那是它的会话，不能替它登出
-      clearSession();
-      window.dispatchEvent(new Event("chat:logout"));
-      throw new ApiError(401, "unauthorized");
-    }
+    // 只有服务端明确拒绝 refresh 或新 access token 才登出；
+    // 代理/网关拦下的 401（非本服务报文）按暂时失败保留会话
+    const reason =
+      refreshed.r === "invalid"
+        ? refreshed.reason ?? LOGOUT_EXPIRED
+        : res.status === 401 && (await serverDenied(res))
+          ? LOGOUT_EXPIRED
+          : null;
+    if (reason) denySession(401, reason, srv);
+    if (res.status === 401) throw new ApiError(503, "暂时连不上服务器，请稍后再试");
   }
   if (res.status === 204) return undefined as T;
   const text = await res.text();
@@ -235,6 +478,12 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
     try {
       msg = JSON.parse(text).error ?? text;
     } catch {}
+    // 账号被禁用：服务端对本会话一切 API 一律 403——与 refresh 被拒同等对待，踢回登录页
+    if (res.status === 403 && msg === REFRESH_DENIED_403 && !NO_REFRESH_PATHS.has(path)) {
+      denySession(403, LOGOUT_DISABLED, srv);
+    }
+    // 登录失败统一口语文案（服务端报文是英文代号 invalid credentials）
+    if (path === "/auth/login" && res.status === 401) msg = "用户名或密码错误";
     // 服务端没有这个接口（客户端更新了、服务端还没更新）
     if (res.status === 404 && msg === "unknown_api") msg = "服务端版本较旧，不支持这个操作，请更新服务端";
     throw new ApiError(res.status, msg);
@@ -308,7 +557,7 @@ export const auth = {
     post<AuthResponse>("/auth/login", { username, password, device_label: deviceLabel() }),
   logout: () => {
     if (!identityMatches()) return; // 存储里已是别的标签页的账号
-    const rt = localStorage.getItem(LS_REFRESH);
+    const rt = readAuth(localStorage, serverScope())?.refresh;
     if (rt) post("/auth/logout", { refresh_token: rt }).catch(() => {});
     clearSession();
   },
@@ -319,7 +568,7 @@ export const auth = {
     const fd = new FormData();
     const ext = file.type === "image/png" ? "png" : file.type === "image/webp" ? "webp" : "jpg";
     fd.append("file", file, `avatar.${ext}`);
-    return call<UserPublic>("/users/me/avatar", { method: "PUT", body: fd });
+    return call<UserPublic>("/users/me/avatar", { method: "PUT", body: fd }, { timeoutMs: 0 });
   },
   removeAvatar: () => call<UserPublic>("/users/me/avatar", { method: "DELETE" }),
   /** 自助改密：返回为当前 session 新签发的凭据（其他 session 已被服务端撤销） */
@@ -504,16 +753,18 @@ export const files = {
     fd.append("conversation_id", conversationId);
     fd.append("file", file, file.name);
     if (opts?.durationMs != null) fd.append("duration_ms", String(opts.durationMs));
-    return call<AttachmentView>("/files", { method: "POST", body: fd });
+    return call<AttachmentView>("/files", { method: "POST", body: fd }, { timeoutMs: 0 });
   },
 };
 
 // ---------- 公共服务器信息 ----------
 /** 登录前探测注册模式。请求失败/404/字段缺失一律视为 open（兼容旧服务端） */
 export async function serverInfo(server?: string): Promise<ServerInfo> {
-  const srv = (server ?? getServer()).trim().replace(/\/+$/, "");
+  // 探测目标要先规范化（手动输入可能缺协议）；规范化不了的按原样试，失败走 open 兜底
+  const srv =
+    server === undefined ? getServer() : normalizeServerUrl(server) ?? server.trim().replace(/\/+$/, "");
   try {
-    const res = await fetch(`${srv}/v1/server-info`);
+    const res = await timedFetch(`${srv}/v1/server-info`);
     if (!res.ok) return { registration_mode: "open" };
     const j = (await res.json()) as Partial<ServerInfo>;
     const m = j.registration_mode;
@@ -571,7 +822,7 @@ export const admin = {
       if (!identityMatches()) return reject(new ApiError(0, "session changed"));
       const xhr = new XMLHttpRequest();
       xhr.open("POST", `${getServer()}/v1/admin/restore`);
-      const at = localStorage.getItem(LS_ACCESS);
+      const at = readAuth(localStorage, serverScope())?.access;
       if (at) xhr.setRequestHeader("authorization", `Bearer ${at}`);
       xhr.upload.onprogress = (e) => {
         if (e.lengthComputable && onProgress)

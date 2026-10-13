@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { auth, browserDeviceLabel, clearSession, convs, deviceLabel, saveSession, setServer, watchIdentity } from "./api";
+import { auth, browserDeviceLabel, clearSession, convs, deviceLabel, getServer, loadSession, saveSession, serverScope, setServer, watchIdentity } from "./api";
+import { authKey, encServer, kickReasonKey, readAuth, writeAuth } from "./servers";
+import { memStorage } from "./testStorage";
 import type { AuthResponse } from "./types";
 
 const login = (name: string): AuthResponse => ({ access_token: `${name}-access`, refresh_token: `${name}-refresh`, access_expires_in: 900, user: { id: name, username: name, display_name: name, role: "user", last_seen_at: null } });
@@ -9,10 +11,18 @@ const deferred = <T,>() => {
   return { promise, resolve };
 };
 
+// T5：凭据分键到 chat_auth:<enc(server)>，「当前服务器」钉在 sessionStorage 里
+const TEST_SRV = "http://test.local";
+const curAuth = () => readAuth(localStorage, serverScope());
+const authAt = (srv: string) => readAuth(localStorage, encServer(srv));
+
 beforeEach(() => {
-  const storage = new Map<string, string>();
-  vi.stubGlobal("localStorage", { getItem: (k: string) => storage.get(k) ?? null, setItem: (k: string, v: string) => storage.set(k, v), removeItem: (k: string) => storage.delete(k) });
+  vi.stubGlobal("localStorage", memStorage());
+  vi.stubGlobal("sessionStorage", memStorage());
   vi.stubGlobal("window", new EventTarget());
+  vi.stubGlobal("location", { origin: "http://localhost", protocol: "http:" });
+  setServer(TEST_SRV); // 钉住本「标签页」的当前服务器
+  sessionStorage.setItem("chat_cur_server", TEST_SRV); // 再 import 的模块也要钉在同一台
   saveSession(login("old"));
 });
 afterEach(() => { clearSession(); vi.unstubAllGlobals(); vi.useRealTimers(); });
@@ -29,7 +39,8 @@ describe("session-owned HTTP requests", () => {
     response.resolve(new Response(status === 204 ? null : "{}", { status }));
     await rejected;
     expect(fetcher).toHaveBeenCalledTimes(1);
-    expect(localStorage.getItem("chat_access")).toBe("new-access");
+    // 新会话写在当时的 TEST_SRV 键下；作废的旧响应不得污染它
+    expect(authAt(TEST_SRV)?.access).toBe("new-access");
   });
 
   it("keeps refresh promises and finalizers isolated across generations", async () => {
@@ -157,12 +168,12 @@ describe("cross-tab refresh", () => {
     await vi.waitFor(() => expect(refreshes.length).toBe(2));
     // 先到的标签页刷新成功并写回 r2；后到的拿旧令牌被服务端拒绝
     refreshes[0].respond(Response.json(creds("a2", "r2")));
-    await vi.waitFor(() => expect(localStorage.getItem("chat_refresh")).toBe("r2"));
+    await vi.waitFor(() => expect(curAuth()?.refresh).toBe("r2"));
     refreshes[1].respond(new Response("{}", { status: 401 }));
     expect(await ra).toEqual(login("u").user);
     expect(await rb).toEqual(login("u").user);
     expect(refreshes.map((r) => r.token)).toEqual(["old-refresh", "old-refresh"]);
-    expect(localStorage.getItem("chat_access")).toBe("a2");
+    expect(curAuth()?.access).toBe("a2");
     expect(authorized.filter((a) => a === "Bearer a2").length).toBe(2);
     expect(logout).not.toHaveBeenCalled();
   });
@@ -190,29 +201,33 @@ describe("cross-tab refresh", () => {
     expect(await rb).toEqual(login("u").user);
     expect(request).toHaveBeenCalledTimes(2);
     expect(refreshes.length).toBe(1);
-    expect(localStorage.getItem("chat_access")).toBe("a2");
+    expect(curAuth()?.access).toBe("a2");
     expect(logout).not.toHaveBeenCalled();
   });
 
   it("clears the session and emits chat:logout when the token is untouched and the server rejects", async () => {
     vi.stubGlobal("navigator", {});
-    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("{}", { status: 401 }))));
+    vi.stubGlobal("fetch", vi.fn((url: string) =>
+      url.endsWith("/auth/refresh")
+        ? Promise.resolve(Response.json({ error: "invalid refresh token" }, { status: 401 }))
+        : Promise.resolve(new Response("{}", { status: 401 }))));
     const logout = vi.fn();
     window.addEventListener("chat:logout", logout);
 
     await expect(auth.me()).rejects.toMatchObject({ status: 401 });
-    expect(localStorage.getItem("chat_refresh")).toBeNull();
-    expect(localStorage.getItem("chat_access")).toBeNull();
+    expect(curAuth()).toBeNull();
     expect(logout).toHaveBeenCalledTimes(1);
   });
 });
 
-// 另一个标签页直接改写共享的 localStorage（不经过本模块）
+// 另一个标签页直接改写共享的 localStorage（不经过本模块），改的是本页服务器的凭据键
 const otherTabLogin = (name: string) => {
   const r = login(name);
-  localStorage.setItem("chat_access", r.access_token);
-  localStorage.setItem("chat_refresh", r.refresh_token);
-  localStorage.setItem("chat_user", JSON.stringify(r.user));
+  writeAuth(localStorage, serverScope(), {
+    access: r.access_token,
+    refresh: r.refresh_token,
+    user: r.user,
+  });
 };
 
 describe("cross-tab identity", () => {
@@ -224,30 +239,103 @@ describe("cross-tab identity", () => {
     expect(fetcher).not.toHaveBeenCalled();
     // 也不能替别的标签页登出
     auth.logout();
-    expect(localStorage.getItem("chat_refresh")).toBe("bob-refresh");
+    expect(curAuth()?.refresh).toBe("bob-refresh");
   });
 
   it("token rotation of the same account keeps working", async () => {
     const fetcher = vi.fn((_url: string, _init?: RequestInit) => Promise.resolve(new Response("{}", { status: 200 })));
     vi.stubGlobal("fetch", fetcher);
     otherTabLogin("old"); // 同一用户 id，只是换了令牌
-    localStorage.setItem("chat_access", "rotated-access");
+    writeAuth(localStorage, serverScope(), {
+      access: "rotated-access",
+      refresh: "old-refresh",
+      user: login("old").user,
+    });
     await convs.rename("g1", "x");
     const headers = fetcher.mock.calls[0][1]?.headers as Record<string, string>;
     expect(headers.authorization).toBe("Bearer rotated-access");
   });
 
-  it("notifies when another tab switches account, not on rotation", () => {
+  it("notifies when another tab switches account on this server, ignores other servers' keys", () => {
     const onChange = vi.fn();
     watchIdentity(onChange);
     const storageEvent = (key: string) => Object.assign(new Event("storage"), { key });
-    localStorage.setItem("chat_access", "rotated");
-    window.dispatchEvent(storageEvent("chat_access"));
-    window.dispatchEvent(storageEvent("chat_user"));
+    // 别的服务器的凭据键动了：与本页无关
+    localStorage.setItem(authKey(encServer("http://other")), "x");
+    window.dispatchEvent(storageEvent(authKey(encServer("http://other"))));
+    // 本服务器的键被改但仍是同一账号（令牌轮换）→ 不通知
+    writeAuth(localStorage, serverScope(), {
+      access: "rotated",
+      refresh: "old-refresh",
+      user: login("old").user,
+    });
+    window.dispatchEvent(storageEvent(authKey(serverScope())));
     expect(onChange).not.toHaveBeenCalled();
     otherTabLogin("bob");
-    window.dispatchEvent(storageEvent("chat_user"));
+    window.dispatchEvent(storageEvent(authKey(serverScope())));
     expect(onChange).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ===== T5：凭据按服务器隔离 =====
+describe("per-server credentials", () => {
+  const A = "http://a.example";
+  const B = "http://b.example";
+
+  it("keeps credentials isolated per server: switching back needs no re-login", () => {
+    setServer(A);
+    saveSession(login("alice"));
+    setServer(B);
+    expect(loadSession()).toBeNull(); // B 上还没有凭据
+    saveSession(login("bob"));
+    expect(loadSession()?.user.id).toBe("bob");
+    // 切回 A：凭据还在，直接读回
+    setServer(A);
+    expect(loadSession()?.user.id).toBe("alice");
+    expect(authAt(B)?.user.id).toBe("bob");
+    setServer(TEST_SRV);
+  });
+
+  it("denied refresh clears only this server's credentials, not the other server's", async () => {
+    vi.stubGlobal("navigator", {});
+    writeAuth(localStorage, encServer(A), {
+      access: "a-a",
+      refresh: "r-a",
+      user: login("alice").user,
+    });
+    writeAuth(localStorage, encServer(B), {
+      access: "a-b",
+      refresh: "r-b",
+      user: login("bob").user,
+    });
+    setServer(A);
+    vi.stubGlobal("fetch", vi.fn((url: string) =>
+      url.endsWith("/auth/refresh")
+        ? Promise.resolve(Response.json({ error: "invalid refresh token" }, { status: 401 }))
+        : Promise.resolve(new Response("{}", { status: 401 }))));
+    const logout = vi.fn();
+    window.addEventListener("chat:logout", logout);
+    await expect(auth.me()).rejects.toMatchObject({ status: 401 });
+    expect(authAt(A)).toBeNull(); // 只有 A 被清
+    expect(authAt(B)?.refresh).toBe("r-b");
+    expect(sessionStorage.getItem(kickReasonKey(encServer(A)))).toBe("登录已失效，请重新登录");
+    expect(logout).toHaveBeenCalledTimes(1);
+    setServer(TEST_SRV);
+  });
+
+  it("clearSession only removes this server's auth and cache", () => {
+    writeAuth(localStorage, encServer(B), {
+      access: "a-b",
+      refresh: "r-b",
+      user: login("bob").user,
+    });
+    localStorage.setItem(`chat_cache:${encServer(B)}:bob`, "snap-b");
+    localStorage.setItem(`chat_cache:${serverScope()}:old`, "snap-a");
+    clearSession();
+    expect(curAuth()).toBeNull();
+    expect(localStorage.getItem(`chat_cache:${serverScope()}:old`)).toBeNull();
+    expect(authAt(B)?.refresh).toBe("r-b");
+    expect(localStorage.getItem(`chat_cache:${encServer(B)}:bob`)).toBe("snap-b");
   });
 });
 
@@ -255,6 +343,11 @@ describe("refresh failures", () => {
   it.each([
     ["503", () => Promise.resolve(new Response("{}", { status: 503 }))],
     ["network error", () => Promise.reject(new TypeError("Failed to fetch"))],
+    ["429", () => Promise.resolve(Response.json({ error: "too many requests" }, { status: 429 }))],
+    ["404 (旧服务端/代理)", () => Promise.resolve(Response.json({ error: "unknown_api" }, { status: 404 }))],
+    ["代理 401（非 JSON）", () => Promise.resolve(new Response("Unauthorized", { status: 401 }))],
+    ["陌生 JSON 401", () => Promise.resolve(Response.json({ error: "sso required" }, { status: 401 }))],
+    ["其他 403", () => Promise.resolve(Response.json({ error: "forbidden" }, { status: 403 }))],
   ])("keeps the session when refresh hits %s", async (_label, refreshResponse) => {
     vi.stubGlobal("navigator", {});
     vi.stubGlobal("fetch", vi.fn((url: string) =>
@@ -262,14 +355,142 @@ describe("refresh failures", () => {
     const logout = vi.fn();
     window.addEventListener("chat:logout", logout);
     await expect(auth.me()).rejects.toMatchObject({ status: 503 });
-    expect(localStorage.getItem("chat_refresh")).toBe("old-refresh");
+    expect(curAuth()?.refresh).toBe("old-refresh");
     expect(logout).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["invalid refresh token", 401, "登录已失效，请重新登录"],
+    ["session expired, please login again", 401, "登录已失效，请重新登录"],
+    ["账号已被禁用", 403, "账号已被禁用，请联系管理员"],
+  ])("logs out with a hint when refresh is explicitly rejected: %s", async (err, status, reason) => {
+    vi.stubGlobal("navigator", {});
+    const mem = new Map<string, string>();
+    vi.stubGlobal("sessionStorage", {
+      getItem: (k: string) => mem.get(k) ?? null,
+      setItem: (k: string, v: string) => void mem.set(k, v),
+      removeItem: (k: string) => void mem.delete(k),
+    });
+    vi.stubGlobal("fetch", vi.fn((url: string) =>
+      url.endsWith("/auth/refresh")
+        ? Promise.resolve(Response.json({ error: err }, { status }))
+        : Promise.resolve(new Response("{}", { status: 401 }))));
+    const logout = vi.fn();
+    window.addEventListener("chat:logout", logout);
+    await expect(auth.me()).rejects.toMatchObject({ status: 401 });
+    expect(curAuth()).toBeNull();
+    expect(logout).toHaveBeenCalledTimes(1);
+    expect(mem.get(kickReasonKey(serverScope()))).toBe(reason);
   });
 
   it("logs out when the server rejects the refresh token", async () => {
     vi.stubGlobal("navigator", {});
-    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("{}", { status: 401 }))));
+    vi.stubGlobal("fetch", vi.fn((url: string) =>
+      url.endsWith("/auth/refresh")
+        ? Promise.resolve(Response.json({ error: "invalid refresh token" }, { status: 401 }))
+        : Promise.resolve(new Response("{}", { status: 401 }))));
     await expect(auth.me()).rejects.toMatchObject({ status: 401 });
-    expect(localStorage.getItem("chat_refresh")).toBeNull();
+    expect(curAuth()).toBeNull();
+  });
+
+  it("keeps the session when a middlebox 401s the retried request after a successful refresh", async () => {
+    vi.stubGlobal("navigator", {});
+    let calls = 0;
+    vi.stubGlobal("fetch", vi.fn((url: string) => {
+      if (url.endsWith("/auth/refresh"))
+        return Promise.resolve(Response.json({ ...login("old"), access_token: "a2", refresh_token: "r2" }));
+      calls++;
+      // 初次 401 触发 refresh；换新 token 重试时被代理拦下（非本服务 JSON 报文）
+      return Promise.resolve(new Response("Unauthorized", { status: 401 }));
+    }));
+    const logout = vi.fn();
+    window.addEventListener("chat:logout", logout);
+    await expect(auth.me()).rejects.toMatchObject({ status: 503 });
+    expect(calls).toBe(2);
+    expect(curAuth()?.refresh).toBe("r2");
+    expect(logout).not.toHaveBeenCalled();
+  });
+
+  it("logs out when the retried request is rejected by the server after a successful refresh", async () => {
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("fetch", vi.fn((url: string) => {
+      if (url.endsWith("/auth/refresh"))
+        return Promise.resolve(Response.json({ ...login("old"), access_token: "a2", refresh_token: "r2" }));
+      return Promise.resolve(
+        Response.json({ error: "session expired, please login again" }, { status: 401 }),
+      );
+    }));
+    const logout = vi.fn();
+    window.addEventListener("chat:logout", logout);
+    await expect(auth.me()).rejects.toMatchObject({ status: 401 });
+    expect(curAuth()).toBeNull();
+    expect(logout).toHaveBeenCalledTimes(1);
+  });
+
+  it("logs out with the disabled hint when any endpoint answers 「账号已被禁用」", async () => {
+    vi.stubGlobal("navigator", {});
+    const mem = new Map<string, string>();
+    vi.stubGlobal("sessionStorage", {
+      getItem: (k: string) => mem.get(k) ?? null,
+      setItem: (k: string, v: string) => void mem.set(k, v),
+      removeItem: (k: string) => void mem.delete(k),
+    });
+    vi.stubGlobal("fetch", vi.fn(() =>
+      Promise.resolve(Response.json({ error: "账号已被禁用" }, { status: 403 }))));
+    const logout = vi.fn();
+    window.addEventListener("chat:logout", logout);
+    await expect(convs.list()).rejects.toMatchObject({ status: 403 });
+    expect(curAuth()).toBeNull();
+    expect(logout).toHaveBeenCalledTimes(1);
+    expect(mem.get(kickReasonKey(serverScope()))).toBe("账号已被禁用，请联系管理员");
+  });
+});
+
+// ===== T1：登录/注册错误不触发刷新与登出 =====
+describe("login/register errors", () => {
+  it("maps a wrong-password 401 to 「用户名或密码错误」 without refreshing or clearing the session", async () => {
+    const fetcher = vi.fn((_url: string, _init?: RequestInit) =>
+      Promise.resolve(Response.json({ error: "invalid credentials" }, { status: 401 })));
+    vi.stubGlobal("fetch", fetcher);
+    const logout = vi.fn();
+    window.addEventListener("chat:logout", logout);
+    await expect(auth.login("old", "wrong")).rejects.toMatchObject({
+      status: 401,
+      message: "用户名或密码错误",
+    });
+    // 登录接口返回 401 时不得尝试刷新令牌（只调了一次接口）
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(String(fetcher.mock.calls[0][0])).toContain("/auth/login");
+    // 已有会话凭据原样保留
+    expect(curAuth()?.refresh).toBe("old-refresh");
+    expect(logout).not.toHaveBeenCalled();
+  });
+
+  it("surfaces register errors as-is without refreshing", async () => {
+    const fetcher = vi.fn((_url: string, _init?: RequestInit) =>
+      Promise.resolve(Response.json({ error: "username already taken" }, { status: 409 })));
+    vi.stubGlobal("fetch", fetcher);
+    await expect(auth.register("old", "secret123")).rejects.toMatchObject({
+      status: 409,
+      message: "username already taken",
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(curAuth()?.refresh).toBe("old-refresh");
+  });
+});
+
+// ===== T1：请求超时，不可达时不挂在「加载中…」 =====
+describe("request timeout", () => {
+  it("aborts a hanging request and rejects as transient (status 0)", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+      }),
+    ));
+    const request = auth.me();
+    const rejected = expect(request).rejects.toMatchObject({ status: 0 });
+    await vi.advanceTimersByTimeAsync(10_000);
+    await rejected;
   });
 });

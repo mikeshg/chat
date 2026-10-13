@@ -835,6 +835,53 @@ async fn p41_backup_admin_gate_and_ticket_rules() {
     assert_eq!(dl4.status(), 401, "非管理员 ticket 应 401");
 }
 
+/// 恢复开始踢下线：其他在线用户收 force_logout("restoring") 并被关闭；
+/// 发起恢复的管理员会话连接保留（它的 HTTP 请求还在等恢复结果，踢了会先看到踢下线提示）。
+#[tokio::test]
+async fn p41_restore_kicks_restoring_keeps_initiator() {
+    let (base, st, _files_dir) = spawn_backup_env("kr").await;
+    let admin = register(&base, &format!("p41r_{}", uniq())).await;
+    let bob = register(&base, &format!("p41s_{}", uniq())).await;
+
+    let (mut sb, _) = tokio_tungstenite::connect_async(ws_url(&base, &bob).await)
+        .await
+        .unwrap();
+    next_of(&mut sb, "presence_init").await;
+    let (mut sa, _) = tokio_tungstenite::connect_async(ws_url(&base, &admin).await)
+        .await
+        .unwrap();
+    next_of(&mut sa, "presence_init").await;
+
+    let name = create_and_wait_backup(&base, &admin.access).await;
+    let bytes = download_backup(&base, &admin.access, &name).await;
+    let r = restore_upload(&base, &admin.access, bytes, Some("RESTORE")).await;
+    assert_eq!(r.status(), 200);
+
+    // bob 被踢：reason=restoring（不是 maintenance），随后服务端主动关闭
+    let f = next_of(&mut sb, "force_logout").await;
+    assert_eq!(f["reason"], "restoring");
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            match sb.next().await {
+                Some(Ok(WsMsg::Close(_))) | None | Some(Err(_)) => break true,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(closed, "server did not close the kicked socket");
+
+    // 发起者的连接保留：连接表里还在，且全程没收到任何帧（踢人帧没有它）
+    let admin_uid = uuid::Uuid::parse_str(&admin.id).unwrap();
+    let bob_uid = uuid::Uuid::parse_str(&bob.id).unwrap();
+    assert_eq!(st.conn_count(admin_uid), 1);
+    assert_eq!(st.conn_count(bob_uid), 0);
+    let silent =
+        tokio::time::timeout(std::time::Duration::from_millis(500), sa.next()).await;
+    assert!(silent.is_err(), "initiator connection received a frame: {silent:?}");
+}
+
 /// 维护模式：maintenance=true 时所有 /v1 请求 503（含 WS 升级）；复位后恢复。
 #[tokio::test]
 async fn p41_maintenance_blocks_api() {

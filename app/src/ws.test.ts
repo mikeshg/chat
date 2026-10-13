@@ -33,6 +33,7 @@ beforeEach(() => {
   refreshStatus = 200;
   vi.stubGlobal("fetch", vi.fn(async (url: string) => {
     if (url.endsWith("/ws/ticket")) return Response.json({ ticket: "t" });
+    if (url.endsWith("/users/me")) return Response.json(me);
     if (url.endsWith("/messages/refresh")) return new Response(refreshStatus === 200 ? JSON.stringify({ messages: [], has_more: false }) : "", { status: refreshStatus });
     if (url.endsWith("/conversations/c")) return Response.json({ id: "c" });
     if (url.endsWith("/conversations")) return Response.json(getState().conversations);
@@ -139,6 +140,8 @@ describe("force_logout reason copy", () => {
     ["password_reset", "密码已被管理员重置，请重新登录"],
     ["password_changed", "密码已在其他设备修改，请重新登录"],
     ["session_revoked", "该设备已被移出登录，请重新登录"],
+    ["maintenance", "服务器维护中，请稍后重新登录"],
+    ["restoring", "正在恢复备份，完成后请重新登录"],
     ["unknown_reason", "登录已失效，请重新登录"],
   ])("kickReasonText(%j) → %s", (reason, want) => {
     expect(kickReasonText(reason)).toBe(want);

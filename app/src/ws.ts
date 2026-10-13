@@ -4,12 +4,13 @@ import {
   clearSession,
   convs,
   friends as friendsApi,
-  getServer,
   msgs,
+  serverScope,
   session,
   wsBase,
 } from "./api";
 import { notifyIncoming } from "./notify";
+import { kickReasonKey } from "./servers";
 import {
   absorbAvatarUsers,
   applyLiveMessage,
@@ -75,7 +76,7 @@ function saveOutbox() {
 /** 登录后取回本账号未发出的消息，放回各会话列表；连上后 flushOutbox 按原 client_msg_id 重发 */
 function restoreOutbox() {
   const me = getState().me;
-  outboxKey = me ? `chat_outbox:${getServer() || location.origin}:${me.id}` : "";
+  outboxKey = me ? `chat_outbox:${serverScope()}:${me.id}` : "";
   outbox.length = 0;
   try {
     const saved: unknown = JSON.parse(localStorage.getItem(outboxKey) || "[]");
@@ -212,12 +213,18 @@ async function connect() {
 }
 
 async function afterOpen(sock: WebSocket, gen: number) {
-  try {
-    await refreshCatalogs();
-  } catch (e) {
-    console.warn("refresh failed", e);
-  }
-  if (stopped || gen !== wsGen || gen !== session() || ws !== sock || sock.readyState !== WebSocket.OPEN) return;
+  const alive = () =>
+    !stopped && gen === wsGen && gen === session() && ws === sock && sock.readyState === WebSocket.OPEN;
+  // 重连恢复：刷新本人资料（离线期间可能被改）+ 拉全部目录
+  const [me] = await Promise.all([
+    auth.me().catch((e: unknown) => {
+      console.warn("me refresh failed", e);
+      return null;
+    }),
+    refreshCatalogs().catch((e: unknown) => console.warn("refresh failed", e)),
+  ]);
+  if (me && alive()) setState({ me });
+  if (!alive()) return;
   const s = getState();
   syncInflight.clear(); // 旧 socket 上的未完成 sync 随连接作废
   for (const conv of new Set([...Object.keys(s.messages), ...syncedSeq.keys()])) {
@@ -334,6 +341,8 @@ export function kickReasonText(reason: string): string {
       return "该设备已被移出登录，请重新登录";
     case "maintenance":
       return "服务器维护中，请稍后重新登录";
+    case "restoring":
+      return "正在恢复备份，完成后请重新登录";
     default:
       return "登录已失效，请重新登录";
   }
@@ -445,8 +454,8 @@ function dispatch(f: WsOut) {
       );
       break;
     case "force_logout": {
-      // 被踢下线（禁用/重置密码/改密/移出设备）：记录原因 → 停连接 → 回登录页
-      sessionStorage.setItem("chat_kick_reason", kickReasonText(f.reason));
+      // 被踢下线（禁用/重置密码/改密/移出设备）：记本服务器的原因 → 停连接 → 回登录页
+      sessionStorage.setItem(kickReasonKey(serverScope()), kickReasonText(f.reason));
       stopWs();
       clearSession();
       window.dispatchEvent(new Event("chat:logout"));

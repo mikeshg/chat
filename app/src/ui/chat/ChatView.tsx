@@ -29,6 +29,7 @@ import RichText from "../../richText";
 import AnnouncementBar from "./AnnouncementBar";
 import AudioBubble from "./AudioBubble";
 import ConvMedia from "./ConvMedia";
+import CtxMenu from "./CtxMenu";
 import ForwardModal from "./ForwardModal";
 import GroupInfo from "./GroupInfo";
 import { meetingMessage } from "./meeting";
@@ -1279,103 +1280,91 @@ export default function ChatView() {
 
       {/* 消息右键菜单（生命周期操作；可用性与 hover 操作条一致） */}
       {msgMenu && (
-        <div
-          className="ctx-mask"
-          onClick={() => setMsgMenu(null)}
-          onContextMenu={(e) => e.preventDefault()}
-        >
-          <div className="ctx-menu" style={{ left: msgMenu.x, top: msgMenu.y }}>
-            {canActMsg(msgMenu.m) && (
-              <>
-                <div
-                  className="ctx-item"
-                  onClick={() => {
-                    setEmojiPick(msgMenu.m.id);
-                    setMsgMenu(null);
-                  }}
-                >
-                  表情
-                </div>
-                <div
-                  className="ctx-item"
-                  onClick={() => {
-                    startReply(msgMenu.m);
-                    setMsgMenu(null);
-                  }}
-                >
-                  回复
-                </div>
-                {canEditMsg(msgMenu.m) && (
-                  <div
-                    className="ctx-item"
-                    onClick={() => {
-                      startEdit(msgMenu.m);
-                      setMsgMenu(null);
-                    }}
-                  >
-                    编辑
-                  </div>
-                )}
-                {canDeleteMsg(msgMenu.m) && (
-                  <div className="ctx-item" onClick={() => void doDelete(msgMenu.m)}>
-                    删除
-                  </div>
-                )}
-              </>
-            )}
-            {canPinMsg(msgMenu.m) && (
-              <div className="ctx-item" onClick={() => void doPin(msgMenu.m)}>
-                {pinnedIds.has(msgMenu.m.id) ? "取消置顶" : "置顶"}
+        <CtxMenu x={msgMenu.x} y={msgMenu.y} onClose={() => setMsgMenu(null)}>
+          {canActMsg(msgMenu.m) && (
+            <>
+              <div
+                className="ctx-item"
+                onClick={() => {
+                  setEmojiPick(msgMenu.m.id);
+                  setMsgMenu(null);
+                }}
+              >
+                表情
               </div>
-            )}
-            {canForwardMsg(msgMenu.m) && (
-              <>
+              <div
+                className="ctx-item"
+                onClick={() => {
+                  startReply(msgMenu.m);
+                  setMsgMenu(null);
+                }}
+              >
+                回复
+              </div>
+              {canEditMsg(msgMenu.m) && (
                 <div
                   className="ctx-item"
                   onClick={() => {
-                    setFwdMsg(msgMenu.m);
+                    startEdit(msgMenu.m);
                     setMsgMenu(null);
                   }}
                 >
-                  转发
+                  编辑
                 </div>
-                <div className="ctx-item" onClick={() => void doFavorite(msgMenu.m)}>
-                  收藏
+              )}
+              {canDeleteMsg(msgMenu.m) && (
+                <div className="ctx-item" onClick={() => void doDelete(msgMenu.m)}>
+                  删除
                 </div>
-              </>
-            )}
-          </div>
-        </div>
+              )}
+            </>
+          )}
+          {canPinMsg(msgMenu.m) && (
+            <div className="ctx-item" onClick={() => void doPin(msgMenu.m)}>
+              {pinnedIds.has(msgMenu.m.id) ? "取消置顶" : "置顶"}
+            </div>
+          )}
+          {canForwardMsg(msgMenu.m) && (
+            <>
+              <div
+                className="ctx-item"
+                onClick={() => {
+                  setFwdMsg(msgMenu.m);
+                  setMsgMenu(null);
+                }}
+              >
+                转发
+              </div>
+              <div className="ctx-item" onClick={() => void doFavorite(msgMenu.m)}>
+                收藏
+              </div>
+            </>
+          )}
+        </CtxMenu>
       )}
 
       {/* 附件右键菜单 */}
       {ctxMenu && (
-        <div
-          className="ctx-mask"
-          onClick={() => setCtxMenu(null)}
-          onContextMenu={(e) => e.preventDefault()}
-        >
-          <div className="ctx-menu" style={{ left: ctxMenu.x, top: ctxMenu.y }}>
-            <div
-              className="ctx-item"
-              onClick={() => {
-                openPreview(ctxMenu.att);
-                setCtxMenu(null);
-              }}
-            >
-              预览
-            </div>
-            <div
-              className="ctx-item"
-              onClick={() => {
-                downloadAttachment(ctxMenu.att);
-                setCtxMenu(null);
-              }}
-            >
-              下载
-            </div>
+        <CtxMenu x={ctxMenu.x} y={ctxMenu.y} onClose={() => setCtxMenu(null)}>
+          <div
+            className="ctx-item"
+            onClick={() => {
+              openPreview(ctxMenu.att);
+              setCtxMenu(null);
+            }}
+          >
+            预览
           </div>
-        </div>
+          <div
+            className="ctx-item"
+            onClick={() => {
+              downloadAttachment(ctxMenu.att);
+              setCtxMenu(null);
+            }}
+          >
+            下载
+          </div>
+        </CtxMenu>
       )}
     </main>
   );

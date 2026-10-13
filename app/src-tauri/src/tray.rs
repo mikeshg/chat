@@ -43,6 +43,10 @@ pub fn install(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// Linux 下左键单击收不到事件：Tauri 的 TrayIconEvent 在 Linux 标注为
+// Unsupported，因为后端 libayatana-appindicator 只有 Activate/ContextMenu
+// 信号且两者都会弹出菜单，应用拿不到点击。所以 Linux 上左/右键行为都是弹
+// 菜单，菜单首项「显示窗口」是入口；本函数只在 Windows/macOS 生效。
 fn click_shows_window(event: &TrayIconEvent) -> bool {
     match event {
         TrayIconEvent::Click {

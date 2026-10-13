@@ -46,7 +46,7 @@
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; margin: 0; }
 body {
-  font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   background: var(--bg);
   color: var(--text);
   font-size: 14px;
@@ -103,6 +103,28 @@ input:focus, textarea:focus { border-color: var(--green); }
 .auth-server { width: 340px; display: flex; justify-content: center; }
 .auth-server input { width: 100%; }
 .auth-server .auth-switch { color: var(--muted); font-size: 13px; }
+/* T5：已保存服务器列表（登录页） */
+.auth-server-form { width: 100%; display: flex; flex-direction: column; gap: 8px; }
+.auth-server-list { display: flex; flex-direction: column; gap: 2px; }
+.auth-server-item { display: flex; align-items: center; gap: 4px; }
+.auth-server-pick {
+  flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start;
+  gap: 2px; padding: 6px 8px; border: none; background: transparent; border-radius: 6px;
+  font-size: 13px; text-align: left; cursor: pointer;
+}
+.auth-server-pick:hover { background: var(--bg); }
+.auth-server-pick .muted { font-size: 12px; overflow-wrap: anywhere; }
+.auth-server-del {
+  border: none; background: transparent; color: var(--muted); font-size: 16px;
+  padding: 4px 8px; border-radius: 6px; cursor: pointer; flex-shrink: 0;
+}
+.auth-server-del:hover { color: var(--danger); background: var(--bg); }
+/* T6b：keepFocus 的 preventDefault 让 Firefox 不触发 :active；
+   .pressed 由 pointerdown/up/leave/cancel 同步，视觉同 :active 且不改布局 */
+.auth-card button.primary:active, .auth-card button.primary.pressed { filter: brightness(0.9); }
+.auth-head .auth-switch:active, .auth-head .auth-switch.pressed { opacity: 0.6; }
+.auth-server-pick:active, .auth-server-pick.pressed { background: var(--bg); }
+.auth-server-del:active, .auth-server-del.pressed { color: var(--danger); background: var(--bg); }
 
 /* ---------- 主框架 ---------- */
 .shell { display: flex; height: 100%; }
@@ -134,6 +156,14 @@ input:focus, textarea:focus { border-color: var(--green); }
   display: flex; flex-direction: column; flex-shrink: 0;
 }
 .conv-head { display: flex; gap: 6px; padding: 10px; border-bottom: 1px solid var(--line); }
+/* 离线横幅：延迟淡入，刚断线又秒连上的瞬间不闪 */
+.offline-banner {
+  padding: 6px 10px; text-align: center; font-size: 12px;
+  color: var(--warn-fg); background: var(--warn-bg);
+  border-bottom: 1px solid var(--line);
+  animation: offline-in .2s ease .8s backwards;
+}
+@keyframes offline-in { from { opacity: 0; } to { opacity: 1; } }
 .search { flex: 1; background: var(--bg); }
 .icon-btn { width: 34px; padding: 0; font-size: 18px; }
 .conv-scroll { flex: 1; overflow-y: auto; }
@@ -988,6 +1018,14 @@ button.st-nav-item.sub { padding-left: 40px; font-size: 13px; }
 .bot-help p { margin: 0; }
 .set-logout-card { margin-top: 22px; }
 button.set-logout { width: 100%; border: none; border-radius: 0; padding: 14px; color: var(--danger); font-size: 14px; }
+/* T5：切换服务器面板（「我」页通用） */
+.srv-panel { gap: 4px; }
+.srv-item { display: flex; align-items: center; gap: 10px; padding: 6px 0; }
+.srv-item .grow { flex: 1; min-width: 0; }
+.srv-item .muted { font-size: 12px; overflow-wrap: anywhere; }
+.srv-item button { flex-shrink: 0; }
+.srv-add { display: flex; gap: 8px; margin-top: 6px; }
+.srv-add input { flex: 1; min-width: 0; }
 
 /* 开关 */
 input.switch {
@@ -1010,3 +1048,23 @@ input.switch:focus-visible { outline: 2px solid var(--green); outline-offset: 2p
 .seg-opt.on { background: var(--panel); color: var(--text); box-shadow: 0 1px 2px var(--shadow-soft); }
 .seg-opt input { position: absolute; opacity: 0; width: 0; height: 0; margin: 0; }
 .seg-opt:has(input:focus-visible) { outline: 2px solid var(--green); }
+
+/* ===== T2：菜单视口夹紧 / 会话列表让位 / 窄屏消息工具栏 ===== */
+/* 右键菜单比视口高时改为内部滚动，保证底部项可点（定位夹紧见 ui/chat/menuPos.ts） */
+.ctx-menu { max-height: calc(100vh - 8px); overflow-y: auto; }
+
+/* 会话列表：悬停/键盘聚焦显出 ⋯ 按钮时，右侧时间与未读数左移让位，不再被按钮盖住 */
+.conv-item:hover .conv-right,
+.conv-item:focus-within .conv-right { margin-right: 30px; }
+
+/* 窄屏：悬停工具栏会盖住上一条消息，改为不显示；操作走长按/右键菜单。
+   表情选择器（.open 由「表情」菜单项显式打开，不靠悬停）改为在气泡内侧占行，
+   不遮任何消息。 */
+@media (max-width: 720px) {
+  .bubble-wrap:hover > .msg-actions:not(.open),
+  .msg-actions:focus-within:not(.open) { display: none; }
+  .msg-actions.open {
+    position: static; display: flex; flex-wrap: wrap; max-width: 100%;
+    margin-bottom: 4px;
+  }
+}
