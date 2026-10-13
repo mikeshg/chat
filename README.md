@@ -1,3 +1,5 @@
+> **⚠️ 修改代码前（包括 AI agent）必须先阅读 [AGENTS.md](AGENTS.md)，尤其是其中的发布与版本号升级规则。**
+
 # Chat
 
 一个私聊 + 群聊的聊天软件。后端 Rust/axum + PostgreSQL，前端 React 单代码库，浏览器 / Windows(Tauri) / Android(Tauri) 三端复用。
