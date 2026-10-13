@@ -1,13 +1,18 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   authKey,
   encServer,
+  firstEmptyCredential,
+  isImeEnter,
   kickReasonKey,
   listServers,
   migrateLegacyStorage,
   needsInsecureConfirm,
   normalizeServerUrl,
+  planServerEnter,
   readAuth,
+  requestFormSubmit,
+  resolveServerBlur,
   resolveServerInput,
   removeServerData,
   removeServerEntry,
@@ -104,6 +109,140 @@ describe("needsInsecureConfirm", () => {
     expect(needsInsecureConfirm(false, "https:", "https://a")).toBe(false);
     expect(needsInsecureConfirm(false, "http:", "http://a")).toBe(false);
     expect(needsInsecureConfirm(true, "https:", "http://a")).toBe(false);
+  });
+});
+
+// ===== T6b：Opus 复审修复 =====
+
+// F1：IME 输入法合成期间的 Enter 不算提交（keyCode 229 是旧浏览器兜底）
+describe("isImeEnter", () => {
+  it("isComposing 或 keyCode 229 → IME 合成中", () => {
+    expect(isImeEnter({ isComposing: true })).toBe(true);
+    expect(isImeEnter({ keyCode: 229 })).toBe(true);
+    expect(isImeEnter({ isComposing: false, keyCode: 13 })).toBe(false);
+    expect(isImeEnter({})).toBe(false);
+  });
+});
+
+describe("firstEmptyCredential", () => {
+  it("返回第一个空凭据字段（用户名优先）；都填了 → null", () => {
+    expect(firstEmptyCredential("", "")).toBe("username");
+    expect(firstEmptyCredential("  ", "x")).toBe("username");
+    expect(firstEmptyCredential("u", "")).toBe("password");
+    expect(firstEmptyCredential("u", "p")).toBeNull();
+  });
+});
+
+// F6/F1/F5/F2：地址框回车的动作决策
+describe("planServerEnter", () => {
+  const base = {
+    composing: false,
+    busy: false,
+    input: "localhost:29072",
+    username: "alice",
+    password: "secret123",
+    desktop: false,
+    origin: "http://localhost:29071",
+  };
+
+  it("F6 登录请求在飞（busy）→ ignore：不提交地址也不发请求", () => {
+    expect(planServerEnter({ ...base, busy: true })).toEqual({ t: "ignore" });
+  });
+
+  it("F1 IME 合成中的 Enter → ignore：不提交不校验", () => {
+    expect(planServerEnter({ ...base, composing: true, input: "zhongwen" })).toEqual({
+      t: "ignore",
+    });
+  });
+
+  it("F5 用户名空 → 只提交地址并聚焦用户名；密码空 → 聚焦密码", () => {
+    expect(planServerEnter({ ...base, username: "  " })).toEqual({
+      t: "focus",
+      url: "http://localhost:29072",
+      field: "username",
+    });
+    expect(planServerEnter({ ...base, password: "" })).toEqual({
+      t: "focus",
+      url: "http://localhost:29072",
+      field: "password",
+    });
+  });
+
+  it("地址非法 → err（面板保持展开）", () => {
+    const p = planServerEnter({ ...base, input: "http://[bad" });
+    expect(p.t).toBe("err");
+    if (p.t === "err") expect(p.err).toContain("服务器地址");
+  });
+
+  it("桌面端地址留空 → err（必填）", () => {
+    const p = planServerEnter({ ...base, input: "  ", desktop: true });
+    expect(p.t).toBe("err");
+  });
+
+  it("凭据齐全 + 地址合法 → submit，返回规范化地址", () => {
+    expect(planServerEnter(base)).toEqual({
+      t: "submit",
+      url: "http://localhost:29072",
+    });
+  });
+});
+
+// F2/F7：地址框失焦去向
+describe("resolveServerBlur", () => {
+  const web = { desktop: false, origin: "http://localhost:29071" };
+
+  it("Web 端留空 → collapse（不动已保存地址）", () => {
+    expect(resolveServerBlur("   ", web)).toEqual({ t: "collapse" });
+  });
+
+  it("F2 桌面端留空 → err（地址必填，面板不收起）", () => {
+    const r = resolveServerBlur("", { desktop: true });
+    expect(r.t).toBe("err");
+    if (r.t === "err") expect(r.err).toContain("请填写服务器地址");
+  });
+
+  it("非法输入 → err（不藏起错误）", () => {
+    const r = resolveServerBlur("http://[bad", web);
+    expect(r.t).toBe("err");
+  });
+
+  it("F7 合法输入 → commit 规范化地址（调用方顺带清掉旧错误）", () => {
+    expect(resolveServerBlur("LOCALHOST:29072/", web)).toEqual({
+      t: "commit",
+      url: "http://localhost:29072",
+    });
+    expect(resolveServerBlur("", { desktop: false, origin: "http://x" })).toEqual({
+      t: "collapse",
+    });
+  });
+});
+
+// F4：老 WebKit 没有 requestSubmit → 派发可取消冒泡的 submit 事件
+describe("requestFormSubmit", () => {
+  it("有 requestSubmit 直接调用", () => {
+    const form = { requestSubmit: vi.fn() };
+    requestFormSubmit(form as unknown as HTMLFormElement);
+    expect(form.requestSubmit).toHaveBeenCalledTimes(1);
+  });
+
+  it("没有 requestSubmit → dispatchEvent submit {cancelable,bubbles}", () => {
+    const seen: Event[] = [];
+    const form = {
+      requestSubmit: undefined,
+      dispatchEvent: (e: Event) => {
+        seen.push(e);
+        return true;
+      },
+    };
+    requestFormSubmit(form as unknown as HTMLFormElement);
+    expect(seen).toHaveLength(1);
+    expect(seen[0].type).toBe("submit");
+    expect(seen[0].cancelable).toBe(true);
+    expect(seen[0].bubbles).toBe(true);
+  });
+
+  it("null 表单安全返回", () => {
+    expect(() => requestFormSubmit(null)).not.toThrow();
   });
 });
 

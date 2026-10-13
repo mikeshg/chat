@@ -76,6 +76,81 @@ export function needsInsecureConfirm(
   return !desktop && pageProtocol === "https:" && serverUrl.startsWith("http://");
 }
 
+// ---------- T6b：地址框交互的纯逻辑（UI 只负责执行） ----------
+// 这些决策从 AuthScreen 抽出来：回车/失焦时「收不收起、保不保存、提不提交、
+// 焦点去哪」全部在这里定死，组件按结果动作，便于单测覆盖各浏览器差异。
+
+/** IME（中/日/韩输入法）合成期间的 Enter 是选词键，不算提交；keyCode 229 是旧内核兜底 */
+export function isImeEnter(e: { isComposing?: boolean; keyCode?: number }): boolean {
+  return !!e.isComposing || e.keyCode === 229;
+}
+
+/** 第一个空凭据字段（用户名优先）；都填了 → null */
+export function firstEmptyCredential(
+  username: string,
+  password: string,
+): "username" | "password" | null {
+  if (!username.trim()) return "username";
+  if (!password) return "password";
+  return null;
+}
+
+/** 地址框失焦去向：收起 / 提交地址 / 报错保持展开（错误必须看得见，不能连面板一起藏） */
+export type ServerBlurResult =
+  | { t: "collapse" }
+  | { t: "commit"; url: string }
+  | { t: "err"; err: string };
+
+export function resolveServerBlur(
+  input: string,
+  opts: { desktop: boolean; origin?: string },
+): ServerBlurResult {
+  // Web 端留空 = 不改动（同源兜底），直接收起；桌面端地址必填，留空按错误处理
+  if (!input.trim() && !opts.desktop) return { t: "collapse" };
+  const r = resolveServerInput(input, opts);
+  return r.ok ? { t: "commit", url: r.url } : { t: "err", err: r.err };
+}
+
+/**
+ * 地址框回车的动作决策：
+ *   ignore —— IME 合成中 / 登录请求在飞：什么都不做，地址也不动
+ *   err    —— 地址非法：提示，面板保持展开
+ *   focus  —— 凭据没填齐：只提交地址（不提交表单），聚焦第一个空凭据字段
+ *   submit —— 提交表单（https→http 确认由 submit 处理，取消就不保存地址）
+ */
+export type ServerEnterPlan =
+  | { t: "ignore" }
+  | { t: "err"; err: string }
+  | { t: "focus"; url: string; field: "username" | "password" }
+  | { t: "submit"; url: string };
+
+export function planServerEnter(a: {
+  composing: boolean;
+  busy: boolean;
+  input: string;
+  username: string;
+  password: string;
+  desktop: boolean;
+  origin?: string;
+}): ServerEnterPlan {
+  if (a.composing || a.busy) return { t: "ignore" };
+  const r = resolveServerInput(a.input, { desktop: a.desktop, origin: a.origin });
+  if (!r.ok) return { t: "err", err: r.err };
+  const field = firstEmptyCredential(a.username, a.password);
+  if (field) return { t: "focus", url: r.url, field };
+  return { t: "submit", url: r.url };
+}
+
+/** 触发表单提交；Safari/WKWebView <16 没有 requestSubmit，派发可取消冒泡的 submit 事件兜底 */
+export function requestFormSubmit(form: HTMLFormElement | null): void {
+  if (!form) return;
+  if (typeof form.requestSubmit === "function") {
+    form.requestSubmit();
+  } else {
+    form.dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
+  }
+}
+
 /** 键名里的服务器段：编码后不含 : 或 /，与 :uid 分段永不冲突 */
 export function encServer(normalized: string): string {
   return encodeURIComponent(normalized);

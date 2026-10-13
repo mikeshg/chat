@@ -119,6 +119,12 @@ input:focus, textarea:focus { border-color: var(--green); }
   padding: 4px 8px; border-radius: 6px; cursor: pointer; flex-shrink: 0;
 }
 .auth-server-del:hover { color: var(--danger); background: var(--bg); }
+/* T6b：keepFocus 的 preventDefault 让 Firefox 不触发 :active；
+   .pressed 由 pointerdown/up/leave/cancel 同步，视觉同 :active 且不改布局 */
+.auth-card button.primary:active, .auth-card button.primary.pressed { filter: brightness(0.9); }
+.auth-head .auth-switch:active, .auth-head .auth-switch.pressed { opacity: 0.6; }
+.auth-server-pick:active, .auth-server-pick.pressed { background: var(--bg); }
+.auth-server-del:active, .auth-server-del.pressed { color: var(--danger); background: var(--bg); }
 
 /* ---------- 主框架 ---------- */
 .shell { display: flex; height: 100%; }
