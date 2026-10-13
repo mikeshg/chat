@@ -196,6 +196,8 @@ jobs:
       contents: write
     env:
       TAG: ${{ github.ref_name }}
+      # 本 job 不 checkout，gh 需要显式指定仓库
+      GH_REPO: ${{ github.repository }}
     steps:
       - name: 七个产物齐了才公开
         env:
