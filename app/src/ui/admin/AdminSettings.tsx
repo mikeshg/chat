@@ -341,7 +341,7 @@ export default function AdminSettings({ part }: { part: AdminPart }) {
             className="grow"
             value={updateRepo}
             disabled={updateSaving}
-            placeholder="Gitea 仓库地址，如 http://192.168.6.210:3000/xiefan/chat（留空 = 关闭）"
+            placeholder="GitHub 仓库，如 xie-fan/chat 或 https://github.com/xie-fan/chat"
             onChange={(e) => setUpdateRepo(e.target.value)}
           />
           <button
@@ -353,7 +353,7 @@ export default function AdminSettings({ part }: { part: AdminPart }) {
           </button>
           {saved && <span className="muted ad-saved">已保存</span>}
         </div>
-        <div className="muted">客户端从这个仓库的最新 Release 获取安装包，下载经本服务中转</div>
+        <div className="muted">客户端从该仓库最新 Release 取安装包，下载经本服务中转；也兼容 Gitea 仓库地址。留空 = 用服务端 CLIENT_UPDATE_REPO（默认 xie-fan/chat），填 off = 关闭</div>
       </div>
     );
 

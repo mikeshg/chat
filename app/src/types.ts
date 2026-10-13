@@ -354,7 +354,7 @@ export interface AdminSettings {
   push_ntfy_token_set?: boolean;
   /** 本服务对外地址，推送通知点击跳转用；空 = 不带 */
   public_url?: string;
-  /** 在线更新的 Gitea 仓库地址（安装包在它的 Release 上）；空 = 关闭 */
+  /** 在线更新的安装包仓库（owner/repo、GitHub 地址或 Gitea 地址）；off = 关闭，空 = 服务端默认 */
   update_repo_url?: string;
 }
 

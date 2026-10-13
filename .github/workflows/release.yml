@@ -1,0 +1,218 @@
+# 推 v* 标签：先复用 ci.yml 的 test job → 建草稿 Release →
+# windows 打 NSIS+签名、ubuntu 打 Android APK、ubuntu-22.04 打 deb+AppImage，
+# 都传到草稿上 → publish 验齐 7 个产物后把草稿转公开（客户端只看 /releases/latest，
+# 草稿对外不可见，半成品不会发出去）。
+# 需要的 Secrets 与排障见 docs/release-runners.md。
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  draft:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: 标签与 tauri.conf.json 版本一致
+        run: |
+          ver=$(python3 -c 'import json;print(json.load(open("app/src-tauri/tauri.conf.json"))["version"])')
+          [ "v$ver" = "$TAG" ] || { echo "::error::标签 $TAG 与 app/src-tauri/tauri.conf.json 的 version $ver 不一致"; exit 1; }
+      - name: 建草稿 Release（标签说明 = 更新说明）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # checkout 只取到轻量引用；重取标签对象才能读到注解内容
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          git tag -l --format='%(contents)' "$TAG" > notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG 已存在（重跑场景），沿用现有草稿"
+          else
+            gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes-file notes.md
+          fi
+
+  windows:
+    needs: draft
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: 检查签名密钥
+        env:
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if (-not $env:SIGNING_KEY) { Write-Host "::error::secrets.TAURI_SIGNING_PRIVATE_KEY 未配置：没有它产不出 .sig，在线更新装不上"; exit 1 }
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            app/src-tauri
+            server
+      - name: Windows 安装包（NSIS + .sig）
+        working-directory: app
+        # 本地打包没有私钥，签名只在 CI 打开
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build --config src-tauri/tauri.updater.conf.json
+      - name: 上传 NSIS
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ver = $env:TAG.TrimStart('v')
+          $b = "app/src-tauri/target/release/bundle/nsis"
+          gh release upload $env:TAG "$b/Chat_${ver}_x64-setup.exe" "$b/Chat_${ver}_x64-setup.exe.sig" --clobber
+
+  android:
+    needs: draft
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - run: rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            app/src-tauri
+            server
+      - run: pnpm install --frozen-lockfile
+      - name: debug.keystore（覆盖安装必须同一个签名）
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_DEBUG_KEYSTORE }}
+        run: |
+          mkdir -p "$HOME/.android"
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$HOME/.android/debug.keystore"
+          else
+            echo "::warning::ANDROID_DEBUG_KEYSTORE 未设置：改用自动生成的 debug key 签名，仅供 fork 测试，覆盖不了已装的正式包"
+          fi
+      - name: Android APK
+        working-directory: app
+        # runner 预装 NDK：ANDROID_NDK_LATEST_HOME → NDK_HOME；SDK 在 ANDROID_HOME
+        run: |
+          export NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          pnpm tauri android build --apk --debug --target aarch64
+      - name: 上传 APK
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ver=${TAG#v}
+          # 输出目录随 Gradle 配置变（universal / arm64），按扩展名找
+          apk=$(find app/src-tauri/gen/android/app/build/outputs/apk -name '*.apk' | head -1)
+          [ -n "$apk" ] || { echo "::error::找不到 APK 产物"; exit 1; }
+          cp "$apk" "Chat_${ver}_arm64.apk"
+          gh release upload "$TAG" "Chat_${ver}_arm64.apk" --clobber
+
+  linux:
+    needs: draft
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+      # linuxdeploy 本身是 AppImage，解开运行就不依赖 FUSE
+      APPIMAGE_EXTRACT_AND_RUN: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: 检查签名密钥
+        env:
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          [ -n "$SIGNING_KEY" ] || { echo "::error::secrets.TAURI_SIGNING_PRIVATE_KEY 未配置：没有它产不出 .sig，在线更新装不上"; exit 1; }
+      - name: 系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf file
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            app/src-tauri
+            server
+      - name: deb 和 AppImage
+        working-directory: app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build --bundles deb,appimage --config src-tauri/tauri.updater.conf.json
+      - name: 上传
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          b=app/src-tauri/target/release/bundle
+          gh release upload "$TAG" $b/deb/*.deb $b/deb/*.deb.sig $b/appimage/*.AppImage $b/appimage/*.AppImage.sig --clobber
+
+  publish:
+    needs: [windows, android, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+      # 本 job 不 checkout，gh 需要显式指定仓库
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: 七个产物齐了才公开
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ver=${TAG#v}
+          have=$(gh release view "$TAG" --json assets --jq '.assets[].name' | sort)
+          want=$(printf '%s\n' \
+            "Chat_${ver}_arm64.apk" \
+            "Chat_${ver}_x64-setup.exe" \
+            "Chat_${ver}_x64-setup.exe.sig" \
+            "Chat_${ver}_amd64.deb" \
+            "Chat_${ver}_amd64.deb.sig" \
+            "Chat_${ver}_amd64.AppImage" \
+            "Chat_${ver}_amd64.AppImage.sig" | sort)
+          missing=$(comm -23 <(echo "$want") <(echo "$have"))
+          [ -z "$missing" ] || { echo "::error::Release 还缺这些文件：$missing"; exit 1; }
+          gh release edit "$TAG" --draft=false --latest

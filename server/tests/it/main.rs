@@ -19,6 +19,7 @@ mod avatar;
 mod backup;
 mod basics;
 mod bots;
+mod client_update;
 mod common;
 mod conv_prefs;
 mod forward;

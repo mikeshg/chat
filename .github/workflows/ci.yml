@@ -1,0 +1,54 @@
+# PR 与推 main 都跑：前端 tsc + vitest，服务端 cargo test（需要 Postgres，测试库自动建删）。
+# release.yml 推标签时也通过 workflow_call 复用这个 job。
+# 只用 GitHub 免费 runner；无 secrets 依赖，fork 的 PR 也能跑。
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  DATABASE_URL: postgres://chat:chat@localhost:5432/postgres
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: chat
+          POSTGRES_PASSWORD: chat
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U chat -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: 前端类型检查与单测
+        working-directory: app
+        run: pnpm exec tsc -b && pnpm test
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            server
+            app/src-tauri
+      - name: 服务端集成与迁移测试
+        working-directory: server
+        run: cargo test --locked

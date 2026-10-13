@@ -46,7 +46,8 @@ pub struct ServerSettings {
     pub public_url: String,
     /// 视频会议地址前缀；空字符串 = 关闭会议按钮
     pub meeting_base_url: String,
-    /// 客户端安装包所在的 Gitea 仓库地址（如 http://gitea:3000/owner/repo）；空 = 不提供在线更新
+    /// 客户端安装包所在仓库：owner/repo、https://github.com/owner/repo（GitHub）或其他
+    /// http(s) 仓库地址（Gitea）；"off" 关闭；空 = 用 CLIENT_UPDATE_REPO（默认 xie-fan/chat）
     pub update_repo_url: String,
 }
 
@@ -156,7 +157,8 @@ pub struct UpdateSettingsReq {
     pub push_ntfy_token: Option<String>,
     /// 本服务对外地址（同 push_ntfy_base 的校验规则）；空 = 通知不带 Click
     pub public_url: Option<String>,
-    /// 在线更新的 Gitea 仓库地址；空 = 关闭。缺省不改
+    /// 在线更新的安装包仓库（GitHub owner/repo 或 Gitea 地址）；"off" 关闭；
+    /// 空 = 用 CLIENT_UPDATE_REPO（默认 xie-fan/chat）。缺省不改
     pub update_repo_url: Option<String>,
 }
 
@@ -257,13 +259,14 @@ pub async fn update(
         .await?;
     }
     if let Some(v) = &req.update_repo_url {
-        let v = normalize_http_url(v)
-            .filter(|v| v.is_empty() || crate::client_update::api_base(v).is_some())
-            .ok_or_else(|| {
-                AppError::bad_request(
-                    "update_repo_url 必须是 Gitea 仓库地址，如 http://gitea:3000/owner/repo",
-                )
-            })?;
+        let v = v.trim().trim_end_matches('/').to_string();
+        let ok = v.len() <= 200
+            && (v.is_empty() || v == "off" || crate::client_update::parse_repo(&v).is_some());
+        if !ok {
+            return Err(AppError::bad_request(
+                "update_repo_url 必须是 owner/repo、https://github.com/owner/repo、其他 http(s) 仓库地址或 off",
+            ));
+        }
         upsert_text(tx, "update_repo_url", &v, updated_by).await?;
     }
     load(&mut **tx).await
