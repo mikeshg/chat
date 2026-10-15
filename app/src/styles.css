@@ -1068,3 +1068,80 @@ input.switch:focus-visible { outline: 2px solid var(--green); outline-offset: 2p
     margin-bottom: 4px;
   }
 }
+
+/* ===== MM2：统一消息菜单 / 动作面板 / 墓碑重编辑 / 复用附件 chip ===== */
+/* 菜单项：SVG 图标 + 文字；撤回末位标红 */
+.ctx-item { display: flex; align-items: center; gap: 8px; }
+.ctx-item svg { width: 16px; height: 16px; flex: none; }
+.ctx-item.danger, .ctx-item.danger svg { color: var(--danger); }
+
+/* 触屏底部动作面板（单指轻点气泡呼出；长按仍交给系统选择） */
+.sheet-mask {
+  position: fixed; inset: 0; z-index: 300;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex; flex-direction: column; justify-content: flex-end;
+}
+.action-sheet {
+  background: var(--panel); border-radius: 12px 12px 0 0;
+  padding: 6px 0 calc(6px + env(safe-area-inset-bottom));
+  max-height: 70vh; overflow-y: auto;
+}
+.sheet-item {
+  display: flex; align-items: center; gap: 12px; width: 100%;
+  border: none; background: transparent; text-align: left;
+  padding: 14px 20px; font-size: 15px; cursor: pointer;
+}
+.sheet-item svg { width: 20px; height: 20px; flex: none; }
+.sheet-item:active { background: var(--bg); }
+.sheet-item.danger, .sheet-item.danger svg { color: var(--danger); }
+.sheet-cancel {
+  justify-content: center; border-top: 1px solid var(--line);
+  margin-top: 4px; color: var(--muted);
+}
+
+/* 墓碑里的「重新编辑」入口 */
+.reedit-link {
+  border: none; background: transparent; padding: 0 0 0 8px;
+  color: var(--accent, var(--green)); font-style: normal; font-size: 12px;
+  cursor: pointer; text-decoration: underline;
+}
+
+/* composer 上的「复用附件」chip（撤回重编辑带出；✕ 或成功发送才摘） */
+.reuse-chip {
+  display: inline-flex; align-items: center; gap: 8px; align-self: flex-start;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  padding: 4px 8px; font-size: 12px; max-width: 320px; margin-bottom: 4px;
+}
+.reuse-chip .rc-thumb {
+  width: 28px; height: 28px; object-fit: cover; border-radius: 4px; flex: none;
+}
+.reuse-chip .rc-ic { flex: none; }
+.reuse-chip .rc-name {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px;
+}
+.reuse-chip.expired { border-style: dashed; opacity: 0.75; }
+.reuse-chip .rc-expired { color: var(--danger); white-space: nowrap; }
+.reuse-chip .rc-x {
+  border: none; background: transparent; color: var(--muted);
+  cursor: pointer; padding: 0 2px; flex: none;
+}
+.reuse-chip .rc-x:hover { color: var(--danger); }
+
+/* 预览/查看器头部动作工具栏（项与消息菜单同一来源） */
+.pv-toolbar { display: inline-flex; align-items: center; gap: 4px; }
+.pv-act {
+  display: inline-flex; align-items: center; gap: 4px;
+  border: none; background: transparent; cursor: pointer;
+  padding: 5px 8px; border-radius: 5px; font-size: 12px; color: inherit;
+}
+.pv-act svg { width: 15px; height: 15px; }
+.pv-act:hover { background: var(--bg); }
+.pv-act.danger, .pv-act.danger svg { color: var(--danger); }
+
+/* 轻量操作反馈（已复制/撤回提示） */
+.op-hint {
+  position: fixed; left: 50%; bottom: 84px; transform: translateX(-50%);
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+  box-shadow: 0 4px 16px var(--shadow); padding: 7px 14px;
+  font-size: 13px; z-index: 400; pointer-events: none;
+}

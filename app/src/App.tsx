@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 import { auth, clearSkipAutoLogin, hasSkipAutoLogin, loadSession, serverScope } from "./api";
-import { readDrafts } from "./drafts";
+import { readDrafts, writeDrafts } from "./drafts";
+import { purgeReedits } from "./reedit";
 import { cacheKey, clearRecent, readLocalCache, seedRecent } from "./localCache";
 import { syncWindowTitle, unreadTitle } from "./notify";
-import { flushDrafts, setState, useApp } from "./store";
+import { flushDrafts, getState, setState, useApp } from "./store";
 import { startWs, stopWs } from "./ws";
 import AuthScreen from "./ui/AuthScreen";
 import ChatScreen from "./ui/ChatScreen";
@@ -17,6 +18,23 @@ export default function App() {
   useEffect(() => {
     const onLogout = () => {
       flushDrafts(); // 先把在途草稿落盘（本地存储保留，同账号下次登录恢复）
+      // MM2：撤回暂存属敏感明文——re-edit 原文与草稿上的「复用附件」chip 随登出清掉；
+      // 纯文字草稿维持原有语义（同账号下次登录恢复）
+      const uid = getState().me?.id ?? loadSession()?.user.id;
+      if (uid) {
+        purgeReedits(localStorage, serverScope(), uid);
+        const dr = readDrafts(localStorage, serverScope(), uid);
+        writeDrafts(
+          localStorage,
+          serverScope(),
+          uid,
+          Object.fromEntries(
+            Object.entries(dr)
+              .filter(([, e]) => e.text)
+              .map(([k, e]) => [k, { text: e.text }]),
+          ),
+        );
+      }
       clearRecent(); // MRU 是账号数据：别让下一个登录的用户继承
       stopWs();
       setState({
@@ -47,6 +65,7 @@ export default function App() {
     (async () => {
       try {
         const me = await auth.me();
+        purgeReedits(localStorage, serverScope(), me.id); // MM2：启动即清过期暂存
         setState({ me, drafts: readDrafts(localStorage, serverScope(), me.id) });
         void startWs();
       } catch {
@@ -55,6 +74,7 @@ export default function App() {
         // 用本地缓存的身份与数据快照先进去，WS 自动重连，恢复后自动拉数据。
         const cached = loadSession()?.user;
         if (cached) {
+          purgeReedits(localStorage, serverScope(), cached.id); // MM2：启动即清过期暂存
           const snap = readLocalCache(localStorage, cacheKey(serverScope(), cached.id));
           if (snap) seedRecent(snap.recent);
           setState({

@@ -95,6 +95,93 @@ function apply(s: AppState, m: MessageView): AppState {
   return { ...s, ...applyUpdatedMessage(s, m) };
 }
 
+// ===== MM2：撤回墓碑的幂等应用 =====
+// REST 响应与 WS message_deleted 帧都走 applyUpdatedMessage（整视图 id+version 合并），
+// 任意到达顺序/重复投递都收敛到同一墓碑态；引用它的消息的 reply_to_preview 同步替换。
+describe("撤回墓碑幂等（REST 与 WS 任意顺序）", () => {
+  const tomb = () =>
+    msg({
+      content: "消息已撤回",
+      deleted_at: "2026-06-01T00:00:00Z",
+      edit_version: 1,
+      recalled: true,
+      recalled_by: "u-a",
+      recalled_by_name: "A",
+    });
+
+  it("HTTP 先到、WS 后到：两次应用同一份墓碑，状态不发散", () => {
+    let s = state();
+    s = { ...s, ...applyLiveMessage(s, msg()) };
+    s = apply(s, tomb()); // REST 响应
+    const afterRest = s.messages[CONV].find((m) => m.id === "m1")!;
+    s = apply(s, tomb()); // WS 帧（同视图再来一遍）
+    const afterWs = s.messages[CONV].find((m) => m.id === "m1")!;
+    expect(afterWs.deleted_at).toBeTruthy();
+    expect(afterWs.recalled_by).toBe("u-a");
+    expect(afterWs.content).toBe("消息已撤回");
+    expect(afterWs).toEqual(afterRest);
+  });
+
+  it("WS 先到、REST 后到：同样收敛，迟到的旧版正文帧不还原墓碑", () => {
+    let s = state();
+    s = { ...s, ...applyLiveMessage(s, msg()) };
+    s = apply(s, tomb()); // WS 帧先到
+    s = apply(s, tomb()); // REST 响应后到
+    s = apply(s, msg()); // 更旧的 v0 完整视图迟到 → 被版本守卫丢弃
+    const m = s.messages[CONV].find((x) => x.id === "m1")!;
+    expect(m.deleted_at).toBeTruthy();
+    expect(m.content).toBe("消息已撤回");
+    // 会话列表 last_message 同步换墓碑
+    expect(s.conversations[0].last_message?.deleted_at).toBeTruthy();
+  });
+
+  it("引用被撤消息的 reply_to_preview 同步墓碑化（撤回者名随预览走）", () => {
+    let s = state();
+    s = { ...s, ...applyLiveMessage(s, msg()) };
+    const reply = msg({
+      id: "m2",
+      seq: 2,
+      reply_to_id: "m1",
+      reply_to_preview: {
+        message_id: "m1",
+        seq: 1,
+        sender_name: "A",
+        excerpt: "v0",
+        kind: "text",
+        deleted: false,
+      },
+    });
+    s = { ...s, ...applyLiveMessage(s, reply) };
+    s = apply(s, tomb());
+    const m2 = s.messages[CONV].find((x) => x.id === "m2")!;
+    expect(m2.reply_to_preview?.deleted).toBe(true);
+    expect(m2.reply_to_preview?.excerpt).toBe("");
+    expect(m2.reply_to_preview?.recalled_by_name).toBe("A");
+  });
+
+  it("离线补齐（applySyncMessages）同样把引用预览墓碑化", () => {
+    let s = state();
+    const reply = msg({
+      id: "m2",
+      seq: 2,
+      reply_to_id: "m1",
+      reply_to_preview: {
+        message_id: "m1",
+        seq: 1,
+        sender_name: "A",
+        excerpt: "v0",
+        kind: "text",
+        deleted: false,
+      },
+    });
+    s = { ...s, ...applySyncMessages(s, CONV, [msg(), reply]) };
+    s = { ...s, ...applySyncMessages(s, CONV, [tomb()]) };
+    const m2 = s.messages[CONV].find((x) => x.id === "m2")!;
+    expect(m2.reply_to_preview?.deleted).toBe(true);
+    expect(m2.reply_to_preview?.recalled_by_name).toBe("A");
+  });
+});
+
 describe("生命周期整视图版本合并（§8 反序安全）", () => {
   it("reaction_update(v2) 先于 message_updated(v1) 到达：正文与 reaction 都保留", () => {
     let s = state();
@@ -197,7 +284,7 @@ describe("acceptance: dependent reply previews", () => {
     s = { ...s, ...applyLiveMessage(s, reply) };
     const latest = msg({ edit_version: 3, content: deleted ? "消息已删除" : "𠀀".repeat(121), deleted_at: deleted ? "t3" : null });
     for (const patch of [applyUpdatedMessage(s, latest), applyRefreshed(s, CONV, [latest, reply]), applySyncMessages(s, CONV, [latest, reply])]) {
-      const expected = { ...reply.reply_to_preview, excerpt: deleted ? "" : "𠀀".repeat(120), deleted };
+      const expected = { ...reply.reply_to_preview, excerpt: deleted ? "" : "𠀀".repeat(120), deleted, recalled_by_name: null };
       expect(patch.messages?.[CONV].find((m) => m.id === reply.id)?.reply_to_preview).toEqual(expected);
       expect(patch.conversations?.[0].last_message?.reply_to_preview).toEqual(expected);
       expect(patch.messages?.[CONV].map((m) => m.id)).toEqual(["m1", "reply"]);

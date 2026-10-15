@@ -6,7 +6,8 @@
 //   chat_auth:<enc>               → StoredAuth（该服务器的登录凭据）
 //   chat_cache:<enc>:<uid>        → 会话/消息快照（localCache.ts）
 //   chat_outbox:<enc>:<uid>       → 未发出的消息（ws.ts）
-//   chat_drafts:<enc>:<uid>       → 输入草稿（drafts.ts）
+//   chat_drafts:<enc>:<uid>       → 输入草稿（drafts.ts；MM2 起含复用附件 chip）
+//   chat_reedit:<enc>:<uid>       → 撤回后「重新编辑」的本地原文（reedit.ts）
 //   sessionStorage chat_cur_server        → 本标签页当前服务器（规范化地址）
 //   sessionStorage chat_kick_reason:<enc> → 该服务器的被踢提示（一次性）
 
@@ -281,7 +282,7 @@ export function clearAuth(storage: Stor, scope: string) {
 // ---------- 删除服务器：清掉它名下的全部本地数据 ----------
 // 只认 `<prefix>:<enc>:`（带尾冒号）开头的键：enc 本身无冒号，
 // 别的服务器的 enc 即使以它为前缀也接不上冒号，不会误匹配。
-const DATA_PREFIXES = ["chat_cache:", "chat_outbox:", "chat_drafts:"];
+const DATA_PREFIXES = ["chat_cache:", "chat_outbox:", "chat_drafts:", "chat_reedit:"];
 
 export function removeServerData(storage: Stor, scope: string) {
   try {

@@ -278,9 +278,15 @@ export function clearSession() {
 
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, msg: string) {
+  /** 服务端附带的稳定机器码（如 recall_expired / attachment_expired）；无则 undefined */
+  code?: string;
+  /** 响应体是否是带 "error" 字段的 JSON（区分业务 404 与路由不存在的裸 404） */
+  hasErrorField?: boolean;
+  constructor(status: number, msg: string, opts?: { code?: string; hasErrorField?: boolean }) {
     super(msg);
     this.status = status;
+    this.code = opts?.code;
+    this.hasErrorField = opts?.hasErrorField;
   }
 }
 
@@ -475,8 +481,15 @@ async function call<T>(path: string, init?: RequestInit, opts?: { timeoutMs?: nu
   requireSession(gen);
   if (!res.ok) {
     let msg = text;
+    let code: string | undefined;
+    let hasErrorField = false;
     try {
-      msg = JSON.parse(text).error ?? text;
+      const j = JSON.parse(text) as { error?: unknown; code?: unknown };
+      if (typeof j?.error === "string") {
+        msg = j.error;
+        hasErrorField = true;
+      }
+      if (typeof j?.code === "string") code = j.code;
     } catch {}
     // 账号被禁用：服务端对本会话一切 API 一律 403——与 refresh 被拒同等对待，踢回登录页
     if (res.status === 403 && msg === REFRESH_DENIED_403 && !NO_REFRESH_PATHS.has(path)) {
@@ -486,7 +499,7 @@ async function call<T>(path: string, init?: RequestInit, opts?: { timeoutMs?: nu
     if (path === "/auth/login" && res.status === 401) msg = "用户名或密码错误";
     // 服务端没有这个接口（客户端更新了、服务端还没更新）
     if (res.status === 404 && msg === "unknown_api") msg = "服务端版本较旧，不支持这个操作，请更新服务端";
-    throw new ApiError(res.status, msg);
+    throw new ApiError(res.status, msg, { code, hasErrorField });
   }
   return JSON.parse(text) as T;
 }
@@ -669,6 +682,16 @@ export function hookUrl(): string {
 // ---------- 消息生命周期 ----------
 // mutation 全部服务端确认后更新（不乐观回滚）；client_op_id 为 UUID 幂等键，
 // 操作结果未知时只能用原 id 重试。reaction/删除响应带 edit_version 供版本合并。
+
+/** MM2：POST /messages/{id}/recall 不被旧服务端认识（路由缺失的裸 404/405）时
+ * 退到 DELETE 别名并记住该服务器能力，之后直接用 DELETE（撤回=旧版删除）。 */
+const recallFallbackServers = new Set<string>();
+
+/** 当前服务器是否支持 MM1 撤回语义（24h 时限 / /recalled 取回 / 附件复用） */
+export function serverSupportsRecall(): boolean {
+  return !recallFallbackServers.has(getServer());
+}
+
 export const msgs = {
   edit: (id: string, content: string, expected_version: number, client_op_id?: string) =>
     patch<MessageView>(`/messages/${id}`, { content, expected_version, client_op_id }),
@@ -676,6 +699,23 @@ export const msgs = {
     del<MessageView>(
       `/messages/${id}${client_op_id ? `?client_op_id=${client_op_id}` : ""}`,
     ),
+  /** 撤回（MM2）：首选 POST /recall；旧服务端（405 或无 error 字段的裸 404）退 DELETE 别名 */
+  recall: async (id: string, client_op_id?: string): Promise<MessageView> => {
+    const q = client_op_id ? `?client_op_id=${client_op_id}` : "";
+    if (recallFallbackServers.has(getServer())) return del<MessageView>(`/messages/${id}${q}`);
+    try {
+      return await post<MessageView>(`/messages/${id}/recall${q}`);
+    } catch (e) {
+      if (
+        e instanceof ApiError &&
+        (e.status === 405 || (e.status === 404 && !e.hasErrorField))
+      ) {
+        recallFallbackServers.add(getServer());
+        return del<MessageView>(`/messages/${id}${q}`);
+      }
+      throw e;
+    }
+  },
   react: (id: string, emoji: string, add: boolean, client_op_id?: string) => {
     const q = client_op_id ? `?client_op_id=${client_op_id}` : "";
     const p = `/messages/${id}/reactions/${encodeURIComponent(emoji)}${q}`;
@@ -754,6 +794,31 @@ export const files = {
     fd.append("file", file, file.name);
     if (opts?.durationMs != null) fd.append("duration_ms", String(opts.durationMs));
     return call<AttachmentView>("/files", { method: "POST", body: fd }, { timeoutMs: 0 });
+  },
+  /**
+   * MM2 撤回附件取回：GET /files/{id}/recalled → object URL。
+   * Bearer 头鉴权（token 永不出现在 URL），no-store；仅上传者 + TTL 内有效，其余一律 404。
+   */
+  recalledUrl: async (id: string, opts?: { thumb?: boolean }): Promise<string> => {
+    const srv = getServer();
+    const q = opts?.thumb ? "?thumb=1" : "";
+    const url = `${srv}/v1/files/${id}/recalled${q}`;
+    const req = () =>
+      timedFetch(url, {
+        cache: "no-store",
+        headers: {
+          authorization: `Bearer ${readAuth(localStorage, encServer(srv))?.access ?? ""}`,
+        },
+      });
+    let res = await req();
+    if (res.status === 401) {
+      const r = await tryRefresh(session(), srv);
+      if (r.r === "ok") res = await req();
+      else if (r.r === "invalid") denySession(401, r.reason ?? LOGOUT_EXPIRED, srv);
+      else throw new ApiError(503, "暂时连不上服务器，请稍后再试");
+    }
+    if (!res.ok) throw new ApiError(res.status, "file not found", { hasErrorField: true });
+    return URL.createObjectURL(await res.blob());
   },
 };
 

@@ -1,8 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { ApiError, convs, files, msgs as msgsApi, serverInfo, session } from "../../api";
+import { ApiError, convs, files, msgs as msgsApi, serverInfo, serverScope, serverSupportsRecall, session } from "../../api";
 import {
   applyLiveMessage,
-  applyRefreshed,
   applyUpdatedMessage,
   convTitle,
   getState,
@@ -11,11 +10,22 @@ import {
   prependMessages,
   pushToast,
   setDraft,
+  setDraftReuse,
   setState,
   upsertMessage,
   useApp,
 } from "../../store";
-import { unsentText } from "../../drafts";
+import { copyPlainText } from "../../clipboard";
+import { unsentText, type DraftReuse } from "../../drafts";
+import {
+  REEDIT_WINDOW_MS,
+  patchReedit,
+  readReedits,
+  reeditFresh,
+  removeReedit,
+  saveReedit,
+  type ReeditEntry,
+} from "../../reedit";
 import type {
   AttachmentView,
   ConversationView,
@@ -39,7 +49,36 @@ import PollCard from "./PollCard";
 import { imageBubbleSize } from "../mediaFormat";
 import Avatar from "../Avatar";
 import VoiceRecorder from "./VoiceRecorder";
-import { PaperclipIcon, PollIcon } from "../icons";
+import { FEATURE_HOVER_TOOLBAR } from "./features";
+import {
+  canRecall,
+  copyTextFor,
+  isTombstone,
+  menuItems,
+  msgDeletedText,
+  quoteDeletedText,
+  shouldOpenMenuOnContextMenu,
+  shouldOpenMenuOnTap,
+  tombstoneText,
+  type MenuAction,
+  type MenuCtx,
+  type MenuItem,
+} from "./msgMenu";
+import {
+  CopyIcon,
+  DownloadIcon,
+  EditIcon,
+  EmojiIcon,
+  EyeIcon,
+  ForwardIcon,
+  MultiSelectIcon,
+  PaperclipIcon,
+  PinIcon,
+  PollIcon,
+  RecallIcon,
+  ReplyIcon,
+  StarIcon,
+} from "../icons";
 
 function fmtSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -125,6 +164,34 @@ function downloadAttachment(a: AttachmentView) {
   el.remove();
 }
 
+/** MM2：菜单动作 → 图标（右键菜单、动作面板、预览工具栏共用） */
+function menuIcon(action: MenuAction) {
+  switch (action) {
+    case "preview":
+      return <EyeIcon />;
+    case "reply":
+      return <ReplyIcon />;
+    case "copy":
+      return <CopyIcon />;
+    case "forward":
+      return <ForwardIcon />;
+    case "download":
+      return <DownloadIcon />;
+    case "multi":
+      return <MultiSelectIcon />;
+    case "recall":
+      return <RecallIcon />;
+    case "reaction":
+      return <EmojiIcon />;
+    case "edit":
+      return <EditIcon />;
+    case "pin":
+      return <PinIcon />;
+    case "favorite":
+      return <StarIcon />;
+  }
+}
+
 /** 图片气泡占位尺寸（V2 P2-1）：按原始宽高比预留，加载前不跳版；无尺寸回退 CSS 上限 */
 function imgDim(att: AttachmentView): React.CSSProperties | undefined {
   if (att.width == null || att.height == null) return undefined;
@@ -138,7 +205,7 @@ export default function ChatView() {
   // 输入框初值取当前会话草稿（组件重挂时不再闪空）
   const [text, setText] = useState(() => {
     const st = getState();
-    return st.activeConv ? (st.drafts[st.activeConv] ?? "") : "";
+    return st.activeConv ? (st.drafts[st.activeConv]?.text ?? "") : "";
   });
   const [showInfo, setShowInfo] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -155,18 +222,23 @@ export default function ChatView() {
   const [searchQ, setSearchQ] = useState("");
   const [searchRes, setSearchRes] = useState<MessageView[] | null>(null);
   const [flashId, setFlashId] = useState<string | null>(null);
-  const [preview, setPreview] = useState<AttachmentView | null>(null);
+  const [preview, setPreview] = useState<{ att: AttachmentView; m: MessageView | null } | null>(null);
   const [previewText, setPreviewText] = useState<string | null>(null);
-  const [ctxMenu, setCtxMenu] = useState<{
-    x: number;
-    y: number;
-    att: AttachmentView;
-  } | null>(null);
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
   const [sending, setSending] = useState(false);
-  // 生命周期：emoji 选择器展开的消息 id、消息右键菜单、mutation 错误/忙碌
+  // 生命周期：emoji 选择器展开的消息 id、消息右键菜单、触屏动作面板、mutation 错误/忙碌
   const [emojiPick, setEmojiPick] = useState<string | null>(null);
   const [msgMenu, setMsgMenu] = useState<{ x: number; y: number; m: MessageView } | null>(null);
+  const [sheet, setSheet] = useState<{ m: MessageView } | null>(null);
+  // MM2：撤回后「重新编辑」暂存条目；复用附件 chip 的缩略图 objectURL
+  const [reedits, setReedits] = useState<ReeditEntry[]>([]);
+  const [reuseUrl, setReuseUrl] = useState<{ id: string; url: string } | null>(null);
+  // 轻量操作反馈（已复制/撤回提示等），自动消失
+  const [hint, setHint] = useState<string | null>(null);
+  const hintTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 点按/右键手势追踪（触屏 tap → 动作面板；contextmenu 只对鼠标/笔放行）
+  const tapStart = useRef<{ x: number; y: number; t: number; type: string } | null>(null);
+  const lastPointer = useRef<{ type: string; ts: number }>({ type: "", ts: 0 });
   const [mutErr, setMutErr] = useState<string | null>(null);
   // 发送（含上传附件）失败的服务端文案，显示在附件条处（V2 P2-1：413 配额提示走这里）
   const [sendErr, setSendErr] = useState<string | null>(null);
@@ -209,6 +281,7 @@ export default function ChatView() {
     setFlashId(null);
     setEmojiPick(null);
     setMsgMenu(null);
+    setSheet(null);
     setMutErr(null);
     // 待发附件属于旧会话，不能带到新会话里发出去
     setPendingFiles([]);
@@ -225,7 +298,7 @@ export default function ChatView() {
     prevConv.current = conv?.id ?? null;
     // 切换会话时退出回复/编辑态（目标属于旧会话）
     setState({ replyingTo: null, editingMessage: null });
-    setText(conv ? (getState().drafts[conv.id] ?? "") : "");
+    setText(conv ? (getState().drafts[conv.id]?.text ?? "") : "");
   }, [conv?.id]);
 
   // 只认最后一次请求，换会话后旧会话的响应作废
@@ -255,6 +328,78 @@ export default function ChatView() {
       window.removeEventListener("chat:pins", onPins);
     };
   }, [conv?.id]);
+
+  // ===== MM2：重新编辑暂存 =====
+  // 打开会话时装载本账号在本服务器的暂存；每 30s 扫一遍把超过 10 分钟的剔除；
+  // 登出时清掉（servers.removeServerData 按 chat_reedit: 键前缀兜底）。
+  useEffect(() => {
+    const meId = getState().me?.id;
+    const reload = () =>
+      setReedits(meId ? readReedits(localStorage, serverScope(), meId) : []);
+    reload();
+    const tick = setInterval(reload, 30_000);
+    const onLogout = () => setReedits([]);
+    window.addEventListener("chat:logout", onLogout);
+    return () => {
+      clearInterval(tick);
+      window.removeEventListener("chat:logout", onLogout);
+    };
+  }, [conv?.id]);
+
+  // MM2：复用发送被拒 → ws.ts 把文字退回草稿后发事件，这里把 composer 文本同步回来
+  useEffect(() => {
+    const onRestore = (e: Event) => {
+      const { convId } = (e as CustomEvent<{ convId: string }>).detail;
+      if (conv?.id === convId) {
+        setText(getState().drafts[convId]?.text ?? "");
+      }
+    };
+    window.addEventListener("chat:composer-restore", onRestore);
+    return () => window.removeEventListener("chat:composer-restore", onRestore);
+  }, [conv?.id]);
+
+  // MM2：消息变墓碑时关掉开着的菜单/面板/预览（预览开着则补一条提示）
+  useEffect(() => {
+    const becameTombstone = (id: string | null | undefined) =>
+      !!id && !!msgs.find((m) => m.id === id && isTombstone(m));
+    if (msgMenu && becameTombstone(msgMenu.m.id)) setMsgMenu(null);
+    if (sheet && becameTombstone(sheet.m.id)) setSheet(null);
+    if (preview?.m && becameTombstone(preview.m.id)) {
+      setPreview(null);
+      showHint("该消息已被撤回");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [msgs]);
+
+  // MM2：复用 chip 的缩略图走鉴权的 /recalled → objectURL；卸载/换件时回收
+  const reuse = conv ? s.drafts[conv.id]?.reuse : undefined;
+  const reuseId = reuse?.attachment_id ?? null;
+  useEffect(() => {
+    if (!reuse || reuse.expired || !reuseId || !serverSupportsRecall()) {
+      setReuseUrl(null);
+      return;
+    }
+    let alive = true;
+    let url: string | null = null;
+    files
+      .recalledUrl(reuseId, { thumb: true })
+      .then((u) => {
+        if (alive) {
+          url = u;
+          setReuseUrl({ id: reuseId, url: u });
+        } else URL.revokeObjectURL(u);
+      })
+      .catch(() => {
+        // 过期/被删：chip 标「附件已过期」，不再重试
+        if (alive) setReuseUrl(null);
+        setDraftReuse(conv!.id, { ...reuse, expired: true });
+      });
+    return () => {
+      alive = false;
+      if (url) URL.revokeObjectURL(url);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reuseId, reuse?.expired]);
 
   useEffect(() => {
     let alive = true;
@@ -326,16 +471,13 @@ export default function ChatView() {
   const readonly = conv.kind === "dm" && conv.peer && !s.friends.some((f) => f.user.id === conv.peer!.id);
 
   // 生命周期入口可见性（服务端在锁内二次校验；这里只做 UI 层收敛）
+  // —— 以下谓词服务已下线功能（feature flag 关闭），代码路径保留 ——
   const canEditMsg = (m: MessageView) =>
     !m.id.startsWith("client:") &&
     !m.deleted_at &&
     isOwnMessage(m, s.me?.id) &&
     m.kind === "text" &&
     withinEditWindow(m);
-  const canDeleteMsg = (m: MessageView) =>
-    !m.id.startsWith("client:") &&
-    !m.deleted_at &&
-    (m.sender_id === s.me?.id || (conv.kind === "group" && conv.owner_id === s.me?.id));
   const canActMsg = (m: MessageView) =>
     !m.id.startsWith("client:") && !m.deleted_at && !readonly;
   // V2 P2-4 转发/收藏入口：非乐观消息、非墓碑、非投票。只读会话仍允许（
@@ -344,6 +486,227 @@ export default function ChatView() {
     !m.id.startsWith("client:") && !m.deleted_at && m.kind !== "poll";
   // 投票可置顶；已删除、乐观消息、只读会话不显示入口
   const canPinMsg = (m: MessageView) => canActMsg(m);
+
+  // ===== MM2：菜单上下文 / 动作分发 =====
+
+  const showHint = (t: string) => {
+    setHint(t);
+    if (hintTimer.current) clearTimeout(hintTimer.current);
+    hintTimer.current = setTimeout(() => setHint(null), 1800);
+  };
+
+  const menuCtx = (): MenuCtx => ({
+    meId: s.me?.id,
+    myRole:
+      conv.kind === "group" && conv.owner_id === s.me?.id ? "owner" : undefined,
+    convType: conv.kind,
+    now: Date.now(),
+    readOnly: !!readonly,
+    serverSupportsRecall: serverSupportsRecall(),
+  });
+
+  const itemsFor = (m: MessageView): MenuItem[] =>
+    menuItems(m, { ...menuCtx(), pinned: pinnedIds.has(m.id) });
+
+  const doCopy = async (m: MessageView) => {
+    showHint((await copyPlainText(copyTextFor(m))) ? "已复制" : "复制失败");
+  };
+
+  const openMenu = (m: MessageView, x: number, y: number) => {
+    if (itemsFor(m).length === 0) return; // 墓碑/乐观消息没有菜单
+    setSheet(null);
+    setMsgMenu({ x, y, m });
+  };
+
+  const openSheet = (m: MessageView) => {
+    if (itemsFor(m).length === 0) return;
+    setMsgMenu(null);
+    setSheet({ m });
+  };
+
+  /**
+   * 撤回（MM1 POST /recall；旧服务端自动退 DELETE）。
+   * 我的消息：先留本地原文（re-edit 暂存），失败立刻删掉，不留没撤回成功的明文；
+   * 成功后用响应里的 recalled_attachment_id 补记，给「复用附件」chip 用。
+   */
+  const doRecall = async (m: MessageView) => {
+    setMsgMenu(null);
+    setSheet(null);
+    if (mutBusy) return;
+    if (!window.confirm("撤回这条消息？所有人将看到“消息已撤回”")) return;
+    const mine = m.sender_id === s.me?.id;
+    const meId = s.me?.id;
+    const canReedit =
+      mine &&
+      !!meId &&
+      serverSupportsRecall() && // 旧服务端撤回=纯删除，没有 re-edit/复用
+      (m.kind === "text" || !!m.attachment) &&
+      m.kind !== "poll" &&
+      m.kind !== "audio";
+    if (canReedit && meId) {
+      saveReedit(localStorage, serverScope(), meId, {
+        conversation_id: conv.id,
+        message_id: m.id,
+        text: m.content,
+        reply_to: m.reply_to_preview?.message_id ?? null,
+        ...(m.attachment
+          ? {
+              attachment: {
+                id: m.attachment.id,
+                file_name: m.attachment.file_name,
+                mime: m.attachment.mime,
+                size: m.attachment.size,
+                kind: m.kind,
+              },
+            }
+          : {}),
+        savedAt: Date.now(),
+      });
+      setReedits(readReedits(localStorage, serverScope(), meId));
+    }
+    setMutBusy(true);
+    setMutErr(null);
+    try {
+      const tomb = await msgsApi.recall(m.id, crypto.randomUUID());
+      setState((st) => applyUpdatedMessage(st, tomb));
+      if (canReedit && meId) {
+        patchReedit(localStorage, serverScope(), meId, m.id, {
+          recalled_attachment_id: tomb.recalled_attachment_id ?? null,
+        });
+        setReedits(readReedits(localStorage, serverScope(), meId));
+      }
+    } catch (e) {
+      // 撤回没发生：不留原文
+      if (canReedit && meId) {
+        removeReedit(localStorage, serverScope(), meId, m.id);
+        setReedits(readReedits(localStorage, serverScope(), meId));
+      }
+      if (e instanceof ApiError && e.code === "recall_expired") {
+        setMutErr("超过 24 小时的消息不能撤回");
+      } else {
+        setMutErr(e instanceof Error ? e.message : "撤回失败");
+      }
+    } finally {
+      setMutBusy(false);
+    }
+  };
+
+  /** 「重新编辑」：原文回填 composer；带过附件则挂「复用附件」chip。用过即删。 */
+  const reeditMsg = (entry: ReeditEntry) => {
+    const meId = s.me?.id;
+    if (!meId) return;
+    removeReedit(localStorage, serverScope(), meId, entry.message_id);
+    setReedits(readReedits(localStorage, serverScope(), meId));
+    if (entry.conversation_id !== conv.id) return;
+    let next = text;
+    if (next) {
+      next = window.confirm("替换当前输入？")
+        ? entry.text
+        : `${next}\n${entry.text}`;
+    } else {
+      next = entry.text;
+    }
+    setText(next);
+    setDraft(conv.id, next);
+    // 附件原件还在 TTL 内 → chip；旧服务端没有 /recalled，chip 不出现
+    const rid = entry.recalled_attachment_id;
+    if (entry.attachment && rid && serverSupportsRecall()) {
+      const chip: DraftReuse = {
+        attachment_id: rid,
+        file_name: entry.attachment.file_name,
+        mime: entry.attachment.mime,
+        size: entry.attachment.size,
+        kind: entry.attachment.kind,
+        conversation_id: conv.id,
+      };
+      setDraftReuse(conv.id, chip);
+    }
+    taRef.current?.focus();
+  };
+
+  // ---------- 手势：右键菜单（鼠标/笔）+ 触屏点按（动作面板） ----------
+  const onBubblePointerDown = (e: React.PointerEvent) => {
+    lastPointer.current = { type: e.pointerType ?? "", ts: Date.now() };
+    tapStart.current = { x: e.clientX, y: e.clientY, t: Date.now(), type: e.pointerType ?? "" };
+  };
+
+  const onMsgContextMenu = (m: MessageView) => (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    // Android WebView 长按也发 contextmenu；源指针是 touch 时让给系统文本选择
+    if (!shouldOpenMenuOnContextMenu(lastPointer.current.type)) return;
+    openMenu(m, e.clientX, e.clientY);
+  };
+
+  const onBubblePointerUp = (m: MessageView) => (e: React.PointerEvent) => {
+    const st = tapStart.current;
+    tapStart.current = null;
+    if (!st || st.type !== "touch") return; // 点按规则只对触摸生效；鼠标单击照旧
+    const moved = Math.hypot(e.clientX - st.x, e.clientY - st.y);
+    const press = Date.now() - st.t;
+    const sel =
+      typeof window !== "undefined" && window.getSelection
+        ? (window.getSelection()?.toString() ?? "")
+        : "";
+    if (
+      shouldOpenMenuOnTap({
+        target: e.target,
+        movedPx: moved,
+        pressMs: press,
+        hasSelection: sel.length > 0,
+      })
+    ) {
+      openSheet(m);
+    }
+  };
+
+  /** 菜单/面板/预览工具栏共用：按 action 分发到具体动作 */
+  const runMenuAction = (m: MessageView, action: MenuAction) => {
+    setMsgMenu(null);
+    setSheet(null);
+    switch (action) {
+      case "preview":
+        if (m.attachment) {
+          setPreviewText(null);
+          setPreview({ att: m.attachment, m });
+        }
+        break;
+      case "reply":
+        startReply(m);
+        break;
+      case "copy":
+        void doCopy(m);
+        break;
+      case "forward":
+        setFwdMsg(m);
+        break;
+      case "download":
+        if (m.attachment) downloadAttachment(m.attachment);
+        break;
+      case "multi":
+        onEnterMultiSelect(m); // MM3 占位
+        break;
+      case "recall":
+        void doRecall(m);
+        break;
+      case "reaction":
+        setEmojiPick(m.id);
+        break;
+      case "edit":
+        startEdit(m);
+        break;
+      case "pin":
+        void doPin(m);
+        break;
+      case "favorite":
+        void doFavorite(m);
+        break;
+    }
+  };
+
+  /** MM3 多选占位（MM2 只渲染入口） */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const onEnterMultiSelect = (_m: MessageView) => {};
 
   const unpinMsg = async (messageId: string) => {
     await convs.unpin(conv.id, messageId);
@@ -488,22 +851,6 @@ export default function ChatView() {
     }
   };
 
-  const doDelete = async (m: MessageView) => {
-    setMsgMenu(null);
-    if (mutBusy) return;
-    if (!window.confirm("删除这条消息？所有人将看到“消息已删除”")) return;
-    setMutBusy(true);
-    setMutErr(null);
-    try {
-      const d = await msgsApi.remove(m.id, crypto.randomUUID());
-      setState((st) => applyUpdatedMessage(st, d));
-    } catch (e) {
-      setMutErr(e instanceof Error ? e.message : "删除失败");
-    } finally {
-      setMutBusy(false);
-    }
-  };
-
   /** 收藏（V2 P2-4）= 转发到本人文件传输助手；每次点击是新 op（重发即有意重复收藏）。
    * 服务端确认后立即并入 self 会话本地缓存；广播帧到达按 id 去重。 */
   const doFavorite = async (m: MessageView) => {
@@ -558,7 +905,10 @@ export default function ChatView() {
       await submitEdit();
       return;
     }
-    if (!t && pendingFiles.length === 0) return;
+    // MM2：chip 还在但没过期 → 以 reuse_attachment_id 发出（文字随行）；
+    // 已过期的 chip 不参与发送，也不自动重发。
+    const chip = reuse && !reuse.expired ? reuse : undefined;
+    if (!t && pendingFiles.length === 0 && !chip) return;
     setSending(true);
     setSendErr(null);
     // 上传期间用户可能继续输入、加附件、切会话：完成后只清本次发出的那部分
@@ -567,6 +917,27 @@ export default function ChatView() {
     const rt0 = s.replyingTo;
     const still = () => getState().activeConv === conv.id;
     try {
+      if (chip) {
+        // 复用发送：附件来自撤回保留原件，本地没有 File 可直接上传
+        const attView: AttachmentView = {
+          id: chip.attachment_id,
+          file_name: chip.file_name,
+          mime: chip.mime,
+          size: chip.size,
+          duration_ms: null,
+          width: null,
+          height: null,
+        };
+        sendChat(conv.id, t, attView, rt0 ?? undefined, true);
+        setDraft(conv.id, "");
+        if (still()) {
+          setText("");
+          setAc(null);
+          stickBottom.current = true;
+        }
+        if (getState().replyingTo === rt0) setState({ replyingTo: null });
+        return;
+      }
       // 先上传待发附件，文字随最后一个附件消息一起发
       const atts: AttachmentView[] = [];
       for (const f of sentFiles) {
@@ -582,7 +953,7 @@ export default function ChatView() {
         ),
       );
       if (atts.length === 0 && t) sendChat(conv.id, t, undefined, rt);
-      const draft = getState().drafts[conv.id] ?? "";
+      const draft = getState().drafts[conv.id]?.text ?? "";
       if (unsentText(draft, sentText) !== draft) setDraft(conv.id, unsentText(draft, sentText)); // 发送即清该会话草稿
       if (getState().replyingTo === rt0) setState({ replyingTo: null });
       if (still()) {
@@ -691,8 +1062,8 @@ export default function ChatView() {
   /** 回复预览点击 → 定位原消息（删除的墓碑仍可定位） */
   const jumpPreview = (p: ReplyPreview) => jumpToRef(p.message_id, p.seq);
 
-  const openPreview = (att: AttachmentView) => {
-    setPreview(att);
+  const openPreview = (att: AttachmentView, m?: MessageView) => {
+    setPreview({ att, m: m ?? null });
     setPreviewText(null);
     if (isTextLike(att)) {
       fetch(files.url(att.id))
@@ -700,13 +1071,6 @@ export default function ChatView() {
         .then((t) => setPreviewText(t.slice(0, 300_000)))
         .catch(() => setPreviewText("（加载失败）"));
     }
-  };
-
-  const onAttMenu = (e: React.MouseEvent, att: AttachmentView) => {
-    e.preventDefault();
-    e.stopPropagation(); // 附件菜单优先，不再冒泡到消息菜单
-    setMsgMenu(null);
-    setCtxMenu({ x: e.clientX, y: e.clientY, att });
   };
 
   const onFile = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -858,17 +1222,16 @@ export default function ChatView() {
                 )}
                 <div
                   className="msg-body"
-                  onContextMenu={(e) => {
-                    if (m.deleted_at || (!canActMsg(m) && !canForwardMsg(m) && !canPinMsg(m))) return;
-                    e.preventDefault();
-                    setMsgMenu({ x: e.clientX, y: e.clientY, m });
-                  }}
+                  onPointerDown={onBubblePointerDown}
+                  onPointerUp={onBubblePointerUp(m)}
+                  onContextMenu={onMsgContextMenu(m)}
                 >
                   {!mine && conv.kind === "group" && (
                     <div className="msg-sender">{m.sender_name}</div>
                   )}
                   <div className="bubble-wrap">
-                    {(canActMsg(m) || canForwardMsg(m) || canPinMsg(m)) && (
+                    {/* MM2：悬停工具栏已下线（FEATURE_HOVER_TOOLBAR），代码保留 */}
+                    {FEATURE_HOVER_TOOLBAR && (canActMsg(m) || canForwardMsg(m) || canPinMsg(m)) && (
                       <div className={`msg-actions ${emojiPick === m.id ? "open" : ""}`}>
                         {emojiPick === m.id && canActMsg(m) ? (
                           <>
@@ -916,11 +1279,11 @@ export default function ChatView() {
                                     ✏️
                                   </button>
                                 )}
-                                {canDeleteMsg(m) && (
+                                {canRecall(m, menuCtx()) && (
                                   <button
-                                    title="删除"
-                                    aria-label="删除"
-                                    onClick={() => void doDelete(m)}
+                                    title="撤回"
+                                    aria-label="撤回"
+                                    onClick={() => void doRecall(m)}
                                   >
                                     🗑
                                   </button>
@@ -958,20 +1321,34 @@ export default function ChatView() {
                         )}
                       </div>
                     )}
-                    {m.deleted_at ? (
-                      <div className={`bubble deleted ${flashId === m.id ? "flash" : ""}`}>
-                        消息已删除
+                    {isTombstone(m) ? (
+                      <div
+                        className={`bubble deleted ${flashId === m.id ? "flash" : ""}`}
+                        data-testid="msg-tombstone"
+                      >
+                        {tombstoneText(m, { meId: s.me?.id, convType: conv.kind })}
+                        {(() => {
+                          // MM2：本地留有原文且在 10 分钟窗口内 → 「重新编辑」
+                          const entry = reedits.find(
+                            (e) => e.message_id === m.id && reeditFresh(e),
+                          );
+                          return entry ? (
+                            <button
+                              type="button"
+                              className="reedit-link"
+                              data-testid="msg-reedit"
+                              onClick={() => reeditMsg(entry)}
+                            >
+                              重新编辑
+                            </button>
+                          ) : null;
+                        })()}
                       </div>
                     ) : (
                       <div
                         className={`bubble ${pending ? "pending" : ""} ${
                           m.mentions.includes(s.me?.id ?? "") ? "mentioned" : ""
                         } ${flashId === m.id ? "flash" : ""}`}
-                        onContextMenu={(e) => {
-                          if (!canActMsg(m) && !canForwardMsg(m) && !canPinMsg(m)) return;
-                          e.preventDefault();
-                          setMsgMenu({ x: e.clientX, y: e.clientY, m });
-                        }}
                       >
                         {m.forwarded_from && (
                           <div className="fwd-from">转发自 {m.forwarded_from}</div>
@@ -985,7 +1362,7 @@ export default function ChatView() {
                             <span className="rq-name">{m.reply_to_preview.sender_name}</span>
                             <span className="rq-text">
                               {m.reply_to_preview.deleted
-                                ? "原消息已删除"
+                                ? quoteDeletedText(m.reply_to_preview)
                                 : m.reply_to_preview.excerpt ||
                                   kindLabel(m.reply_to_preview.kind)}
                             </span>
@@ -999,8 +1376,8 @@ export default function ChatView() {
                             })}
                             alt={m.attachment.file_name}
                             style={imgDim(m.attachment)}
-                            onClick={() => openPreview(m.attachment!)}
-                            onContextMenu={(e) => onAttMenu(e, m.attachment!)}
+                            data-own-action
+                            onClick={() => openPreview(m.attachment!, m)}
                           />
                         )}
                         {m.attachment && m.kind === "audio" && (
@@ -1009,8 +1386,8 @@ export default function ChatView() {
                         {m.attachment && m.kind === "file" && (
                           <div
                             className="msg-file"
-                            onClick={() => openPreview(m.attachment!)}
-                            onContextMenu={(e) => onAttMenu(e, m.attachment!)}
+                            data-own-action
+                            onClick={() => openPreview(m.attachment!, m)}
                           >
                             <span className="file-ic">📄</span>
                             <span className="file-meta">
@@ -1083,7 +1460,7 @@ export default function ChatView() {
                 <span className="cb-label">回复 {s.replyingTo.sender_name}</span>
                 <span className="cb-text">
                   {s.replyingTo.deleted_at
-                    ? "原消息已删除"
+                    ? msgDeletedText(s.replyingTo)
                     : s.replyingTo.attachment
                       ? kindLabel(s.replyingTo.kind)
                       : s.replyingTo.content.slice(0, 60)}
@@ -1113,6 +1490,31 @@ export default function ChatView() {
               </div>
             )}
             {mutErr && <div className="mut-err">{mutErr}</div>}
+            {/* MM2：撤回重编辑挂上的「复用附件」chip；✕ 或成功发送才摘（清文字不摘） */}
+            {reuse && (
+              <div
+                className={`reuse-chip ${reuse.expired ? "expired" : ""}`}
+                data-testid="reuse-chip"
+              >
+                {reuseUrl?.id === reuse.attachment_id ? (
+                  <img className="rc-thumb" src={reuseUrl.url} alt="" />
+                ) : (
+                  <span className="rc-ic">📎</span>
+                )}
+                <span className="rc-name" title={reuse.file_name}>
+                  {reuse.file_name}
+                </span>
+                {reuse.expired && <span className="rc-expired">附件已过期</span>}
+                <button
+                  type="button"
+                  className="rc-x"
+                  aria-label="移除附件"
+                  onClick={() => setDraftReuse(conv.id, null)}
+                >
+                  ✕
+                </button>
+              </div>
+            )}
             {acItems.length > 0 && (
               <div className="ac-list">
                 {acItems.map((item) => (
@@ -1201,7 +1603,9 @@ export default function ChatView() {
                   className="primary send-btn"
                   onClick={send}
                   disabled={
-                    sending || mutBusy || (!text.trim() && pendingFiles.length === 0)
+                    sending ||
+                    mutBusy ||
+                    (!text.trim() && pendingFiles.length === 0 && !(reuse && !reuse.expired))
                   }
                 >
                   {s.editingMessage ? (mutBusy ? "保存中…" : "保存") : sending ? "发送中…" : "发送"}
@@ -1236,41 +1640,72 @@ export default function ChatView() {
         <ForwardModal message={fwdMsg} onClose={() => setFwdMsg(null)} />
       )}
 
-      {/* 附件预览 */}
+      {/* 附件预览 / 大图查看器（MM2：带动作工具栏；工具栏项与消息菜单共用 items 函数） */}
       {preview && (
         <div className="modal-mask" onClick={() => setPreview(null)}>
           <div className="pv-modal" onClick={(e) => e.stopPropagation()}>
             <div className="pv-head">
-              <span className="pv-name" title={preview.file_name}>
-                {preview.file_name}
+              <span className="pv-name" title={preview.att.file_name}>
+                {preview.att.file_name}
               </span>
-              <span className="muted">{fmtSize(preview.size)}</span>
-              <button onClick={() => downloadAttachment(preview)}>下载</button>
-              <button className="icon-btn" onClick={() => setPreview(null)}>
+              <span className="muted">{fmtSize(preview.att.size)}</span>
+              <span className="pv-toolbar">
+                {/* 回复/转发/多选/撤回与消息菜单同一来源（viewer-<action>） */}
+                {preview.m &&
+                  itemsFor(preview.m)
+                    .filter((it) => ["reply", "forward", "multi", "recall"].includes(it.action))
+                    .map((it) => (
+                      <button
+                        key={it.action}
+                        type="button"
+                        className={`pv-act ${it.danger ? "danger" : ""}`}
+                        data-testid={`viewer-${it.action}`}
+                        title={it.label}
+                        onClick={() => {
+                          const m = preview.m!;
+                          setPreview(null);
+                          runMenuAction(m, it.action);
+                        }}
+                      >
+                        {menuIcon(it.action)}
+                        <span>{it.label}</span>
+                      </button>
+                    ))}
+                <button
+                  type="button"
+                  className="pv-act"
+                  data-testid="viewer-download"
+                  onClick={() => downloadAttachment(preview.att)}
+                >
+                  <DownloadIcon />
+                  <span>下载</span>
+                </button>
+              </span>
+              <button className="icon-btn" data-testid="viewer-close" onClick={() => setPreview(null)}>
                 ✕
               </button>
             </div>
             <div className="pv-body">
-              {preview.mime.startsWith("image/") && (
-                <img src={files.url(preview.id)} alt={preview.file_name} />
+              {preview.att.mime.startsWith("image/") && (
+                <img src={files.url(preview.att.id)} alt={preview.att.file_name} />
               )}
-              {isTextLike(preview) && !preview.mime.startsWith("image/") && (
+              {isTextLike(preview.att) && !preview.att.mime.startsWith("image/") && (
                 <pre>{previewText ?? "加载中…"}</pre>
               )}
-              {preview.mime === "application/pdf" && (
-                <iframe src={files.url(preview.id)} title={preview.file_name} />
+              {preview.att.mime === "application/pdf" && (
+                <iframe src={files.url(preview.att.id)} title={preview.att.file_name} />
               )}
-              {preview.mime.startsWith("audio/") && (
-                <audio controls src={files.url(preview.id)} />
+              {preview.att.mime.startsWith("audio/") && (
+                <audio controls src={files.url(preview.att.id)} />
               )}
-              {preview.mime.startsWith("video/") && (
-                <video controls src={files.url(preview.id)} />
+              {preview.att.mime.startsWith("video/") && (
+                <video controls src={files.url(preview.att.id)} />
               )}
-              {!preview.mime.startsWith("image/") &&
-                !preview.mime.startsWith("audio/") &&
-                !preview.mime.startsWith("video/") &&
-                preview.mime !== "application/pdf" &&
-                !isTextLike(preview) && (
+              {!preview.att.mime.startsWith("image/") &&
+                !preview.att.mime.startsWith("audio/") &&
+                !preview.att.mime.startsWith("video/") &&
+                preview.att.mime !== "application/pdf" &&
+                !isTextLike(preview.att) && (
                   <div className="pv-unsupported">暂不支持预览此格式，请下载后查看</div>
                 )}
             </div>
@@ -1278,94 +1713,52 @@ export default function ChatView() {
         </div>
       )}
 
-      {/* 消息右键菜单（生命周期操作；可用性与 hover 操作条一致） */}
+      {/* MM2：统一消息菜单（图标+文字）；附件不再有单独的右键菜单 */}
       {msgMenu && (
         <CtxMenu x={msgMenu.x} y={msgMenu.y} onClose={() => setMsgMenu(null)}>
-          {canActMsg(msgMenu.m) && (
-            <>
-              <div
-                className="ctx-item"
-                onClick={() => {
-                  setEmojiPick(msgMenu.m.id);
-                  setMsgMenu(null);
-                }}
-              >
-                表情
-              </div>
-              <div
-                className="ctx-item"
-                onClick={() => {
-                  startReply(msgMenu.m);
-                  setMsgMenu(null);
-                }}
-              >
-                回复
-              </div>
-              {canEditMsg(msgMenu.m) && (
-                <div
-                  className="ctx-item"
-                  onClick={() => {
-                    startEdit(msgMenu.m);
-                    setMsgMenu(null);
-                  }}
-                >
-                  编辑
-                </div>
-              )}
-              {canDeleteMsg(msgMenu.m) && (
-                <div className="ctx-item" onClick={() => void doDelete(msgMenu.m)}>
-                  删除
-                </div>
-              )}
-            </>
-          )}
-          {canPinMsg(msgMenu.m) && (
-            <div className="ctx-item" onClick={() => void doPin(msgMenu.m)}>
-              {pinnedIds.has(msgMenu.m.id) ? "取消置顶" : "置顶"}
+          {itemsFor(msgMenu.m).map((it) => (
+            <div
+              key={it.action}
+              className={`ctx-item ${it.danger ? "danger" : ""}`}
+              data-testid={`msg-menu-${it.action}`}
+              onClick={() => runMenuAction(msgMenu.m, it.action)}
+            >
+              {menuIcon(it.action)}
+              <span>{it.label}</span>
             </div>
-          )}
-          {canForwardMsg(msgMenu.m) && (
-            <>
-              <div
-                className="ctx-item"
-                onClick={() => {
-                  setFwdMsg(msgMenu.m);
-                  setMsgMenu(null);
-                }}
-              >
-                转发
-              </div>
-              <div className="ctx-item" onClick={() => void doFavorite(msgMenu.m)}>
-                收藏
-              </div>
-            </>
-          )}
+          ))}
         </CtxMenu>
       )}
 
-      {/* 附件右键菜单 */}
-      {ctxMenu && (
-        <CtxMenu x={ctxMenu.x} y={ctxMenu.y} onClose={() => setCtxMenu(null)}>
-          <div
-            className="ctx-item"
-            onClick={() => {
-              openPreview(ctxMenu.att);
-              setCtxMenu(null);
-            }}
-          >
-            预览
+      {/* MM2：触屏点按 → 底部动作面板（同一套菜单项 + 取消） */}
+      {sheet && (
+        <div className="sheet-mask" data-testid="action-sheet" onClick={() => setSheet(null)}>
+          <div className="action-sheet" onClick={(e) => e.stopPropagation()}>
+            {itemsFor(sheet.m).map((it) => (
+              <button
+                key={it.action}
+                type="button"
+                className={`sheet-item ${it.danger ? "danger" : ""}`}
+                data-testid={`msg-menu-${it.action}`}
+                onClick={() => runMenuAction(sheet.m, it.action)}
+              >
+                {menuIcon(it.action)}
+                <span>{it.label}</span>
+              </button>
+            ))}
+            <button
+              type="button"
+              className="sheet-item sheet-cancel"
+              onClick={() => setSheet(null)}
+            >
+              取消
+            </button>
           </div>
-          <div
-            className="ctx-item"
-            onClick={() => {
-              downloadAttachment(ctxMenu.att);
-              setCtxMenu(null);
-            }}
-          >
-            下载
-          </div>
-        </CtxMenu>
+        </div>
       )}
+
+      {/* 轻量操作反馈 */}
+      {hint && <div className="op-hint">{hint}</div>}
     </main>
   );
 }

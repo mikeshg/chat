@@ -87,4 +87,64 @@ describe("会话列表副标题预览", () => {
     });
     expect(convPreview(c, { ...base })).toEqual({ kind: "message", text: "[语音]" });
   });
+
+  // ===== MM2 =====
+  it("撤回的最后一条消息按墓碑文案预览（含群主撤回与旧删除）", () => {
+    const recalled = msg({
+      deleted_at: "t",
+      recalled_by: "u-b",
+      recalled_by_name: "B",
+      content: "消息已撤回",
+    });
+    expect(convPreview(conv({ last_message: recalled }), { ...base })).toEqual({
+      kind: "message",
+      text: "对方撤回了一条消息",
+    });
+    const mine = msg({ sender_id: "me", deleted_at: "t", recalled_by: "me", recalled_by_name: "我" });
+    expect(convPreview(conv({ last_message: mine }), { ...base })).toEqual({
+      kind: "message",
+      text: "你撤回了一条消息",
+    });
+    const owner = msg({
+      deleted_at: "t",
+      recalled_by: "owner",
+      recalled_by_name: "群主A",
+      sender_name: "B",
+      content: "消息已撤回",
+    });
+    expect(convPreview(conv({ kind: "group", last_message: owner }), { ...base })).toEqual({
+      kind: "message",
+      text: "群主撤回了 B 的一条消息",
+    });
+    // MM1 之前的历史墓碑保持旧文案
+    const legacy = msg({ deleted_at: "t", content: "消息已删除" });
+    expect(convPreview(conv({ last_message: legacy }), { ...base })).toEqual({
+      kind: "message",
+      text: "消息已删除",
+    });
+  });
+
+  it("结构化草稿：DraftEntry.text 参与预览；只有 chip 时占位文件名", () => {
+    const c = conv({ last_message: msg() });
+    expect(convPreview(c, { ...base, draft: { text: "草稿字" } })).toEqual({
+      kind: "draft",
+      text: "草稿字",
+    });
+    expect(
+      convPreview(c, {
+        ...base,
+        draft: {
+          text: "",
+          reuse: {
+            attachment_id: "a1",
+            file_name: "p.png",
+            mime: "image/png",
+            size: 1,
+            kind: "image",
+            conversation_id: "c1",
+          },
+        },
+      }),
+    ).toEqual({ kind: "draft", text: "[文件] p.png" });
+  });
 });
