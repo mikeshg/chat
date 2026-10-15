@@ -4,7 +4,7 @@ use super::*;
 
 #[tokio::test]
 async fn admin_rules() {
-    let base = spawn_named_db(&format!("chat_t_adm_{}", uniq())).await;
+    let (_guard, base) = spawn_named_db(&format!("chat_t_adm_{}", uniq())).await;
     let c = http();
 
     // 首个注册用户 = admin；其余为 user

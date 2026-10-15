@@ -172,7 +172,7 @@ async fn p33_setup(
 ///    test 端点给单台设备直达一条测试推送。
 #[tokio::test]
 async fn p33_push_dm_basic() {
-    let (base, _st) = spawn_named_state(&format!("chat_it_p33a_{}", uniq())).await;
+    let (_guard, base, _st) = spawn_named_state(&format!("chat_it_p33a_{}", uniq())).await;
     let ntfy = fake_ntfy().await;
     let (_admin, a, b, conv) = p33_setup(&base, &ntfy, "a").await;
 
@@ -231,7 +231,7 @@ async fn p33_push_dm_basic() {
 ///    没推过的人（发送者 A）推进已读不发 clear。
 #[tokio::test]
 async fn p33_push_always_and_clear_on_read() {
-    let (base, _st) = spawn_named_state(&format!("chat_it_p33b_{}", uniq())).await;
+    let (_guard, base, _st) = spawn_named_state(&format!("chat_it_p33b_{}", uniq())).await;
     let ntfy = fake_ntfy().await;
     let (_admin, a, b, conv) = p33_setup(&base, &ntfy, "b").await;
     let t1 = push_on(&base, &b, json!({"enabled": true})).await;
@@ -279,7 +279,7 @@ async fn p33_push_always_and_clear_on_read() {
 /// 3. B 静音群会话 → 普通消息不推；@B 的消息推（priority=4，标题=群名+未读数）。
 #[tokio::test]
 async fn p33_push_mute_and_mention() {
-    let (base, _st) = spawn_named_state(&format!("chat_it_p33c_{}", uniq())).await;
+    let (_guard, base, _st) = spawn_named_state(&format!("chat_it_p33c_{}", uniq())).await;
     let ntfy = fake_ntfy().await;
     let (_admin, a, b, _dm) = p33_setup(&base, &ntfy, "c").await;
     push_on(&base, &b, json!({"enabled": true})).await;
@@ -316,7 +316,7 @@ async fn p33_push_mute_and_mention() {
 /// 4. 合并：窗口内连发 3 条只推 1 条；窗口外照推，标题带累计未读数，sequence_id 不变。
 #[tokio::test]
 async fn p33_push_coalesce() {
-    let (base, st) = spawn_named_state(&format!("chat_it_p33d_{}", uniq())).await;
+    let (_guard, base, st) = spawn_named_state(&format!("chat_it_p33d_{}", uniq())).await;
     let ntfy = fake_ntfy().await;
     let (_admin, a, b, conv) = p33_setup(&base, &ntfy, "d").await;
     push_on(&base, &b, json!({"enabled": true})).await;
@@ -346,7 +346,7 @@ async fn p33_push_coalesce() {
 /// 5. preview 开 → 正文是「昵称: 内容」。
 #[tokio::test]
 async fn p33_push_preview() {
-    let (base, _st) = spawn_named_state(&format!("chat_it_p33e_{}", uniq())).await;
+    let (_guard, base, _st) = spawn_named_state(&format!("chat_it_p33e_{}", uniq())).await;
     let ntfy = fake_ntfy().await;
     let (_admin, a, b, conv) = p33_setup(&base, &ntfy, "e").await;
     push_on(&base, &b, json!({"enabled": true, "preview": true})).await;
@@ -368,7 +368,7 @@ async fn p33_push_preview() {
 ///    server-info.push_available=false。配置后登记了设备但未开启 → 发消息不产生请求。
 #[tokio::test]
 async fn p33_push_unconfigured() {
-    let (base, _st) = spawn_named_state(&format!("chat_it_p33f_{}", uniq())).await;
+    let (_guard, base, _st) = spawn_named_state(&format!("chat_it_p33f_{}", uniq())).await;
     let ntfy = fake_ntfy().await;
     let admin = register(&base, &format!("p33fadm_{}", uniq())).await;
     let a = register(&base, &format!("p33fa_{}", uniq())).await;
@@ -416,7 +416,7 @@ async fn p33_push_unconfigured() {
 ///    非法地址 400；配置令牌后推送带 Authorization；空串清除。
 #[tokio::test]
 async fn p33_admin_settings() {
-    let (base, _st) = spawn_named_state(&format!("chat_it_p33g_{}", uniq())).await;
+    let (_guard, base, _st) = spawn_named_state(&format!("chat_it_p33g_{}", uniq())).await;
     let ntfy = fake_ntfy().await;
     let admin = register(&base, &format!("p33gadm_{}", uniq())).await;
     let a = register(&base, &format!("p33ga_{}", uniq())).await;
@@ -482,7 +482,7 @@ async fn p33_admin_settings() {
 /// 8. 移除一台手机：只有剩下那台还收到推送；别人删不了；删不存在的 404。
 #[tokio::test]
 async fn p33_push_delete_device() {
-    let (base, _st) = spawn_named_state(&format!("chat_it_p33h_{}", uniq())).await;
+    let (_guard, base, _st) = spawn_named_state(&format!("chat_it_p33h_{}", uniq())).await;
     let ntfy = fake_ntfy().await;
     let (_admin, a, b, conv) = p33_setup(&base, &ntfy, "h").await;
     let lost = push_on(&base, &b, json!({"enabled": true})).await;
@@ -521,7 +521,7 @@ async fn p33_push_delete_device() {
 ///    应在超时窗口内被服务端关闭，好友看到其离线；正常读帧的客户端不受影响。
 #[tokio::test]
 async fn p33_ws_idle_timeout() {
-    let (base, st) = spawn_named_state(&format!("chat_it_p33i_{}", uniq())).await;
+    let (_guard, base, st) = spawn_named_state(&format!("chat_it_p33i_{}", uniq())).await;
     st.ws_ping_interval_ms
         .store(200, std::sync::atomic::Ordering::Relaxed);
     st.ws_idle_timeout_ms
@@ -592,7 +592,7 @@ async fn p33_ws_idle_timeout() {
 /// 10. 推送发送失败（连接拒绝）不影响消息正常送达；test 端点失败 502 带原因。
 #[tokio::test]
 async fn p33_push_failure_isolated() {
-    let (base, _st) = spawn_named_state(&format!("chat_it_p33j_{}", uniq())).await;
+    let (_guard, base, _st) = spawn_named_state(&format!("chat_it_p33j_{}", uniq())).await;
     // 拿一个已释放的回环端口 → 连接拒绝
     let dead = {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();

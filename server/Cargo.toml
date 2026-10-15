@@ -35,3 +35,4 @@ tokio-tungstenite = "0.26"
 # V2 P4-1：测试里解包/篡改备份文件
 tar = "0.4"
 flate2 = "1"
+libc = "0.2"

@@ -167,7 +167,7 @@ async fn github_release_flow() {
         ("CLIENT_UPDATE_REPO", None),
         ("CLIENT_UPDATE_PROXY", None),
     ]);
-    let (base, st) = spawn_named_state(&format!("chat_t_cu_{}", uniq())).await;
+    let (_guard, base, st) = spawn_named_state(&format!("chat_t_cu_{}", uniq())).await;
     set_repo(&st.pool, "octo/chat").await;
 
     // /client/latest：GitHub release 字段映射
@@ -238,7 +238,7 @@ async fn github_no_release_is_404() {
         ("CLIENT_UPDATE_REPO", None),
         ("CLIENT_UPDATE_PROXY", None),
     ]);
-    let (base, st) = spawn_named_state(&format!("chat_t_cu_{}", uniq())).await;
+    let (_guard, base, st) = spawn_named_state(&format!("chat_t_cu_{}", uniq())).await;
     set_repo(&st.pool, "octo/chat").await;
     let resp = http()
         .get(format!("{base}/v1/client/latest"))
@@ -264,7 +264,7 @@ async fn gitea_release_still_works() {
         ("CLIENT_UPDATE_REPO", None),
         ("CLIENT_UPDATE_PROXY", None),
     ]);
-    let (base, st) = spawn_named_state(&format!("chat_t_cu_{}", uniq())).await;
+    let (_guard, base, st) = spawn_named_state(&format!("chat_t_cu_{}", uniq())).await;
     // 非 github.com 的 http(s) 地址 → Gitea 兼容模式
     set_repo(&st.pool, &format!("{}/octo/chat", mock.api_base)).await;
     let r: Value = http()
@@ -298,7 +298,7 @@ async fn gitea_release_still_works() {
 async fn env_fallback_and_off() {
     let _lock = ENV_LOCK.lock().await;
     let mock = gh_mock(true).await;
-    let (base, st) = spawn_named_state(&format!("chat_t_cu_{}", uniq())).await;
+    let (_guard, base, st) = spawn_named_state(&format!("chat_t_cu_{}", uniq())).await;
     {
         // DB 为空 → 用 CLIENT_UPDATE_REPO
         let _env = EnvRestore::new(&[
@@ -343,7 +343,7 @@ async fn env_fallback_and_off() {
 
 #[tokio::test]
 async fn update_repo_url_validation() {
-    let base = spawn_named_db(&format!("chat_t_cu_{}", uniq())).await;
+    let (_guard, base) = spawn_named_db(&format!("chat_t_cu_{}", uniq())).await;
     let a = register(&base, &format!("ad_{}", uniq())).await; // 首个用户 = admin
     for ok in [
         "xie-fan/chat",

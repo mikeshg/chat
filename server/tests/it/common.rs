@@ -1,17 +1,13 @@
 use super::*;
 
 pub(crate) fn base_db_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://chat:chat@localhost:15432/postgres".into())
+    testdb::admin_db_url()
 }
 
+/// 共享测试库的 URL：MM5 起不再是固定 chat_test——TEST_DATABASE_NAME 指定
+/// 或每次运行生成 chat_it_run_<pid>_<rand>（退出自动删）。
 pub(crate) fn test_db_url() -> String {
-    let base = base_db_url();
-    // 把库名替换为 chat_test
-    match base.rfind('/') {
-        Some(i) => format!("{}/chat_test", &base[..i]),
-        None => "postgres://chat:chat@localhost:15432/chat_test".into(),
-    }
+    testdb::db_url_for(&testdb::run_db_name())
 }
 
 static DB_INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
@@ -19,25 +15,13 @@ static DB_INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 pub(crate) async fn ensure_test_db() {
     DB_INIT
         .get_or_init(|| async {
-            let admin = PgPoolOptions::new()
-                .max_connections(1)
-                .connect(&base_db_url())
+            let name = testdb::prepare_run_db().await;
+            let pool = PgPoolOptions::new()
+                .connect(&testdb::db_url_for(&name))
                 .await
-                .expect("connect admin db (docker compose up db)");
-            let exists = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = 'chat_test')",
-            )
-            .fetch_one(&admin)
-            .await
-            .unwrap();
-            if !exists {
-                // 并发下重复建库会报 23505，忽略即可
-                let _ = sqlx::query("CREATE DATABASE chat_test")
-                    .execute(&admin)
-                    .await;
-            }
-            let pool = PgPoolOptions::new().connect(&test_db_url()).await.unwrap();
+                .unwrap();
             sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+            pool.close().await;
         })
         .await;
 }
@@ -211,33 +195,18 @@ where
     panic!("did not receive frame type={want}");
 }
 
-/// 独立库：首个注册用户自动成为管理员，便于确定性测试
-pub(crate) async fn spawn_named_db(db_name: &str) -> String {
-    spawn_named_state(db_name).await.0
+/// 独立库：首个注册用户自动成为管理员，便于确定性测试。
+/// 返回的 TempDb 守卫必须在整个测试作用域存活：作用域结束（含 panic）即删库。
+pub(crate) async fn spawn_named_db(db_name: &str) -> (testdb::TempDb, String) {
+    let (db, base, _st) = spawn_named_state(db_name).await;
+    (db, base)
 }
 
-pub(crate) async fn spawn_named_state(db_name: &str) -> (String, chat_server::state::SharedState) {
-    let admin = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&base_db_url())
-        .await
-        .unwrap();
-    let exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)",
-    )
-    .bind(db_name)
-    .fetch_one(&admin)
-    .await
-    .unwrap();
-    if !exists {
-        let _ = sqlx::query(&format!("CREATE DATABASE {db_name}"))
-            .execute(&admin)
-            .await;
-    }
-    let url = match base_db_url().rfind('/') {
-        Some(i) => format!("{}/{db_name}", &base_db_url()[..i]),
-        None => format!("postgres://chat:chat@localhost:15432/{db_name}"),
-    };
+pub(crate) async fn spawn_named_state(
+    db_name: &str,
+) -> (testdb::TempDb, String, chat_server::state::SharedState) {
+    let db = testdb::TempDb::create(db_name).await;
+    let url = db.url();
     let pool = PgPoolOptions::new().connect(&url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
 
@@ -269,7 +238,7 @@ pub(crate) async fn spawn_named_state(db_name: &str) -> (String, chat_server::st
         .await
         .unwrap();
     });
-    (format!("http://{addr}"), state)
+    (db, format!("http://{addr}"), state)
 }
 
 pub(crate) async fn me(base: &str, u: &TestUser) -> Value {

@@ -24,7 +24,7 @@ async fn post_forward(
 /// 独立库：首个注册者即管理员，顺手校验 admin_overview 口径。
 #[tokio::test]
 async fn p24_self_conv_on_register() {
-    let base = spawn_named_db(&format!("chat_it_p24a_{}", uniq())).await;
+    let (_guard, base) = spawn_named_db(&format!("chat_it_p24a_{}", uniq())).await;
     let a = register(&base, &format!("p24a_{}", uniq())).await;
     let convs = conv_list(&base, &a).await;
     let selves: Vec<_> = convs

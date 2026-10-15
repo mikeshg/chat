@@ -332,7 +332,7 @@ async fn p2_1_delete_cleans_thumb() {
 /// 配额：1MB 上限 → 600KB 成功、再 600KB 拒绝；共享行不重复计；0 恢复不限
 #[tokio::test]
 async fn p2_1_storage_quota() {
-    let (base, state) = spawn_named_state(&format!("chat_t_p21q_{}", uniq())).await;
+    let (_guard, base, state) = spawn_named_state(&format!("chat_t_p21q_{}", uniq())).await;
     let admin = register(&base, &format!("qad_{}", uniq())).await;
     let u = register(&base, &format!("qu_{}", uniq())).await;
     befriend(&base, &admin, &u).await;
@@ -461,7 +461,7 @@ async fn p2_1_storage_quota() {
 /// 非管理员设配额 403；非法值 400；server-info 不暴露配额
 #[tokio::test]
 async fn p2_1_quota_admin_and_validation() {
-    let base = spawn_named_db(&format!("chat_t_p21v_{}", uniq())).await;
+    let (_guard, base) = spawn_named_db(&format!("chat_t_p21v_{}", uniq())).await;
     let admin = register(&base, &format!("vad_{}", uniq())).await;
     let u = register(&base, &format!("vu_{}", uniq())).await;
     let c = http();

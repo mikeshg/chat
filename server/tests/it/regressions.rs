@@ -192,7 +192,7 @@ pub(crate) async fn wait_for_blocker<T>(
 
 #[tokio::test]
 async fn token_issuance_waits_for_user_authorization() {
-    let (base, st) = spawn_named_state(&format!("chat_t_issue_{}", uniq())).await;
+    let (_guard, base, st) = spawn_named_state(&format!("chat_t_issue_{}", uniq())).await;
     let _admin = register(&base, &format!("ia_{}", uniq())).await;
     for refresh in [false, true] {
         let u = register(&base, &format!("iu_{}", uniq())).await;
@@ -242,7 +242,7 @@ async fn token_issuance_waits_for_user_authorization() {
 
 #[tokio::test]
 async fn registration_is_not_visible_before_token_issuance_commits() {
-    let (base, st) = spawn_named_state(&format!("chat_t_register_{}", uniq())).await;
+    let (_guard, base, st) = spawn_named_state(&format!("chat_t_register_{}", uniq())).await;
     let admin = register(&base, &format!("rga_{}", uniq())).await;
     let name = format!("rgu_{}", uniq());
     let mut barrier = st.pool.begin().await.unwrap();
@@ -287,7 +287,7 @@ async fn registration_is_not_visible_before_token_issuance_commits() {
 
 #[tokio::test]
 async fn reset_and_disable_revoke_tokens_atomically() {
-    let (base, st) = spawn_named_state(&format!("chat_t_atomic_{}", uniq())).await;
+    let (_guard, base, st) = spawn_named_state(&format!("chat_t_atomic_{}", uniq())).await;
     let admin = register(&base, &format!("ata_{}", uniq())).await;
     for operation in ["password", "disable"] {
         let u = register(&base, &format!("atu_{}", uniq())).await;
@@ -346,7 +346,7 @@ async fn reset_and_disable_revoke_tokens_atomically() {
 /// P1-3：管理员重置密码后，旧 access token 与 WS ticket 立即失效。
 #[tokio::test]
 async fn reset_password_revokes_access() {
-    let base = spawn_named_db(&format!("chat_t_rp_{}", uniq())).await;
+    let (_guard, base) = spawn_named_db(&format!("chat_t_rp_{}", uniq())).await;
     let c = http();
     let a = register(&base, &format!("ra_{}", uniq())).await; // 首个 = admin
     let b = register(&base, &format!("rb_{}", uniq())).await;
@@ -406,7 +406,7 @@ async fn reset_password_revokes_access() {
 /// P1-2：禁用用户时旧 WS 收到 force_logout 后被服务端主动关闭；旧连接无法再写。
 #[tokio::test]
 async fn force_logout_actually_closes_socket() {
-    let base = spawn_named_db(&format!("chat_t_fk_{}", uniq())).await;
+    let (_guard, base) = spawn_named_db(&format!("chat_t_fk_{}", uniq())).await;
     let c = http();
     let a = register(&base, &format!("ka_{}", uniq())).await;
     let b = register(&base, &format!("kb_{}", uniq())).await;
@@ -475,7 +475,7 @@ where
 
 #[tokio::test]
 async fn ws_reset_between_upgrade_and_registration_closes_without_presence() {
-    let (base, st) = spawn_named_state(&format!("chat_t_upgrade_{}", uniq())).await;
+    let (_guard, base, st) = spawn_named_state(&format!("chat_t_upgrade_{}", uniq())).await;
     let admin = register(&base, &format!("uga_{}", uniq())).await;
     let u = register(&base, &format!("ugu_{}", uniq())).await;
     let grant = chat_server::auth::verify_access(&u.access, &st.cfg.jwt_secret).unwrap();
@@ -537,7 +537,7 @@ async fn ws_reset_between_upgrade_and_registration_closes_without_presence() {
 
 #[tokio::test]
 async fn ws_rechecks_session_version_before_frames_and_preserves_other_connections() {
-    let (base, st) = spawn_named_state(&format!("chat_t_frame_{}", uniq())).await;
+    let (_guard, base, st) = spawn_named_state(&format!("chat_t_frame_{}", uniq())).await;
     let u = register(&base, &format!("fvu_{}", uniq())).await;
     let peer = register(&base, &format!("fvp_{}", uniq())).await;
     befriend(&base, &u, &peer).await;
@@ -722,7 +722,7 @@ async fn dissolve_invite_race() {
 #[tokio::test]
 async fn admin_role_safety() {
     let db_name = format!("chat_t_ar_{}", uniq());
-    let base = spawn_named_db(&db_name).await;
+    let (_guard, base) = spawn_named_db(&db_name).await;
     let c = http();
     let a = register(&base, &format!("aa_{}", uniq())).await; // admin
     let b = register(&base, &format!("bb_{}", uniq())).await;
@@ -1021,7 +1021,7 @@ async fn sync_paginates_beyond_500() {
 ///    .restore-old / .restore-new 不留；.restore-old 有遗留原文件时拒绝恢复且不碰它。
 #[tokio::test]
 async fn review_restore_swap_failure_keeps_files_and_db() {
-    let (base, _st, files_dir) = spawn_backup_env("sf").await;
+    let (_guard, base, _st, files_dir) = spawn_backup_env("sf").await;
     let c = http();
     let admin = register(&base, &format!("rvsf_{}", uniq())).await;
     std::fs::write(files_dir.join("keep.bin"), b"before").unwrap();
@@ -1089,7 +1089,7 @@ async fn review_restore_swap_failure_keeps_files_and_db() {
 /// 4. 空库并发注册只能产生一个管理员
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn review_register_race_single_admin() {
-    let (base, st) = spawn_named_state(&format!("chat_it_rvreg_{}", uniq())).await;
+    let (_guard, base, st) = spawn_named_state(&format!("chat_it_rvreg_{}", uniq())).await;
     let tasks: Vec<_> = (0..8)
         .map(|i| {
             let base = base.clone();
@@ -1146,7 +1146,7 @@ async fn review_logout_kicks_session_ws() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_ws_stuck_reader_is_dropped() {
     use std::sync::atomic::Ordering::Relaxed;
-    let (base, st) = spawn_named_state(&format!("chat_it_rvws_{}", uniq())).await;
+    let (_guard, base, st) = spawn_named_state(&format!("chat_it_rvws_{}", uniq())).await;
     st.ws_ping_interval_ms.store(60_000, Relaxed);
     st.ws_idle_timeout_ms.store(1000, Relaxed);
     let z = register(&base, &format!("rvws_{}", uniq())).await;

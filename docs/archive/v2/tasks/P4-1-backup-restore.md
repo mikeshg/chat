@@ -88,3 +88,12 @@ Vitest：确认词校验、文件大小格式化等纯函数。
 
 - 定时自动备份、备份到对象存储 / 远程、增量备份、备份加密。
 - 跨迁移版本恢复（升级 / 降级转换）。
+
+## 修订记录
+
+### Amendment (MM1/MM5) — 2026-10-15
+
+- `migration_version` 校验由「必须等于当前」放宽为「不比当前新」：`manifest.migration_version <=` 当前 `_sqlx_migrations` 最大成功版本即可恢复；比当前新仍拒绝。400 文案沿用「备份版本与当前服务端不一致」——注意它现在的含义是「备份版本比当前服务端新」。
+- 回灌改为按 **CSV 表头驱动 COPY 列清单**：备份缺少的新列（如 0039 加的 `attachments.recalled_at`）由库默认值/NULL 补齐；CSV 含当前库不存在的列直接 400（跨版本恢复不许悄悄丢数据）。
+- 原因：MM1（0039 消息撤回）给 `attachments` 加了 `recalled_at` 后，MM1 之前生成的备份应可恢复。
+- 测试锁定（`tests/it/backup.rs`）：`mm5_restore_accepts_older_backup_without_recalled_at`（版本拨回 38 + 删列 → 恢复成功，`recalled_at` 为 NULL）、`mm5_restore_rejects_unknown_column`（未知列 → 400 且数据不变）、`p41_restore_rejects_version_mismatch`（加强：精确错误文案 + 全表行数/文件清单逐项不变）。

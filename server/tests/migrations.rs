@@ -3,24 +3,17 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::str::FromStr;
 use uuid::Uuid;
 
+// MM5：所有测试库经 TempDb 守卫创建（作用域结束含 panic 即删库）。
+#[path = "common/testdb.rs"]
+mod testdb;
+
 #[tokio::test]
 async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://chat:chat@localhost:15432/postgres".into());
-    let options = PgConnectOptions::from_str(&database_url).unwrap();
-    let admin = PgPoolOptions::new()
-        .max_connections(1)
-        .connect_with(options.clone())
-        .await
-        .unwrap();
-    let name = format!("chat_migration_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE DATABASE {name}"))
-        .execute(&admin)
-        .await
-        .unwrap();
+    let db = testdb::TempDb::create(&format!("chat_t_mig_{}", Uuid::new_v4().simple())).await;
+    let options = PgConnectOptions::from_str(&testdb::admin_db_url()).unwrap();
     let pool = PgPoolOptions::new()
         .max_connections(3)
-        .connect_with(options.database(&name))
+        .connect_with(options.database(db.name()))
         .await
         .unwrap();
     for script in [
@@ -228,32 +221,17 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
     );
 
     pool.close().await;
-    sqlx::query(&format!("DROP DATABASE {name}"))
-        .execute(&admin)
-        .await
-        .unwrap();
 }
 
 /// V2 P2-4：0015 为 0015 之前已存在的用户回填 type='self' 会话与 owner 成员；
 /// 重复执行幂等（uq_self_conversation 部分唯一索引 + memberships PK 兜底）。
 #[tokio::test]
 async fn upgrade_backfills_self_conversations() {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://chat:chat@localhost:15432/postgres".into());
-    let options = PgConnectOptions::from_str(&database_url).unwrap();
-    let admin = PgPoolOptions::new()
-        .max_connections(1)
-        .connect_with(options.clone())
-        .await
-        .unwrap();
-    let name = format!("chat_migration_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE DATABASE {name}"))
-        .execute(&admin)
-        .await
-        .unwrap();
+    let db = testdb::TempDb::create(&format!("chat_t_mig_{}", Uuid::new_v4().simple())).await;
+    let options = PgConnectOptions::from_str(&testdb::admin_db_url()).unwrap();
     let pool = PgPoolOptions::new()
         .max_connections(3)
-        .connect_with(options.database(&name))
+        .connect_with(options.database(db.name()))
         .await
         .unwrap();
     for script in [
@@ -344,31 +322,16 @@ async fn upgrade_backfills_self_conversations() {
         .unwrap();
 
     pool.close().await;
-    sqlx::query(&format!("DROP DATABASE {name}"))
-        .execute(&admin)
-        .await
-        .unwrap();
 }
 
 /// V2 P3-1：0016 在已有数据上创建 pg_trgm 扩展与 messages.content 部分 GIN 索引。
 #[tokio::test]
 async fn upgrade_creates_search_trgm_index() {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://chat:chat@localhost:15432/postgres".into());
-    let options = PgConnectOptions::from_str(&database_url).unwrap();
-    let admin = PgPoolOptions::new()
-        .max_connections(1)
-        .connect_with(options.clone())
-        .await
-        .unwrap();
-    let name = format!("chat_migration_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE DATABASE {name}"))
-        .execute(&admin)
-        .await
-        .unwrap();
+    let db = testdb::TempDb::create(&format!("chat_t_mig_{}", Uuid::new_v4().simple())).await;
+    let options = PgConnectOptions::from_str(&testdb::admin_db_url()).unwrap();
     let pool = PgPoolOptions::new()
         .max_connections(3)
-        .connect_with(options.database(&name))
+        .connect_with(options.database(db.name()))
         .await
         .unwrap();
     for script in [
@@ -443,31 +406,16 @@ async fn upgrade_creates_search_trgm_index() {
     assert_eq!(hits, 1);
 
     pool.close().await;
-    sqlx::query(&format!("DROP DATABASE {name}"))
-        .execute(&admin)
-        .await
-        .unwrap();
 }
 
 /// 0035：Agent 专属会话整个删掉；Agent 在群里发的消息删掉，人发的留下。
 #[tokio::test]
 async fn drop_agents_removes_agent_messages_and_conversations() {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://chat:chat@localhost:15432/postgres".into());
-    let options = PgConnectOptions::from_str(&database_url).unwrap();
-    let admin = PgPoolOptions::new()
-        .max_connections(1)
-        .connect_with(options.clone())
-        .await
-        .unwrap();
-    let name = format!("chat_migration_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE DATABASE {name}"))
-        .execute(&admin)
-        .await
-        .unwrap();
+    let db = testdb::TempDb::create(&format!("chat_t_mig_{}", Uuid::new_v4().simple())).await;
+    let options = PgConnectOptions::from_str(&testdb::admin_db_url()).unwrap();
     let pool = PgPoolOptions::new()
         .max_connections(3)
-        .connect_with(options.database(&name))
+        .connect_with(options.database(db.name()))
         .await
         .unwrap();
     let mut files: Vec<_> = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
@@ -555,8 +503,4 @@ async fn drop_agents_removes_agent_messages_and_conversations() {
     assert_eq!(agent_convs, 0);
 
     pool.close().await;
-    sqlx::query(&format!("DROP DATABASE {name}"))
-        .execute(&admin)
-        .await
-        .unwrap();
 }
