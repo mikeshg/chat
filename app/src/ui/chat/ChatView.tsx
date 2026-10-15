@@ -54,6 +54,7 @@ import Avatar from "../Avatar";
 import VoiceRecorder from "./VoiceRecorder";
 import { FEATURE_HOVER_TOOLBAR } from "./features";
 import { pushBackLayer, resetBackLayers } from "./backStack";
+import { Z } from "./layers";
 import { recordLabel } from "./chatRecord";
 import {
   enterMultiSelect,
@@ -2179,8 +2180,10 @@ export default function ChatView() {
           触屏打开后 GHOST_CLICK_MS 内的 click 按幽灵点击忽略（兼容 click 可能落到
           刚渲染的工具栏按钮上）；鼠标/笔打开的预览永不忽略点击 */}
       {preview && (
+        // Z.modal：记录查看页(Z.recordView)之上、转发弹窗(Z.forwardModal)之下
         <div
           className="modal-mask"
+          style={{ zIndex: Z.modal }}
           onClick={() => {
             if (!isGhostClick(previewAt.current)) setPreview(null);
           }}

@@ -3,6 +3,7 @@ import { ApiError, msgs as msgsApi, session } from "../../api";
 import { applyLiveMessage, convTitle, getState, setState, useApp } from "../../store";
 import type { MessageView } from "../../types";
 import { forwardTargets } from "./forwardTargets";
+import { Z } from "./layers";
 
 const MAX_TARGETS = 10;
 
@@ -182,7 +183,8 @@ export default function ForwardModal({
   const onConfirm = submit ? submitDelegated : submitSingle;
 
   return (
-    <div className="modal-mask" onClick={onClose}>
+    // Z.forwardModal：高过查看器/预览（记录内打开时预览不关，同层 DOM 序会盖住弹窗）
+    <div className="modal-mask" style={{ zIndex: Z.forwardModal }} onClick={onClose}>
       <div className="modal fwd-modal" onClick={(e) => e.stopPropagation()}>
         <h3>{submit?.title ?? "转发消息"}</h3>
         {done ? (

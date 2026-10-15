@@ -326,6 +326,8 @@ button.ctx-item:hover { background: var(--bg); }
 .pick { cursor: pointer; }
 
 /* ---------- 弹窗 ---------- */
+/* 层级数值以 ui/chat/layers.ts 为唯一事实来源（这里保留与 Z.modal 相同的兜底值；
+   转发弹窗等需要更上层的浮层在组件里用 Z.* 内联覆盖） */
 .modal-mask {
   position: fixed; inset: 0; background: var(--overlay);
   display: grid; place-items: center; z-index: 100;
@@ -1212,7 +1214,8 @@ input.switch:focus-visible { outline: 2px solid var(--green); outline-offset: 2p
 .record-more:hover { background: var(--hover); color: var(--text); }
 
 /* ---------- MF2 记录查看页 ---------- */
-/* 低于 .modal-mask(100)：记录内打开的附件预览/转发弹窗必须浮在查看页之上 */
+/* Z.recordView：低于通用弹窗层——记录内打开的附件预览/转发弹窗必须浮在查看页之上
+   （层级数值以 ui/chat/layers.ts 为唯一事实来源，组件内联给值；这里是同值兜底） */
 .rv-mask {
   position: fixed; inset: 0; background: var(--overlay);
   display: grid; place-items: center; z-index: 90;

@@ -10,6 +10,7 @@ import {
   recordSections,
   recordTitle,
 } from "./chatRecord";
+import { Z } from "./layers";
 
 // ===== MF2 聊天记录卡片 + 查看页 =====
 // 快照（RecordItem/嵌套 record）只活在本组件 props/调用方 state 里：
@@ -206,7 +207,8 @@ export default function ChatRecordView({
 }) {
   const top = view.levels[view.levels.length - 1];
   return (
-    <div className="rv-mask" onClick={onClose}>
+    // Z.recordView：查看页在一切弹窗之下（记录内预览/转发弹窗都要压过它）
+    <div className="rv-mask" style={{ zIndex: Z.recordView }} onClick={onClose}>
       <div className="record-view" data-testid="record-view" onClick={(e) => e.stopPropagation()}>
         <div className="rv-head">
           {view.levels.length > 1 && (
