@@ -10,6 +10,7 @@ import {
   wsBase,
 } from "./api";
 import { notifyIncoming } from "./notify";
+import { RECORD_TITLE_MAX, recordLabel } from "./ui/chat/chatRecord";
 import { clearReuseOnAck, failReuseSend } from "./drafts";
 import { kickReasonKey } from "./servers";
 import {
@@ -534,7 +535,9 @@ function onMessage(m: MessageView) {
         : m.kind === "audio" || m.attachment.duration_ms != null
           ? "[语音]"
           : `[文件] ${m.attachment.file_name}`
-      : m.content.slice(0, 80);
+      : m.kind === "chat_record"
+        ? recordLabel(m, RECORD_TITLE_MAX)
+        : m.content.slice(0, 80);
     const tag = cur.me && m.mentions.includes(cur.me.id) ? "[有人@我] " : "";
     pushToast({
       convId: m.conversation_id,

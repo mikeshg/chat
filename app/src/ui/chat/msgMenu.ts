@@ -113,7 +113,8 @@ export function menuItems(m: MessageView, ctx: MenuCtx): MenuItem[] {
     items.push({ action: "preview", label: m.kind === "image" ? "查看大图" : "预览" });
   }
   if (canAct(m, ctx)) items.push({ action: "reply", label: "回复" });
-  items.push({ action: "copy", label: "复制" });
+  // MF2：聊天记录卡片不提供「复制」（快照文本非原文，复制会误导；菜单恰为 回复/转发/多选/撤回）
+  if (m.kind !== "chat_record") items.push({ action: "copy", label: "复制" });
   // —— 下线的旧菜单项：开关关闭，代码保留（MM2 审查口径） ——
   if (FEATURE_MENU_REACTION && canAct(m, ctx)) items.push({ action: "reaction", label: "表情" });
   if (FEATURE_MENU_EDIT && canEditMsg(m, ctx)) items.push({ action: "edit", label: "编辑" });
@@ -123,7 +124,7 @@ export function menuItems(m: MessageView, ctx: MenuCtx): MenuItem[] {
   }
   if (FEATURE_MENU_FAVORITE && canForward(m)) items.push({ action: "favorite", label: "收藏" });
   if (m.attachment) items.push({ action: "download", label: "下载" });
-  // MM3 多选暂缓（合并转发设计未定稿）：开关关闭，代码路径保留
+  // MF2 多选：菜单位置在下载之后、撤回之前（查看器/预览工具栏不进此项——那里手动挑白名单）
   if (FEATURE_MULTI_SELECT) items.push({ action: "multi", label: "多选" });
   if (canRecall(m, ctx)) items.push({ action: "recall", label: "撤回", danger: true });
   return items;

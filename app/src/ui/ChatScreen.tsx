@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { dismissToast, setState, useApp } from "../store";
+import { consumeBack } from "./chat/backStack";
 import { revealDownloaded } from "../download";
 import { openConversation, refreshCatalogs } from "../ws";
 import ConvList from "./chat/ConvList";
@@ -22,7 +23,13 @@ export default function ChatScreen() {
     else if (!s.activeConv && history.state?.chat) history.back();
   }, [s.activeConv]);
   useEffect(() => {
-    const onPop = () => !history.state?.chat && setState({ activeConv: null });
+    const onPop = () => {
+      if (history.state?.chat) return;
+      // MF2：返回键先关 ChatView 里最上层的覆盖物（转发弹窗 → 预览 → 记录查看页 → 多选），
+      // 消费掉就补回 {chat:1} 让会话保持打开；没有覆盖层才退回会话列表
+      if (consumeBack()) history.pushState({ chat: 1 }, "");
+      else setState({ activeConv: null });
+    };
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
   }, []);
@@ -102,6 +109,20 @@ export default function ChatScreen() {
           >
             <b>{t.title}</b>
             {t.text && <span>{t.text}</span>}
+            {/* MF2：结果未确认类的操作重试（同一 client_op_id 幂等重发） */}
+            {t.action && (
+              <span
+                className="toast-act"
+                role="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  dismissToast(t.id);
+                  t.action!.run();
+                }}
+              >
+                {t.action.label}
+              </span>
+            )}
           </button>
         ))}
       </div>

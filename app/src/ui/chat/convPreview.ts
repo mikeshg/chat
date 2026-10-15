@@ -1,6 +1,7 @@
 import type { ConversationView } from "../../types";
 import type { DraftEntry } from "../../drafts";
 import { tombstoneText } from "./msgMenu";
+import { RECORD_TITLE_MAX, recordLabel } from "./chatRecord";
 
 // ===== V2 P1-3 =====
 // 会话列表副标题预览：typing > 草稿 > 最后一条消息 > 空。
@@ -37,5 +38,10 @@ export function convPreview(c: ConversationView, o: ConvPreviewInput): ConvPrevi
   const tomb = tombstoneText(m, { meId: o.meId, convType: c.kind });
   if (tomb != null) return { kind: "message", text: tomb };
   const who = c.kind === "group" && m.sender_id !== o.meId ? `${m.sender_name}：` : "";
+  // MF2：聊天记录卡片在列表里恒显示「[聊天记录] {title}」（标题 >30 字截断），
+  // 不回落到含逐行摘要的 content 兜底文本；群聊保留发送者前缀
+  if (m.kind === "chat_record") {
+    return { kind: "message", text: `${who}${recordLabel(m, RECORD_TITLE_MAX)}` };
+  }
   return { kind: "message", text: `${who}${m.content}` };
 }

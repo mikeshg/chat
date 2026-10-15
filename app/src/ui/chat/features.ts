@@ -12,5 +12,5 @@ export const FEATURE_MENU_EDIT = false;
 export const FEATURE_MENU_PIN = false;
 /** 消息菜单「收藏」项 */
 export const FEATURE_MENU_FAVORITE = false;
-/** 消息菜单/动作面板「多选」项（MM3 暂缓，等合并转发设计定稿再接回） */
-export const FEATURE_MULTI_SELECT = false;
+/** 消息菜单/动作面板「多选」项（MF2：多选 + 逐条/合并转发） */
+export const FEATURE_MULTI_SELECT = true;

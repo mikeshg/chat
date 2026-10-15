@@ -2,6 +2,7 @@ import { useSyncExternalStore } from "react";
 import { loadSession, serverScope } from "./api";
 import { writeDrafts, type DraftEntry, type DraftReuse } from "./drafts";
 import { cacheKey, getRecent, touchRecent, writeLocalCache } from "./localCache";
+import { recordLabel } from "./ui/chat/chatRecord";
 import type {
   ConversationPref,
   ConversationView,
@@ -21,6 +22,8 @@ export interface Toast {
   ts: number;
   /** MM4：下载成功 toast 点击「在文件夹中显示」（仅桌面端设置） */
   filePath?: string;
+  /** MF2：失败操作的重试入口（如批量转发网络错误后同 client_op_id 重发） */
+  action?: { label: string; run: () => void };
 }
 
 export interface AppState {
@@ -228,7 +231,10 @@ export function replyPreview(m: MessageView) {
     message_id: m.id,
     seq: m.seq,
     sender_name: m.sender_name,
-    excerpt: m.deleted_at ? "" : m.attachment
+    // MF2：回复聊天记录引用「[聊天记录] {title}」首行（与服务端 preview 同口径），不带逐行摘要
+    excerpt: m.deleted_at ? "" : m.kind === "chat_record"
+      ? recordLabel(m)
+      : m.attachment
       ? m.kind === "image"
         ? "[图片]"
         : m.kind === "audio" || m.attachment.duration_ms != null

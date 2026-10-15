@@ -29,6 +29,7 @@ import {
 } from "../../reedit";
 import type {
   AttachmentView,
+  ChatRecord,
   ConversationView,
   MemberView,
   MessageView,
@@ -47,10 +48,31 @@ import { meetingMessage } from "./meeting";
 import PinnedBar from "./PinnedBar";
 import NewPollModal from "./NewPollModal";
 import PollCard from "./PollCard";
+import ChatRecordView, { ChatRecordCard, type RecordViewState } from "./ChatRecord";
 import { attImgSrc, imageBubbleSize } from "../mediaFormat";
 import Avatar from "../Avatar";
 import VoiceRecorder from "./VoiceRecorder";
 import { FEATURE_HOVER_TOOLBAR } from "./features";
+import { pushBackLayer, resetBackLayers } from "./backStack";
+import { recordLabel } from "./chatRecord";
+import {
+  enterMultiSelect,
+  orderedSelectedIds,
+  pruneSelection,
+  selectable,
+  toggleSelect,
+  type MultiSelect,
+} from "./multiSelect";
+import {
+  FALLBACK_MERGED_TOAST,
+  FALLBACK_SEPARATE_CAP,
+  batchResultToast,
+  fallbackSeparateToast,
+  forwardRespToast,
+  isOldServerUnsupported,
+  prepareBatchSubmission,
+  type BatchPayload,
+} from "./forwardBatch";
 import {
   canRecall,
   copyTextFor,
@@ -151,6 +173,7 @@ function kindLabel(kind: string): string {
   if (kind === "file") return "[文件]";
   if (kind === "audio") return "[语音]";
   if (kind === "poll") return "[投票]";
+  if (kind === "chat_record") return "[聊天记录]";
   return "";
 }
 
@@ -217,7 +240,12 @@ export default function ChatView() {
   const [searchQ, setSearchQ] = useState("");
   const [searchRes, setSearchRes] = useState<MessageView[] | null>(null);
   const [flashId, setFlashId] = useState<string | null>(null);
-  const [preview, setPreview] = useState<{ att: AttachmentView; m: MessageView | null } | null>(null);
+  const [preview, setPreview] = useState<{
+    att: AttachmentView;
+    m: MessageView | null;
+    /** MF2：从聊天记录查看页打开的附件（工具栏恰为 下载/转发/关闭） */
+    rec?: { outerId: string; attachmentId: string };
+  } | null>(null);
   const [previewText, setPreviewText] = useState<string | null>(null);
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
   const [sending, setSending] = useState(false);
@@ -251,8 +279,20 @@ export default function ChatView() {
   // 投票：创建弹窗开关 + 每条消息的操作 busy 态
   const [showPoll, setShowPoll] = useState(false);
   const [pollBusy, setPollBusy] = useState<Record<string, boolean>>({});
-  // V2 P2-4：转发弹窗的源消息（收藏不走弹窗，直接调接口到 self 会话）
+  // V2 P2-4 + MF2：转发弹窗——单条 / 多选批量 / 记录内附件条目（各自带幂等 op）
   const [fwdMsg, setFwdMsg] = useState<MessageView | null>(null);
+  const [fwdBatch, setFwdBatch] = useState<{ mode: "separate" | "merged"; ids: string[] } | null>(null);
+  const [fwdRecord, setFwdRecord] = useState<{ outerId: string; attachmentId: string; fileName: string } | null>(null);
+  // MF2 多选模式（选中集只认服务端消息 id；作用域随 conv.id）
+  const [ms, setMs] = useState<MultiSelect | null>(null);
+  // MF2 聊天记录查看页（快照只活在组件 state；永不进全局 store/本地缓存/日志）
+  const [recordView, setRecordView] = useState<RecordViewState | null>(null);
+  // 批量/记录转发最近一次确认的载荷（网络错误后同 op 重试复用）
+  const batchSub = useRef<BatchPayload | null>(null);
+  const recSub = useRef<{ outerId: string; attachmentId: string; targets: string[]; op: string } | null>(null);
+  // Esc/返回键层栈要读到最新 recordView（effect 闭包会滞后一次渲染）
+  const rvRef = useRef<RecordViewState | null>(null);
+  rvRef.current = recordView;
   const [pins, setPins] = useState<PinEntry[]>([]);
   const pinnedIds = new Set(pins.map((p) => p.message.id));
   const pinsRequest = useRef(0);
@@ -267,6 +307,9 @@ export default function ChatView() {
   const conv = s.conversations.find((c) => c.id === s.activeConv) ?? null;
   const msgs = conv ? (s.messages[conv.id] ?? []) : [];
   const hasMore = conv ? (s.hasMore[conv.id] ?? false) : false;
+  // MF2：多选态只在本会话生效；recordView 的最外层消息（撤回监听、附件转发的 outerId）
+  const msMode = !!ms && !!conv && ms.convId === conv.id;
+  const recordDead = (outerId: string) => !!msgs.find((x) => x.id === outerId)?.deleted_at;
   const current = (token: object | null) => token != null && token === viewOwner.current && gen === session() && getState().activeConv === conv?.id;
 
   // 群聊拉成员列表（@补全用）
@@ -288,6 +331,15 @@ export default function ChatView() {
     setMsgMenu(null);
     setSheet(null);
     setMutErr(null);
+    // MF2：会话切换即退出多选并丢弃选中集；覆盖层（查看页/预览/转发弹窗）一并关
+    setMs(null);
+    setRecordView(null);
+    setFwdBatch(null);
+    setFwdRecord(null);
+    setFwdMsg(null);
+    setPreview(null);
+    batchSub.current = null;
+    recSub.current = null;
     // 待发附件属于旧会话，不能带到新会话里发出去
     setPendingFiles([]);
     setSendErr(null);
@@ -343,7 +395,19 @@ export default function ChatView() {
       setReedits(meId ? readReedits(localStorage, serverScope(), meId) : []);
     reload();
     const tick = setInterval(reload, 30_000);
-    const onLogout = () => setReedits([]);
+    const onLogout = () => {
+      setReedits([]);
+      // MF2：登出/服务端切换丢弃多选与查看页；返回键层栈兜底清空
+      setMs(null);
+      setRecordView(null);
+      setFwdMsg(null);
+      setFwdBatch(null);
+      setFwdRecord(null);
+      setPreview(null);
+      batchSub.current = null;
+      recSub.current = null;
+      resetBackLayers();
+    };
     window.addEventListener("chat:logout", onLogout);
     return () => {
       clearInterval(tick);
@@ -494,6 +558,116 @@ export default function ChatView() {
     void jumpToRef(pj.messageId, pj.seq);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [s.pendingJump, conv?.id]);
+
+  // ===== MF2：多选模式 / 批量转发 / 聊天记录查看页 =====
+
+  // 选中集收编：消息列表变化（WS 撤回/删除）后把已变墓碑/消失的选中剔除；
+  // 不在已加载窗口的 id 保留（可能分页还没拉到）
+  useEffect(() => {
+    setMs((cur) => (cur && conv && cur.convId === conv.id ? pruneSelection(cur, msgs) : cur));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [msgs, conv?.id]);
+
+  // 记录查看页：打开时恰好一次 GET /record；外层消息被撤回 → 「聊天记录不可用」
+  useEffect(() => {
+    if (!recordView?.loading) return;
+    const outerId = recordView.outerId;
+    let alive = true;
+    msgsApi
+      .record(outerId)
+      .then((rec) => {
+        if (!alive) return;
+        setRecordView((cur) =>
+          cur && cur.outerId === outerId && cur.loading
+            ? { ...cur, loading: false, levels: [{ title: rec.title, items: rec.items }] }
+            : cur,
+        );
+      })
+      .catch(() => {
+        if (!alive) return;
+        setRecordView((cur) =>
+          cur && cur.outerId === outerId ? { ...cur, loading: false, error: true } : cur,
+        );
+      });
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recordView?.outerId, recordView?.loading]);
+
+  // WS 撤回外层消息：查看页换成不可用；若正在看其中附件（preview.rec 同 outerId）先关掉
+  useEffect(() => {
+    if (recordView && recordDead(recordView.outerId)) {
+      setRecordView((cur) => (cur ? { ...cur, loading: false, error: true } : cur));
+      setPreview((cur) => (cur?.rec && cur.rec.outerId === recordView.outerId ? null : cur));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [msgs, recordView]);
+
+  // Android 返回键层栈（顺序由下往上：多选 → 记录查看 → 预览 → 转发弹窗）
+  useEffect(() => (msMode ? pushBackLayer(() => setMs(null)) : undefined), [msMode]);
+  useEffect(() => {
+    if (!recordView) return;
+    let unreg: (() => void) | undefined;
+    const popOrClose = () => {
+      const cur = rvRef.current;
+      if (!cur) return;
+      if (cur.levels.length > 1) {
+        // 弹一层后查看页仍开着：本次 back 已消费注册项，重新占栈顶
+        setRecordView({ ...cur, levels: cur.levels.slice(0, -1) });
+        unreg = pushBackLayer(popOrClose);
+      } else {
+        setRecordView(null);
+      }
+    };
+    unreg = pushBackLayer(popOrClose);
+    return () => unreg?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recordView != null]);
+  useEffect(() => (preview ? pushBackLayer(() => setPreview(null)) : undefined), [preview != null]);
+  const fwdOpen = !!(fwdMsg || fwdBatch || fwdRecord);
+  useEffect(
+    () =>
+      fwdOpen
+        ? pushBackLayer(() => {
+            setFwdMsg(null);
+            setFwdBatch(null);
+            setFwdRecord(null);
+          })
+        : undefined,
+    [fwdOpen],
+  );
+
+  // Esc 编排（document 捕获阶段）：ForwardModal → 查看器/预览 → 记录查看页(逐层) → 多选。
+  // 右键菜单/动作面板各自挂了捕获 Esc（escClose + stopPropagation），这里让路；
+  // composer 的 Esc 在 textarea 目标阶段，捕获拦截后事件不下沉，不会连发。
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (msgMenu || sheet) return; // 浮层自己的 Esc 处理器负责
+      const closeTop = fwdMsg || fwdBatch || fwdRecord
+        ? () => {
+            setFwdMsg(null);
+            setFwdBatch(null);
+            setFwdRecord(null);
+          }
+        : preview
+          ? () => setPreview(null)
+          : recordView
+            ? () =>
+                setRecordView((cur) =>
+                  cur && cur.levels.length > 1
+                    ? { ...cur, levels: cur.levels.slice(0, -1) }
+                    : null,
+                )
+            : msMode
+              ? () => setMs(null)
+              : null;
+      if (closeTop) escClose(e, closeTop);
+    };
+    document.addEventListener("keydown", onKey, true);
+    return () => document.removeEventListener("keydown", onKey, true);
+  });
 
   if (!conv) {
     return (
@@ -681,6 +855,7 @@ export default function ChatView() {
   const onMsgContextMenu = (m: MessageView) => (e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
+    if (msMode) return; // MF2：多选模式下不开菜单（点击已被行级捕获改成勾选切换）
     // Android WebView 长按也发 contextmenu；源指针是 touch 时让给系统文本选择
     if (!shouldOpenMenuOnContextMenu(lastPointer.current.type)) return;
     openMenu(m, e.clientX, e.clientY);
@@ -702,6 +877,7 @@ export default function ChatView() {
   const onBubbleClick = (m: MessageView) => (e: React.MouseEvent) => {
     const tap = tapEnd.current;
     tapEnd.current = null;
+    if (msMode) return; // MF2：多选模式点按只切勾选（行级捕获已做），不弹动作面板
     if (!tap || tap.type !== "touch") return; // 点按规则只对触摸生效；鼠标单击照旧
     const sel =
       typeof window !== "undefined" && window.getSelection
@@ -761,9 +937,173 @@ export default function ChatView() {
     }
   };
 
-  /** MM3 多选占位（MM2 只渲染入口） */
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const onEnterMultiSelect = (_m: MessageView) => {};
+  // ===== MF2：多选模式入口/切换 =====
+
+  /** 消息菜单「多选」→ 进模式并预选该条（投票等不可选条目只进模式） */
+  const onEnterMultiSelect = (m: MessageView) => {
+    if (!conv) return;
+    setMsgMenu(null);
+    setSheet(null);
+    setMs(enterMultiSelect(conv.id, m));
+  };
+
+  /** 多选模式：点行任意位置切换勾选（含卡片/⋯/链接——行级捕获已拦掉内层动作） */
+  const toggleMs = (m: MessageView) => {
+    const cur = ms;
+    if (!cur || cur.convId !== conv.id) return;
+    const r = toggleSelect(cur, m);
+    if (r.toast) showHint(r.toast);
+    setMs(r.next);
+  };
+
+  const exitMultiSelect = () => setMs(null);
+
+  // ===== MF2：批量转发（forward-batch；旧服务端逐条兜底） =====
+
+  const openBatchForward = (mode: "separate" | "merged") => {
+    if (!msMode || !ms || ms.ids.size === 0) return;
+    const ids = orderedSelectedIds(ms, msgs); // seq（气泡）序
+    if (ids.length === 0) return;
+    setFwdBatch({ mode, ids });
+  };
+
+  /** 弹窗确认 → 载荷（op 复用由 prepareBatchSubmission 按参数判同）→ 执行 */
+  const submitBatchForward = async (mode: "separate" | "merged", ids: string[], targets: string[]) => {
+    if (!conv) return;
+    const p = prepareBatchSubmission(batchSub.current, conv.id, ids, targets, mode);
+    batchSub.current = p;
+    await runBatchForward(p);
+  };
+
+  const runBatchForward = async (p: BatchPayload): Promise<void> => {
+    try {
+      const resp = await msgsApi.forwardBatch(
+        p.conversation_id,
+        p.message_ids,
+        p.targets,
+        p.mode,
+        p.client_op_id,
+      );
+      const t = batchResultToast(resp);
+      pushToast({ title: "转发", text: t.text });
+      // MF2-C5：至少一个目标成功才退出多选；全败保留选中。
+      // 已落定：清掉载荷，下一次「同样的选择再发一次」拿新 op（不命中服务端幂等去重）
+      if (t.ok >= 1) {
+        setMs(null);
+        batchSub.current = null;
+      }
+    } catch (e) {
+      if (isOldServerUnsupported(e)) {
+        await runBatchFallback(p);
+        batchSub.current = null; // 兜底路径已完结
+      } else if (e instanceof ApiError) {
+        // 整单拒绝（400 等：没有可转发/嵌套过深/太大/超上限）：服务端文案原样展示，保留选中
+        pushToast({ title: "转发失败", text: e.message || "转发失败" });
+        // 明确拒绝 → 下次提交是新 op；网络/5xx 未确认 → 保留 op 供重试
+        if ([400, 403, 404, 409, 422].includes(e.status)) batchSub.current = null;
+      } else {
+        // 结果未确认（网络错误/超时无 HTTP 响应）：toast 重试按钮用同一 client_op_id 重发
+        pushToast(
+          {
+            title: "转发失败",
+            text: "结果未确认；点「重试」以同一请求重发（幂等，不会重复）",
+            action: { label: "重试", run: () => void runBatchForward(p) },
+          },
+          { timeoutMs: 0 },
+        );
+      }
+    }
+  };
+
+  /** 旧服务端兜底（MF2-C6）：merged 直接提示；separate 逐条单转（≤20 条、首个失败即止） */
+  const runBatchFallback = async (p: BatchPayload) => {
+    if (p.mode === "merged") {
+      pushToast({ title: "转发", text: FALLBACK_MERGED_TOAST });
+      return;
+    }
+    let sent = 0;
+    for (const id of p.message_ids.slice(0, FALLBACK_SEPARATE_CAP)) {
+      try {
+        // 单转幂等键 fwd:{op}:{target} 不含源消息 id——每条必须新 op
+        const r = await msgsApi.forward(id, p.targets, crypto.randomUUID());
+        const oks = r.results.filter((x) => x.ok && x.message);
+        for (const x of oks) setState((st) => applyLiveMessage(st, x.message!));
+        if (r.results.some((x) => x.ok)) sent++;
+      } catch {
+        break; // 首个 4xx/网络错误停手，不放大失败
+      }
+    }
+    pushToast({ title: "转发", text: fallbackSeparateToast(sent, p.message_ids.length) });
+    if (sent > 0) setMs(null);
+  };
+
+  // ===== MF2：记录内附件条目转发（POST /messages/{outerId}/forward + record_attachment_id） =====
+
+  const submitRecordForward = async (outerId: string, attachmentId: string, targets: string[]) => {
+    const sorted = [...targets].sort();
+    const prev = recSub.current;
+    const p =
+      prev &&
+      prev.outerId === outerId &&
+      prev.attachmentId === attachmentId &&
+      prev.targets.join("\n") === sorted.join("\n")
+        ? prev
+        : { outerId, attachmentId, targets: sorted, op: crypto.randomUUID() };
+    recSub.current = p;
+    await runRecordForward(p);
+  };
+
+  const runRecordForward = async (p: { outerId: string; attachmentId: string; targets: string[]; op: string }) => {
+    try {
+      const resp = await msgsApi.forward(p.outerId, p.targets, p.op, {
+        recordAttachmentId: p.attachmentId,
+      });
+      const oks = resp.results.filter((r) => r.ok && r.message);
+      for (const r of oks) setState((st) => applyLiveMessage(st, r.message!));
+      pushToast({ title: "转发", text: forwardRespToast(resp).text });
+      if (oks.length > 0) recSub.current = null; // 同上：落定后下次同参换新 op
+    } catch (e) {
+      if (e instanceof ApiError) {
+        // 400/404：服务端文案原样（附件不存在/记录不可用/参数错误）
+        pushToast({ title: "转发失败", text: e.message || "转发失败" });
+        recSub.current = null; // 明确拒绝 → 下次是新提交
+      } else {
+        pushToast(
+          {
+            title: "转发失败",
+            text: "结果未确认；点「重试」以同一请求重发（幂等，不会重复）",
+            action: { label: "重试", run: () => void runRecordForward(p) },
+          },
+          { timeoutMs: 0 },
+        );
+      }
+    }
+  };
+
+  // ===== MF2：聊天记录查看页 =====
+
+  const openRecord = (m: MessageView) => {
+    setMsgMenu(null);
+    setSheet(null);
+    setRecordView({ outerId: m.id, levels: [], loading: true, error: false });
+  };
+
+  const pushRecordLevel = (rec: ChatRecord) =>
+    setRecordView((cur) =>
+      cur ? { ...cur, levels: [...cur.levels, { title: rec.title, items: rec.items }] } : cur,
+    );
+
+  const popRecordLevel = () =>
+    setRecordView((cur) =>
+      cur && cur.levels.length > 1 ? { ...cur, levels: cur.levels.slice(0, -1) } : null,
+    );
+
+  /** 记录内附件 → 查看器/预览（带记录上下文：工具栏恰为 下载/转发/关闭） */
+  const openRecordPreview = (att: AttachmentView) => {
+    const outerId = rvRef.current?.outerId;
+    if (!outerId) return;
+    openPreview(att, undefined, { outerId, attachmentId: att.id });
+  };
 
   const unpinMsg = async (messageId: string) => {
     await convs.unpin(conv.id, messageId);
@@ -1119,9 +1459,9 @@ export default function ChatView() {
   /** 回复预览点击 → 定位原消息（删除的墓碑仍可定位） */
   const jumpPreview = (p: ReplyPreview) => jumpToRef(p.message_id, p.seq);
 
-  const openPreview = (att: AttachmentView, m?: MessageView) => {
+  const openPreview = (att: AttachmentView, m?: MessageView, rec?: { outerId: string; attachmentId: string }) => {
     previewAt.current = { at: Date.now(), touch: lastPointer.current.type === "touch" };
-    setPreview({ att, m: m ?? null });
+    setPreview({ att, m: m ?? null, rec });
     setPreviewText(null);
     // 撤回件复用的乐观附件（att.recalled）：公共 URL 已 404，不拉取
     if (isTextLike(att) && !att.recalled) {
@@ -1268,15 +1608,44 @@ export default function ChatView() {
           const prev = msgs[i - 1];
           const showTime =
             !prev || new Date(m.created_at).getTime() - new Date(prev.created_at).getTime() > 300000;
+          const msSelected = msMode && ms!.ids.has(m.id);
           return (
             <div key={m.id}>
               {showTime && (
                 <div className="msg-sys">{new Date(m.created_at).toLocaleString()}</div>
               )}
+              {/* MF2 多选：整行任意位置点击切换勾选——捕获阶段拦掉内层所有动作
+                  （卡片/⋯/链接/附件预览/语音播放），只剩勾选切换。日期分隔条在行外不带勾选 */}
               <div
-                className={`msg-row ${mine ? "mine" : ""}`}
-                data-mid={m.id}
+                className={`ms-wrap${msMode ? " on" : ""}${msSelected ? " sel" : ""}`}
+                onClickCapture={
+                  msMode
+                    ? (e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        toggleMs(m);
+                      }
+                    : undefined
+                }
               >
+                {msMode && (
+                  <span className="ms-col">
+                    <input
+                      type="checkbox"
+                      className="ms-checkbox"
+                      data-testid="ms-checkbox"
+                      checked={msSelected}
+                      disabled={!selectable(m)}
+                      readOnly
+                      tabIndex={-1}
+                      aria-label="选择此消息"
+                    />
+                  </span>
+                )}
+                <div
+                  className={`msg-row ${mine ? "mine" : ""} ${msSelected ? "ms-sel" : ""}`}
+                  data-mid={m.id}
+                >
                 {!mine && (
                   <Avatar
                     userId={m.sender_id}
@@ -1487,7 +1856,14 @@ export default function ChatView() {
                             </span>
                           </div>
                         )}
-                        {m.kind === "poll" && m.poll ? (
+                        {m.kind === "chat_record" ? (
+                          // MF2 聊天记录卡片：点按/回车开查看页；⋯ 开动作面板（无长按菜单）
+                          <ChatRecordCard
+                            m={m}
+                            onOpen={() => openRecord(m)}
+                            onMore={() => openSheet(m)}
+                          />
+                        ) : m.kind === "poll" && m.poll ? (
                           <PollCard
                             m={m}
                             conv={conv}
@@ -1499,7 +1875,7 @@ export default function ChatView() {
                             onErr={setMutErr}
                           />
                         ) : (
-                          showText(m) && <RichText text={m.content} />
+                          showText(m) && <RichText text={m.content} mentions={!m.forwarded_from} />
                         )}
                         {m.edited_at && <span className="edited-mark">（已编辑）</span>}
                       </div>
@@ -1533,6 +1909,7 @@ export default function ChatView() {
                     )}
                   </div>
                 </div>
+                </div>
               </div>
             </div>
           );
@@ -1540,6 +1917,33 @@ export default function ChatView() {
         {typingFresh && <div className="msg-sys">{typing.user.display_name} 正在输入…</div>}
       </div>
 
+      {msMode ? (
+        // MF2 多选底栏：已选数 + 逐条/合并转发 + 取消（替代 composer；转发 0 条时禁用）
+        <footer className="ms-bar" data-testid="ms-bar">
+          <span className="ms-count">已选 {ms!.ids.size} 条</span>
+          <span className="ms-actions">
+            <button
+              type="button"
+              data-testid="ms-forward-separate"
+              disabled={ms!.ids.size === 0}
+              onClick={() => openBatchForward("separate")}
+            >
+              逐条转发
+            </button>
+            <button
+              type="button"
+              data-testid="ms-forward-merged"
+              disabled={ms!.ids.size === 0}
+              onClick={() => openBatchForward("merged")}
+            >
+              合并转发
+            </button>
+            <button type="button" data-testid="ms-cancel" onClick={exitMultiSelect}>
+              取消
+            </button>
+          </span>
+        </footer>
+      ) : (
       <footer className="composer">
         {readonly ? (
           <div className="readonly-hint">对方已不是你的好友，会话只读</div>
@@ -1552,9 +1956,11 @@ export default function ChatView() {
                 <span className="cb-text">
                   {s.replyingTo.deleted_at
                     ? msgDeletedText(s.replyingTo)
-                    : s.replyingTo.attachment
-                      ? kindLabel(s.replyingTo.kind)
-                      : s.replyingTo.content.slice(0, 60)}
+                    : s.replyingTo.kind === "chat_record"
+                      ? recordLabel(s.replyingTo)
+                      : s.replyingTo.attachment
+                        ? kindLabel(s.replyingTo.kind)
+                        : s.replyingTo.content.slice(0, 60)}
                 </span>
                 <button
                   className="icon-btn"
@@ -1710,6 +2116,7 @@ export default function ChatView() {
           </>
         )}
       </footer>
+      )}
       {showInfo && conv.kind === "group" && (
         <GroupInfo
           conv={conv}
@@ -1734,6 +2141,39 @@ export default function ChatView() {
       {fwdMsg && (
         <ForwardModal message={fwdMsg} onClose={() => setFwdMsg(null)} />
       )}
+      {/* MF2 批量转发：确认后走 forward-batch（结果 toast + 旧服务端兜底在调用方） */}
+      {fwdBatch && (
+        <ForwardModal
+          submit={{
+            title: `${fwdBatch.mode === "merged" ? "合并转发" : "逐条转发"} ${fwdBatch.ids.length} 条消息`,
+            run: (targets) => submitBatchForward(fwdBatch.mode, fwdBatch.ids, targets),
+          }}
+          onClose={() => setFwdBatch(null)}
+        />
+      )}
+      {/* MF2 记录内附件条目转发：POST /messages/{outerId}/forward + record_attachment_id */}
+      {fwdRecord && (
+        <ForwardModal
+          submit={{
+            title: `转发附件 ${fwdRecord.fileName}`,
+            run: (targets) => submitRecordForward(fwdRecord.outerId, fwdRecord.attachmentId, targets),
+          }}
+          onClose={() => setFwdRecord(null)}
+        />
+      )}
+      {/* MF2 记录查看页（嵌套层下钻在组件 state；外层被撤回时显示不可用） */}
+      {recordView && (
+        <ChatRecordView
+          view={{
+            ...recordView,
+            error: recordView.error || recordDead(recordView.outerId),
+          }}
+          onClose={() => setRecordView(null)}
+          onPopLevel={popRecordLevel}
+          onPushLevel={pushRecordLevel}
+          onPreview={openRecordPreview}
+        />
+      )}
 
       {/* 附件预览 / 大图查看器（MM2：带动作工具栏；工具栏项与消息菜单共用 items 函数）。
           触屏打开后 GHOST_CLICK_MS 内的 click 按幽灵点击忽略（兼容 click 可能落到
@@ -1753,39 +2193,74 @@ export default function ChatView() {
               <span className="muted">{fmtSize(preview.att.size)}</span>
               <span className="pv-toolbar">
                 {/* 回复/转发/撤回与消息菜单同一来源（viewer-<action>）；多选不进预览工具栏 */}
-                {preview.m &&
-                  itemsFor(preview.m)
-                    .filter((it) => ["reply", "forward", "recall"].includes(it.action))
-                    .map((it) => (
+                {preview.rec ? (
+                  /* MF2-C8 记录上下文：恰为 下载 → 转发（关闭在右侧 pv-head 固定位置） */
+                  <>
+                    <button
+                      type="button"
+                      className="pv-act"
+                      data-testid="viewer-download"
+                      onClick={() => {
+                        if (!isGhostClick(previewAt.current)) void saveAttachment(preview.att);
+                      }}
+                    >
+                      <DownloadIcon />
+                      <span>下载</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="pv-act"
+                      data-testid="viewer-forward"
+                      onClick={() => {
+                        if (isGhostClick(previewAt.current)) return;
+                        setFwdRecord({
+                          outerId: preview.rec!.outerId,
+                          attachmentId: preview.rec!.attachmentId,
+                          fileName: preview.att.file_name,
+                        });
+                      }}
+                    >
+                      <ForwardIcon />
+                      <span>转发</span>
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    {preview.m &&
+                      itemsFor(preview.m)
+                        .filter((it) => ["reply", "forward", "recall"].includes(it.action))
+                        .map((it) => (
+                          <button
+                            key={it.action}
+                            type="button"
+                            className={`pv-act ${it.danger ? "danger" : ""}`}
+                            data-testid={`viewer-${it.action}`}
+                            title={it.label}
+                            onClick={() => {
+                              if (isGhostClick(previewAt.current)) return;
+                              const m = preview.m!;
+                              setPreview(null);
+                              runMenuAction(m, it.action);
+                            }}
+                          >
+                            {menuIcon(it.action)}
+                            <span>{it.label}</span>
+                          </button>
+                        ))}
+                    {!preview.att.recalled && (
                       <button
-                        key={it.action}
                         type="button"
-                        className={`pv-act ${it.danger ? "danger" : ""}`}
-                        data-testid={`viewer-${it.action}`}
-                        title={it.label}
+                        className="pv-act"
+                        data-testid="viewer-download"
                         onClick={() => {
-                          if (isGhostClick(previewAt.current)) return;
-                          const m = preview.m!;
-                          setPreview(null);
-                          runMenuAction(m, it.action);
+                          if (!isGhostClick(previewAt.current)) void saveAttachment(preview.att);
                         }}
                       >
-                        {menuIcon(it.action)}
-                        <span>{it.label}</span>
+                        <DownloadIcon />
+                        <span>下载</span>
                       </button>
-                    ))}
-                {!preview.att.recalled && (
-                  <button
-                    type="button"
-                    className="pv-act"
-                    data-testid="viewer-download"
-                    onClick={() => {
-                      if (!isGhostClick(previewAt.current)) void saveAttachment(preview.att);
-                    }}
-                  >
-                    <DownloadIcon />
-                    <span>下载</span>
-                  </button>
+                    )}
+                  </>
                 )}
               </span>
               <button

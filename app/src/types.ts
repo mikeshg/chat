@@ -181,8 +181,53 @@ export interface MessageView {
   recalled_by_name?: string | null;
   /** 仅撤回发起的 REST 响应携带、且仅附件上传者可见：用于取回/重发 */
   recalled_attachment_id?: string | null;
+  /** kind='chat_record' 时的卡片摘要（前 4 条、每条 ≤60 字；撤回后为 null） */
+  record_preview?: RecordPreview | null;
   /** 仅客户端：乐观消息被服务端永久拒绝的原因（显示失败气泡，可重试/删除） */
   send_error?: string;
+}
+
+// ---------- MF1/MF2 聊天记录（chat_record） ----------
+
+/** record_preview 的单条摘要（服务端已带 [图片]/[文件] 名 等前缀；永不含附件 id） */
+export interface RecordPreviewItem {
+  sender_name: string;
+  kind: string;
+  text: string;
+}
+
+/** 列表/WS 帧里的卡片摘要；完整快照走 GET /v1/messages/{id}/record */
+export interface RecordPreview {
+  title: string;
+  count: number;
+  /** 前 4 条 */
+  items: RecordPreviewItem[];
+}
+
+/** 聊天记录快照条目（record jsonb items[]） */
+export interface RecordItem {
+  sender_id: string;
+  sender_name: string;
+  has_avatar: boolean;
+  avatar_version: number;
+  created_at: string;
+  /** "text" | "image" | "file" | "audio" | "chat_record" */
+  kind: string;
+  /** 文字内容或附件说明（≤4000 字） */
+  content: string;
+  /** 快照附件：id 是目标会话克隆行 id（能力 URL 直接可用）；源已撤回/缺失为 null */
+  attachment: AttachmentView | null;
+  /** 嵌套聊天记录快照（最多 3 层） */
+  record: ChatRecord | null;
+}
+
+/** GET /v1/messages/{id}/record 返回的完整快照（messages.record jsonb，v=1） */
+export interface ChatRecord {
+  v: number;
+  title: string;
+  source_kind: "dm" | "group" | "self" | string;
+  count: number;
+  items: RecordItem[];
 }
 
 /** 会话偏好（用户维度；旧服务端无此字段 → 视为全默认） */
@@ -429,6 +474,36 @@ export interface ForwardResultItem {
 
 export interface ForwardResp {
   results: ForwardResultItem[];
+}
+
+// ---------- MF1/MF2 批量转发 / 合并转发 ----------
+
+/** POST /messages/forward-batch 的跳过原因计数（闭集：unavailable/recalled/poll/too_deep；0 的键不出现） */
+export type SkipMap = Record<string, number>;
+
+export interface ForwardBatchError {
+  code: string;
+  /** 面向用户的中文原因 */
+  message: string;
+}
+
+export interface ForwardBatchTarget {
+  conversation_id: string;
+  ok: boolean;
+  /** 该目标写入的消息数（merged 恒 1） */
+  forwarded: number;
+  /** ok=true：写入消息 id 列表（按 seq 序） */
+  message_ids?: string[];
+  error?: ForwardBatchError;
+  /** 与顶层 skipped 相同（每目标一份拷贝） */
+  skipped: SkipMap;
+}
+
+export interface ForwardBatchResp {
+  /** 与去重后请求目标顺序一一对应；逐目标独立成败 */
+  results: ForwardBatchTarget[];
+  /** 源侧一次计算的跳过汇总（对全部目标相同，勿按目标数乘） */
+  skipped: SkipMap;
 }
 
 // ---------- V2 P4-1 备份/恢复 ----------

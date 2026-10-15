@@ -1165,3 +1165,102 @@ input.switch:focus-visible { outline: 2px solid var(--green); outline-offset: 2p
   box-shadow: 0 4px 16px var(--shadow); padding: 7px 14px;
   font-size: 13px; z-index: 400; pointer-events: none;
 }
+
+/* ---------- MF2 多选模式 ---------- */
+/* 非多选时包装层不占布局（display: contents 保留事件冒泡路径） */
+.ms-wrap { display: contents; }
+.ms-wrap.on { display: flex; align-items: center; gap: 4px; margin: 10px 0; }
+.ms-wrap.on .msg-row { flex: 1; min-width: 0; margin: 0; }
+/* 固定宽度勾选列恒在最左：自己的消息行仍右对齐（列在行外不受 row-reverse 影响） */
+.ms-col { width: 28px; flex: none; display: flex; justify-content: center; }
+.ms-checkbox { width: 16px; height: 16px; accent-color: var(--green); pointer-events: none; }
+.ms-checkbox:disabled { opacity: 0.35; }
+.ms-wrap.on { cursor: pointer; }
+.ms-wrap.sel { background: var(--hover); border-radius: 6px; }
+.ms-bar {
+  border-top: 1px solid var(--line); background: var(--panel);
+  padding: 10px 12px; display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+}
+.ms-count { font-size: 13px; color: var(--muted); flex: 1; }
+.ms-actions { display: flex; gap: 8px; }
+.ms-actions button { padding: 6px 14px; border-radius: 6px; }
+.ms-actions button:disabled { opacity: 0.45; cursor: default; }
+
+/* ---------- MF2 聊天记录卡片 ---------- */
+.record-card {
+  width: 240px; max-width: 100%; cursor: pointer; user-select: none;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.record-card:focus-visible { outline: 2px solid var(--green); }
+.rc-title {
+  font-weight: 600; font-size: 14px; line-height: 1.4;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.rc-lines { display: flex; flex-direction: column; gap: 1px; }
+.rc-line {
+  font-size: 12px; color: var(--muted); line-height: 1.5;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.rc-divider { border-top: 1px solid var(--line); margin: 2px 0; }
+.rc-foot { display: flex; align-items: center; justify-content: space-between; }
+.rc-tag { font-size: 11px; color: var(--muted); }
+.record-more {
+  min-width: 32px; min-height: 32px; border: none; background: transparent;
+  color: var(--muted); font-size: 16px; line-height: 1; border-radius: 6px;
+  display: inline-flex; align-items: center; justify-content: center; cursor: pointer;
+}
+.record-more:hover { background: var(--hover); color: var(--text); }
+
+/* ---------- MF2 记录查看页 ---------- */
+/* 低于 .modal-mask(100)：记录内打开的附件预览/转发弹窗必须浮在查看页之上 */
+.rv-mask {
+  position: fixed; inset: 0; background: var(--overlay);
+  display: grid; place-items: center; z-index: 90;
+}
+.record-view {
+  width: 480px; max-width: 92vw; height: 70vh; max-height: 80vh;
+  background: var(--panel); border-radius: 10px; box-shadow: 0 8px 32px var(--shadow);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.rv-head {
+  display: flex; align-items: center; gap: 8px; padding: 10px 14px;
+  border-bottom: 1px solid var(--line); flex: none;
+}
+.rv-back { font-size: 20px; }
+.rv-title { flex: 1; font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rv-body { flex: 1; overflow-y: auto; padding: 12px 14px; }
+.rv-day { text-align: center; color: var(--muted); font-size: 11px; margin: 10px 0; }
+.rv-item { display: flex; gap: 8px; margin: 8px 0; align-items: flex-start; }
+.rv-item.clickable .rv-item-body { cursor: pointer; }
+.rv-item-main { flex: 1; min-width: 0; }
+.rv-item-meta { display: flex; gap: 8px; align-items: baseline; margin-bottom: 2px; }
+.rv-sender { font-size: 12px; color: var(--muted); }
+.rv-time { font-size: 11px; color: var(--muted); margin-left: auto; }
+.rv-item-body {
+  background: var(--bubble-other); border-radius: 6px; padding: 7px 10px;
+  font-size: 14px; line-height: 1.5; word-break: break-word; white-space: pre-wrap;
+  display: inline-block; max-width: 100%;
+}
+.rv-item.clickable .rv-item-body:hover { filter: brightness(0.97); }
+.rv-img { display: block; max-width: 220px; max-height: 220px; border-radius: 4px; cursor: zoom-in; }
+.rv-att-ph { color: var(--muted); }
+.rv-file { display: inline-flex; align-items: center; gap: 10px; min-width: 160px; }
+.rv-file .file-ic { font-size: 26px; }
+.rv-file .file-meta { display: flex; flex-direction: column; }
+.rv-file .file-meta b { font-size: 13px; word-break: break-all; }
+.rv-file .file-meta i { color: var(--muted); font-size: 11px; font-style: normal; }
+.rv-nested {
+  border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px;
+  display: flex; flex-direction: column; gap: 2px; min-width: 160px;
+}
+.rv-nested b { font-size: 13px; }
+.rv-nested i { color: var(--muted); font-size: 11px; font-style: normal; }
+.rv-err { text-align: center; color: var(--muted); padding: 40px 0; }
+
+/* 移动端：查看页整屏 */
+@media (max-width: 720px) {
+  .record-view { width: 100vw; max-width: 100vw; height: 100vh; max-height: 100vh; border-radius: 0; }
+}
+
+/* toast 里的操作按钮（MF2 转发重试） */
+.toast-act { color: var(--green); font-weight: 600; align-self: flex-end; padding: 2px 4px; }

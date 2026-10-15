@@ -57,11 +57,12 @@ const labels = (m: MessageView, c: MenuCtx) => menuItems(m, c).map((i) => i.labe
 describe("menuItems：统一菜单项", () => {
   it("文本消息（他人，DM）：回复/复制/转发；撤回在末位仅自己消息有", () => {
     const items = menuItems(msg(), ctx());
-    expect(items.map((i) => i.action)).toEqual(["reply", "copy", "forward"]);
+    expect(items.map((i) => i.action)).toEqual(["reply", "copy", "forward", "multi"]);
     expect(menuItems(msg({ sender_id: "me" }), ctx()).map((i) => i.action)).toEqual([
       "reply",
       "copy",
       "forward",
+      "multi",
       "recall",
     ]);
     // 撤回末位且标红
@@ -94,12 +95,12 @@ describe("menuItems：统一菜单项", () => {
   });
 
   it("只读会话：回复隐藏，复制保留", () => {
-    expect(actions(msg(), ctx({ readOnly: true }))).toEqual(["copy", "forward"]);
+    expect(actions(msg(), ctx({ readOnly: true }))).toEqual(["copy", "forward", "multi"]);
   });
 
-  it("「多选」在 FEATURE_MULTI_SELECT=false 下不出现（MM3 暂缓，开启侧见 multiSelect.test.ts）", () => {
-    expect(actions(msg(), ctx())).not.toContain("multi");
-    expect(actions(msg({ sender_id: "me" }), ctx())).not.toContain("multi");
+  it("「多选」自 MF2 起出现在普通消息菜单（位于下载之后、撤回之前）", () => {
+    expect(actions(msg(), ctx())).toContain("multi");
+    expect(actions(msg({ sender_id: "me" }), ctx())).toContain("multi");
     expect(
       actions(
         msg({
@@ -108,7 +109,7 @@ describe("menuItems：统一菜单项", () => {
         }),
         ctx(),
       ),
-    ).not.toContain("multi");
+    ).toContain("multi");
   });
 
   it("投票消息没有转发（不可转），复制拿标题", () => {

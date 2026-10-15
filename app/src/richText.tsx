@@ -84,10 +84,14 @@ function splitInline(text: string): ({ t: "raw"; text: string } | Extract<Token,
   return out;
 }
 
-/** 最后切链接与 @（仅普通文本段） */
-function splitRich(text: string): Token[] {
+/** 最后切链接与 @（仅普通文本段）；withMentions=false 时 @ 按纯文本处理（MF2 记录/转发文本） */
+function splitRich(text: string, withMentions: boolean): Token[] {
   const out: Token[] = [];
   const pushMentions = (s: string) => {
+    if (!withMentions) {
+      if (s) out.push({ t: "text", text: s });
+      return;
+    }
     let p = 0;
     for (const m of s.matchAll(RE_MENTION)) {
       if (m.index > p) out.push({ t: "text", text: s.slice(p, m.index) });
@@ -114,7 +118,7 @@ function splitRich(text: string): Token[] {
   return out;
 }
 
-export function tokenize(text: string): Token[] {
+export function tokenize(text: string, opts: { mentions?: boolean } = {}): Token[] {
   const out: Token[] = [];
   const push = (t: Token) => {
     const last = out[out.length - 1];
@@ -136,7 +140,7 @@ export function tokenize(text: string): Token[] {
         push(s2);
         continue;
       }
-      for (const s3 of splitRich(s2.text)) push(s3);
+      for (const s3 of splitRich(s2.text, opts.mentions !== false)) push(s3);
     }
   }
   return out;
@@ -195,10 +199,10 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
   );
 }
 
-export default function RichText({ text }: { text: string }) {
+export default function RichText({ text, mentions = true }: { text: string; mentions?: boolean }) {
   return (
     <>
-      {tokenize(text).map((tok, i) => {
+      {tokenize(text, { mentions }).map((tok, i) => {
         switch (tok.t) {
           case "link":
             return (

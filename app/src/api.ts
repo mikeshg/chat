@@ -27,11 +27,13 @@ import type {
   BackupList,
   BackupTicket,
   RestoreResult,
+  ChatRecord,
   ConversationDetail,
   ConversationPref,
   ConversationView,
   CreateInviteReq,
   CreatePollReq,
+  ForwardBatchResp,
   ForwardResp,
   FriendView,
   InviteView,
@@ -725,9 +727,32 @@ export const msgs = {
   refresh: (convId: string, ids: string[]) =>
     post<MessagesPage>(`/conversations/${convId}/messages/refresh`, { ids }),
   /** 转发/收藏（V2 P2-4）：targets ≤10（服务端去重）；client_op_id 幂等——
-   * 结果未确认时只能用原值重试，否则会产生第二条转发消息 */
-  forward: (id: string, conversation_ids: string[], client_op_id: string) =>
-    post<ForwardResp>(`/messages/${id}/forward`, { conversation_ids, client_op_id }),
+   * 结果未确认时只能用原值重试，否则会产生第二条转发消息。
+   * MF1 扩展：record_attachment_id = 转发聊天记录内的单个附件条目（404/400 由服务端统一拒绝）。 */
+  forward: (id: string, conversation_ids: string[], client_op_id: string, opts?: { recordAttachmentId?: string }) =>
+    post<ForwardResp>(`/messages/${id}/forward`, {
+      conversation_ids,
+      client_op_id,
+      ...(opts?.recordAttachmentId ? { record_attachment_id: opts.recordAttachmentId } : {}),
+    }),
+  /** MF1：同一源会话多选转发（≤100 条 → ≤10 目标）；mode merged=每目标一条聊天记录 / separate=逐条。
+   * 旧服务端没有此路由（405 或裸 404）时由调用方走逐条兜底。 */
+  forwardBatch: (
+    conversation_id: string,
+    message_ids: string[],
+    targets: string[],
+    mode: "separate" | "merged",
+    client_op_id: string,
+  ) =>
+    post<ForwardBatchResp>("/messages/forward-batch", {
+      conversation_id,
+      message_ids,
+      targets,
+      mode,
+      client_op_id,
+    }),
+  /** MF1：聊天记录完整快照（仅所在会话成员可取；撤回/非记录消息 → 404 聊天记录不可用） */
+  record: (id: string) => get<ChatRecord>(`/messages/${id}/record`),
 };
 
 // ---------- 轻量投票 ----------
