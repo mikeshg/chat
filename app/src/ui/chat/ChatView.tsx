@@ -53,12 +53,13 @@ import { FEATURE_HOVER_TOOLBAR } from "./features";
 import {
   canRecall,
   copyTextFor,
+  isGhostClick,
   isTombstone,
   menuItems,
   msgDeletedText,
   quoteDeletedText,
+  shouldOpenMenuOnClick,
   shouldOpenMenuOnContextMenu,
-  shouldOpenMenuOnTap,
   tombstoneText,
   type MenuAction,
   type MenuCtx,
@@ -238,7 +239,13 @@ export default function ChatView() {
   const hintTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // 点按/右键手势追踪（触屏 tap → 动作面板；contextmenu 只对鼠标/笔放行）
   const tapStart = useRef<{ x: number; y: number; t: number; type: string } | null>(null);
+  // pointerup 记下的完整手势，交给随后的 click 判定（开面板挪到 click 阶段——幽灵点击修复）
+  const tapEnd = useRef<{ type: string; movedPx: number; pressMs: number } | null>(null);
   const lastPointer = useRef<{ type: string; ts: number }>({ type: "", ts: 0 });
+  // 面板/菜单/预览的打开时刻：GHOST_CLICK_MS 内到达的 click 按幽灵点击忽略
+  const sheetAt = useRef(0);
+  const menuAt = useRef(0);
+  const previewAt = useRef(0);
   const [mutErr, setMutErr] = useState<string | null>(null);
   // 发送（含上传附件）失败的服务端文案，显示在附件条处（V2 P2-1：413 配额提示走这里）
   const [sendErr, setSendErr] = useState<string | null>(null);
@@ -515,12 +522,14 @@ export default function ChatView() {
   const openMenu = (m: MessageView, x: number, y: number) => {
     if (itemsFor(m).length === 0) return; // 墓碑/乐观消息没有菜单
     setSheet(null);
+    menuAt.current = Date.now();
     setMsgMenu({ x, y, m });
   };
 
   const openSheet = (m: MessageView) => {
     if (itemsFor(m).length === 0) return;
     setMsgMenu(null);
+    sheetAt.current = Date.now();
     setSheet({ m });
   };
 
@@ -628,6 +637,7 @@ export default function ChatView() {
   const onBubblePointerDown = (e: React.PointerEvent) => {
     lastPointer.current = { type: e.pointerType ?? "", ts: Date.now() };
     tapStart.current = { x: e.clientX, y: e.clientY, t: Date.now(), type: e.pointerType ?? "" };
+    tapEnd.current = null; // 新手势开始：作废上一条没等到 click 的记录
   };
 
   const onMsgContextMenu = (m: MessageView) => (e: React.MouseEvent) => {
@@ -638,21 +648,33 @@ export default function ChatView() {
     openMenu(m, e.clientX, e.clientY);
   };
 
-  const onBubblePointerUp = (m: MessageView) => (e: React.PointerEvent) => {
+  const onBubblePointerUp = (e: React.PointerEvent) => {
     const st = tapStart.current;
     tapStart.current = null;
-    if (!st || st.type !== "touch") return; // 点按规则只对触摸生效；鼠标单击照旧
-    const moved = Math.hypot(e.clientX - st.x, e.clientY - st.y);
-    const press = Date.now() - st.t;
+    if (!st) return;
+    // 只记手势，不开面板：随后到来的 click 才判定（pointerup 开面板会让
+    // 兼容 click 落到刚渲染的面板项上，触发随机动作——Android WebView 幽灵点击）
+    tapEnd.current = {
+      type: st.type,
+      movedPx: Math.hypot(e.clientX - st.x, e.clientY - st.y),
+      pressMs: Date.now() - st.t,
+    };
+  };
+
+  const onBubbleClick = (m: MessageView) => (e: React.MouseEvent) => {
+    const tap = tapEnd.current;
+    tapEnd.current = null;
+    if (!tap || tap.type !== "touch") return; // 点按规则只对触摸生效；鼠标单击照旧
     const sel =
       typeof window !== "undefined" && window.getSelection
         ? (window.getSelection()?.toString() ?? "")
         : "";
     if (
-      shouldOpenMenuOnTap({
+      shouldOpenMenuOnClick({
+        pointerType: tap.type,
+        movedPx: tap.movedPx,
+        pressMs: tap.pressMs,
         target: e.target,
-        movedPx: moved,
-        pressMs: press,
         hasSelection: sel.length > 0,
       })
     ) {
@@ -666,10 +688,7 @@ export default function ChatView() {
     setSheet(null);
     switch (action) {
       case "preview":
-        if (m.attachment) {
-          setPreviewText(null);
-          setPreview({ att: m.attachment, m });
-        }
+        if (m.attachment) openPreview(m.attachment, m);
         break;
       case "reply":
         startReply(m);
@@ -1063,6 +1082,7 @@ export default function ChatView() {
   const jumpPreview = (p: ReplyPreview) => jumpToRef(p.message_id, p.seq);
 
   const openPreview = (att: AttachmentView, m?: MessageView) => {
+    previewAt.current = Date.now();
     setPreview({ att, m: m ?? null });
     setPreviewText(null);
     if (isTextLike(att)) {
@@ -1223,7 +1243,8 @@ export default function ChatView() {
                 <div
                   className="msg-body"
                   onPointerDown={onBubblePointerDown}
-                  onPointerUp={onBubblePointerUp(m)}
+                  onPointerUp={onBubblePointerUp}
+                  onClick={onBubbleClick(m)}
                   onContextMenu={onMsgContextMenu(m)}
                 >
                   {!mine && conv.kind === "group" && (
@@ -1640,9 +1661,16 @@ export default function ChatView() {
         <ForwardModal message={fwdMsg} onClose={() => setFwdMsg(null)} />
       )}
 
-      {/* 附件预览 / 大图查看器（MM2：带动作工具栏；工具栏项与消息菜单共用 items 函数） */}
+      {/* 附件预览 / 大图查看器（MM2：带动作工具栏；工具栏项与消息菜单共用 items 函数）。
+          打开后 GHOST_CLICK_MS 内的 click 按幽灵点击忽略（触屏点开大图后，
+          兼容 click 可能落到刚渲染的工具栏按钮上） */}
       {preview && (
-        <div className="modal-mask" onClick={() => setPreview(null)}>
+        <div
+          className="modal-mask"
+          onClick={() => {
+            if (!isGhostClick(previewAt.current)) setPreview(null);
+          }}
+        >
           <div className="pv-modal" onClick={(e) => e.stopPropagation()}>
             <div className="pv-head">
               <span className="pv-name" title={preview.att.file_name}>
@@ -1662,6 +1690,7 @@ export default function ChatView() {
                         data-testid={`viewer-${it.action}`}
                         title={it.label}
                         onClick={() => {
+                          if (isGhostClick(previewAt.current)) return;
                           const m = preview.m!;
                           setPreview(null);
                           runMenuAction(m, it.action);
@@ -1675,13 +1704,21 @@ export default function ChatView() {
                   type="button"
                   className="pv-act"
                   data-testid="viewer-download"
-                  onClick={() => downloadAttachment(preview.att)}
+                  onClick={() => {
+                    if (!isGhostClick(previewAt.current)) downloadAttachment(preview.att);
+                  }}
                 >
                   <DownloadIcon />
                   <span>下载</span>
                 </button>
               </span>
-              <button className="icon-btn" data-testid="viewer-close" onClick={() => setPreview(null)}>
+              <button
+                className="icon-btn"
+                data-testid="viewer-close"
+                onClick={() => {
+                  if (!isGhostClick(previewAt.current)) setPreview(null);
+                }}
+              >
                 ✕
               </button>
             </div>
@@ -1715,13 +1752,21 @@ export default function ChatView() {
 
       {/* MM2：统一消息菜单（图标+文字）；附件不再有单独的右键菜单 */}
       {msgMenu && (
-        <CtxMenu x={msgMenu.x} y={msgMenu.y} onClose={() => setMsgMenu(null)}>
+        <CtxMenu
+          x={msgMenu.x}
+          y={msgMenu.y}
+          onClose={() => {
+            if (!isGhostClick(menuAt.current)) setMsgMenu(null);
+          }}
+        >
           {itemsFor(msgMenu.m).map((it) => (
             <div
               key={it.action}
               className={`ctx-item ${it.danger ? "danger" : ""}`}
               data-testid={`msg-menu-${it.action}`}
-              onClick={() => runMenuAction(msgMenu.m, it.action)}
+              onClick={() => {
+                if (!isGhostClick(menuAt.current)) runMenuAction(msgMenu.m, it.action);
+              }}
             >
               {menuIcon(it.action)}
               <span>{it.label}</span>
@@ -1730,9 +1775,17 @@ export default function ChatView() {
         </CtxMenu>
       )}
 
-      {/* MM2：触屏点按 → 底部动作面板（同一套菜单项 + 取消） */}
+      {/* MM2：触屏点按 → 底部动作面板（同一套菜单项 + 取消）。
+          打开后 GHOST_CLICK_MS 内的 click 按幽灵点击忽略（Android WebView 兼容 click
+          会落到刚打开的面板项/遮罩上） */}
       {sheet && (
-        <div className="sheet-mask" data-testid="action-sheet" onClick={() => setSheet(null)}>
+        <div
+          className="sheet-mask"
+          data-testid="action-sheet"
+          onClick={() => {
+            if (!isGhostClick(sheetAt.current)) setSheet(null);
+          }}
+        >
           <div className="action-sheet" onClick={(e) => e.stopPropagation()}>
             {itemsFor(sheet.m).map((it) => (
               <button
@@ -1740,7 +1793,9 @@ export default function ChatView() {
                 type="button"
                 className={`sheet-item ${it.danger ? "danger" : ""}`}
                 data-testid={`msg-menu-${it.action}`}
-                onClick={() => runMenuAction(sheet.m, it.action)}
+                onClick={() => {
+                  if (!isGhostClick(sheetAt.current)) runMenuAction(sheet.m, it.action);
+                }}
               >
                 {menuIcon(it.action)}
                 <span>{it.label}</span>
@@ -1749,7 +1804,9 @@ export default function ChatView() {
             <button
               type="button"
               className="sheet-item sheet-cancel"
-              onClick={() => setSheet(null)}
+              onClick={() => {
+                if (!isGhostClick(sheetAt.current)) setSheet(null);
+              }}
             >
               取消
             </button>

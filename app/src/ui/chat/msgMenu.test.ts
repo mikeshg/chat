@@ -1,13 +1,16 @@
 import { describe, expect, it } from "vitest";
 import type { MessageView } from "../../types";
 import {
+  GHOST_CLICK_MS,
   RECALL_WINDOW_MS,
   canRecall,
   copyTextFor,
+  isGhostClick,
   isTombstone,
   menuItems,
   msgDeletedText,
   quoteDeletedText,
+  shouldOpenMenuOnClick,
   shouldOpenMenuOnContextMenu,
   shouldOpenMenuOnTap,
   tombstoneText,
@@ -176,6 +179,41 @@ describe("shouldOpenMenuOnContextMenu：右键来源判定", () => {
     expect(shouldOpenMenuOnContextMenu("pen")).toBe(true);
     expect(shouldOpenMenuOnContextMenu("")).toBe(true);
     expect(shouldOpenMenuOnContextMenu(null)).toBe(true);
+  });
+});
+
+describe("shouldOpenMenuOnClick：click 路径的点按判定（幽灵点击修复）", () => {
+  const el = (hit: boolean) => ({ closest: () => (hit ? {} : null) });
+  const tap = { movedPx: 0, pressMs: 100, hasSelection: false, target: el(false) };
+
+  it("触屏点按开面板", () => {
+    expect(shouldOpenMenuOnClick({ pointerType: "touch", ...tap })).toBe(true);
+  });
+
+  it("鼠标/笔单击不开（桌面行为照旧）", () => {
+    expect(shouldOpenMenuOnClick({ pointerType: "mouse", ...tap })).toBe(false);
+    expect(shouldOpenMenuOnClick({ pointerType: "pen", ...tap })).toBe(false);
+    expect(shouldOpenMenuOnClick({ pointerType: "", ...tap })).toBe(false);
+  });
+
+  it("手势不合格照样不开：位移/按压/选区/排除目标沿用 tap 规则", () => {
+    expect(shouldOpenMenuOnClick({ pointerType: "touch", ...tap, movedPx: 11 })).toBe(false);
+    expect(shouldOpenMenuOnClick({ pointerType: "touch", ...tap, pressMs: 501 })).toBe(false);
+    expect(shouldOpenMenuOnClick({ pointerType: "touch", ...tap, hasSelection: true })).toBe(false);
+    expect(shouldOpenMenuOnClick({ pointerType: "touch", ...tap, target: el(true) })).toBe(false);
+  });
+});
+
+describe("isGhostClick：浮层打开后的幽灵点击豁免窗", () => {
+  it("350ms 内的点击忽略，窗外放行（严格小于）", () => {
+    expect(isGhostClick(NOW, NOW)).toBe(true);
+    expect(isGhostClick(NOW, NOW + GHOST_CLICK_MS - 1)).toBe(true);
+    expect(isGhostClick(NOW, NOW + GHOST_CLICK_MS)).toBe(false);
+    expect(isGhostClick(NOW, NOW + 60_000)).toBe(false);
+  });
+
+  it("未打开（openedAt=0）不算幽灵点击", () => {
+    expect(isGhostClick(0, NOW)).toBe(false);
   });
 });
 

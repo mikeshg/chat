@@ -3,7 +3,7 @@
 // 撤回前一刻由发起端自己把原文留到本机（明文，按设计如此——本机草稿同理）。
 // localStorage 键 chat_reedit:<enc(server)>:<userId> → ReeditEntry[]，
 // 按服务器 + 账号隔离；10 分钟窗口外读取时顺带清除；
-// 登出 / 移除服务器由 servers.removeServerData 的键前缀统一清掉。
+// 登出由 clearReedits 整键删除；移除服务器由 servers.removeServerData 的键前缀统一清掉。
 
 import type { Stor } from "./servers";
 
@@ -122,4 +122,11 @@ export function removeReedit(storage: Stor, scope: string, userId: string, messa
 export function purgeReedits(storage: Stor, scope: string, userId: string, now = Date.now()) {
   const key = reeditKey(scope, userId);
   writeList(storage, key, parseList(storage, key).filter((e) => reeditFresh(e, now)));
+}
+
+/** 登出时整键删除（含未过期条目——暂存是敏感明文，不留给下一次登录） */
+export function clearReedits(storage: Stor, scope: string, userId: string) {
+  try {
+    storage.removeItem(reeditKey(scope, userId));
+  } catch {}
 }

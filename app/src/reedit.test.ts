@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   REEDIT_WINDOW_MS,
+  clearReedits,
   patchReedit,
   purgeReedits,
   readReedits,
@@ -77,6 +78,21 @@ describe("重新编辑暂存（chat_reedit:<enc>:<uid>）", () => {
     saveReedit(st, A, "u1", entry({ message_id: "m2" }));
     purgeReedits(st, A, "u1", NOW);
     expect(readReedits(st, A, "u1", NOW).map((e) => e.message_id)).toEqual(["m2"]);
+  });
+
+  it("clearReedits：登出整键删除（新鲜条目也不留），其他账号/服务器不动", () => {
+    const st = memStorage();
+    saveReedit(st, A, "u1", entry()); // 新鲜条目
+    saveReedit(st, A, "u2", entry({ message_id: "m2" }));
+    saveReedit(st, B, "u1", entry({ message_id: "m3" }));
+    clearReedits(st, A, "u1");
+    expect(st.raw.has(reeditKey(A, "u1"))).toBe(false); // 键整个没了
+    expect(readReedits(st, A, "u1", NOW)).toEqual([]);
+    expect(readReedits(st, A, "u2", NOW).map((e) => e.message_id)).toEqual(["m2"]);
+    expect(readReedits(st, B, "u1", NOW).map((e) => e.message_id)).toEqual(["m3"]);
+    // 空键/storage 抛错不炸
+    expect(() => clearReedits(st, A, "u1")).not.toThrow();
+    expect(() => clearReedits({ getItem: () => null, setItem: () => {}, removeItem: () => { throw new Error("denied"); } }, A, "u1")).not.toThrow();
   });
 
   it("删除服务器：chat_reedit 前缀随其余数据一起清掉", () => {

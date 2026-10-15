@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { auth, clearSkipAutoLogin, hasSkipAutoLogin, loadSession, serverScope } from "./api";
 import { readDrafts, writeDrafts } from "./drafts";
-import { purgeReedits } from "./reedit";
+import { clearReedits, purgeReedits } from "./reedit";
 import { cacheKey, clearRecent, readLocalCache, seedRecent } from "./localCache";
 import { syncWindowTitle, unreadTitle } from "./notify";
 import { flushDrafts, getState, setState, useApp } from "./store";
@@ -22,7 +22,7 @@ export default function App() {
       // 纯文字草稿维持原有语义（同账号下次登录恢复）
       const uid = getState().me?.id ?? loadSession()?.user.id;
       if (uid) {
-        purgeReedits(localStorage, serverScope(), uid);
+        clearReedits(localStorage, serverScope(), uid);
         const dr = readDrafts(localStorage, serverScope(), uid);
         writeDrafts(
           localStorage,

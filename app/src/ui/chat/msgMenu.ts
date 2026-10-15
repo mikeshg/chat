@@ -174,6 +174,33 @@ export function shouldOpenMenuOnContextMenu(lastPointerType: string | null | und
   return lastPointerType !== "touch";
 }
 
+/**
+ * click 路径的点按判定输入：pointerdown/up 记下的手势（pointerType/位移/按压）
+ * + click 当时的目标与选区（面板此时尚未打开，目标即抬起位置的元素）。
+ */
+export interface TapClick extends TapGesture {
+  /** pointerdown 的 pointerType（仅触屏点按开面板） */
+  pointerType: string;
+}
+
+/**
+ * 触屏点按在 click 阶段才开面板：pointerup 就开会让随后的兼容 click 落到
+ * 刚渲染的面板项上，触发随机动作（Android WebView 幽灵点击，MM2-fix1）。
+ * pointerType 不是 touch 一律不开——鼠标单击行为照旧。
+ */
+export function shouldOpenMenuOnClick(t: TapClick): boolean {
+  if (t.pointerType !== "touch") return false;
+  return shouldOpenMenuOnTap(t);
+}
+
+/** 面板/菜单/预览刚打开时的幽灵点击豁免窗：同上防御，兼容 click 可能落到新浮层项上 */
+export const GHOST_CLICK_MS = 350;
+
+/** openedAt 后 GHOST_CLICK_MS 内到达的点击按幽灵点击忽略 */
+export function isGhostClick(openedAt: number, now = Date.now()): boolean {
+  return now - openedAt < GHOST_CLICK_MS;
+}
+
 // ---------- 墓碑文案 ----------
 
 export interface TombstoneCtx {
