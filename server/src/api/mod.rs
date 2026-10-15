@@ -129,6 +129,12 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
         .route("/messages/{id}/poll/votes", put(vote_poll))
         .route("/messages/{id}/poll/close", post(close_poll))
         .route("/messages/{id}/forward", post(forward_message))
+        // MF1：记录完整快照 + 批量/合并转发（64KiB 上限：100 uuid + 10 target + 外壳足够）
+        .route("/messages/{id}/record", get(get_record))
+        .route(
+            "/messages/forward-batch",
+            post(forward_batch).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
         .route("/conversations/{id}/members", post(add_members))
         .route("/conversations/{id}/members/me", delete(leave_conversation))
         .route("/conversations/{id}/members/{uid}", delete(kick_member))

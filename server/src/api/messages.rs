@@ -300,6 +300,10 @@ pub(super) async fn close_poll(
 /// 源侧统一拒绝（非成员 403 / 墓碑或投票 400 / 目标列表形状 400）；目标侧逐条
 /// 独立成败：HTTP 恒 200，results 与去重后的请求目标顺序一一对应。
 /// 每条成功目标走与 WS 发送相同的 message 帧广播（含 unarchive 偏好推送）。
+///
+/// record_attachment_id（MF1）：转发 {id} 聊天记录内的某个附件条目为普通附件消息。
+/// 该路径校验顺序固定为：形状 → 消息存在且成员（403 与其它拒绝同形）→ 限流 →
+/// 撤回/附件归属校验（400/404）→ 逐目标写入。
 pub(super) async fn forward_message(
     State(st): State<SharedState>,
     headers: HeaderMap,
@@ -307,8 +311,6 @@ pub(super) async fn forward_message(
     Json(req): Json<ForwardReq>,
 ) -> AppResult<Json<ForwardResp>> {
     let uid = uid_of(&headers, &st).await?;
-    // 整个请求按 uid 限流（与注册/登录同一滑动窗口参数）
-    rate_limit(&st, format!("fwd:{uid}"))?;
     if req.conversation_ids.is_empty() || req.conversation_ids.len() > 10 {
         return Err(AppError::bad_request(
             "conversation_ids must be 1-10 targets",
@@ -323,13 +325,30 @@ pub(super) async fn forward_message(
         .filter(|c| seen.insert(*c))
         .collect();
 
-    let results = domain::forward_message(&st.pool, uid, message_id, &targets, req.client_op_id)
-        .await
-        .map_err(post_err)?;
+    let results = match req.record_attachment_id {
+        Some(att) => {
+            // 记录内附件转发：成员/存在 403 先判（不进限流），再计一次 fwd 桶
+            domain::record_source_member(&st.pool, uid, message_id)
+                .await
+                .map_err(post_err)?;
+            rate_limit(&st, format!("fwd:{uid}"))?;
+            domain::forward_record_item(&st.pool, uid, message_id, att, &targets, req.client_op_id)
+                .await
+                .map_err(post_err)?
+        }
+        None => {
+            // 整个请求按 uid 限流（与注册/登录同一滑动窗口参数）
+            rate_limit(&st, format!("fwd:{uid}"))?;
+            domain::forward_message(&st.pool, uid, message_id, &targets, req.client_op_id)
+                .await
+                .map_err(post_err)?
+        }
+    };
     let mut items = Vec::with_capacity(results.len());
     for r in results {
         match r {
             domain::Forwarded::Ok { conv, posted } => {
+                // inserted=false 的幂等重放不重复广播（broadcast_posted 内跳过消息帧）
                 ws::broadcast_posted(&st, conv, &posted).await;
                 items.push(ForwardResultItem {
                     conversation_id: conv,
@@ -353,4 +372,105 @@ pub(super) async fn forward_message(
         }
     }
     Ok(Json(ForwardResp { results: items }))
+}
+
+/// GET /messages/{id}/record：聊天记录完整快照。
+/// 消息不存在/非成员 → 同一 403；已撤回/非 chat_record → 404。
+pub(super) async fn get_record(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(message_id): Path<Uuid>,
+) -> AppResult<Json<Value>> {
+    let uid = uid_of(&headers, &st).await?;
+    let record = domain::get_record(&st.pool, uid, message_id)
+        .await
+        .map_err(post_err)?;
+    Ok(Json(record))
+}
+
+/// POST /messages/forward-batch：同一源会话的多选转发（MF1）。
+/// merged：每目标一条 chat_record（fwdm:{op}:{target} 幂等）；
+/// separate：按 seq 逐条转发（fwds:{op}:{target}:{source_id} 幂等，每目标单事务）。
+/// 顺序固定：形状校验 → 源会话成员 403（不进限流）→ 限流一次 → 快照/大小校验 → 写。
+/// 跳过原因闭集：unavailable / recalled / poll / too_deep。
+pub(super) async fn forward_batch(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<ForwardBatchReq>,
+) -> AppResult<Json<ForwardBatchResp>> {
+    let uid = uid_of(&headers, &st).await?;
+    let merged = match req.mode.as_str() {
+        "merged" => true,
+        "separate" => false,
+        _ => return Err(AppError::bad_request("mode must be merged or separate")),
+    };
+    if req.message_ids.is_empty() || req.message_ids.len() > 100 {
+        return Err(AppError::bad_request("message_ids must be 1-100"));
+    }
+    if req.targets.is_empty() || req.targets.len() > 10 {
+        return Err(AppError::bad_request("targets must be 1-10"));
+    }
+    let dedupe = |v: &[Uuid]| -> Vec<Uuid> {
+        let mut seen = std::collections::HashSet::new();
+        v.iter().copied().filter(|c| seen.insert(*c)).collect()
+    };
+    let ids = dedupe(&req.message_ids);
+    let targets = dedupe(&req.targets);
+
+    // 授权 + 一致读 + 分类：空结果/全 too_deep 的 400 在这里抛，不占限流
+    let plan = domain::forward_batch_prepare(
+        &st.pool,
+        uid,
+        req.conversation_id,
+        &ids,
+        merged,
+    )
+    .await
+    .map_err(post_err)?;
+    // 批量限流独立桶：一次请求只计一次命中（与 fwd:/收藏 分开）
+    rate_limit(&st, format!("fwdb:{uid}"))?;
+    let outcome = domain::forward_batch_exec(&st.pool, uid, plan, &targets, req.client_op_id)
+        .await
+        .map_err(post_err)?;
+
+    let mut results = Vec::with_capacity(outcome.targets.len());
+    for t in outcome.targets {
+        match t {
+            domain::BatchTarget::Ok { conv, posteds } => {
+                // 每条写入消息一帧；separate 模式下只有末条（幂等重放的不算）触发推送，
+                // 一目标一请求至多一条通知、摘要取自末条（MF1-C9）。
+                let last_push = posteds.iter().rposition(|p| p.inserted);
+                for (i, p) in posteds.iter().enumerate() {
+                    ws::broadcast_posted_push(&st, conv, p, last_push == Some(i)).await;
+                }
+                results.push(ForwardBatchTarget {
+                    conversation_id: conv,
+                    ok: true,
+                    forwarded: posteds.len() as i64,
+                    message_ids: Some(posteds.iter().map(|p| p.message.id).collect()),
+                    error: None,
+                    skipped: outcome.skipped.clone(),
+                });
+            }
+            domain::BatchTarget::Fail {
+                conv,
+                code,
+                message,
+            } => results.push(ForwardBatchTarget {
+                conversation_id: conv,
+                ok: false,
+                forwarded: 0,
+                message_ids: None,
+                error: Some(ForwardBatchError {
+                    code: code.to_string(),
+                    message: message.to_string(),
+                }),
+                skipped: outcome.skipped.clone(),
+            }),
+        }
+    }
+    Ok(Json(ForwardBatchResp {
+        results,
+        skipped: outcome.skipped,
+    }))
 }

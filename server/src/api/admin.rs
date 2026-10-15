@@ -104,12 +104,17 @@ pub(super) async fn admin_users(
             .fetch_all(&st.pool)
             .await?
     };
-    // 每人附件已用存储（V2 P2-1）：按 storage_path 去重，转发副本不重复计
+    // 每人附件已用存储（V2 P2-1，MF1 修订）：同一 storage_path 只归最早一行的
+    // 上传者计费——转发/记录克隆行 uploader=转发者但更晚，不会被计入其配额。
     let ids: Vec<Uuid> = rows.iter().map(|u| u.id).collect();
     let usage: std::collections::HashMap<Uuid, i64> = sqlx::query_as::<_, (Uuid, i64)>(
         "SELECT uploader_id, SUM(size)::bigint
-           FROM (SELECT DISTINCT uploader_id, storage_path, size
-                   FROM attachments WHERE uploader_id = ANY($1)) d
+           FROM (SELECT DISTINCT a.uploader_id, a.storage_path, a.size
+                   FROM attachments a
+                  WHERE a.uploader_id = ANY($1)
+                    AND NOT EXISTS (SELECT 1 FROM attachments o
+                                     WHERE o.storage_path = a.storage_path
+                                       AND (o.created_at, o.id) < (a.created_at, a.id))) d
           GROUP BY uploader_id",
     )
     .bind(&ids)

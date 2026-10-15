@@ -276,6 +276,17 @@ pub async fn post_and_broadcast(
 /// WS send_message / REST create_poll / REST forward 三处共用
 /// （第 3 阶段离线推送也挂在它上面，所有新消息必须经过这里）。
 pub async fn broadcast_posted(st: &SharedState, conv: Uuid, posted: &domain::Posted) {
+    broadcast_posted_push(st, conv, posted, true).await
+}
+
+/// with_push=false 时只发 WS 帧/已读同步，不触发离线推送——逐条批量转发里
+/// 除每目标末条外的消息都走这个（每目标一次请求至多一条推送，摘要用末条的）。
+pub async fn broadcast_posted_push(
+    st: &SharedState,
+    conv: Uuid,
+    posted: &domain::Posted,
+    with_push: bool,
+) {
     if posted.inserted {
         let p = frame(&WsOut::Message {
             message: posted.message.clone(),
@@ -290,7 +301,9 @@ pub async fn broadcast_posted(st: &SharedState, conv: Uuid, posted: &domain::Pos
             }),
         );
         // V2 P3-3：离线推送（ntfy）——判定与发送全在 spawned 任务里，不拖慢广播
-        crate::push::schedule(st, conv, posted);
+        if with_push {
+            crate::push::schedule(st, conv, posted);
+        }
         crate::api::dispatch_bots(st, conv, &posted.message);
     }
     // 新 @本人消息已在事务内解除其归档：偏好帧只发给本人全部连接（其他成员不可见）

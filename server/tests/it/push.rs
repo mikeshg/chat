@@ -284,7 +284,7 @@ async fn p33_push_mute_and_mention() {
     let (_admin, a, b, _dm) = p33_setup(&base, &ntfy, "c").await;
     push_on(&base, &b, json!({"enabled": true})).await;
 
-    let gid = mk_group(&base, &a, &[b.id.clone()]).await;
+    let gid = mk_group(&base, &a, std::slice::from_ref(&b.id)).await;
     // B 永久静音该群
     let r = put_pref(&base, &b, &gid, json!({"mute": {"mode": "forever"}})).await;
     assert_eq!(r.status(), 200);
@@ -640,4 +640,122 @@ async fn p33_push_failure_isolated() {
         .as_str()
         .unwrap()
         .contains("推送"));
+}
+
+// ===== MF1 =====
+// chat_record 推送摘要 = 「[聊天记录] {title}」，永不退化成多行兜底正文；
+// separate 批量一目标一请求至多一条推送（摘取末条），WS 仍逐条一帧。
+
+/// a 合并转发文本到与 b 的私聊：b 的推送正文 = 「{a}: [聊天记录] {a} 和 {b} 的聊天记录」。
+#[tokio::test]
+async fn mf1_push_chat_record_excerpt() {
+    let (_guard, base, st) = spawn_named_state(&format!("chat_it_mf1p_{}", uniq())).await;
+    let ntfy = fake_ntfy().await;
+    let (_admin, a, b, conv) = p33_setup(&base, &ntfy, "cr").await;
+    push_on(&base, &b, json!({"enabled": true, "preview": true})).await;
+    // 关掉合并窗口：否则会话内第二条推送被压掉，没法断言摘要
+    st.push_coalesce_ms
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+
+    let mut sa = ws_of(&base, &a).await;
+    ws_send(
+        &mut sa,
+        &conv,
+        json!({"client_msg_id": "cr1", "content": "收进记录"}),
+    )
+    .await;
+    // 源消息本身产生一条普通推送，先等它到齐
+    let hits = ntfy.wait_hits(1, 3000).await;
+    assert_eq!(hits.len(), 1);
+
+    let page = conv_messages(&base, &a, &conv).await;
+    let src = page[0]["id"].as_str().unwrap().to_string();
+    let r = forward_batch::post_batch(
+        &base,
+        &a,
+        &conv,
+        &[src],
+        std::slice::from_ref(&conv),
+        "merged",
+        &uuid::Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+
+    let hits = ntfy.wait_hits(2, 3000).await;
+    assert_eq!(hits.len(), 2);
+    assert_eq!(
+        hits[1]["message"],
+        format!(
+            "{}: [聊天记录] {} 和 {} 的聊天记录",
+            a.username, a.username, b.username
+        ),
+        "记录推送摘要 = [聊天记录] 标题，不得含兜底正文行: {}",
+        hits[1]["message"]
+    );
+}
+
+/// separate 批量 5 条：每条 WS 一帧，但一目标一请求只发一条推送（摘取末条）。
+/// 把合并窗口关掉（coalesce=0）才能区分「发了几条」与「窗口压了几条」。
+#[tokio::test]
+async fn mf1_push_separate_batch_once() {
+    let (_guard, base, st) = spawn_named_state(&format!("chat_it_mf1s_{}", uniq())).await;
+    let ntfy = fake_ntfy().await;
+    let (_admin, a, b, conv) = p33_setup(&base, &ntfy, "sb").await;
+    push_on(&base, &b, json!({"enabled": true, "preview": true})).await;
+    st.push_coalesce_ms
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+
+    let mut sa = ws_of(&base, &a).await;
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let m = ws_send(
+            &mut sa,
+            &conv,
+            json!({"client_msg_id": format!("s{i}"), "content": format!("第{i}条")}),
+        )
+        .await;
+        ids.push(m["id"].as_str().unwrap().to_string());
+    }
+    let hits = ntfy.wait_hits(5, 3000).await;
+    assert_eq!(hits.len(), 5, "五条源消息各一推");
+    let _ = conv_messages(&base, &a, &conv).await;
+
+    // b 连 WS 收帧；a 逐条转发 5 条回本会话
+    let mut sb = ws_of(&base, &b).await;
+    let r = forward_batch::post_batch(
+        &base,
+        &a,
+        &conv,
+        &ids,
+        std::slice::from_ref(&conv),
+        "separate",
+        &uuid::Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["results"][0]["forwarded"], 5);
+
+    // WS：恰好 5 个 message 帧
+    let mut kinds = Vec::new();
+    for _ in 0..5 {
+        kinds.push(next_of(&mut sb, "message").await["message"]["kind"].clone());
+    }
+    assert_eq!(kinds, vec![json!("text"); 5], "每条各一帧: {kinds:?}");
+
+    // 推送：一目标一请求至多一条，摘要来自末条（"第4条"）
+    let hits = ntfy.wait_hits(7, 2500).await;
+    assert_eq!(
+        hits.len(),
+        6,
+        "separate 5 条只追加一条推送（末条）: {}",
+        hits.len()
+    );
+    assert_eq!(
+        hits[5]["message"],
+        format!("{}: 第4条", a.username),
+        "推送摘要应取末条: {}",
+        hits[5]["message"]
+    );
 }

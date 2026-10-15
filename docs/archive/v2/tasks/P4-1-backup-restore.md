@@ -97,3 +97,10 @@ Vitest：确认词校验、文件大小格式化等纯函数。
 - 回灌改为按 **CSV 表头驱动 COPY 列清单**：备份缺少的新列（如 0039 加的 `attachments.recalled_at`）由库默认值/NULL 补齐；CSV 含当前库不存在的列直接 400（跨版本恢复不许悄悄丢数据）。
 - 原因：MM1（0039 消息撤回）给 `attachments` 加了 `recalled_at` 后，MM1 之前生成的备份应可恢复。
 - 测试锁定（`tests/it/backup.rs`）：`mm5_restore_accepts_older_backup_without_recalled_at`（版本拨回 38 + 删列 → 恢复成功，`recalled_at` 为 NULL）、`mm5_restore_rejects_unknown_column`（未知列 → 400 且数据不变）、`p41_restore_rejects_version_mismatch`（加强：精确错误文案 + 全表行数/文件清单逐项不变）。
+
+### Amendment (MF1) — 恢复拒绝文案 + 0040 新列
+
+- 「备份比服务端新」的 400 文案改为「该备份来自更新版本的服务端，请先升级服务端后再恢复」（MF1：用户更可读；`p41_restore_rejects_version_mismatch` 断言同步为新文案）。
+- 0040 新增 `messages.record`（jsonb，chat_record 快照）与 `attachments.record_message_id`（记录内克隆附件宿主）。两者随全表导出/CSV 恢复自动覆盖；v39 及更早的备份缺这两列，按 MM1/MM5 的 CSV 表头驱动 COPY 语义补 NULL。
+- 循环依赖：`attachments.record_message_id → messages.id` 与 `messages.attachment_id → attachments.id` 构成环；既有 `restore_order` 的「断环-回灌-补约束」路径已覆盖（先卸环上 FK、COPY 回灌、再重建）。
+- 新增测试：`mf1_backup_chat_record_roundtrip`（含克隆附件的记录备份恢复，record jsonb 逐字节相等、record_message_id 不变、文件回得来）、`mf1_restore_accepts_v39_backup`（manifest 拨回 39 + 两 CSV 删新列 → 200，新列全 NULL）。

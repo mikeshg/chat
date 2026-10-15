@@ -758,7 +758,9 @@ async fn validate_archive(st: SharedState, upload_path: PathBuf) -> AppResult<Ma
         // 逐表按 CSV 表头列清单回灌，备份里缺的新列（如 attachments.recalled_at）
         // 落默认值；更新版本生成的备份拒绝，防止降级灌库。
         if m.migration_version > mv {
-            return Err(AppError::bad_request("备份版本与当前服务端不一致"));
+            return Err(AppError::bad_request(
+                "该备份来自更新版本的服务端，请先升级服务端后再恢复",
+            ));
         }
         let mset: BTreeSet<String> = m.tables.iter().map(|t| t.name.clone()).collect();
         if mset != expected {

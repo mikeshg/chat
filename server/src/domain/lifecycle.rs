@@ -225,13 +225,20 @@ pub(super) async fn finish_edit(
     })
 }
 
-/// 用户已用附件存储（V2 P2-1）：其上传的附件按 storage_path 去重求和，
-/// 转发产生的副本共享同一 storage_path，不重复计。
+/// 用户已用附件存储（V2 P2-1，MF1 修订）：其上传的附件按 storage_path 去重求和，
+/// 转发/记录克隆副本共享同一 storage_path 且不重复计。
+/// 克隆行 uploader_id 现已记为转发者：同一 storage_path 只归「最早那行的上传者」
+/// （created_at,id 最小的行）计费——克隆行更晚，转发不会推高转发者配额；
+/// 最早行被清扫删除后，存活的最早引用自然接手计费。
 pub async fn storage_used(pool: &PgPool, uid: Uuid) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar::<_, i64>(
         "SELECT COALESCE(SUM(size), 0)::bigint
-           FROM (SELECT DISTINCT storage_path, size
-                   FROM attachments WHERE uploader_id = $1) d",
+           FROM (SELECT DISTINCT a.storage_path, a.size
+                   FROM attachments a
+                  WHERE a.uploader_id = $1
+                    AND NOT EXISTS (SELECT 1 FROM attachments o
+                                     WHERE o.storage_path = a.storage_path
+                                       AND (o.created_at, o.id) < (a.created_at, a.id))) d",
     )
     .bind(uid)
     .fetch_one(pool)
@@ -366,6 +373,19 @@ pub(super) async fn recall_in_tx(
         if uploader == Some(uid) {
             recalled_attachment_id = Some(att);
         }
+    }
+
+    // 聊天记录级联（MF1）：记录内全部克隆附件（含嵌套，克隆行一律挂最外层记录 id）
+    // 随消息同事务标记撤回——公开下载立即 404；行与文件由清扫按 TTL/引用计数处理。
+    // 墓碑响应不带 recalled_attachment_id（记录消息 attachment_id 恒 NULL，天然满足）。
+    if m.kind == "chat_record" {
+        sqlx::query(
+            "UPDATE attachments SET recalled_at = now()
+              WHERE record_message_id = $1 AND recalled_at IS NULL",
+        )
+        .bind(message_id)
+        .execute(&mut **tx)
+        .await?;
     }
 
     let row = sqlx::query_as::<_, MsgViewRow>("SELECT * FROM message_views WHERE id = $1")

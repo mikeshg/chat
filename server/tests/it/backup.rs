@@ -743,8 +743,9 @@ async fn p41_aborted_restore_upload_leaves_no_part_file() {
     assert!(parts().is_empty(), "残留上传文件: {:?}", parts());
 }
 
-/// 篡改 manifest 的 migration_version（比当前新）→ 400「备份版本与当前服务端不一致」，
-/// 数据不变（全表行数 + 文件清单逐项复核）。MM5 起该文案只表示「备份比服务端新」。
+/// 篡改 manifest 的 migration_version（比当前新）→ 400
+/// 「该备份来自更新版本的服务端，请先升级服务端后再恢复」（MF1 起换新文案，
+/// 逐字断言），数据不变（全表行数 + 文件清单逐项复核）。
 #[tokio::test]
 async fn p41_restore_rejects_version_mismatch() {
     let (_guard, base, st, files_dir) = spawn_backup_env("vm").await;
@@ -783,7 +784,7 @@ async fn p41_restore_rejects_version_mismatch() {
     let body: Value = r.json().await.unwrap();
     assert_eq!(
         body["error"].as_str().unwrap_or(""),
-        "备份版本与当前服务端不一致",
+        "该备份来自更新版本的服务端，请先升级服务端后再恢复",
         "{body}"
     );
 
@@ -1166,4 +1167,177 @@ async fn mm5_restore_rejects_unknown_column() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200, "恢复被拒后旧 token 应仍有效");
+}
+
+// ===== MF1 =====
+// 备份/恢复与新 schema 的兼容性：chat_record 快照 + record_message_id 克隆行
+// 随全表导出/CSV 恢复自动带走；version-39 老备份（缺新列）照样恢复成 NULL。
+
+/// 含 chat_record（带嵌套克隆附件）的库整备一份 → 恢复后：
+/// record jsonb 逐字节相等、克隆行 record_message_id 不变、物理文件回得来。
+#[tokio::test]
+async fn mf1_backup_chat_record_roundtrip() {
+    let (_guard, base, st, files_dir) = spawn_backup_env("rc").await;
+    let admin = register(&base, &format!("mf1ra_{}", uniq())).await; // 首个 = 管理员
+    let bob = register(&base, &format!("mf1rb_{}", uniq())).await;
+    befriend(&base, &admin, &bob).await;
+    let dm = dm_conv(&base, &admin).await;
+    let selfc = self_conv(&base, &admin).await["id"].as_str().unwrap().to_string();
+
+    // bob 发图 → admin 合并转发到自己 self → 产生 chat_record + 附件克隆
+    let att_body = png_bytes();
+    let (scode, att) = upload_att(&base, &dm, &bob.access, "r.png", "image/png", att_body.clone()).await;
+    assert_eq!(scode, 200);
+    let mut sb = tokio_tungstenite::connect_async(ws_url(&base, &bob).await)
+        .await
+        .unwrap()
+        .0;
+    next_of(&mut sb, "presence_init").await;
+    let img = ws_send(
+        &mut sb,
+        &dm,
+        json!({"client_msg_id": "rb1", "content": "", "attachment_id": att["id"]}),
+    )
+    .await;
+    let r = forward_batch::post_batch(
+        &base,
+        &admin,
+        &dm,
+        &[img["id"].as_str().unwrap().to_string()],
+        std::slice::from_ref(&selfc),
+        "merged",
+        &uuid::Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let rid = r.json::<Value>().await.unwrap()["results"][0]["message_ids"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let rid_u = uuid::Uuid::parse_str(&rid).unwrap();
+
+    // 备份前的库内快照（::text 逐字节比较口径）
+    let before_text: String = sqlx::query_scalar("SELECT record::text FROM messages WHERE id = $1")
+        .bind(rid_u)
+        .fetch_one(&st.pool)
+        .await
+        .unwrap();
+    let clone_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM attachments WHERE record_message_id = $1")
+            .bind(rid_u)
+            .fetch_one(&st.pool)
+            .await
+            .unwrap();
+
+    let name = create_and_wait_backup(&base, &admin.access).await;
+    let bytes = download_backup(&base, &admin.access, &name).await;
+    // 备份 CSV 里新列已随全表导出
+    let entries = read_backup(&bytes);
+    let mcsv = String::from_utf8(entries["db/messages.csv"].clone()).unwrap();
+    assert!(mcsv.lines().next().unwrap().contains("record"), "messages.csv 应含 record 列");
+    let acsv = String::from_utf8(entries["db/attachments.csv"].clone()).unwrap();
+    assert!(
+        acsv.lines().next().unwrap().contains("record_message_id"),
+        "attachments.csv 应含 record_message_id 列"
+    );
+
+    let r = restore_upload(&base, &admin.access, bytes, Some("RESTORE")).await;
+    assert_eq!(r.status(), 200, "恢复应成功");
+
+    // 逐字节相等 + 克隆行引用不变 + 文件回来
+    let after_text: String = sqlx::query_scalar("SELECT record::text FROM messages WHERE id = $1")
+        .bind(rid_u)
+        .fetch_one(&st.pool)
+        .await
+        .unwrap();
+    assert_eq!(after_text, before_text, "record jsonb 必须逐字节还原");
+    let (att_mid, cnt): (Option<uuid::Uuid>, i64) = sqlx::query_as(
+        "SELECT record_message_id, count(*) OVER() FROM attachments WHERE id = $1",
+    )
+    .bind(clone_id)
+    .fetch_one(&st.pool)
+    .await
+    .unwrap();
+    assert_eq!(att_mid, Some(rid_u), "record_message_id 必须原样还原");
+    assert_eq!(cnt, 1);
+    let admin2 = login_again(&base, &admin.username).await;
+    let dl = http()
+        .get(format!("{base}/v1/files/{clone_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dl.status(), 200, "恢复后克隆附件可下载");
+    assert_eq!(dl.bytes().await.unwrap().as_ref(), att_body.as_slice());
+    // 克隆行与源共享 storage_path：物理文件名以库记录为准
+    let sp: String = sqlx::query_scalar("SELECT storage_path FROM attachments WHERE id = $1")
+        .bind(clone_id)
+        .fetch_one(&st.pool)
+        .await
+        .unwrap();
+    assert!(files_dir.join(&sp).exists());
+    // 成员可读恢复后的记录
+    let rec = http()
+        .get(format!("{base}/v1/messages/{rid}/record"))
+        .header("authorization", authz(&admin2.access))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rec.status(), 200);
+    assert_eq!(rec.json::<Value>().await.unwrap()["count"], 1);
+}
+
+/// version-39 老备份（CSVs 缺 record / record_message_id 两列）照常恢复，
+/// 新列一律 NULL。
+#[tokio::test]
+async fn mf1_restore_accepts_v39_backup() {
+    let (_guard, base, st, _files_dir) = spawn_backup_env("v39").await;
+    let admin = register(&base, &format!("mf1va_{}", uniq())).await;
+    let bob = register(&base, &format!("mf1vb_{}", uniq())).await;
+    befriend(&base, &admin, &bob).await;
+    let dm = dm_conv(&base, &admin).await;
+    let mut sa = tokio_tungstenite::connect_async(ws_url(&base, &admin).await)
+        .await
+        .unwrap()
+        .0;
+    next_of(&mut sa, "presence_init").await;
+    ws_send(&mut sa, &dm, json!({"client_msg_id": "v39", "content": "old rows"})).await;
+
+    let name = create_and_wait_backup(&base, &admin.access).await;
+    let bytes = download_backup(&base, &admin.access, &name).await;
+
+    let mut entries = read_backup(&bytes);
+    let mut manifest: Value = serde_json::from_slice(&entries["manifest.json"]).unwrap();
+    assert!(manifest["migration_version"].as_i64().unwrap() >= 40);
+    manifest["migration_version"] = json!(39);
+    entries.insert("manifest.json".into(), serde_json::to_vec(&manifest).unwrap());
+    let mcsv = String::from_utf8(entries["db/messages.csv"].clone()).unwrap();
+    assert!(mcsv.lines().next().unwrap().contains("record"));
+    entries.insert(
+        "db/messages.csv".into(),
+        csv_drop_column(&mcsv, "record").into_bytes(),
+    );
+    let acsv = String::from_utf8(entries["db/attachments.csv"].clone()).unwrap();
+    if acsv.lines().next().unwrap().contains("record_message_id") {
+        entries.insert(
+            "db/attachments.csv".into(),
+            csv_drop_column(&acsv, "record_message_id").into_bytes(),
+        );
+    }
+    let tweaked = write_backup(&entries);
+
+    let r = restore_upload(&base, &admin.access, tweaked, Some("RESTORE")).await;
+    assert_eq!(r.status(), 200, "v39 备份应可恢复");
+
+    // 新列全部 NULL（缺列由库默认补齐）
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE record IS NOT NULL")
+        .fetch_one(&st.pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "老备份恢复后 record 应全 NULL");
+    let n: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM attachments WHERE record_message_id IS NOT NULL")
+            .fetch_one(&st.pool)
+            .await
+            .unwrap();
+    assert_eq!(n, 0, "老备份恢复后 record_message_id 应全 NULL");
 }

@@ -446,6 +446,8 @@ pub(super) async fn download_file(
 
 /// 撤回附件取回：GET /files/{id}/recalled，仅 Bearer + 上传者本人 + 保留期内。
 /// 不满足一律 404（不泄露行是否存在）；无 Bearer → 401。
+/// 记录内克隆行（record_message_id 非空）恒 404——它们没有重发语义，
+/// 记录撤回后走这条取回路径不该再拿到内容（MF1）。
 /// ?thumb=1 / ?dl=1 语义与公开下载一致，但强制 Cache-Control: private, no-store——
 /// 撤回件不应再被缓存扩散（与公开下载的 immutable 缓存策略刻意相反）。
 pub(super) async fn download_recalled(
@@ -461,7 +463,7 @@ pub(super) async fn download_recalled(
     let row = sqlx::query_as::<_, (Uuid, String, String, String, Option<String>, bool)>(
         "SELECT uploader_id, file_name, mime, storage_path, thumb_path,
                 recalled_at IS NOT NULL AND recalled_at + make_interval(secs => $2) > now()
-           FROM attachments WHERE id = $1",
+           FROM attachments WHERE id = $1 AND record_message_id IS NULL",
     )
     .bind(id)
     .bind(ttl)

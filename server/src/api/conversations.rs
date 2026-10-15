@@ -65,6 +65,8 @@ pub(super) struct ConvRow {
     // 撤回（0039）：最后一条消息的撤回者与展示名
     m_recalled_by: Option<Uuid>,
     m_recalled_by_name: Option<String>,
+    // 聊天记录（0040）：完整快照仅用于派生 record_preview，不外泄
+    m_record: Option<sqlx::types::Json<serde_json::Value>>,
     // 本人偏好（conversation_preferences 左连接，无行则全 NULL/false）
     p_pinned_at: Option<DateTime<Utc>>,
     p_archived_at: Option<DateTime<Utc>>,
@@ -106,6 +108,7 @@ pub(super) async fn list_conversations(
                 lm.sender_avatar_version AS m_sender_avatar_version,
                 lm.sender_has_avatar AS m_sender_has_avatar, lm.forwarded_from AS m_forwarded_from,
                 lm.recalled_by AS m_recalled_by, lm.recalled_by_name AS m_recalled_by_name,
+                lm.record AS m_record,
                 cp.pinned_at AS p_pinned_at, cp.archived_at AS p_archived_at,
                 cp.muted_until AS p_muted_until, cp.mute_forever AS p_mute_forever,
                 cp.updated_at AS p_updated_at,
@@ -140,7 +143,7 @@ pub(super) async fn list_conversations(
                       reply_to_id, reply_to, edited_at, edit_version, deleted_at, reactions, poll,
                       att_width, att_height, att_has_thumb, att_duration_ms,
                       sender_avatar_version, sender_has_avatar, forwarded_from,
-                      recalled_by, recalled_by_name
+                      recalled_by, recalled_by_name, record
                  FROM message_views
                 WHERE conversation_id = c.id
                 ORDER BY seq DESC
@@ -208,6 +211,9 @@ pub(super) async fn list_conversations(
                     })
                     .unwrap_or_default(),
                 poll: r.m_poll.map(|j| j.0.into_view(uid)),
+                record_preview: r
+                    .m_record
+                    .and_then(|j| domain::record_preview(&j.0)),
                 sender_avatar_version: r.m_sender_avatar_version.unwrap_or(0),
                 sender_has_avatar: r.m_sender_has_avatar.unwrap_or(false),
                 forwarded_from: r.m_forwarded_from.clone(),

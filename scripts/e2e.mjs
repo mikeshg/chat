@@ -549,6 +549,70 @@ async function phase2() {
     const again = await api(b.token, 'POST', '/hooks', { content: 'after restart' });
     ok('bot hook works after restart', again.status === 200, `got ${again.status}`);
   }
+
+  console.log('== MF1 合并转发（聊天记录）==');
+  {
+    // 一对新用户：m1 合并转发 m2 的两条私聊消息回同一会话
+    const M1 = mk('m1'), M2 = mk('m2'), M3 = mk('m3');
+    for (const u of [M1, M2, M3]) {
+      const r = await api(null, 'POST', '/auth/register', { username: u.username, password: u.password });
+      Object.assign(u, r.json);
+    }
+    const freq = await api(M1.access_token, 'POST', '/friends/requests', { username: M2.username, message: 'mf1' });
+    ok('mf1 friend request', freq.status === 200 || freq.status === 201, `got ${freq.status}`);
+    const inbox = await api(M2.access_token, 'GET', '/friends/requests');
+    const fr = (inbox.json?.incoming || []).find((x) => x.user?.username === M1.username);
+    const acc = await api(M2.access_token, 'POST', `/friends/requests/${fr?.id}/accept`);
+    ok('mf1 friend accepted', acc.status === 200 || acc.status === 204, `got ${acc.status}`);
+    const m1convs = await api(M1.access_token, 'GET', '/conversations');
+    const dm = (m1convs.json || []).find((c) => c.kind === 'dm' && c.peer?.username === M2.username);
+    ok('mf1 dm exists', !!dm?.id);
+
+    const w = new Ws();
+    await w.connect(M2.access_token);
+    await w.waitType('presence_init');
+    const texts = [`mf1-one-${rid}`, `mf1-two-${rid}`];
+    const ids = [];
+    for (const [i, text] of texts.entries()) {
+      w.send({ type: 'send_message', conversation_id: dm.id, client_msg_id: `mf1s${i}`, content: text });
+      const ack = await w.waitType('message_ack', (m) => m.client_msg_id === `mf1s${i}`);
+      ids.push(ack.message?.id);
+    }
+
+    const fb = await api(M1.access_token, 'POST', '/messages/forward-batch', {
+      conversation_id: dm.id, message_ids: ids, targets: [dm.id],
+      mode: 'merged', client_op_id: randomUUID(),
+    });
+    const t = fb.json?.results?.[0];
+    ok('merged forward ok', fb.status === 200 && t?.ok === true && t.forwarded === 1 &&
+      t.message_ids?.length === 1 && Object.keys(t.skipped || {}).length === 0,
+      `got ${fb.status} ${JSON.stringify(fb.json)?.slice(0, 200)}`);
+    const rid2 = t?.message_ids?.[0];
+
+    // 接收方视角：WS 帧与历史都只带 record_preview，不带完整快照
+    const frame = await w.waitType('message', (m) => m.message?.kind === 'chat_record');
+    ok('ws frame is chat_record with preview', frame.message?.id === rid2 &&
+      frame.message?.record_preview?.count === 2 &&
+      frame.message?.record === undefined, JSON.stringify(frame.message?.record_preview));
+    const hist = await api(M2.access_token, 'GET', `/conversations/${dm.id}/messages`);
+    const rec = (hist.json?.messages || []).find((m) => m.id === rid2);
+    ok('recipient sees record_preview', rec?.kind === 'chat_record' &&
+      rec.record_preview?.title === `${M1.user.display_name} 和 ${M2.user.display_name} 的聊天记录` &&
+      rec.record_preview?.items?.length === 2 && rec.record === undefined,
+      JSON.stringify({ title: rec?.record_preview?.title, n: rec?.record_preview?.items?.length }));
+    ok('fallback content first line', (rec?.content || '').startsWith('[聊天记录] '),
+      `got ${(rec?.content || '').slice(0, 40)}`);
+
+    // GET record：成员拿全量，非成员同形 403
+    const full = await api(M1.access_token, 'GET', `/messages/${rid2}/record`);
+    ok('member GET record 200', full.status === 200 && full.json?.v === 1 &&
+      full.json?.count === 2 && full.json?.items?.[0]?.content === texts[0] &&
+      full.json?.items?.[0]?.sender_name === M2.user.display_name,
+      `got ${full.status} ${JSON.stringify(full.json)?.slice(0, 200)}`);
+    const denied = await api(M3.access_token, 'GET', `/messages/${rid2}/record`);
+    ok('non-member GET record 403', denied.status === 403, `got ${denied.status}`);
+    w.close();
+  }
 }
 
 // ---------- V2 ----------

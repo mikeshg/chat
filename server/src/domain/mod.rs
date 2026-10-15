@@ -1,7 +1,7 @@
 use crate::error::{AppError, AppResult};
 use crate::model::{
     AttachmentView, ConversationPref, CreatePollReq, MessageView, PollOptionView, PollView,
-    PrefUpdateReq, ReactionView, ReplyPreview,
+    PrefUpdateReq, ReactionView, ReplyPreview, SkipMap,
 };
 use chrono::{DateTime, Utc};
 use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
@@ -11,12 +11,14 @@ mod forward;
 mod lifecycle;
 mod polls;
 mod preferences;
+mod record;
 mod send;
 
 pub use forward::*;
 pub use lifecycle::*;
 pub use polls::*;
 pub use preferences::*;
+pub use record::*;
 pub use send::*;
 
 pub fn canonical_pair(a: Uuid, b: Uuid) -> (Uuid, Uuid) {
@@ -224,6 +226,8 @@ pub struct MsgViewRow {
     // 撤回（0039）：撤回者 id 与展示名（deleted_by 的 JOIN 展开）
     pub recalled_by: Option<Uuid>,
     pub recalled_by_name: Option<String>,
+    // 聊天记录（0040）：完整 jsonb 快照（墓碑为 NULL）；REST/WS 只暴露 into_view 派的 preview
+    pub record: Option<sqlx::types::Json<serde_json::Value>>,
 }
 
 impl MsgViewRow {
@@ -250,7 +254,14 @@ impl MsgViewRow {
             }),
             mentions: self.mentions.unwrap_or_default(),
             reply_to_id: self.reply_to_id,
-            reply_to_preview: self.reply_to.map(|j| j.0),
+            reply_to_preview: self.reply_to.map(|j| {
+                let mut p = j.0;
+                // 回复目标是聊天记录：预览固定为首行「[聊天记录] 标题」，不带后续摘要行
+                if p.kind == "chat_record" && !p.deleted {
+                    p.excerpt = p.excerpt.lines().next().unwrap_or_default().to_string();
+                }
+                p
+            }),
             edited_at: self.edited_at,
             edit_version: self.edit_version,
             deleted_at: self.deleted_at,
@@ -265,6 +276,7 @@ impl MsgViewRow {
                 })
                 .collect(),
             poll: self.poll.map(|j| j.0.into_view(viewer)),
+            record_preview: self.record.and_then(|j| record_preview(&j.0)),
             created_at: self.created_at,
             sender_avatar_version: self.sender_avatar_version,
             sender_has_avatar: self.sender_has_avatar,

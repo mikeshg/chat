@@ -82,6 +82,7 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
         include_str!("../migrations/0037_bot_tokens.sql"),
         include_str!("../migrations/0038_push_devices.sql"),
         include_str!("../migrations/0039_message_recall.sql"),
+        include_str!("../migrations/0040_chat_record.sql"),
     ] {
         sqlx::raw_sql(script).execute(&pool).await.unwrap();
     }
@@ -404,6 +405,85 @@ async fn upgrade_creates_search_trgm_index() {
     .await
     .unwrap();
     assert_eq!(hits, 1);
+
+    pool.close().await;
+}
+
+/// MF1 0040：messages.record jsonb、attachments.record_message_id + 部分索引、
+/// client_msg_id 上限放宽到 120、message_views 追加末尾列 record（墓碑掩 NULL）。
+#[tokio::test]
+async fn upgrade_0040_chat_record() {
+    let db = testdb::TempDb::create(&format!("chat_t_mig_{}", Uuid::new_v4().simple())).await;
+    let options = PgConnectOptions::from_str(&testdb::admin_db_url()).unwrap();
+    let pool = PgPoolOptions::new()
+        .max_connections(3)
+        .connect_with(options.database(db.name()))
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+    // 列与索引
+    let cols: Vec<(String, String)> = sqlx::query_as(
+        "SELECT column_name, data_type FROM information_schema.columns
+          WHERE table_name IN ('messages','attachments')
+            AND column_name IN ('record','record_message_id')",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(cols.contains(&("record".into(), "jsonb".into())), "{cols:?}");
+    assert!(cols.contains(&("record_message_id".into(), "uuid".into())));
+    let idx = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM pg_indexes
+          WHERE tablename = 'attachments' AND indexname = 'idx_attachments_record_message'
+            AND indexdef LIKE '%WHERE%record_message_id%')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(idx, "record_message_id 需要部分索引");
+
+    // message_views 最后一列必须是 record（只允许追加）
+    let last_col: String = sqlx::query_scalar(
+        "SELECT column_name FROM information_schema.columns
+          WHERE table_name = 'message_views'
+          ORDER BY ordinal_position DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(last_col, "record");
+
+    // client_msg_id 上限 120：120 通过、121 被拒
+    let u = Uuid::new_v4();
+    let conv = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id,username,display_name,password_hash) VALUES ($1,'mig40','Mig40','x')")
+        .bind(u).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO conversations (id,type,name,owner_id,last_seq) VALUES ($1,'group','G',$2,0)")
+        .bind(conv).bind(u).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO memberships (conversation_id,user_id,role) VALUES ($1,$2,'owner')")
+        .bind(conv).bind(u).execute(&pool).await.unwrap();
+    let k120 = "k".repeat(120);
+    sqlx::query("INSERT INTO messages (conversation_id,seq,sender_id,content,client_msg_id) VALUES ($1,1,$2,'x',$3)")
+        .bind(conv).bind(u).bind(&k120).execute(&pool).await.unwrap();
+    let too_long = "k".repeat(121);
+    let e = sqlx::query("INSERT INTO messages (conversation_id,seq,sender_id,content,client_msg_id) VALUES ($1,2,$2,'x',$3)")
+        .bind(conv).bind(u).bind(&too_long).execute(&pool).await;
+    assert!(e.is_err(), "121 字符的 client_msg_id 必须被 CHECK 拒掉");
+
+    // 墓碑掩 record：deleted_at 非空时视图里 record 为 NULL
+    sqlx::query(
+        "UPDATE messages SET record = '{\"v\":1}'::jsonb, deleted_at = now() WHERE seq = 1",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let rec: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT record FROM message_views WHERE seq = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(rec.is_none(), "墓碑消息的 record 必须掩去");
 
     pool.close().await;
 }

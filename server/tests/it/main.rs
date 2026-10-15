@@ -27,6 +27,7 @@ mod client_update;
 mod common;
 mod conv_prefs;
 mod forward;
+mod forward_batch;
 mod harness;
 mod invites;
 mod messages;
