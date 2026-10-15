@@ -1138,6 +1138,19 @@ input.switch:focus-visible { outline: 2px solid var(--green); outline-offset: 2p
 .pv-act:hover { background: var(--bg); }
 .pv-act.danger, .pv-act.danger svg { color: var(--danger); }
 
+/* 窄屏（≤480px）：预览头部折两行——第一行 文件名(ellipsis)+大小(nowrap)+关闭，
+   第二行 动作按钮均分整行、图标在上短标签在下且不换行 */
+@media (max-width: 480px) {
+  .pv-head { flex-wrap: wrap; row-gap: 4px; padding: 8px 12px; }
+  .pv-head > .muted { white-space: nowrap; flex: none; }
+  .pv-toolbar { order: 1; flex: 0 0 100%; display: flex; }
+  .pv-act {
+    flex: 1; flex-direction: column; align-items: center; justify-content: center;
+    gap: 2px; white-space: nowrap; padding: 5px 4px;
+  }
+  .pv-act svg { width: 18px; height: 18px; }
+}
+
 /* 轻量操作反馈（已复制/撤回提示） */
 .op-hint {
   position: fixed; left: 50%; bottom: 84px; transform: translateX(-50%);

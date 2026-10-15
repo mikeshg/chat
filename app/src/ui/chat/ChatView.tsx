@@ -58,12 +58,14 @@ import {
   menuItems,
   msgDeletedText,
   quoteDeletedText,
+  reeditTextFor,
   shouldOpenMenuOnClick,
   shouldOpenMenuOnContextMenu,
   tombstoneText,
   type MenuAction,
   type MenuCtx,
   type MenuItem,
+  type OverlayOpen,
 } from "./msgMenu";
 import {
   CopyIcon,
@@ -242,10 +244,11 @@ export default function ChatView() {
   // pointerup 记下的完整手势，交给随后的 click 判定（开面板挪到 click 阶段——幽灵点击修复）
   const tapEnd = useRef<{ type: string; movedPx: number; pressMs: number } | null>(null);
   const lastPointer = useRef<{ type: string; ts: number }>({ type: "", ts: 0 });
-  // 面板/菜单/预览的打开时刻：GHOST_CLICK_MS 内到达的 click 按幽灵点击忽略
-  const sheetAt = useRef(0);
-  const menuAt = useRef(0);
-  const previewAt = useRef(0);
+  // 面板/菜单/预览的打开记录：仅触屏打开的浮层，GHOST_CLICK_MS 内到达的 click
+  // 才按幽灵点击忽略；鼠标/笔打开的永不忽略（右键→快速点菜单项是正常操作）
+  const sheetAt = useRef<OverlayOpen>({ at: 0, touch: false });
+  const menuAt = useRef<OverlayOpen>({ at: 0, touch: false });
+  const previewAt = useRef<OverlayOpen>({ at: 0, touch: false });
   const [mutErr, setMutErr] = useState<string | null>(null);
   // 发送（含上传附件）失败的服务端文案，显示在附件条处（V2 P2-1：413 配额提示走这里）
   const [sendErr, setSendErr] = useState<string | null>(null);
@@ -522,14 +525,16 @@ export default function ChatView() {
   const openMenu = (m: MessageView, x: number, y: number) => {
     if (itemsFor(m).length === 0) return; // 墓碑/乐观消息没有菜单
     setSheet(null);
-    menuAt.current = Date.now();
+    // contextmenu 已对 touch 源放行屏蔽，这里照常记录来源（恒为非 touch）
+    menuAt.current = { at: Date.now(), touch: lastPointer.current.type === "touch" };
     setMsgMenu({ x, y, m });
   };
 
   const openSheet = (m: MessageView) => {
     if (itemsFor(m).length === 0) return;
     setMsgMenu(null);
-    sheetAt.current = Date.now();
+    // 动作面板只由触屏点按打开（shouldOpenMenuOnClick 要求 pointerType==="touch"）
+    sheetAt.current = { at: Date.now(), touch: true };
     setSheet({ m });
   };
 
@@ -556,7 +561,8 @@ export default function ChatView() {
       saveReedit(localStorage, serverScope(), meId, {
         conversation_id: conv.id,
         message_id: m.id,
-        text: m.content,
+        // 附件消息的 content 是服务端占位（[图片]/[文件] 名/[语音]），不是用户文本
+        text: reeditTextFor(m),
         reply_to: m.reply_to_preview?.message_id ?? null,
         ...(m.attachment
           ? {
@@ -607,16 +613,19 @@ export default function ChatView() {
     removeReedit(localStorage, serverScope(), meId, entry.message_id);
     setReedits(readReedits(localStorage, serverScope(), meId));
     if (entry.conversation_id !== conv.id) return;
-    let next = text;
-    if (next) {
-      next = window.confirm("替换当前输入？")
-        ? entry.text
-        : `${next}\n${entry.text}`;
-    } else {
-      next = entry.text;
+    // 附件消息的暂存正文是 ""（占位非用户文本）：不动 composer，只恢复 chip
+    if (entry.text) {
+      let next = text;
+      if (next) {
+        next = window.confirm("替换当前输入？")
+          ? entry.text
+          : `${next}\n${entry.text}`;
+      } else {
+        next = entry.text;
+      }
+      setText(next);
+      setDraft(conv.id, next);
     }
-    setText(next);
-    setDraft(conv.id, next);
     // 附件原件还在 TTL 内 → chip；旧服务端没有 /recalled，chip 不出现
     const rid = entry.recalled_attachment_id;
     if (entry.attachment && rid && serverSupportsRecall()) {
@@ -1082,7 +1091,7 @@ export default function ChatView() {
   const jumpPreview = (p: ReplyPreview) => jumpToRef(p.message_id, p.seq);
 
   const openPreview = (att: AttachmentView, m?: MessageView) => {
-    previewAt.current = Date.now();
+    previewAt.current = { at: Date.now(), touch: lastPointer.current.type === "touch" };
     setPreview({ att, m: m ?? null });
     setPreviewText(null);
     if (isTextLike(att)) {
@@ -1127,7 +1136,14 @@ export default function ChatView() {
   };
 
   return (
-    <main className="chat-view">
+    <main
+      className="chat-view"
+      // 全视图捕获 pointerType：lastPointer 供 contextmenu 来源判定与
+      // openPreview 的幽灵点击豁免（触屏打开才豁免）使用，不限于气泡区域
+      onPointerDownCapture={(e) => {
+        lastPointer.current = { type: e.pointerType ?? "", ts: Date.now() };
+      }}
+    >
       <header className="chat-head">
         <button className="chat-back" aria-label="返回" onClick={() => setState({ activeConv: null })}>
           ‹
@@ -1662,8 +1678,8 @@ export default function ChatView() {
       )}
 
       {/* 附件预览 / 大图查看器（MM2：带动作工具栏；工具栏项与消息菜单共用 items 函数）。
-          打开后 GHOST_CLICK_MS 内的 click 按幽灵点击忽略（触屏点开大图后，
-          兼容 click 可能落到刚渲染的工具栏按钮上） */}
+          触屏打开后 GHOST_CLICK_MS 内的 click 按幽灵点击忽略（兼容 click 可能落到
+          刚渲染的工具栏按钮上）；鼠标/笔打开的预览永不忽略点击 */}
       {preview && (
         <div
           className="modal-mask"
@@ -1678,10 +1694,10 @@ export default function ChatView() {
               </span>
               <span className="muted">{fmtSize(preview.att.size)}</span>
               <span className="pv-toolbar">
-                {/* 回复/转发/多选/撤回与消息菜单同一来源（viewer-<action>） */}
+                {/* 回复/转发/撤回与消息菜单同一来源（viewer-<action>）；多选不进预览工具栏 */}
                 {preview.m &&
                   itemsFor(preview.m)
-                    .filter((it) => ["reply", "forward", "multi", "recall"].includes(it.action))
+                    .filter((it) => ["reply", "forward", "recall"].includes(it.action))
                     .map((it) => (
                       <button
                         key={it.action}
@@ -1777,7 +1793,7 @@ export default function ChatView() {
 
       {/* MM2：触屏点按 → 底部动作面板（同一套菜单项 + 取消）。
           打开后 GHOST_CLICK_MS 内的 click 按幽灵点击忽略（Android WebView 兼容 click
-          会落到刚打开的面板项/遮罩上） */}
+          会落到刚打开的面板项/遮罩上）；面板仅由触屏点按打开 */}
       {sheet && (
         <div
           className="sheet-mask"

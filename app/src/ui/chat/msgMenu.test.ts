@@ -10,6 +10,7 @@ import {
   menuItems,
   msgDeletedText,
   quoteDeletedText,
+  reeditTextFor,
   shouldOpenMenuOnClick,
   shouldOpenMenuOnContextMenu,
   shouldOpenMenuOnTap,
@@ -53,14 +54,13 @@ const actions = (m: MessageView, c: MenuCtx) => menuItems(m, c).map((i) => i.act
 const labels = (m: MessageView, c: MenuCtx) => menuItems(m, c).map((i) => i.label);
 
 describe("menuItems：统一菜单项", () => {
-  it("文本消息（他人，DM）：回复/复制/转发/多选；撤回在末位仅自己消息有", () => {
+  it("文本消息（他人，DM）：回复/复制/转发；撤回在末位仅自己消息有", () => {
     const items = menuItems(msg(), ctx());
-    expect(items.map((i) => i.action)).toEqual(["reply", "copy", "forward", "multi"]);
+    expect(items.map((i) => i.action)).toEqual(["reply", "copy", "forward"]);
     expect(menuItems(msg({ sender_id: "me" }), ctx()).map((i) => i.action)).toEqual([
       "reply",
       "copy",
       "forward",
-      "multi",
       "recall",
     ]);
     // 撤回末位且标红
@@ -93,7 +93,21 @@ describe("menuItems：统一菜单项", () => {
   });
 
   it("只读会话：回复隐藏，复制保留", () => {
-    expect(actions(msg(), ctx({ readOnly: true }))).toEqual(["copy", "forward", "multi"]);
+    expect(actions(msg(), ctx({ readOnly: true }))).toEqual(["copy", "forward"]);
+  });
+
+  it("「多选」在 FEATURE_MULTI_SELECT=false 下不出现（MM3 暂缓，开启侧见 multiSelect.test.ts）", () => {
+    expect(actions(msg(), ctx())).not.toContain("multi");
+    expect(actions(msg({ sender_id: "me" }), ctx())).not.toContain("multi");
+    expect(
+      actions(
+        msg({
+          kind: "image",
+          attachment: { id: "a", file_name: "p.png", mime: "image/png", size: 1 },
+        }),
+        ctx(),
+      ),
+    ).not.toContain("multi");
   });
 
   it("投票消息没有转发（不可转），复制拿标题", () => {
@@ -204,16 +218,62 @@ describe("shouldOpenMenuOnClick：click 路径的点按判定（幽灵点击修�
   });
 });
 
-describe("isGhostClick：浮层打开后的幽灵点击豁免窗", () => {
-  it("350ms 内的点击忽略，窗外放行（严格小于）", () => {
-    expect(isGhostClick(NOW, NOW)).toBe(true);
-    expect(isGhostClick(NOW, NOW + GHOST_CLICK_MS - 1)).toBe(true);
-    expect(isGhostClick(NOW, NOW + GHOST_CLICK_MS)).toBe(false);
-    expect(isGhostClick(NOW, NOW + 60_000)).toBe(false);
+describe("isGhostClick：浮层打开后的幽灵点击豁免窗（仅触屏打开生效）", () => {
+  const touchOpened = { at: NOW, touch: true };
+  const mouseOpened = { at: NOW, touch: false };
+
+  it("触屏打开的浮层：350ms 内的点击忽略，窗外放行（严格小于）", () => {
+    expect(isGhostClick(touchOpened, NOW)).toBe(true);
+    expect(isGhostClick({ at: NOW, touch: true }, NOW + GHOST_CLICK_MS - 1)).toBe(true);
+    expect(isGhostClick(touchOpened, NOW + GHOST_CLICK_MS)).toBe(false);
+    expect(isGhostClick(touchOpened, NOW + 60_000)).toBe(false);
   });
 
-  it("未打开（openedAt=0）不算幽灵点击", () => {
-    expect(isGhostClick(0, NOW)).toBe(false);
+  it("鼠标/笔打开的浮层永不忽略点击（右键→快速点「复制」不被吞）", () => {
+    expect(isGhostClick(mouseOpened, NOW)).toBe(false);
+    expect(isGhostClick(mouseOpened, NOW + 1)).toBe(false);
+    expect(isGhostClick(mouseOpened, NOW + 60_000)).toBe(false);
+  });
+
+  it("未打开（at=0）不算幽灵点击", () => {
+    expect(isGhostClick({ at: 0, touch: true }, NOW)).toBe(false);
+    expect(isGhostClick({ at: 0, touch: false }, NOW)).toBe(false);
+  });
+});
+
+describe("reeditTextFor：重新编辑暂存正文", () => {
+  it("附件消息的 content 是服务端占位 → 存空串（只恢复复用 chip）", () => {
+    expect(
+      reeditTextFor(
+        msg({
+          kind: "image",
+          content: "[图片]",
+          attachment: { id: "a", file_name: "p.png", mime: "image/png", size: 1 },
+        }),
+      ),
+    ).toBe("");
+    expect(
+      reeditTextFor(
+        msg({
+          kind: "file",
+          content: "[文件] d.pdf",
+          attachment: { id: "a", file_name: "d.pdf", mime: "application/pdf", size: 1 },
+        }),
+      ),
+    ).toBe("");
+    expect(
+      reeditTextFor(
+        msg({
+          kind: "audio",
+          content: "[语音]",
+          attachment: { id: "a", file_name: "v.amr", mime: "audio/amr", size: 1 },
+        }),
+      ),
+    ).toBe("");
+  });
+
+  it("纯文本消息存原文", () => {
+    expect(reeditTextFor(msg({ content: "原文" }))).toBe("原文");
   });
 });
 

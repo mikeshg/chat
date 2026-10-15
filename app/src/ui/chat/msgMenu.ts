@@ -9,6 +9,7 @@ import {
   FEATURE_MENU_FAVORITE,
   FEATURE_MENU_PIN,
   FEATURE_MENU_REACTION,
+  FEATURE_MULTI_SELECT,
 } from "./features";
 
 export type MenuAction =
@@ -101,8 +102,9 @@ export function canForward(m: MessageView): boolean {
 
 /**
  * 单条消息的全部菜单项（唯一来源）。顺序即展示顺序：
- * 预览/查看大图（附件，最前）→ 回复 → 复制 → 转发 → 下载 → 多选 → 撤回（末位红色）。
+ * 预览/查看大图（附件，最前）→ 回复 → 复制 → 转发 → 下载 → [多选] → 撤回（末位红色）。
  * 墓碑与乐观消息没有任何菜单项（调用方据此不开菜单）。
+ * 多选在 FEATURE_MULTI_SELECT 后：MM3 暂缓，等合并转发设计定稿再接回。
  */
 export function menuItems(m: MessageView, ctx: MenuCtx): MenuItem[] {
   if (isTombstone(m) || isPending(m)) return [];
@@ -121,7 +123,8 @@ export function menuItems(m: MessageView, ctx: MenuCtx): MenuItem[] {
   }
   if (FEATURE_MENU_FAVORITE && canForward(m)) items.push({ action: "favorite", label: "收藏" });
   if (m.attachment) items.push({ action: "download", label: "下载" });
-  items.push({ action: "multi", label: "多选" }); // MM3 接多选态；MM2 为占位
+  // MM3 多选暂缓（合并转发设计未定稿）：开关关闭，代码路径保留
+  if (FEATURE_MULTI_SELECT) items.push({ action: "multi", label: "多选" });
   if (canRecall(m, ctx)) items.push({ action: "recall", label: "撤回", danger: true });
   return items;
 }
@@ -196,9 +199,19 @@ export function shouldOpenMenuOnClick(t: TapClick): boolean {
 /** 面板/菜单/预览刚打开时的幽灵点击豁免窗：同上防御，兼容 click 可能落到新浮层项上 */
 export const GHOST_CLICK_MS = 350;
 
-/** openedAt 后 GHOST_CLICK_MS 内到达的点击按幽灵点击忽略 */
-export function isGhostClick(openedAt: number, now = Date.now()): boolean {
-  return now - openedAt < GHOST_CLICK_MS;
+/** 浮层打开记录：at=打开时刻；touch=是否由触屏点按打开（豁免窗只对触屏打开生效） */
+export interface OverlayOpen {
+  at: number;
+  touch: boolean;
+}
+
+/**
+ * 幽灵点击判定：只有「触屏点按打开」的浮层才有兼容 click 落到刚渲染浮层项
+ * 上的问题（Android WebView）；鼠标/笔打开的菜单与预览永不忽略点击——
+ * 否则右键后快速点「复制」这类正常操作会被吞掉。
+ */
+export function isGhostClick(opened: OverlayOpen, now = Date.now()): boolean {
+  return opened.touch && now - opened.at < GHOST_CLICK_MS;
 }
 
 // ---------- 墓碑文案 ----------
@@ -246,4 +259,13 @@ export function copyTextFor(m: MessageView): string {
   if (m.kind === "poll") return m.poll?.question ?? m.content;
   if (m.attachment) return m.attachment.file_name;
   return m.content;
+}
+
+/**
+ * 「重新编辑」暂存的正文：附件消息没有用户配文，content 是服务端占位
+ * （[图片] / [语音] / [文件] <名>，见 server send.rs），回填只能是空串——
+ * 原件由「复用附件」chip 恢复。
+ */
+export function reeditTextFor(m: MessageView): string {
+  return m.attachment ? "" : m.content;
 }
