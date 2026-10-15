@@ -1,3 +1,9 @@
+/// 撤回附件默认保留期：上传者取回/重发窗口（秒）。单一 TTL 同时约束
+/// GET /files/{id}/recalled、reuse_attachment_id 重发校验与后台清扫。
+pub const DEFAULT_RECALL_ATTACHMENT_TTL_SECS: u64 = 86400;
+/// 撤回附件默认清扫周期（秒）。
+pub const DEFAULT_RECALL_SWEEP_INTERVAL_SECS: u64 = 3600;
+
 #[derive(Clone)]
 pub struct Config {
     pub database_url: String,
@@ -10,6 +16,11 @@ pub struct Config {
     /// 服务端挂在反向代理后面：限流按 X-Forwarded-For 最右一跳认客户端 IP。
     /// 不在代理后面时千万别开，否则谁都能伪造这个头绕过限流。
     pub trust_proxy: bool,
+    /// 撤回附件保留期（秒，默认 86400=1 天）：上传者取回/重发的窗口，
+    /// 过期后后台清扫删行并按引用计数删物理文件。所有判定用数据库 now()。
+    pub recall_attachment_ttl_secs: u64,
+    /// 撤回附件清扫周期（秒，默认 3600=每小时）
+    pub recall_sweep_interval_secs: u64,
 }
 
 impl Config {
@@ -35,8 +46,24 @@ impl Config {
                 std::env::var("TRUST_PROXY").as_deref(),
                 Ok("1") | Ok("true")
             ),
+            recall_attachment_ttl_secs: env_secs(
+                "RECALL_ATTACHMENT_TTL_SECS",
+                DEFAULT_RECALL_ATTACHMENT_TTL_SECS,
+            ),
+            recall_sweep_interval_secs: env_secs(
+                "RECALL_SWEEP_INTERVAL_SECS",
+                DEFAULT_RECALL_SWEEP_INTERVAL_SECS,
+            ),
         }
     }
+}
+
+fn env_secs(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
 }
 
 /// 凭据签名密钥。缺省或太短就拒绝启动：公开的默认值等于谁都能伪造任意用户的 token。

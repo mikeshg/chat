@@ -298,6 +298,52 @@ E2E 停止（退出码 2）：未设置 E2E_ADMIN_USER，且当前库还没有�
     ok('non-member search rejected', bad.status === 403 || bad.status === 404, `got ${bad.status}`);
   }
 
+  // --- 消息撤回（MM1） ---
+  {
+    // B 发群消息，群主 A 撤回（群主可撤群内他人消息、不受 24h 限）
+    wsb.send({ type: 'send_message', conversation_id: gid, client_msg_id: 'rc1', content: '撤回我' });
+    const bsent = await wsb.waitType('message_ack', (m) => m.client_msg_id === 'rc1');
+    const rec = await api(A.access_token, 'POST', `/messages/${bsent.message.id}/recall`);
+    ok('owner recalls member msg', rec.status === 200 && rec.json?.recalled === true
+      && rec.json?.content === '消息已撤回' && rec.json?.recalled_by === A.user.id,
+      `got ${rec.status} ${JSON.stringify(rec.json)?.slice(0, 180)}`);
+    const rf = await wsa.waitType('message_deleted', (m) => m.message.id === bsent.message.id);
+    ok('message_deleted carries recall fields', rf.message.recalled === true
+      && rf.message.recalled_by === A.user.id && rf.message.recalled_by_name === 'AliceA'
+      && rf.message.recalled_attachment_id === undefined, JSON.stringify(rf.message).slice(0, 200));
+    // 发送者本人 24h 内撤回（DELETE 别名同语义；重复撤回幂等）
+    wsb.send({ type: 'send_message', conversation_id: gid, client_msg_id: 'rc2', content: '我自己撤' });
+    const bsent2 = await wsb.waitType('message_ack', (m) => m.client_msg_id === 'rc2');
+    const d = await api(B.access_token, 'DELETE', `/messages/${bsent2.message.id}`);
+    ok('sender recalls own via DELETE alias', d.status === 200 && d.json?.recalled === true
+      && d.json?.recalled_by === B.user.id, `got ${d.status}`);
+    const d2 = await api(B.access_token, 'DELETE', `/messages/${bsent2.message.id}`);
+    ok('re-recall idempotent', d2.status === 200 && d2.json?.edit_version === d.json?.edit_version,
+      `v=${d2.json?.edit_version}`);
+    // 附件撤回：公开下载封口，上传者 Bearer 取回，复用重发克隆新行
+    const fd = new FormData();
+    fd.append('conversation_id', gid);
+    fd.append('file', new Blob(['rc-bytes'], { type: 'text/plain' }), 'rc.txt');
+    const up = await fetch(`${BASE}/files`, { method: 'POST', headers: { authorization: `Bearer ${A.access_token}` }, body: fd });
+    const att = (await up.json()).id;
+    wsa.send({ type: 'send_message', conversation_id: gid, client_msg_id: 'rc3', content: '', attachment_id: att });
+    const asent = await wsa.waitType('message_ack', (m) => m.client_msg_id === 'rc3');
+    const rec3 = await api(A.access_token, 'POST', `/messages/${asent.message.id}/recall`);
+    ok('recall response carries recalled_attachment_id for uploader', rec3.status === 200
+      && rec3.json?.recalled_attachment_id === att, `got ${rec3.status} ${JSON.stringify(rec3.json)?.slice(0, 180)}`);
+    const gone = await fetch(`${BASE}/files/${att}`);
+    ok('recalled attachment hidden (404)', gone.status === 404);
+    const back = await fetch(`${BASE}/files/${att}/recalled`, { headers: { authorization: `Bearer ${A.access_token}` } });
+    ok('uploader fetches recalled blob', back.status === 200 && (await back.text()) === 'rc-bytes'
+      && (back.headers.get('cache-control') || '').includes('no-store'), `got ${back.status}`);
+    wsa.send({ type: 'send_message', conversation_id: gid, client_msg_id: 'rc4', content: '', reuse_attachment_id: att });
+    const resent = await wsa.waitType('message_ack', (m) => m.client_msg_id === 'rc4');
+    const newAtt = resent.message?.attachment?.id;
+    ok('reuse_attachment_id resends clone', !!newAtt && newAtt !== att, JSON.stringify(resent.message?.attachment));
+    const dl = await fetch(`${BASE}/files/${newAtt}`);
+    ok('reused attachment downloads', dl.status === 200 && (await dl.text()) === 'rc-bytes');
+  }
+
   // --- 离线补发 ---
   wsb.close();
   await new Promise((r) => setTimeout(r, 300));

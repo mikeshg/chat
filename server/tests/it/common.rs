@@ -58,6 +58,8 @@ pub(crate) async fn spawn() -> String {
             .into(),
         upload_max_bytes: 25 * 1024 * 1024,
         trust_proxy: false,
+        recall_attachment_ttl_secs: 86400,
+        recall_sweep_interval_secs: 3600,
     };
     std::fs::create_dir_all(&cfg.files_dir).unwrap();
     let state = AppState::new(pool, cfg.clone());
@@ -251,6 +253,8 @@ pub(crate) async fn spawn_named_state(db_name: &str) -> (String, chat_server::st
             .into(),
         upload_max_bytes: 25 * 1024 * 1024,
         trust_proxy: false,
+        recall_attachment_ttl_secs: 86400,
+        recall_sweep_interval_secs: 3600,
     };
     std::fs::create_dir_all(&cfg.files_dir).unwrap();
     let state = AppState::new(pool, cfg.clone());
@@ -461,6 +465,22 @@ pub(crate) async fn admin_put_settings(
         .header("authorization", authz(&admin.access))
         .json(&patch)
         .send()
+        .await
+        .unwrap()
+}
+
+/// 撤回附件清扫（测试用）：把指定行拨过保留期后跑一轮 sweep，返回删除的行数。
+/// 注意 sweep 会清掉全库所有过期行——共享库上并行测试若也拨过行，返回值可能 > ids.len()，
+/// 故断言用 >= 并配合逐行存在性检查。
+pub(crate) async fn sweep_recalled(pool: &sqlx::PgPool, files_dir: &str, ids: &[uuid::Uuid]) -> u64 {
+    sqlx::query(
+        "UPDATE attachments SET recalled_at = now() - interval '2 days' WHERE id = ANY($1)",
+    )
+    .bind(ids)
+    .execute(pool)
+    .await
+    .unwrap();
+    chat_server::domain::sweep_recalled_attachments(pool, files_dir, Dur::from_secs(86400))
         .await
         .unwrap()
 }

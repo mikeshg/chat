@@ -95,6 +95,8 @@ export interface ReplyPreview {
   excerpt: string;
   kind: string;
   deleted: boolean;
+  /** 撤回者展示名（仅服务端 0039+ 的墓碑预览携带） */
+  recalled_by_name?: string | null;
 }
 
 /** 单 emoji 聚合；reacted_by_me 是服务端按当前用户个性化输出的 */
@@ -168,6 +170,14 @@ export interface MessageView {
   sender_has_avatar?: boolean;
   /** 转发消息：原发送者展示名 */
   forwarded_from?: string | null;
+  /** 是否已撤回（= deleted_at 非空；服务端 0039+ 携带） */
+  recalled?: boolean;
+  /** 撤回发起者 id（本人或群主）；历史墓碑无 deleted_by 时为 null */
+  recalled_by?: string | null;
+  /** 撤回者展示名 */
+  recalled_by_name?: string | null;
+  /** 仅撤回发起的 REST 响应携带、且仅附件上传者可见：用于取回/重发 */
+  recalled_attachment_id?: string | null;
   /** 仅客户端：乐观消息被服务端永久拒绝的原因（显示失败气泡，可重试/删除） */
   send_error?: string;
 }

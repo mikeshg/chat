@@ -80,8 +80,27 @@ pub async fn run() {
         .await
         .expect("migrations failed");
 
-    let state = AppState::new(pool, cfg.clone());
+    let state = AppState::new(pool.clone(), cfg.clone());
     let app = build_router(state, &cfg);
+
+    // 撤回附件定时清扫（默认每小时）：过保留期的附件行删除、无引用的物理文件清掉。
+    // 首轮立即执行——停机期间过期的行不该等到下一个整点。
+    {
+        let files_dir = cfg.files_dir.clone();
+        let ttl = std::time::Duration::from_secs(cfg.recall_attachment_ttl_secs);
+        let every = std::time::Duration::from_secs(cfg.recall_sweep_interval_secs);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            loop {
+                tick.tick().await;
+                match domain::sweep_recalled_attachments(&pool, &files_dir, ttl).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(swept = n, "recalled attachments swept"),
+                    Err(e) => tracing::error!(error = %e, "recalled attachment sweep failed"),
+                }
+            }
+        });
+    }
 
     let addr: SocketAddr = format!("{}:{}", cfg.bind, cfg.port).parse().unwrap();
     let listener = tokio::net::TcpListener::bind(addr)

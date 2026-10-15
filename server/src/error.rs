@@ -17,6 +17,13 @@ pub enum AppError {
     PayloadTooLarge(String),
     /// 上游服务（如 ntfy）不可达/拒绝——推送测试端点用
     BadGateway(String),
+    /// 带稳定机器码的错误：响应体多一个 "code" 字段，客户端按码分支
+    /// （如撤回超时 recall_expired / 附件过期 attachment_expired）。旧客户端只读 error。
+    Coded {
+        status: StatusCode,
+        code: &'static str,
+        message: String,
+    },
     Internal(String),
 }
 
@@ -45,6 +52,14 @@ impl AppError {
     pub fn bad_gateway(m: impl Into<String>) -> Self {
         Self::BadGateway(m.into())
     }
+    /// 带稳定机器码的领域错误（HTTP 状态 + JSON {error, code}）
+    pub fn coded(status: StatusCode, code: &'static str, m: impl Into<String>) -> Self {
+        Self::Coded {
+            status,
+            code,
+            message: m.into(),
+        }
+    }
 }
 
 impl IntoResponse for AppError {
@@ -57,6 +72,14 @@ impl IntoResponse for AppError {
             Self::Conflict(m) => (StatusCode::CONFLICT, m),
             Self::PayloadTooLarge(m) => (StatusCode::PAYLOAD_TOO_LARGE, m),
             Self::BadGateway(m) => (StatusCode::BAD_GATEWAY, m),
+            Self::Coded {
+                status,
+                code,
+                message,
+            } => {
+                return (status, Json(json!({ "error": message, "code": code })))
+                    .into_response();
+            }
             Self::Internal(m) => {
                 tracing::error!(error = %m, "internal error");
                 (

@@ -308,7 +308,7 @@ async fn lifecycle_delete() {
     assert_eq!(r.status(), 200);
     let tomb: Value = r.json().await.unwrap();
     assert_eq!(tomb["id"], m2_id);
-    assert_eq!(tomb["content"], "消息已删除");
+    assert_eq!(tomb["content"], "消息已撤回");
     assert!(tomb["deleted_at"].is_string());
     assert!(tomb["edit_version"].as_i64().unwrap() >= 1);
     let dl = c
@@ -347,7 +347,7 @@ async fn lifecycle_delete() {
         .iter()
         .find(|m| m["id"] == Value::from(m1_id))
         .unwrap();
-    assert_eq!(t1["content"], "消息已删除");
+    assert_eq!(t1["content"], "消息已撤回");
     assert!(t1["deleted_at"].is_string());
     assert_eq!(t1["seq"].as_i64().unwrap(), 1);
     let found: Value = c
@@ -597,7 +597,7 @@ async fn lifecycle_ws_frames() {
     let del_b = next_of(&mut sb, "message_deleted").await;
     assert_eq!(del_a["message"]["id"], mid);
     assert_eq!(del_b["message"]["id"], mid);
-    assert_eq!(del_a["message"]["content"], "消息已删除");
+    assert_eq!(del_a["message"]["content"], "消息已撤回");
     assert_eq!(del_a["message"]["seq"].as_i64().unwrap(), 1);
     assert!(del_a["message"]["deleted_at"].is_string());
     assert!(del_a["edit_version"].as_i64().unwrap() >= 2);
@@ -673,7 +673,7 @@ async fn lifecycle_frames_carry_full_view() {
     assert_eq!(m3["edit_version"].as_i64().unwrap(), 3);
     assert_eq!(m3["id"], mid);
     assert_eq!(m3["seq"].as_i64().unwrap(), 1);
-    assert_eq!(m3["content"], "消息已删除");
+    assert_eq!(m3["content"], "消息已撤回");
     assert!(m3["deleted_at"].is_string());
     assert_eq!(m3["reactions"].as_array().unwrap().len(), 0);
 }

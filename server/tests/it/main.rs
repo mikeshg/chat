@@ -27,6 +27,7 @@ mod invites;
 mod messages;
 mod polls;
 mod push;
+mod recall;
 mod regressions;
 mod search;
 mod sessions;

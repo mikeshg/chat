@@ -221,6 +221,9 @@ pub struct MsgViewRow {
     pub sender_avatar_version: i32,
     pub sender_has_avatar: bool,
     pub forwarded_from: Option<String>,
+    // 撤回（0039）：撤回者 id 与展示名（deleted_by 的 JOIN 展开）
+    pub recalled_by: Option<Uuid>,
+    pub recalled_by_name: Option<String>,
 }
 
 impl MsgViewRow {
@@ -266,6 +269,11 @@ impl MsgViewRow {
             sender_avatar_version: self.sender_avatar_version,
             sender_has_avatar: self.sender_has_avatar,
             forwarded_from: self.forwarded_from,
+            recalled: self.deleted_at.is_some(),
+            recalled_by: self.recalled_by,
+            recalled_by_name: self.recalled_by_name,
+            // 只有 REST 撤回响应的上传者视角才填；普通视图/广播恒 None
+            recalled_attachment_id: None,
         }
     }
 }
@@ -341,7 +349,7 @@ fn like_escape(s: &str) -> String {
 }
 
 /// 会话内搜索（V2 P3-1 改为两阶段）：先在 messages 表取候选 id
-/// （deleted_at IS NULL 排除墓碑——搜「消息已删除」不再命中占位文本；
+/// （deleted_at IS NULL 排除墓碑——搜「消息已撤回」不再命中占位文本；
 /// 正文上的 trgm 部分索引可用），再按 id 回读 message_views 组装视图。
 pub async fn search_messages(
     pool: &PgPool,

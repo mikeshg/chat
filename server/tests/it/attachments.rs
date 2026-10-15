@@ -8,17 +8,6 @@ fn it_files_dir() -> std::path::PathBuf {
     std::env::temp_dir().join("chat-it-files")
 }
 
-/// 物理清理由 tokio::spawn 异步执行：轮询文件存在性直到达到期望状态
-async fn wait_file(path: &std::path::Path, exists: bool) {
-    for _ in 0..50 {
-        if path.exists() == exists {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    panic!("file state not reached: {}", path.display());
-}
-
 /// 复制一行 attachments（新 id，共享 storage_path/thumb_path），模拟 P2-4 转发副本
 async fn copy_attachment(pool: &sqlx::PgPool, src_id: &str) -> String {
     let copy_id = uuid::Uuid::new_v4();
@@ -221,7 +210,8 @@ async fn p2_1_small_and_broken_image() {
     assert_eq!(att["has_thumb"], false);
 }
 
-/// 删除消息：原文件与缩略图一起清理；仍有副本共享 storage_path 时两者都保留
+/// 撤回消息：附件行保留并隐藏（公开下载 404），物理文件由过期清扫按引用计数删——
+/// 仍有副本共享 storage_path 时原图与缩略图都保留
 #[tokio::test]
 async fn p2_1_delete_cleans_thumb() {
     let base = spawn().await;
@@ -263,10 +253,24 @@ async fn p2_1_delete_cleans_thumb() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
-    wait_file(&file, false).await;
-    wait_file(&thumb, false).await;
+    // 撤回不再删文件：公开下载立即 404，物理文件与缩略图保留（待过期清扫）
+    let dl = c
+        .get(format!("{base}/v1/files/{id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dl.status(), 404);
+    assert!(file.exists());
+    assert!(thumb.exists());
 
-    // 共享 storage_path 的副本（模拟转发）存在时，删除一条不清理物理文件
+    // 拨过保留期后清扫：独立 storage_path 的原图与缩略图一起删
+    let pool = PgPoolOptions::new().connect(&test_db_url()).await.unwrap();
+    let att_uuid = uuid::Uuid::parse_str(id).unwrap();
+    assert!(sweep_recalled(&pool, it_files_dir().to_str().unwrap(), &[att_uuid]).await >= 1);
+    assert!(!file.exists());
+    assert!(!thumb.exists());
+
+    // 共享 storage_path 的副本（模拟转发）存在时，撤回一条不清理物理文件
     let (_, att2) = upload_att(
         &base,
         &conv,
@@ -301,8 +305,11 @@ async fn p2_1_delete_cleans_thumb() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
-    // 清理是异步的；等一个足够窗口后两文件都应仍在（副本引用计数兜底）
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // 撤回行过期清扫：副本行仍引用同一 storage_path，物理文件保留
+    let id2_uuid = uuid::Uuid::parse_str(id2).unwrap();
+    assert!(
+        sweep_recalled(&pool, it_files_dir().to_str().unwrap(), &[id2_uuid]).await >= 1
+    );
     assert!(file2.exists());
     assert!(thumb2.exists());
 
@@ -313,8 +320,13 @@ async fn p2_1_delete_cleans_thumb() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
-    wait_file(&file2, false).await;
-    wait_file(&thumb2, false).await;
+    // 最后一个引用过期：原图与缩略图一起删
+    let copy_uuid = uuid::Uuid::parse_str(&copy).unwrap();
+    assert!(
+        sweep_recalled(&pool, it_files_dir().to_str().unwrap(), &[copy_uuid]).await >= 1
+    );
+    assert!(!file2.exists());
+    assert!(!thumb2.exists());
 }
 
 /// 配额：1MB 上限 → 600KB 成功、再 600KB 拒绝；共享行不重复计；0 恢复不限

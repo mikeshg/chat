@@ -85,9 +85,18 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
         include_str!("../migrations/0033_agent_workspaces.sql"),
         include_str!("../migrations/0034_agent_scratch_workspace.sql"),
         include_str!("../migrations/0035_drop_agents.sql"),
+        include_str!("../migrations/0036_bots.sql"),
+        include_str!("../migrations/0037_bot_tokens.sql"),
+        include_str!("../migrations/0038_push_devices.sql"),
+        include_str!("../migrations/0039_message_recall.sql"),
     ] {
         sqlx::raw_sql(script).execute(&pool).await.unwrap();
     }
+    // 0039 起发送者撤回限 24h（库 now() 判定）：把夹具消息拨到当下使其可撤回
+    sqlx::query("UPDATE messages SET created_at = now()")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let references = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
         "SELECT id,attachment_id FROM messages ORDER BY seq",
@@ -123,21 +132,86 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
             .unwrap();
     assert_eq!(visible, 3);
 
+    // 0039 撤回语义：附件行不删，标 recalled_at 并在读模型掩去；物理文件由清扫按引用计数删
+    let att_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT attachment_id FROM messages ORDER BY seq",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(att_ids.len(), 3);
+    let files_dir =
+        std::env::temp_dir().join(format!("chat-migration-files-{}", Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&files_dir).unwrap();
+    std::fs::write(files_dir.join("migration-shared-path"), b"shared").unwrap();
+
     for (index, id) in ids.iter().enumerate() {
-        let deleted = domain::delete_message(&pool, *id, user).await.unwrap();
-        if index < 2 {
-            assert!(deleted.orphan_files.is_empty());
-            let remaining = sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM message_views WHERE att_id IS NOT NULL",
-            )
+        let recalled = domain::recall_message(&pool, *id, user, 86400)
+            .await
+            .unwrap();
+        // 发起者是上传者 → REST 响应带撤回附件 id
+        assert_eq!(recalled.recalled_attachment_id, Some(att_ids[index]));
+        let remaining = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM message_views WHERE att_id IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 2 - index as i64);
+    }
+    let marked = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM attachments WHERE recalled_at IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(marked, 3, "撤回只打 recalled_at，不删附件行");
+
+    // 前两行先过期清扫：行删、messages 引用摘掉，但物理文件被第三行引用而保留
+    sqlx::query(
+        "UPDATE attachments SET recalled_at = now() - interval '2 days' WHERE id = ANY($1)",
+    )
+    .bind(&att_ids[..2])
+    .execute(&pool)
+    .await
+    .unwrap();
+    let n = domain::sweep_recalled_attachments(
+        &pool,
+        files_dir.to_str().unwrap(),
+        std::time::Duration::from_secs(86400),
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 2);
+    assert!(
+        files_dir.join("migration-shared-path").exists(),
+        "仍有行引用 storage_path 时文件不得删除"
+    );
+
+    // 第三行过期：最后一个引用消失，物理文件删除
+    sqlx::query(
+        "UPDATE attachments SET recalled_at = now() - interval '2 days' WHERE id = $1",
+    )
+    .bind(att_ids[2])
+    .execute(&pool)
+    .await
+    .unwrap();
+    let n = domain::sweep_recalled_attachments(
+        &pool,
+        files_dir.to_str().unwrap(),
+        std::time::Duration::from_secs(86400),
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 1);
+    assert!(!files_dir.join("migration-shared-path").exists());
+    let dangling =
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM messages WHERE attachment_id IS NOT NULL")
             .fetch_one(&pool)
             .await
             .unwrap();
-            assert_eq!(remaining, 2 - index as i64);
-        } else {
-            assert_eq!(deleted.orphan_files, vec!["migration-shared-path"]);
-        }
-    }
+    assert_eq!(dangling, 0, "清扫后消息上的附件引用必须置空");
+    std::fs::remove_dir_all(&files_dir).unwrap();
     // 0035 把 Agent 的表、列和设置全部拿掉
     let leftovers = sqlx::query_scalar::<_, i64>(
         "SELECT (SELECT count(*) FROM information_schema.tables WHERE table_name LIKE 'agent%')

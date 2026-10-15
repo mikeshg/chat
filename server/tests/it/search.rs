@@ -105,7 +105,7 @@ async fn p31_search_global_scope_and_tombstone() {
     );
 
     // 2) 搜墓碑占位文字不命中已删除消息
-    let (st, page) = gsearch(&base, &a.access, &[("q", "消息已删除".into())]).await;
+    let (st, page) = gsearch(&base, &a.access, &[("q", "消息已撤回".into())]).await;
     assert_eq!(st, 200);
     assert!(gids(&page).is_empty(), "tombstone must not match");
 

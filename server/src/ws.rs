@@ -228,9 +228,9 @@ pub async fn broadcast_message_updated(st: &SharedState, ed: &domain::Edited) {
     }
 }
 
-/// 软删除广播：完整墓碑视图逐成员成帧（删除后 reactions 已清空，各成员等价，
-/// 但统一走 into_view 保持协议形状一致）。
-pub fn broadcast_message_deleted(st: &SharedState, d: &domain::Deleted) {
+/// 撤回广播：完整墓碑视图逐成员成帧（撤回后 reactions 已清空，各成员等价，
+/// 但统一走 into_view 保持协议形状一致）。帧类型保持 message_deleted，旧客户端无感。
+pub fn broadcast_message_deleted(st: &SharedState, d: &domain::Recalled) {
     for m in &d.member_ids {
         let view = d.row.clone().into_view(*m);
         st.send_to_user(
@@ -338,6 +338,7 @@ async fn on_text(
             client_msg_id,
             content,
             attachment_id,
+            reuse_attachment_id,
             reply_to_id,
             ..
         }) => {
@@ -349,6 +350,7 @@ async fn on_text(
                 client_msg_id.clone(),
                 &content,
                 attachment_id,
+                reuse_attachment_id,
                 reply_to_id,
             )
             .await;
@@ -379,6 +381,7 @@ async fn on_text(
 
 type WsResult = Result<(), (&'static str, String)>;
 
+#[allow(clippy::too_many_arguments)]
 async fn send_message(
     st: &SharedState,
     uid: Uuid,
@@ -387,6 +390,7 @@ async fn send_message(
     client_msg_id: Option<String>,
     content: &str,
     attachment_id: Option<Uuid>,
+    reuse_attachment_id: Option<Uuid>,
     reply_to_id: Option<Uuid>,
 ) -> WsResult {
     // 投票、转发字段保持 text() 的空值：用户 WS 不能伪造这些负载
@@ -395,6 +399,8 @@ async fn send_message(
         domain::PostMessage {
             client_msg_id: client_msg_id.as_deref(),
             attachment_id,
+            reuse_attachment_id,
+            recall_attachment_ttl_secs: st.cfg.recall_attachment_ttl_secs,
             reply_to_id,
             ..domain::PostMessage::text(conv, uid, content)
         },

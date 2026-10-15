@@ -171,19 +171,27 @@ pub(super) async fn edit_message(
     Ok(Json(ed.row.into_view(uid)))
 }
 
-/// 软删除：本人/群主权限在领域层锁内判定；重复删除幂等。
-/// client_op_id 仅作幂等契约参数（删除本身已状态幂等）。
-/// 返回发起者视角的完整墓碑视图（与 message_deleted 广播同形），发起端立即合并。
-pub(super) async fn delete_message(
+/// 撤回消息（原软删除通道改名，语义收紧）：
+/// POST /messages/{id}/recall 与旧 DELETE /messages/{id} 共用本处理——旧客户端无感。
+/// 权限在领域层锁内判定：发送者限 24h（超时 recall_expired）、群主可撤群内他人消息；
+/// 重复撤回幂等。client_op_id 仅作契约参数（撤回本身已状态幂等）。
+/// 返回发起者视角的完整墓碑视图（与 message_deleted 广播同形），发起端立即合并；
+/// 仅当发起者是被撤附件的上传者时，响应多带 recalled_attachment_id（取回/重发用）。
+pub(super) async fn recall_message(
     State(st): State<SharedState>,
     headers: HeaderMap,
     Path(message_id): Path<Uuid>,
     Query(_q): Query<ClientOpQuery>,
 ) -> AppResult<Json<MessageView>> {
     let uid = uid_of(&headers, &st).await?;
-    let d = domain::delete_message(&st.pool, message_id, uid)
-        .await
-        .map_err(post_err)?;
+    let d = domain::recall_message(
+        &st.pool,
+        message_id,
+        uid,
+        st.cfg.recall_attachment_ttl_secs,
+    )
+    .await
+    .map_err(post_err)?;
     ws::broadcast_message_deleted(&st, &d);
     if d.pins_dropped {
         notify_pins(
@@ -195,8 +203,10 @@ pub(super) async fn delete_message(
             },
         );
     }
-    spawn_file_cleanup(&st, d.orphan_files);
-    Ok(Json(d.row.into_view(uid)))
+    // 附件不删：置 recalled_at 隐藏公开下载，物理文件由后台清扫按引用计数处理。
+    let mut view = d.row.into_view(uid);
+    view.recalled_attachment_id = d.recalled_attachment_id;
+    Ok(Json(view))
 }
 
 pub(super) async fn reaction_write(

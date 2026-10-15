@@ -18,6 +18,12 @@ pub struct PostMessage<'a> {
     /// 转发专用「已校验附件」：源消息上的 attachment id，事务内在目标会话克隆一行。
     /// 与 attachment_id 互斥——attachment_id 仍要求 uploader=发送者，此路径不可达普通发送。
     pub forward_attachment: Option<Uuid>,
+    /// 撤回附件重发（reuse_attachment_id）：引用发送者自己已撤回消息上的附件行，
+    /// 事务内校验归属/撤回期/会话后克隆出新行（与 attachment_id 互斥）。
+    pub reuse_attachment_id: Option<Uuid>,
+    /// 撤回附件保留期（秒）：reuse 校验用它判定 recalled_at 是否过期。
+    /// WS 发送路径从 Config 注入；构造器默认取 config 模块的公共缺省。
+    pub recall_attachment_ttl_secs: u64,
 }
 
 impl<'a> PostMessage<'a> {
@@ -34,6 +40,8 @@ impl<'a> PostMessage<'a> {
             poll: None,
             forwarded_from: None,
             forward_attachment: None,
+            reuse_attachment_id: None,
+            recall_attachment_ttl_secs: crate::config::DEFAULT_RECALL_ATTACHMENT_TTL_SECS,
         }
     }
 }
@@ -178,7 +186,7 @@ pub(super) async fn write_message(
                 PostError::deny("bad_request", "polls are only supported in groups").into(),
             );
         }
-        if msg.attachment_id.is_some() {
+        if msg.attachment_id.is_some() || msg.reuse_attachment_id.is_some() {
             return Err(PostError::deny("bad_request", "poll cannot carry attachments").into());
         }
         if let Some(exp) = spec.expires_at {
@@ -196,10 +204,30 @@ pub(super) async fn write_message(
         }
     }
 
+    if msg.attachment_id.is_some() && msg.reuse_attachment_id.is_some() {
+        return Err(PostError::deny(
+            "bad_request",
+            "attachment_id and reuse_attachment_id are mutually exclusive",
+        )
+        .into());
+    }
     let attachment = match msg.forward_attachment {
         // 转发路径：调用方已校验源消息可读；在目标会话克隆附件行（共享物理文件）
         Some(src) => clone_attachment(tx, src, msg.conversation_id).await?,
-        None => load_attachment(tx, msg).await?,
+        None => match msg.reuse_attachment_id {
+            // 撤回附件重发：锁内校验归属/保留期/会话后克隆新行
+            Some(src) => {
+                reuse_recalled_attachment(
+                    tx,
+                    src,
+                    msg.sender_id,
+                    msg.conversation_id,
+                    msg.recall_attachment_ttl_secs,
+                )
+                .await?
+            }
+            None => load_attachment(tx, msg).await?,
+        },
     };
     let (content, kind) = match &msg.poll {
         // 旧客户端 fallback：content 里始终有 '[投票] 问题' 可读文本
@@ -335,7 +363,7 @@ pub(super) async fn load_attachment(
     >(
         "SELECT id, file_name, mime, size, conv_id, width, height, thumb_path IS NOT NULL, duration_ms
            FROM attachments
-          WHERE id = $1 AND uploader_id = $2
+          WHERE id = $1 AND uploader_id = $2 AND recalled_at IS NULL
           FOR UPDATE",
     )
     .bind(att_id)
@@ -369,6 +397,51 @@ pub(super) async fn load_attachment(
         has_thumb: row.7,
         duration_ms: row.8,
     }))
+}
+
+/// 撤回附件重发复用（write_message 事务内调用，client_msg_id 幂等判定之后）：
+/// - FOR SHARE 锁源行后复查：行不存在/已被清扫 → attachment_expired；
+///   uploader ≠ 发送者 → forbidden；recalled_at 为空或已过期 → attachment_expired；
+/// - 目标会话由 reuse_conv_allowed 判定（当前仅同源会话），通过后 clone_attachment
+///   生成新行（recalled_at NULL，不再进清扫集）；TTL 内同一源可重复利用多次。
+///
+/// 新行 kind/宽高/时长全部来自源行，客户端传的值不采信。
+pub(super) async fn reuse_recalled_attachment(
+    tx: &mut Transaction<'_, Postgres>,
+    src_id: Uuid,
+    sender: Uuid,
+    conv: Uuid,
+    ttl_secs: u64,
+) -> Result<Option<AttachmentView>, WriteError> {
+    let row = sqlx::query_as::<_, (Uuid, Uuid, Option<DateTime<Utc>>, bool)>(
+        "SELECT uploader_id, conv_id, recalled_at,
+                recalled_at IS NOT NULL
+                  AND recalled_at + make_interval(secs => $2) > now() AS fresh
+           FROM attachments WHERE id = $1
+          FOR SHARE",
+    )
+    .bind(src_id)
+    .bind(ttl_secs as f64)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| PostError::deny("attachment_expired", "附件已过期或不存在"))?;
+    let (uploader, src_conv, recalled_at, fresh) = row;
+    if uploader != sender {
+        return Err(PostError::deny("forbidden", "无权使用该附件").into());
+    }
+    if recalled_at.is_none() || !fresh {
+        return Err(PostError::deny("attachment_expired", "附件已过期或不存在").into());
+    }
+    if !reuse_conv_allowed(src_conv, conv) {
+        return Err(PostError::deny("forbidden", "无权在该会话使用该附件").into());
+    }
+    clone_attachment(tx, src_id, conv).await
+}
+
+/// 撤回附件允许重发到哪个会话：当前仅允许原会话（src_conv == 目标）。
+/// 有意收成独立小函数：以后要放宽（如同用户任意会话）只改这里。
+fn reuse_conv_allowed(src_conv: Uuid, target_conv: Uuid) -> bool {
+    src_conv == target_conv
 }
 
 /// 转发专用附件克隆（write_message 事务内调用）：

@@ -754,7 +754,10 @@ async fn validate_archive(st: SharedState, upload_path: PathBuf) -> AppResult<Ma
         if m.format != 1 {
             return Err(AppError::bad_request("备份格式版本不支持"));
         }
-        if m.migration_version != mv {
+        // 只允许「不比当前新」的备份：更老版本的备份可恢复——表集合仍须一致，
+        // 逐表按 CSV 表头列清单回灌，备份里缺的新列（如 attachments.recalled_at）
+        // 落默认值；更新版本生成的备份拒绝，防止降级灌库。
+        if m.migration_version > mv {
             return Err(AppError::bad_request("备份版本与当前服务端不一致"));
         }
         let mset: BTreeSet<String> = m.tables.iter().map(|t| t.name.clone()).collect();
@@ -912,9 +915,10 @@ async fn restore_db(
         if !csv.is_file() {
             return Err(AppError::internal(format!("missing csv for table {t}")));
         }
+        let cols = copy_column_list(&mut tx, t, &csv).await?;
         let mut ci = tx
             .copy_in_raw(&format!(
-                "COPY {} FROM STDIN WITH (FORMAT csv, HEADER true)",
+                "COPY {} ({cols}) FROM STDIN WITH (FORMAT csv, HEADER true)",
                 qi(t)
             ))
             .await?;
@@ -946,6 +950,45 @@ async fn restore_db(
         .execute(&mut *tx)
         .await?;
     Ok((tx, order))
+}
+
+/// 从 CSV 表头构造 COPY 列清单：按备份自身的列序灌入——老备份缺少的新列
+/// （如 0039 的 attachments.recalled_at）由库默认值/NULL 补齐。
+/// CSV 里出现当前库没有的列直接拒绝：跨版本恢复不许悄悄丢数据。
+async fn copy_column_list(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table: &str,
+    csv: &Path,
+) -> Result<String, AppError> {
+    use tokio::io::AsyncBufReadExt;
+    let f = tokio::fs::File::open(csv).await.map_err(AppError::internal)?;
+    let header = tokio::io::BufReader::new(f)
+        .lines()
+        .next_line()
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::bad_request(format!("备份表 {table} 缺少表头")))?;
+    let known: std::collections::HashSet<String> = sqlx::query_scalar::<_, String>(
+        "SELECT column_name FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = $1",
+    )
+    .bind(table)
+    .fetch_all(&mut **tx)
+    .await?
+    .into_iter()
+    .collect();
+    let mut cols = Vec::new();
+    for raw in header.trim_end_matches('\r').split(',') {
+        let c = raw.trim().trim_matches('"');
+        if c.is_empty() || !known.contains(c) {
+            return Err(AppError::bad_request(format!("备份表 {table} 含未知列 {c}")));
+        }
+        cols.push(qi(c));
+    }
+    if cols.is_empty() {
+        return Err(AppError::bad_request(format!("备份表 {table} 缺少表头")));
+    }
+    Ok(cols.join(", "))
 }
 
 /// regclass 文本 → 纯表名（剥掉 schema 与引号；我们的对象名都是简单小写标识符）

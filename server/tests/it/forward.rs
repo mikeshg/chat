@@ -325,7 +325,7 @@ async fn p24_forward_attachment_lifecycle() {
     assert_eq!(dl.status(), 200);
     assert_eq!(dl.bytes().await.unwrap().as_ref(), b"png-bytes-p24");
 
-    // 删除源消息 → 目标副本仍被引用，下载不受影响
+    // 撤回源消息 → 目标副本仍被引用，下载不受影响（撤回只藏自己的附件行）
     let r = c
         .delete(format!("{base}/v1/messages/{src}"))
         .header("authorization", authz(&a.access))
@@ -339,8 +339,17 @@ async fn p24_forward_attachment_lifecycle() {
         .await
         .unwrap();
     assert_eq!(dl.status(), 200);
+    // 源附件公开下载已 404（recalled_at 隐藏），物理文件因副本引用仍在
+    let dl = c
+        .get(format!("{base}/v1/files/{att}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dl.status(), 404);
+    let path = std::env::temp_dir().join("chat-it-files").join(&att);
+    assert!(path.exists(), "撤回保留期内物理文件不得删除");
 
-    // 删除目标副本 → 最后一个 storage_path 引用消失，物理文件清理（异步轮询）
+    // 撤回目标副本 → 两行都过期清扫后，最后一个 storage_path 引用消失，物理文件删除
     let r = c
         .delete(format!("{base}/v1/messages/{fwd_id}"))
         .header("authorization", authz(&a.access))
@@ -348,13 +357,17 @@ async fn p24_forward_attachment_lifecycle() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
-    let path = std::env::temp_dir().join("chat-it-files").join(&att);
-    for _ in 0..50 {
-        if !path.exists() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+    let pool = PgPoolOptions::new().connect(&test_db_url()).await.unwrap();
+    let swept = sweep_recalled(
+        &pool,
+        std::env::temp_dir().join("chat-it-files").to_str().unwrap(),
+        &[
+            uuid::Uuid::parse_str(&att).unwrap(),
+            uuid::Uuid::parse_str(&fwd_att).unwrap(),
+        ],
+    )
+    .await;
+    assert!(swept >= 2, "两行撤回附件都应被清扫，got {swept}");
     assert!(!path.exists(), "孤儿物理文件必须被清理");
 }
 
@@ -527,7 +540,7 @@ async fn p24_forward_rejections() {
         .to_string();
     assert!(err.contains("投票"), "{err}");
 
-    // 2) 已删除消息 → 400 消息已删除
+    // 2) 已撤回消息 → 400 消息已撤回
     let (mut sa, _) = tokio_tungstenite::connect_async(ws_url(&base, &a).await)
         .await
         .unwrap();
@@ -552,7 +565,7 @@ async fn p24_forward_rejections() {
         .as_str()
         .unwrap()
         .to_string();
-    assert!(err.contains("已删除"), "{err}");
+    assert!(err.contains("已撤回"), "{err}");
 
     // 3) 转发他人 self 会话里的消息（a 非成员）→ 403
     let (mut sb, _) = tokio_tungstenite::connect_async(ws_url(&base, &b).await)

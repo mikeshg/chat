@@ -56,7 +56,7 @@ pub async fn forward_message(
         .await
         .map_err(PostError::Db)?;
     if src.deleted_at.is_some() {
-        return Err(PostError::deny("bad_message", "消息已删除"));
+        return Err(PostError::deny("bad_message", "消息已撤回"));
     }
     if src.kind == "poll" {
         return Err(PostError::deny("bad_request", "投票不能转发"));

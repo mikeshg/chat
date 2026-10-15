@@ -166,6 +166,9 @@ pub struct ReplyPreview {
     pub excerpt: String,
     pub kind: String,
     pub deleted: bool,
+    /// 被撤回消息的撤回者展示名（渲染「X 撤回了一条消息」）；旧数据无此键 → null
+    #[serde(default)]
+    pub recalled_by_name: Option<String>,
 }
 
 /// 单个 emoji 的聚合视图；reacted_by_me 按观看者个性化，广播时逐成员计算。
@@ -233,6 +236,17 @@ pub struct MessageView {
     pub sender_has_avatar: bool,
     /// 转发消息：原发送者展示名快照
     pub forwarded_from: Option<String>,
+    /// 是否已撤回（= deleted_at 非空）。旧客户端只看 deleted_at。
+    pub recalled: bool,
+    /// 撤回发起者（= deleted_by）：本人撤回或群主撤群内消息；无 deleted_by 的历史墓碑为 null
+    pub recalled_by: Option<Uuid>,
+    /// 撤回者展示名；deleted_by 为 NULL 时为 null
+    pub recalled_by_name: Option<String>,
+    /// 仅 REST 撤回响应、且发起者是该附件上传者时携带：
+    /// 客户端凭它走 GET /files/{id}/recalled 取回或按 reuse_attachment_id 重发。
+    /// 广播帧与普通视图永为 null（不序列化）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recalled_attachment_id: Option<Uuid>,
 }
 
 /// 群公告（会话列表随 ConversationView 下发；清空时整字段为 null）。
@@ -350,6 +364,9 @@ pub enum WsIn {
         kind: Option<String>,
         #[serde(default)]
         attachment_id: Option<Uuid>,
+        /// 撤回附件重发：引用自己已撤回消息上的附件（TTL 内），服务端克隆出新行
+        #[serde(default)]
+        reuse_attachment_id: Option<Uuid>,
         /// 回复目标：必须是同会话消息
         #[serde(default)]
         reply_to_id: Option<Uuid>,
@@ -410,7 +427,8 @@ pub enum WsOut {
         message: MessageView,
         edit_version: i32,
     },
-    /// 软删除广播：携带完整墓碑视图（id/seq 保留，正文/附件/reaction 已被读模型掩去），
+    /// 撤回广播（帧名保留 message_deleted 兼容旧客户端）：携带完整墓碑视图
+    /// （id/seq 保留，正文/附件/reaction 已被读模型掩去），
     /// 与 message_updated/reaction_update 一样整视图按 (id, edit_version) 合并——
     /// 部分字段帧会因全局版本互相吞掉更新（反序交付丢正文）。
     MessageDeleted {
