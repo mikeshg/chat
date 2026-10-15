@@ -14,10 +14,13 @@ import type {
 /** 应用内新消息提示（最小通知出口；点击打开会话） */
 export interface Toast {
   id: string;
-  convId: string;
+  /** 点击后打开的会话；下载结果等非会话 toast 为空 */
+  convId?: string;
   title: string;
   text: string;
   ts: number;
+  /** MM4：下载成功 toast 点击「在文件夹中显示」（仅桌面端设置） */
+  filePath?: string;
 }
 
 export interface AppState {
@@ -345,10 +348,21 @@ export function shouldNotify(s: AppState, m: MessageView): boolean {
   return true;
 }
 
-export function pushToast(t: Omit<Toast, "id" | "ts">) {
+/** timeoutMs 传 0 = 常驻不自动消失（MM4「下载中…」在途提示，由结果 toast 接替） */
+export function pushToast(t: Omit<Toast, "id" | "ts">, opts?: { timeoutMs?: number }): string {
   const id = crypto.randomUUID();
   setState((s) => ({
     toasts: [...s.toasts.slice(-3), { ...t, id, ts: Date.now() }],
+  }));
+  const ms = opts?.timeoutMs ?? 5000;
+  if (ms > 0) setTimeout(() => dismissToast(id), ms);
+  return id;
+}
+
+/** MM4：更新已弹出的 toast（下载中 → 结果）；结果重新计 5s 消失 */
+export function updateToast(id: string, patch: Partial<Omit<Toast, "id" | "ts">>) {
+  setState((s) => ({
+    toasts: s.toasts.map((t) => (t.id === id ? { ...t, ...patch } : t)),
   }));
   setTimeout(() => dismissToast(id), 5000);
 }

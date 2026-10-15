@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { dismissToast, setState, useApp } from "../store";
+import { revealDownloaded } from "../download";
 import { openConversation, refreshCatalogs } from "../ws";
 import ConvList from "./chat/ConvList";
 import ChatView from "./chat/ChatView";
@@ -87,7 +88,7 @@ export default function ChatScreen() {
       {s.tab === "me" && <MePanel />}
       {s.tab === "admin" && s.me?.role === "admin" && <AdminPanel />}
 
-      {/* 最小应用内提示：新消息 toast，点击打开会话；静音会话已被抑制（@我除外） */}
+      {/* 最小应用内提示：新消息 toast 点击打开会话；下载完成 toast（桌面）点击在文件夹中显示 */}
       <div className="toasts" aria-live="polite">
         {s.toasts.map((t) => (
           <button
@@ -95,11 +96,12 @@ export default function ChatScreen() {
             className="toast"
             onClick={() => {
               dismissToast(t.id);
-              openConversation(t.convId);
+              if (t.filePath) void revealDownloaded(t.filePath);
+              else if (t.convId) openConversation(t.convId);
             }}
           >
             <b>{t.title}</b>
-            <span>{t.text}</span>
+            {t.text && <span>{t.text}</span>}
           </button>
         ))}
       </div>

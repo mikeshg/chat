@@ -16,6 +16,7 @@ import {
   useApp,
 } from "../../store";
 import { copyPlainText } from "../../clipboard";
+import { saveAttachment } from "../../download";
 import { unsentText, type DraftReuse } from "../../drafts";
 import {
   REEDIT_WINDOW_MS,
@@ -155,16 +156,6 @@ function kindLabel(kind: string): string {
 /** 编辑窗口 15 分钟（客户端只用于隐藏入口，服务端按库时间强制判定） */
 function withinEditWindow(m: MessageView): boolean {
   return Date.now() - new Date(m.created_at).getTime() < 15 * 60 * 1000;
-}
-
-/** 触发客户端下载（借助 Content-Disposition: attachment） */
-function downloadAttachment(a: AttachmentView) {
-  const el = document.createElement("a");
-  el.href = files.url(a.id, { dl: true });
-  el.download = a.file_name;
-  document.body.appendChild(el);
-  el.click();
-  el.remove();
 }
 
 /** MM2：菜单动作 → 图标（右键菜单、动作面板、预览工具栏共用） */
@@ -709,7 +700,7 @@ export default function ChatView() {
         setFwdMsg(m);
         break;
       case "download":
-        if (m.attachment) downloadAttachment(m.attachment);
+        if (m.attachment) void saveAttachment(m.attachment);
         break;
       case "multi":
         onEnterMultiSelect(m); // MM3 占位
@@ -1721,7 +1712,7 @@ export default function ChatView() {
                   className="pv-act"
                   data-testid="viewer-download"
                   onClick={() => {
-                    if (!isGhostClick(previewAt.current)) downloadAttachment(preview.att);
+                    if (!isGhostClick(previewAt.current)) void saveAttachment(preview.att);
                   }}
                 >
                   <DownloadIcon />

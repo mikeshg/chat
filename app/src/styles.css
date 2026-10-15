@@ -863,6 +863,7 @@ button.ctx-item:hover { background: var(--bg); }
 .cm-dl {
   flex: none; padding: 2px 8px; border-radius: 6px; border: 1px solid var(--line);
   color: var(--text); text-decoration: none; font-size: 14px;
+  background: none; cursor: pointer; font-family: inherit;
 }
 .cm-dl:hover { background: var(--bg); }
 .cm-audio { padding: 6px 4px; }
