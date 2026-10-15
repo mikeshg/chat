@@ -85,6 +85,9 @@ export interface AttachmentView {
   has_thumb?: boolean;
   /** 语音时长（毫秒）；有值即语音消息 */
   duration_ms?: number | null;
+  /** 仅客户端：撤回件复用的乐观附件。id 指向撤回保留原件，公共 /v1/files/{id}
+   * 已 404——渲染只能用「复用附件」chip 取回的 object URL，绝不走公共 URL。 */
+  recalled?: boolean;
 }
 
 /** 回复引用预览（只展开一层）；deleted=true 时 excerpt 为空，id/seq 仍可用于跳转 */

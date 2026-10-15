@@ -196,6 +196,22 @@ export function shouldOpenMenuOnClick(t: TapClick): boolean {
   return shouldOpenMenuOnTap(t);
 }
 
+/**
+ * 浮层 Esc 关闭判定（右键菜单/触屏动作面板共用，MM2 fix3）：
+ * 调用方在 document 上以「捕获阶段」挂 keydown——composer 的 Esc 处理挂在
+ * textarea 上，捕获拦截后事件不再下沉，两处逻辑不会连发。
+ * 返回 true = 已处理（已 stopPropagation + onClose）。
+ */
+export function escClose(
+  e: { key: string; stopPropagation: () => void },
+  onClose: () => void,
+): boolean {
+  if (e.key !== "Escape") return false;
+  e.stopPropagation();
+  onClose();
+  return true;
+}
+
 /** 面板/菜单/预览刚打开时的幽灵点击豁免窗：同上防御，兼容 click 可能落到新浮层项上 */
 export const GHOST_CLICK_MS = 350;
 

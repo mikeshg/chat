@@ -5,6 +5,7 @@ import {
   RECALL_WINDOW_MS,
   canRecall,
   copyTextFor,
+  escClose,
   isGhostClick,
   isTombstone,
   menuItems,
@@ -369,5 +370,31 @@ describe("引用/横幅文案与复制文本", () => {
         }),
       ),
     ).toBe("问题");
+  });
+});
+
+describe("escClose（MM2 fix3：Esc 关浮层）", () => {
+  const ev = (key: string) => {
+    const calls = { stopped: false };
+    const e = { key, stopPropagation: () => (calls.stopped = true) };
+    return { e, calls };
+  };
+
+  it("Escape → 关闭并 stopPropagation（composer 的 Esc 不再连发）", () => {
+    const { e, calls } = ev("Escape");
+    let closed = false;
+    expect(escClose(e, () => (closed = true))).toBe(true);
+    expect(closed).toBe(true);
+    expect(calls.stopped).toBe(true);
+  });
+
+  it("其他按键不动：不关闭、不拦事件", () => {
+    for (const key of ["Enter", "a", "Esc", "Escape2"]) {
+      const { e, calls } = ev(key);
+      let closed = false;
+      expect(escClose(e, () => (closed = true))).toBe(false);
+      expect(closed).toBe(false);
+      expect(calls.stopped).toBe(false);
+    }
   });
 });

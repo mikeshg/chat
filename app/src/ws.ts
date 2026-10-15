@@ -639,6 +639,10 @@ export function sendChat(
   const clientMsgId = crypto.randomUUID();
   const me = getState().me;
   if (!me) return undefined;
+  // MM2 fix3：复用发送的乐观附件打上 recalled 标——id 是撤回保留原件，
+  // 公共 /v1/files/{id} 已 404，气泡只能渲染 chip 已取回的 object URL。
+  const optimisticAtt =
+    attachment && reuse ? { ...attachment, recalled: true } : attachment;
   const optimistic: MessageView = {
     id: `client:${clientMsgId}`,
     conversation_id: convId,
@@ -648,21 +652,21 @@ export function sendChat(
     sender_name: me.display_name,
     content:
       content ||
-      (attachment
-        ? attachment.duration_ms != null
+      (optimisticAtt
+        ? optimisticAtt.duration_ms != null
           ? "[语音]"
-          : attachment.mime.startsWith("image/")
+          : optimisticAtt.mime.startsWith("image/")
             ? "[图片]"
-            : `[文件] ${attachment.file_name}`
+            : `[文件] ${optimisticAtt.file_name}`
         : ""),
-    kind: attachment
-      ? attachment.duration_ms != null
+    kind: optimisticAtt
+      ? optimisticAtt.duration_ms != null
         ? "audio"
-        : attachment.mime.startsWith("image/")
+        : optimisticAtt.mime.startsWith("image/")
           ? "image"
           : "file"
       : "text",
-    attachment: attachment ?? null,
+    attachment: optimisticAtt ?? null,
     mentions: [],
     reply_to_id: replyTo?.id ?? null,
     reply_to_preview: replyTo ? replyPreview(replyTo) : null,

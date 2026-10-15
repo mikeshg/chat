@@ -17,6 +17,11 @@ pub struct Downloaded {
     pub name: String,
 }
 
+/// Android 插件句柄的受管状态。包一层 newtype：裸 PluginHandle<R> 是泛型，
+/// 别的插件若也 manage 同型会撞 state（try_state 只能按类型存取）。
+#[cfg(target_os = "android")]
+struct DownloadHandle<R: tauri::Runtime>(tauri::plugin::PluginHandle<R>);
+
 /// Tauri 插件壳：仅在 Android 上注册 Kotlin DownloadPlugin（com.chat.app.DownloadPlugin），
 /// 桌面平台没有原生侧，setup 空转。
 pub fn init<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
@@ -25,7 +30,7 @@ pub fn init<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
             #[cfg(target_os = "android")]
             {
                 let handle = api.register_android_plugin("com.chat.app", "DownloadPlugin")?;
-                app.manage(handle);
+                app.manage(DownloadHandle(handle));
             }
             #[cfg(not(target_os = "android"))]
             let _ = (app, api);
@@ -162,11 +167,12 @@ async fn platform_download(
     url: &url::Url,
     name: &str,
 ) -> Result<Downloaded, String> {
-    use tauri::plugin::{mobile::PluginInvokeError, PluginHandle};
+    use tauri::plugin::mobile::PluginInvokeError;
     let handle = app
-        .try_state::<PluginHandle<tauri::Wry>>()
+        .try_state::<DownloadHandle<tauri::Wry>>()
         .ok_or_else(|| "下载组件未就绪".to_string())?;
     handle
+        .0
         .run_mobile_plugin_async::<Downloaded>(
             "download",
             serde_json::json!({ "url": url.as_str(), "fileName": name }),
@@ -236,18 +242,23 @@ mod imp {
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
     const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+    /// XDG_DOWNLOAD_DIR 可能指向根本不存在的目录（下载会报 No such file or
+    /// directory）——无论系统返回还是 home 回退，拿到路径先补建。
+    pub(super) fn ensure_dir(dir: PathBuf) -> Result<PathBuf, String> {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("保存失败：{e}"))?;
+        Ok(dir)
+    }
+
     /// 下载目录（C7）：系统 Downloads；拿不到退回 ~/Downloads（没有就建）
     pub(super) fn downloads_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         if let Ok(d) = app.path().download_dir() {
-            return Ok(d);
+            return ensure_dir(d);
         }
         let home = app
             .path()
             .home_dir()
             .map_err(|e| format!("无法确定下载目录：{e}"))?;
-        let dir = home.join("Downloads");
-        std::fs::create_dir_all(&dir).map_err(|e| format!("保存失败：{e}"))?;
-        Ok(dir)
+        ensure_dir(home.join("Downloads"))
     }
 
     fn client() -> Result<reqwest::Client, String> {
@@ -553,6 +564,18 @@ mod tests {
             let err = imp::download_to_dir(&url, &dir, "a.bin").await.unwrap_err();
             assert!(!err.is_empty());
             assert!(entries(&dir).is_empty(), ".part 必须被清理");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        // ---------- 下载目录补建（fix3） ----------
+        #[test]
+        fn ensure_dir_creates_missing_dir() {
+            // XDG_DOWNLOAD_DIR 返回了不存在的路径：必须就地建好而不是直接失败
+            let dir = tmp_dir("ensure").join("XDG-Downloads");
+            assert!(!dir.exists());
+            let got = imp::ensure_dir(dir.clone()).unwrap();
+            assert_eq!(got, dir);
+            assert!(dir.is_dir());
             std::fs::remove_dir_all(&dir).ok();
         }
     }

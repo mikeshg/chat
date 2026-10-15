@@ -47,13 +47,14 @@ import { meetingMessage } from "./meeting";
 import PinnedBar from "./PinnedBar";
 import NewPollModal from "./NewPollModal";
 import PollCard from "./PollCard";
-import { imageBubbleSize } from "../mediaFormat";
+import { attImgSrc, imageBubbleSize } from "../mediaFormat";
 import Avatar from "../Avatar";
 import VoiceRecorder from "./VoiceRecorder";
 import { FEATURE_HOVER_TOOLBAR } from "./features";
 import {
   canRecall,
   copyTextFor,
+  escClose,
   isGhostClick,
   isTombstone,
   menuItems,
@@ -225,8 +226,11 @@ export default function ChatView() {
   const [msgMenu, setMsgMenu] = useState<{ x: number; y: number; m: MessageView } | null>(null);
   const [sheet, setSheet] = useState<{ m: MessageView } | null>(null);
   // MM2：撤回后「重新编辑」暂存条目；复用附件 chip 的缩略图 objectURL
+  // （按撤回附件 id 建表：chip 与复用发送的在飞乐观气泡共用，谁都不用了才回收）
   const [reedits, setReedits] = useState<ReeditEntry[]>([]);
-  const [reuseUrl, setReuseUrl] = useState<{ id: string; url: string } | null>(null);
+  const [reuseUrls, setReuseUrls] = useState<Record<string, string>>({});
+  const reuseUrlsRef = useRef<Record<string, string>>({});
+  reuseUrlsRef.current = reuseUrls;
   // 轻量操作反馈（已复制/撤回提示等），自动消失
   const [hint, setHint] = useState<string | null>(null);
   const hintTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -372,35 +376,69 @@ export default function ChatView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [msgs]);
 
-  // MM2：复用 chip 的缩略图走鉴权的 /recalled → objectURL；卸载/换件时回收
+  // Esc 关闭触屏动作面板（MM2 fix3）：捕获阶段拦截，composer 的 Esc 不再连发；
+  // 右键菜单同款逻辑在 CtxMenu 内部。
+  useEffect(() => {
+    if (!sheet) return;
+    const onKey = (e: KeyboardEvent) => escClose(e, () => setSheet(null));
+    document.addEventListener("keydown", onKey, true);
+    return () => document.removeEventListener("keydown", onKey, true);
+  }, [sheet]);
+
+  // MM2：复用 chip 的缩略图走鉴权的 /recalled → objectURL，存进 reuseUrls 表。
+  // 只取图片 kind：file 的 ?thumb=1 回退原件全文（白拉一个大 blob，chip 也用不上）。
   const reuse = conv ? s.drafts[conv.id]?.reuse : undefined;
   const reuseId = reuse?.attachment_id ?? null;
   useEffect(() => {
-    if (!reuse || reuse.expired || !reuseId || !serverSupportsRecall()) {
-      setReuseUrl(null);
+    if (!reuse || reuse.expired || !reuseId || reuse.kind !== "image" || !serverSupportsRecall()) {
       return;
     }
     let alive = true;
-    let url: string | null = null;
     files
       .recalledUrl(reuseId, { thumb: true })
       .then((u) => {
-        if (alive) {
-          url = u;
-          setReuseUrl({ id: reuseId, url: u });
-        } else URL.revokeObjectURL(u);
+        if (alive) setReuseUrls((m) => (m[reuseId] ? m : { ...m, [reuseId]: u }));
+        else URL.revokeObjectURL(u);
       })
       .catch(() => {
         // 过期/被删：chip 标「附件已过期」，不再重试
-        if (alive) setReuseUrl(null);
-        setDraftReuse(conv!.id, { ...reuse, expired: true });
+        if (alive) setDraftReuse(conv!.id, { ...reuse, expired: true });
       });
     return () => {
       alive = false;
-      if (url) URL.revokeObjectURL(url);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reuseId, reuse?.expired]);
+
+  // objectURL 回收：仅当「未过期 chip」与「引用它的在飞乐观气泡」都不存在时
+  // 才 revoke（chip 可能在复用发送在途时被摘掉，URL 要给气泡续命到 ack/拒收）。
+  // 组件卸载时无条件全收。
+  useEffect(() => {
+    const inUse = new Set<string>();
+    for (const d of Object.values(s.drafts)) {
+      if (d.reuse && !d.reuse.expired) inUse.add(d.reuse.attachment_id);
+    }
+    for (const list of Object.values(s.messages)) {
+      for (const m of list) {
+        const a = m.attachment;
+        if (a?.recalled && m.id.startsWith("client:")) inUse.add(a.id);
+      }
+    }
+    setReuseUrls((cur) => {
+      const dead = Object.keys(cur).filter((id) => !inUse.has(id));
+      if (dead.length === 0) return cur;
+      for (const id of dead) URL.revokeObjectURL(cur[id]);
+      const next = { ...cur };
+      for (const id of dead) delete next[id];
+      return next;
+    });
+  }, [s.drafts, s.messages]);
+  useEffect(
+    () => () => {
+      for (const u of Object.values(reuseUrlsRef.current)) URL.revokeObjectURL(u);
+    },
+    [],
+  );
 
   useEffect(() => {
     let alive = true;
@@ -1085,7 +1123,8 @@ export default function ChatView() {
     previewAt.current = { at: Date.now(), touch: lastPointer.current.type === "touch" };
     setPreview({ att, m: m ?? null });
     setPreviewText(null);
-    if (isTextLike(att)) {
+    // 撤回件复用的乐观附件（att.recalled）：公共 URL 已 404，不拉取
+    if (isTextLike(att) && !att.recalled) {
       fetch(files.url(att.id))
         .then((r) => r.text())
         .then((t) => setPreviewText(t.slice(0, 300_000)))
@@ -1396,18 +1435,37 @@ export default function ChatView() {
                             </span>
                           </button>
                         )}
-                        {m.attachment && m.kind === "image" && (
-                          <img
-                            className="msg-img"
-                            src={files.url(m.attachment.id, {
-                              thumb: !!m.attachment.has_thumb,
-                            })}
-                            alt={m.attachment.file_name}
-                            style={imgDim(m.attachment)}
-                            data-own-action
-                            onClick={() => openPreview(m.attachment!, m)}
-                          />
-                        )}
+                        {m.attachment &&
+                          m.kind === "image" &&
+                          (() => {
+                            const att = m.attachment;
+                            if (!att) return null;
+                            // 复用发送的乐观附件（att.recalled）：公共 URL 已 404，
+                            // 只渲染 chip 取回的 objectURL；没取回画中性占位，不闪破图
+                            const src = attImgSrc(
+                              att,
+                              att.recalled ? reuseUrls[att.id] : undefined,
+                              files.url(att.id, { thumb: !!att.has_thumb }),
+                            );
+                            return src ? (
+                              <img
+                                className="msg-img"
+                                src={src}
+                                alt={att.file_name}
+                                style={imgDim(att)}
+                                data-own-action
+                                onClick={() => openPreview(att, m)}
+                              />
+                            ) : (
+                              <div
+                                className="msg-img-ph"
+                                style={imgDim(att)}
+                                aria-label={att.file_name}
+                              >
+                                🖼
+                              </div>
+                            );
+                          })()}
                         {m.attachment && m.kind === "audio" && (
                           <AudioBubble att={m.attachment} />
                         )}
@@ -1415,7 +1473,12 @@ export default function ChatView() {
                           <div
                             className="msg-file"
                             data-own-action
-                            onClick={() => openPreview(m.attachment!, m)}
+                            // 复用在途的撤回件：公共 URL 已 404，预览没有意义
+                            onClick={
+                              m.attachment.recalled
+                                ? undefined
+                                : () => openPreview(m.attachment!, m)
+                            }
                           >
                             <span className="file-ic">📄</span>
                             <span className="file-meta">
@@ -1524,8 +1587,12 @@ export default function ChatView() {
                 className={`reuse-chip ${reuse.expired ? "expired" : ""}`}
                 data-testid="reuse-chip"
               >
-                {reuseUrl?.id === reuse.attachment_id ? (
-                  <img className="rc-thumb" src={reuseUrl.url} alt="" />
+                {reuse.kind === "image" && reuseUrls[reuse.attachment_id] ? (
+                  <img
+                    className="rc-thumb"
+                    src={reuseUrls[reuse.attachment_id]}
+                    alt=""
+                  />
                 ) : (
                   <span className="rc-ic">📎</span>
                 )}
@@ -1707,17 +1774,19 @@ export default function ChatView() {
                         <span>{it.label}</span>
                       </button>
                     ))}
-                <button
-                  type="button"
-                  className="pv-act"
-                  data-testid="viewer-download"
-                  onClick={() => {
-                    if (!isGhostClick(previewAt.current)) void saveAttachment(preview.att);
-                  }}
-                >
-                  <DownloadIcon />
-                  <span>下载</span>
-                </button>
+                {!preview.att.recalled && (
+                  <button
+                    type="button"
+                    className="pv-act"
+                    data-testid="viewer-download"
+                    onClick={() => {
+                      if (!isGhostClick(previewAt.current)) void saveAttachment(preview.att);
+                    }}
+                  >
+                    <DownloadIcon />
+                    <span>下载</span>
+                  </button>
+                )}
               </span>
               <button
                 className="icon-btn"
@@ -1730,9 +1799,19 @@ export default function ChatView() {
               </button>
             </div>
             <div className="pv-body">
-              {preview.att.mime.startsWith("image/") && (
-                <img src={files.url(preview.att.id)} alt={preview.att.file_name} />
-              )}
+              {preview.att.mime.startsWith("image/") &&
+                (() => {
+                  const src = attImgSrc(
+                    preview.att,
+                    preview.att.recalled ? reuseUrls[preview.att.id] : undefined,
+                    files.url(preview.att.id),
+                  );
+                  return src ? (
+                    <img src={src} alt={preview.att.file_name} />
+                  ) : (
+                    <div className="pv-unsupported">附件加载中…</div>
+                  );
+                })()}
               {isTextLike(preview.att) && !preview.att.mime.startsWith("image/") && (
                 <pre>{previewText ?? "加载中…"}</pre>
               )}
