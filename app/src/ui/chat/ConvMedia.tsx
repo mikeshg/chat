@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { files, searchApi } from "../../api";
+import { saveAttachment } from "../../download";
 import type { AttachmentView, ConversationView, MessageView } from "../../types";
 import AudioBubble from "./AudioBubble";
 
@@ -133,14 +134,14 @@ export default function ConvMedia({
                   {new Date(m.created_at).toLocaleDateString()}
                 </i>
               </span>
-              <a
+              <button
+                type="button"
                 className="cm-dl"
-                href={files.url(m.attachment!.id, { dl: true })}
-                download={m.attachment!.file_name}
                 title="下载"
+                onClick={() => void saveAttachment(m.attachment!)}
               >
                 ⤓
-              </a>
+              </button>
             </div>
           ))}
         {tab === "audio" &&

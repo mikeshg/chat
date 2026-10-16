@@ -172,7 +172,7 @@ async fn p33_setup(
 ///    test 端点给单台设备直达一条测试推送。
 #[tokio::test]
 async fn p33_push_dm_basic() {
-    let (base, _st) = spawn_named_state(&format!("chat_it_p33a_{}", uniq())).await;
+    let (_guard, base, _st) = spawn_named_state(&format!("chat_it_p33a_{}", uniq())).await;
     let ntfy = fake_ntfy().await;
     let (_admin, a, b, conv) = p33_setup(&base, &ntfy, "a").await;
 
@@ -231,7 +231,7 @@ async fn p33_push_dm_basic() {
 ///    没推过的人（发送者 A）推进已读不发 clear。
 #[tokio::test]
 async fn p33_push_always_and_clear_on_read() {
-    let (base, _st) = spawn_named_state(&format!("chat_it_p33b_{}", uniq())).await;
+    let (_guard, base, _st) = spawn_named_state(&format!("chat_it_p33b_{}", uniq())).await;
     let ntfy = fake_ntfy().await;
     let (_admin, a, b, conv) = p33_setup(&base, &ntfy, "b").await;
     let t1 = push_on(&base, &b, json!({"enabled": true})).await;
@@ -279,12 +279,12 @@ async fn p33_push_always_and_clear_on_read() {
 /// 3. B 静音群会话 → 普通消息不推；@B 的消息推（priority=4，标题=群名+未读数）。
 #[tokio::test]
 async fn p33_push_mute_and_mention() {
-    let (base, _st) = spawn_named_state(&format!("chat_it_p33c_{}", uniq())).await;
+    let (_guard, base, _st) = spawn_named_state(&format!("chat_it_p33c_{}", uniq())).await;
     let ntfy = fake_ntfy().await;
     let (_admin, a, b, _dm) = p33_setup(&base, &ntfy, "c").await;
     push_on(&base, &b, json!({"enabled": true})).await;
 
-    let gid = mk_group(&base, &a, &[b.id.clone()]).await;
+    let gid = mk_group(&base, &a, std::slice::from_ref(&b.id)).await;
     // B 永久静音该群
     let r = put_pref(&base, &b, &gid, json!({"mute": {"mode": "forever"}})).await;
     assert_eq!(r.status(), 200);
@@ -316,7 +316,7 @@ async fn p33_push_mute_and_mention() {
 /// 4. 合并：窗口内连发 3 条只推 1 条；窗口外照推，标题带累计未读数，sequence_id 不变。
 #[tokio::test]
 async fn p33_push_coalesce() {
-    let (base, st) = spawn_named_state(&format!("chat_it_p33d_{}", uniq())).await;
+    let (_guard, base, st) = spawn_named_state(&format!("chat_it_p33d_{}", uniq())).await;
     let ntfy = fake_ntfy().await;
     let (_admin, a, b, conv) = p33_setup(&base, &ntfy, "d").await;
     push_on(&base, &b, json!({"enabled": true})).await;
@@ -346,7 +346,7 @@ async fn p33_push_coalesce() {
 /// 5. preview 开 → 正文是「昵称: 内容」。
 #[tokio::test]
 async fn p33_push_preview() {
-    let (base, _st) = spawn_named_state(&format!("chat_it_p33e_{}", uniq())).await;
+    let (_guard, base, _st) = spawn_named_state(&format!("chat_it_p33e_{}", uniq())).await;
     let ntfy = fake_ntfy().await;
     let (_admin, a, b, conv) = p33_setup(&base, &ntfy, "e").await;
     push_on(&base, &b, json!({"enabled": true, "preview": true})).await;
@@ -368,7 +368,7 @@ async fn p33_push_preview() {
 ///    server-info.push_available=false。配置后登记了设备但未开启 → 发消息不产生请求。
 #[tokio::test]
 async fn p33_push_unconfigured() {
-    let (base, _st) = spawn_named_state(&format!("chat_it_p33f_{}", uniq())).await;
+    let (_guard, base, _st) = spawn_named_state(&format!("chat_it_p33f_{}", uniq())).await;
     let ntfy = fake_ntfy().await;
     let admin = register(&base, &format!("p33fadm_{}", uniq())).await;
     let a = register(&base, &format!("p33fa_{}", uniq())).await;
@@ -416,7 +416,7 @@ async fn p33_push_unconfigured() {
 ///    非法地址 400；配置令牌后推送带 Authorization；空串清除。
 #[tokio::test]
 async fn p33_admin_settings() {
-    let (base, _st) = spawn_named_state(&format!("chat_it_p33g_{}", uniq())).await;
+    let (_guard, base, _st) = spawn_named_state(&format!("chat_it_p33g_{}", uniq())).await;
     let ntfy = fake_ntfy().await;
     let admin = register(&base, &format!("p33gadm_{}", uniq())).await;
     let a = register(&base, &format!("p33ga_{}", uniq())).await;
@@ -482,7 +482,7 @@ async fn p33_admin_settings() {
 /// 8. 移除一台手机：只有剩下那台还收到推送；别人删不了；删不存在的 404。
 #[tokio::test]
 async fn p33_push_delete_device() {
-    let (base, _st) = spawn_named_state(&format!("chat_it_p33h_{}", uniq())).await;
+    let (_guard, base, _st) = spawn_named_state(&format!("chat_it_p33h_{}", uniq())).await;
     let ntfy = fake_ntfy().await;
     let (_admin, a, b, conv) = p33_setup(&base, &ntfy, "h").await;
     let lost = push_on(&base, &b, json!({"enabled": true})).await;
@@ -521,7 +521,7 @@ async fn p33_push_delete_device() {
 ///    应在超时窗口内被服务端关闭，好友看到其离线；正常读帧的客户端不受影响。
 #[tokio::test]
 async fn p33_ws_idle_timeout() {
-    let (base, st) = spawn_named_state(&format!("chat_it_p33i_{}", uniq())).await;
+    let (_guard, base, st) = spawn_named_state(&format!("chat_it_p33i_{}", uniq())).await;
     st.ws_ping_interval_ms
         .store(200, std::sync::atomic::Ordering::Relaxed);
     st.ws_idle_timeout_ms
@@ -592,7 +592,7 @@ async fn p33_ws_idle_timeout() {
 /// 10. 推送发送失败（连接拒绝）不影响消息正常送达；test 端点失败 502 带原因。
 #[tokio::test]
 async fn p33_push_failure_isolated() {
-    let (base, _st) = spawn_named_state(&format!("chat_it_p33j_{}", uniq())).await;
+    let (_guard, base, _st) = spawn_named_state(&format!("chat_it_p33j_{}", uniq())).await;
     // 拿一个已释放的回环端口 → 连接拒绝
     let dead = {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -640,4 +640,122 @@ async fn p33_push_failure_isolated() {
         .as_str()
         .unwrap()
         .contains("推送"));
+}
+
+// ===== MF1 =====
+// chat_record 推送摘要 = 「[聊天记录] {title}」，永不退化成多行兜底正文；
+// separate 批量一目标一请求至多一条推送（摘取末条），WS 仍逐条一帧。
+
+/// a 合并转发文本到与 b 的私聊：b 的推送正文 = 「{a}: [聊天记录] {a} 和 {b} 的聊天记录」。
+#[tokio::test]
+async fn mf1_push_chat_record_excerpt() {
+    let (_guard, base, st) = spawn_named_state(&format!("chat_it_mf1p_{}", uniq())).await;
+    let ntfy = fake_ntfy().await;
+    let (_admin, a, b, conv) = p33_setup(&base, &ntfy, "cr").await;
+    push_on(&base, &b, json!({"enabled": true, "preview": true})).await;
+    // 关掉合并窗口：否则会话内第二条推送被压掉，没法断言摘要
+    st.push_coalesce_ms
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+
+    let mut sa = ws_of(&base, &a).await;
+    ws_send(
+        &mut sa,
+        &conv,
+        json!({"client_msg_id": "cr1", "content": "收进记录"}),
+    )
+    .await;
+    // 源消息本身产生一条普通推送，先等它到齐
+    let hits = ntfy.wait_hits(1, 3000).await;
+    assert_eq!(hits.len(), 1);
+
+    let page = conv_messages(&base, &a, &conv).await;
+    let src = page[0]["id"].as_str().unwrap().to_string();
+    let r = forward_batch::post_batch(
+        &base,
+        &a,
+        &conv,
+        &[src],
+        std::slice::from_ref(&conv),
+        "merged",
+        &uuid::Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+
+    let hits = ntfy.wait_hits(2, 3000).await;
+    assert_eq!(hits.len(), 2);
+    assert_eq!(
+        hits[1]["message"],
+        format!(
+            "{}: [聊天记录] {} 和 {} 的聊天记录",
+            a.username, a.username, b.username
+        ),
+        "记录推送摘要 = [聊天记录] 标题，不得含兜底正文行: {}",
+        hits[1]["message"]
+    );
+}
+
+/// separate 批量 5 条：每条 WS 一帧，但一目标一请求只发一条推送（摘取末条）。
+/// 把合并窗口关掉（coalesce=0）才能区分「发了几条」与「窗口压了几条」。
+#[tokio::test]
+async fn mf1_push_separate_batch_once() {
+    let (_guard, base, st) = spawn_named_state(&format!("chat_it_mf1s_{}", uniq())).await;
+    let ntfy = fake_ntfy().await;
+    let (_admin, a, b, conv) = p33_setup(&base, &ntfy, "sb").await;
+    push_on(&base, &b, json!({"enabled": true, "preview": true})).await;
+    st.push_coalesce_ms
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+
+    let mut sa = ws_of(&base, &a).await;
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let m = ws_send(
+            &mut sa,
+            &conv,
+            json!({"client_msg_id": format!("s{i}"), "content": format!("第{i}条")}),
+        )
+        .await;
+        ids.push(m["id"].as_str().unwrap().to_string());
+    }
+    let hits = ntfy.wait_hits(5, 3000).await;
+    assert_eq!(hits.len(), 5, "五条源消息各一推");
+    let _ = conv_messages(&base, &a, &conv).await;
+
+    // b 连 WS 收帧；a 逐条转发 5 条回本会话
+    let mut sb = ws_of(&base, &b).await;
+    let r = forward_batch::post_batch(
+        &base,
+        &a,
+        &conv,
+        &ids,
+        std::slice::from_ref(&conv),
+        "separate",
+        &uuid::Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["results"][0]["forwarded"], 5);
+
+    // WS：恰好 5 个 message 帧
+    let mut kinds = Vec::new();
+    for _ in 0..5 {
+        kinds.push(next_of(&mut sb, "message").await["message"]["kind"].clone());
+    }
+    assert_eq!(kinds, vec![json!("text"); 5], "每条各一帧: {kinds:?}");
+
+    // 推送：一目标一请求至多一条，摘要来自末条（"第4条"）
+    let hits = ntfy.wait_hits(7, 2500).await;
+    assert_eq!(
+        hits.len(),
+        6,
+        "separate 5 条只追加一条推送（末条）: {}",
+        hits.len()
+    );
+    assert_eq!(
+        hits[5]["message"],
+        format!("{}: 第4条", a.username),
+        "推送摘要应取末条: {}",
+        hits[5]["message"]
+    );
 }

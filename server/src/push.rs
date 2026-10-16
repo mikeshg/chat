@@ -306,6 +306,13 @@ fn excerpt(msg: &MessageView) -> String {
         return format!("[文件] {}", a.file_name);
     }
     match msg.kind.as_str() {
+        // 聊天记录：摘要恒为「[聊天记录] 标题」，缺预览时只回落到固定前缀，
+        // 永不落到正文兜底行（MF1-C9）
+        "chat_record" => msg
+            .record_preview
+            .as_ref()
+            .map(|p| format!("[聊天记录] {}", p.title))
+            .unwrap_or_else(|| "[聊天记录]".into()),
         "poll" => msg
             .poll
             .as_ref()

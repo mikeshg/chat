@@ -5,31 +5,17 @@ use super::*;
 // 全部测试用 spawn_backup_env（独立库 + 独立文件目录），不得用共享的 spawn/spawn_named_db。
 
 /// spawn_named_state 的备份版：独立库 + 每次测试独立的 FILES_DIR。
+/// 返回的 TempDb 守卫必须在整个测试作用域存活：作用域结束（含 panic）即删库。
 pub(crate) async fn spawn_backup_env(
     tag: &str,
-) -> (String, chat_server::state::SharedState, std::path::PathBuf) {
-    let db_name = format!("chat_t_p41{tag}_{}", uniq());
-    let admin = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&base_db_url())
-        .await
-        .unwrap();
-    let exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)",
-    )
-    .bind(&db_name)
-    .fetch_one(&admin)
-    .await
-    .unwrap();
-    if !exists {
-        let _ = sqlx::query(&format!("CREATE DATABASE {db_name}"))
-            .execute(&admin)
-            .await;
-    }
-    let url = match base_db_url().rfind('/') {
-        Some(i) => format!("{}/{db_name}", &base_db_url()[..i]),
-        None => format!("postgres://chat:chat@localhost:15432/{db_name}"),
-    };
+) -> (
+    testdb::TempDb,
+    String,
+    chat_server::state::SharedState,
+    std::path::PathBuf,
+) {
+    let db = testdb::TempDb::create(&format!("chat_t_p41{tag}_{}", uniq())).await;
+    let url = db.url();
     let pool = PgPoolOptions::new().connect(&url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
 
@@ -43,6 +29,8 @@ pub(crate) async fn spawn_backup_env(
         files_dir: files_dir.to_string_lossy().into(),
         upload_max_bytes: 25 * 1024 * 1024,
         trust_proxy: false,
+        recall_attachment_ttl_secs: 86400,
+        recall_sweep_interval_secs: 3600,
     };
     std::fs::create_dir_all(&cfg.files_dir).unwrap();
     let state = AppState::new(pool, cfg.clone());
@@ -57,7 +45,7 @@ pub(crate) async fn spawn_backup_env(
         .await
         .unwrap();
     });
-    (format!("http://{addr}"), state, files_dir)
+    (db, format!("http://{addr}"), state, files_dir)
 }
 
 /// 申请下载 ticket 并把备份文件完整拉回来
@@ -193,6 +181,118 @@ pub(crate) fn write_backup(entries: &std::collections::HashMap<String, Vec<u8>>)
     out
 }
 
+/// 全表行数快照（顺序稳定）——校验「恢复被拒后数据分毫未动」。
+async fn table_counts(pool: &sqlx::PgPool) -> std::collections::BTreeMap<String, i64> {
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name FROM information_schema.tables
+          WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+            AND table_name <> '_sqlx_migrations' ORDER BY 1",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let mut m = std::collections::BTreeMap::new();
+    for t in names {
+        let n: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM \"{}\"",
+            t.replace('"', "\"\"")
+        ))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        m.insert(t, n);
+    }
+    m
+}
+
+/// files_dir 递归相对路径清单（排序）——校验「恢复被拒后文件分毫未动」。
+fn files_listing(dir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.push(p.strip_prefix(dir).unwrap().to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// 从 COPY 格式 CSV 删掉一列（按表头列名定位；引号感知，字段保留原始文本。
+/// 夹具数据字段内没有内嵌换行——逐行处理足够）。
+fn csv_drop_column(csv: &str, col: &str) -> String {
+    fn split_fields(line: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut in_q = false;
+        let mut ch = line.chars().peekable();
+        while let Some(c) = ch.next() {
+            if in_q {
+                cur.push(c);
+                if c == '"' {
+                    if ch.peek() == Some(&'"') {
+                        cur.push(ch.next().unwrap());
+                    } else {
+                        in_q = false;
+                    }
+                }
+            } else if c == '"' {
+                in_q = true;
+                cur.push(c);
+            } else if c == ',' {
+                out.push(std::mem::take(&mut cur));
+            } else {
+                cur.push(c);
+            }
+        }
+        out.push(cur);
+        out
+    }
+    let mut lines = csv.lines();
+    let header = lines.next().expect("csv header");
+    let cols = split_fields(header);
+    let idx = cols
+        .iter()
+        .position(|c| c.trim_matches('"') == col)
+        .unwrap_or_else(|| panic!("column {col} not in csv header {header}"));
+    let drop_col = |line: &str| {
+        split_fields(line)
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| *i != idx)
+            .map(|(_, c)| c)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let mut out = drop_col(header);
+    for line in lines {
+        out.push('\n');
+        out.push_str(&drop_col(line));
+    }
+    out.push('\n');
+    out
+}
+
+/// 给 COPY 格式 CSV 追加一列（表头加列名、每数据行加值）。
+fn csv_add_column(csv: &str, col: &str, value: &str) -> String {
+    let mut out = String::new();
+    for (i, line) in csv.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+        out.push(',');
+        out.push_str(if i == 0 { col } else { value });
+    }
+    out.push('\n');
+    out
+}
+
 /// 原密码重新登录，返回新凭据
 async fn login_again(base: &str, username: &str) -> TestUser {
     let r: Value = http()
@@ -217,7 +317,7 @@ async fn login_again(base: &str, username: &str) -> TestUser {
 /// 生成中再次请求 409。
 #[tokio::test]
 async fn p41_backup_list_download_manifest() {
-    let (base, _st, files_dir) = spawn_backup_env("bk").await;
+    let (_guard, base, _st, files_dir) = spawn_backup_env("bk").await;
     let c = http();
     let admin = register(&base, &format!("p41a_{}", uniq())).await; // 首个 = 管理员
     let bob = register(&base, &format!("p41b_{}", uniq())).await;
@@ -301,7 +401,7 @@ async fn p41_backup_list_download_manifest() {
 /// 删除备份时清单一起删。
 #[tokio::test]
 async fn backup_reports_missing_referenced_files() {
-    let (base, _st, files_dir) = spawn_backup_env("miss").await;
+    let (_guard, base, _st, files_dir) = spawn_backup_env("miss").await;
     let admin = register(&base, &format!("bma_{}", uniq())).await;
     let bob = register(&base, &format!("bmb_{}", uniq())).await;
     befriend(&base, &admin, &bob).await;
@@ -359,7 +459,7 @@ async fn backup_reports_missing_referenced_files() {
 /// 恢复前的 access/refresh 全部失效，原密码可重新登录。
 #[tokio::test]
 async fn p41_restore_rolls_back_data_and_credentials() {
-    let (base, st, files_dir) = spawn_backup_env("rs").await;
+    let (_guard, base, st, files_dir) = spawn_backup_env("rs").await;
     let c = http();
     let admin = register(&base, &format!("p41c_{}", uniq())).await;
     let bob = register(&base, &format!("p41d_{}", uniq())).await;
@@ -509,7 +609,7 @@ async fn p41_restore_rolls_back_data_and_credentials() {
 /// confirm 缺失或不是 RESTORE → 400，数据不变。
 #[tokio::test]
 async fn p41_restore_requires_confirm() {
-    let (base, _st, _files_dir) = spawn_backup_env("cf").await;
+    let (_guard, base, _st, _files_dir) = spawn_backup_env("cf").await;
     let c = http();
     let admin = register(&base, &format!("p41e_{}", uniq())).await;
     let bob = register(&base, &format!("p41f_{}", uniq())).await;
@@ -557,7 +657,7 @@ async fn p41_restore_requires_confirm() {
 /// refresh token 重放：宽限期内重试旧令牌只回 401、会话照常；过了宽限期再用旧令牌 = 被盗，整个会话作废
 #[tokio::test]
 async fn refresh_token_reuse_revokes_session() {
-    let (base, st) = spawn_named_state(&format!("chat_it_reuse_{}", uniq())).await;
+    let (_guard, base, st) = spawn_named_state(&format!("chat_it_reuse_{}", uniq())).await;
     let u = register(&base, &format!("reuse_{}", uniq())).await;
     let refresh = |rt: String| {
         let base = base.clone();
@@ -602,7 +702,7 @@ async fn refresh_token_reuse_revokes_session() {
 /// 上传读到一半连接出错：不留 .restore-upload-*.part
 #[tokio::test]
 async fn p41_aborted_restore_upload_leaves_no_part_file() {
-    let (base, _st, files_dir) = spawn_backup_env("tr").await;
+    let (_guard, base, _st, files_dir) = spawn_backup_env("tr").await;
     let admin = register(&base, &format!("p41t_{}", uniq())).await;
     let head =
         "--XB\r\nContent-Disposition: form-data; name=\"file\"; filename=\"b.tar.gz\"\r\n\r\n";
@@ -643,10 +743,12 @@ async fn p41_aborted_restore_upload_leaves_no_part_file() {
     assert!(parts().is_empty(), "残留上传文件: {:?}", parts());
 }
 
-/// 篡改 manifest 的 migration_version → 400「版本不一致」，数据不变。
+/// 篡改 manifest 的 migration_version（比当前新）→ 400
+/// 「该备份来自更新版本的服务端，请先升级服务端后再恢复」（MF1 起换新文案，
+/// 逐字断言），数据不变（全表行数 + 文件清单逐项复核）。
 #[tokio::test]
 async fn p41_restore_rejects_version_mismatch() {
-    let (base, _st, _files_dir) = spawn_backup_env("vm").await;
+    let (_guard, base, st, files_dir) = spawn_backup_env("vm").await;
     let c = http();
     let admin = register(&base, &format!("p41g_{}", uniq())).await;
     let bob = register(&base, &format!("p41h_{}", uniq())).await;
@@ -674,13 +776,21 @@ async fn p41_restore_rejects_version_mismatch() {
         serde_json::to_vec(&manifest).unwrap(),
     );
     let bad = write_backup(&entries);
+
+    let before_counts = table_counts(&st.pool).await;
+    let before_files = files_listing(&files_dir);
     let r = restore_upload(&base, &admin.access, bad, Some("RESTORE")).await;
     assert_eq!(r.status(), 400);
     let body: Value = r.json().await.unwrap();
-    let err = body["error"].as_str().unwrap_or("");
-    assert!(err.contains("版本") || err.contains("不一致"), "{body}");
+    assert_eq!(
+        body["error"].as_str().unwrap_or(""),
+        "该备份来自更新版本的服务端，请先升级服务端后再恢复",
+        "{body}"
+    );
 
-    // 数据不变
+    // 数据/文件分毫未动（校验在 TRUNCATE 之前——这里整库根本没进恢复流程）
+    assert_eq!(table_counts(&st.pool).await, before_counts);
+    assert_eq!(files_listing(&files_dir), before_files);
     let page: Value = c
         .get(format!("{base}/v1/conversations/{conv}/messages"))
         .header("authorization", authz(&admin.access))
@@ -691,12 +801,13 @@ async fn p41_restore_rejects_version_mismatch() {
         .await
         .unwrap();
     assert_eq!(page["messages"].as_array().unwrap().len(), 1);
+    assert!(!st.maintenance.load(std::sync::atomic::Ordering::SeqCst));
 }
 
 /// tar 里放 ../evil 或绝对路径条目 → 400，FILES_DIR 外不出现新文件。
 #[tokio::test]
 async fn p41_restore_rejects_unsafe_paths() {
-    let (base, _st, files_dir) = spawn_backup_env("ev").await;
+    let (_guard, base, _st, files_dir) = spawn_backup_env("ev").await;
     let c = http();
     let admin = register(&base, &format!("p41i_{}", uniq())).await;
     let _bob = register(&base, &format!("p41j_{}", uniq())).await;
@@ -726,7 +837,7 @@ async fn p41_restore_rejects_unsafe_paths() {
 /// 非管理员调用各接口 403；ticket 重复使用 401、过期 401；非法备份名 400。
 #[tokio::test]
 async fn p41_backup_admin_gate_and_ticket_rules() {
-    let (base, st, _files_dir) = spawn_backup_env("gt").await;
+    let (_guard, base, st, _files_dir) = spawn_backup_env("gt").await;
     let c = http();
     let admin = register(&base, &format!("p41k_{}", uniq())).await;
     let user = register(&base, &format!("p41l_{}", uniq())).await;
@@ -839,7 +950,7 @@ async fn p41_backup_admin_gate_and_ticket_rules() {
 /// 发起恢复的管理员会话连接保留（它的 HTTP 请求还在等恢复结果，踢了会先看到踢下线提示）。
 #[tokio::test]
 async fn p41_restore_kicks_restoring_keeps_initiator() {
-    let (base, st, _files_dir) = spawn_backup_env("kr").await;
+    let (_guard, base, st, _files_dir) = spawn_backup_env("kr").await;
     let admin = register(&base, &format!("p41r_{}", uniq())).await;
     let bob = register(&base, &format!("p41s_{}", uniq())).await;
 
@@ -885,7 +996,7 @@ async fn p41_restore_kicks_restoring_keeps_initiator() {
 /// 维护模式：maintenance=true 时所有 /v1 请求 503（含 WS 升级）；复位后恢复。
 #[tokio::test]
 async fn p41_maintenance_blocks_api() {
-    let (base, st, _files_dir) = spawn_backup_env("mt").await;
+    let (_guard, base, st, _files_dir) = spawn_backup_env("mt").await;
     let c = http();
     let u = register(&base, &format!("p41m_{}", uniq())).await;
 
@@ -918,4 +1029,315 @@ async fn p41_maintenance_blocks_api() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
+}
+
+// ===== MM5：放宽后的版本闸（MM1 起迁移版本「不比当前新即可」） =====
+
+/// 老备份可恢复：取一份真备份，把 manifest.migration_version 改回 0039 之前（38），
+/// 并从 attachments.csv 删掉 recalled_at 列（模拟 MM1 之前生成的备份）。
+/// 恢复应 200：行在、recalled_at 为 NULL（该列无默认值，COPY 列清单不含它）。
+#[tokio::test]
+async fn mm5_restore_accepts_older_backup_without_recalled_at() {
+    let (_guard, base, st, files_dir) = spawn_backup_env("old").await;
+    let admin = register(&base, &format!("mm5a_{}", uniq())).await;
+    let bob = register(&base, &format!("mm5b_{}", uniq())).await;
+    befriend(&base, &admin, &bob).await;
+    let conv = dm_conv(&base, &admin).await;
+    let (mut sa, _) = tokio_tungstenite::connect_async(ws_url(&base, &admin).await)
+        .await
+        .unwrap();
+    next_of(&mut sa, "presence_init").await;
+    let m = ws_send(
+        &mut sa,
+        &conv,
+        json!({"client_msg_id": "m1", "content": "old backup msg"}),
+    )
+    .await;
+    let msg_id = m["id"].as_str().unwrap().to_string();
+    let att_body = b"old-backup-att".to_vec();
+    let (st_code, att) = upload_att(
+        &base,
+        &conv,
+        &admin.access,
+        "old.bin",
+        "application/octet-stream",
+        att_body.clone(),
+    )
+    .await;
+    assert_eq!(st_code, 200);
+    let att_id = att["id"].as_str().unwrap().to_string();
+
+    let name = create_and_wait_backup(&base, &admin.access).await;
+    let bytes = download_backup(&base, &admin.access, &name).await;
+
+    // 篡改成「0039 之前生成的备份」：版本拨回 38，attachments.csv 去掉 recalled_at
+    let mut entries = read_backup(&bytes);
+    let mut manifest: Value = serde_json::from_slice(&entries["manifest.json"]).unwrap();
+    let cur_mv = manifest["migration_version"].as_i64().unwrap();
+    assert!(cur_mv >= 39, "本仓 schema 已到 0039: mv={cur_mv}");
+    manifest["migration_version"] = json!(38);
+    entries.insert(
+        "manifest.json".into(),
+        serde_json::to_vec(&manifest).unwrap(),
+    );
+    let csv = String::from_utf8(entries["db/attachments.csv"].clone()).unwrap();
+    assert!(csv.lines().next().unwrap().contains("recalled_at"));
+    entries.insert(
+        "db/attachments.csv".into(),
+        csv_drop_column(&csv, "recalled_at").into_bytes(),
+    );
+    let tweaked = write_backup(&entries);
+
+    let r = restore_upload(&base, &admin.access, tweaked, Some("RESTORE")).await;
+    assert_eq!(r.status(), 200, "older backup must restore");
+
+    // 恢复后旧凭据作废，直接查库：附件行在、recalled_at 为 NULL
+    let att_uuid = uuid::Uuid::parse_str(&att_id).unwrap();
+    let (n, recalled): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(recalled_at) FROM attachments WHERE id = $1",
+    )
+    .bind(att_uuid)
+    .fetch_one(&st.pool)
+    .await
+    .unwrap();
+    assert_eq!(n, 1, "attachment row must be restored");
+    assert_eq!(recalled, 0, "recalled_at must be NULL (缺列由库默认补齐)");
+    let msgs: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM messages WHERE id = $1::uuid")
+            .bind(&msg_id)
+            .fetch_one(&st.pool)
+            .await
+            .unwrap();
+    assert_eq!(msgs, 1, "message row must be restored");
+    // 物理文件也回来了
+    assert_eq!(std::fs::read(files_dir.join(&att_id)).unwrap(), att_body);
+}
+
+/// 备份 CSV 含未知列 → 恢复拒绝 400「备份表 users 含未知列 …」。
+/// 该列校验发生在恢复事务内（TRUNCATE 之后）：顺带验证恢复是单事务、
+/// 失败整体回滚——全表行数与文件清单逐项不变。
+#[tokio::test]
+async fn mm5_restore_rejects_unknown_column() {
+    let (_guard, base, st, files_dir) = spawn_backup_env("uc").await;
+    let admin = register(&base, &format!("mm5c_{}", uniq())).await;
+    let bob = register(&base, &format!("mm5d_{}", uniq())).await;
+    befriend(&base, &admin, &bob).await;
+    let conv = dm_conv(&base, &admin).await;
+    let (mut sa, _) = tokio_tungstenite::connect_async(ws_url(&base, &admin).await)
+        .await
+        .unwrap();
+    next_of(&mut sa, "presence_init").await;
+    ws_send(
+        &mut sa,
+        &conv,
+        json!({"client_msg_id": "x", "content": "do not lose me"}),
+    )
+    .await;
+
+    let name = create_and_wait_backup(&base, &admin.access).await;
+    let bytes = download_backup(&base, &admin.access, &name).await;
+
+    let mut entries = read_backup(&bytes);
+    let csv = String::from_utf8(entries["db/users.csv"].clone()).unwrap();
+    entries.insert(
+        "db/users.csv".into(),
+        csv_add_column(&csv, "pwn_col", "x").into_bytes(),
+    );
+    let bad = write_backup(&entries);
+
+    let before_counts = table_counts(&st.pool).await;
+    let before_files = files_listing(&files_dir);
+    let r = restore_upload(&base, &admin.access, bad, Some("RESTORE")).await;
+    assert_eq!(r.status(), 400);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(
+        body["error"].as_str().unwrap_or(""),
+        "备份表 users 含未知列 pwn_col",
+        "{body}"
+    );
+
+    // 事务整体回滚：行数/文件分毫未动，旧凭据仍然有效，维护模式已退出
+    assert_eq!(table_counts(&st.pool).await, before_counts);
+    assert_eq!(files_listing(&files_dir), before_files);
+    assert!(!st.maintenance.load(std::sync::atomic::Ordering::SeqCst));
+    let r = http()
+        .get(format!("{base}/v1/users/me"))
+        .header("authorization", authz(&admin.access))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "恢复被拒后旧 token 应仍有效");
+}
+
+// ===== MF1 =====
+// 备份/恢复与新 schema 的兼容性：chat_record 快照 + record_message_id 克隆行
+// 随全表导出/CSV 恢复自动带走；version-39 老备份（缺新列）照样恢复成 NULL。
+
+/// 含 chat_record（带嵌套克隆附件）的库整备一份 → 恢复后：
+/// record jsonb 逐字节相等、克隆行 record_message_id 不变、物理文件回得来。
+#[tokio::test]
+async fn mf1_backup_chat_record_roundtrip() {
+    let (_guard, base, st, files_dir) = spawn_backup_env("rc").await;
+    let admin = register(&base, &format!("mf1ra_{}", uniq())).await; // 首个 = 管理员
+    let bob = register(&base, &format!("mf1rb_{}", uniq())).await;
+    befriend(&base, &admin, &bob).await;
+    let dm = dm_conv(&base, &admin).await;
+    let selfc = self_conv(&base, &admin).await["id"].as_str().unwrap().to_string();
+
+    // bob 发图 → admin 合并转发到自己 self → 产生 chat_record + 附件克隆
+    let att_body = png_bytes();
+    let (scode, att) = upload_att(&base, &dm, &bob.access, "r.png", "image/png", att_body.clone()).await;
+    assert_eq!(scode, 200);
+    let mut sb = tokio_tungstenite::connect_async(ws_url(&base, &bob).await)
+        .await
+        .unwrap()
+        .0;
+    next_of(&mut sb, "presence_init").await;
+    let img = ws_send(
+        &mut sb,
+        &dm,
+        json!({"client_msg_id": "rb1", "content": "", "attachment_id": att["id"]}),
+    )
+    .await;
+    let r = forward_batch::post_batch(
+        &base,
+        &admin,
+        &dm,
+        &[img["id"].as_str().unwrap().to_string()],
+        std::slice::from_ref(&selfc),
+        "merged",
+        &uuid::Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let rid = r.json::<Value>().await.unwrap()["results"][0]["message_ids"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let rid_u = uuid::Uuid::parse_str(&rid).unwrap();
+
+    // 备份前的库内快照（::text 逐字节比较口径）
+    let before_text: String = sqlx::query_scalar("SELECT record::text FROM messages WHERE id = $1")
+        .bind(rid_u)
+        .fetch_one(&st.pool)
+        .await
+        .unwrap();
+    let clone_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM attachments WHERE record_message_id = $1")
+            .bind(rid_u)
+            .fetch_one(&st.pool)
+            .await
+            .unwrap();
+
+    let name = create_and_wait_backup(&base, &admin.access).await;
+    let bytes = download_backup(&base, &admin.access, &name).await;
+    // 备份 CSV 里新列已随全表导出
+    let entries = read_backup(&bytes);
+    let mcsv = String::from_utf8(entries["db/messages.csv"].clone()).unwrap();
+    assert!(mcsv.lines().next().unwrap().contains("record"), "messages.csv 应含 record 列");
+    let acsv = String::from_utf8(entries["db/attachments.csv"].clone()).unwrap();
+    assert!(
+        acsv.lines().next().unwrap().contains("record_message_id"),
+        "attachments.csv 应含 record_message_id 列"
+    );
+
+    let r = restore_upload(&base, &admin.access, bytes, Some("RESTORE")).await;
+    assert_eq!(r.status(), 200, "恢复应成功");
+
+    // 逐字节相等 + 克隆行引用不变 + 文件回来
+    let after_text: String = sqlx::query_scalar("SELECT record::text FROM messages WHERE id = $1")
+        .bind(rid_u)
+        .fetch_one(&st.pool)
+        .await
+        .unwrap();
+    assert_eq!(after_text, before_text, "record jsonb 必须逐字节还原");
+    let (att_mid, cnt): (Option<uuid::Uuid>, i64) = sqlx::query_as(
+        "SELECT record_message_id, count(*) OVER() FROM attachments WHERE id = $1",
+    )
+    .bind(clone_id)
+    .fetch_one(&st.pool)
+    .await
+    .unwrap();
+    assert_eq!(att_mid, Some(rid_u), "record_message_id 必须原样还原");
+    assert_eq!(cnt, 1);
+    let admin2 = login_again(&base, &admin.username).await;
+    let dl = http()
+        .get(format!("{base}/v1/files/{clone_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dl.status(), 200, "恢复后克隆附件可下载");
+    assert_eq!(dl.bytes().await.unwrap().as_ref(), att_body.as_slice());
+    // 克隆行与源共享 storage_path：物理文件名以库记录为准
+    let sp: String = sqlx::query_scalar("SELECT storage_path FROM attachments WHERE id = $1")
+        .bind(clone_id)
+        .fetch_one(&st.pool)
+        .await
+        .unwrap();
+    assert!(files_dir.join(&sp).exists());
+    // 成员可读恢复后的记录
+    let rec = http()
+        .get(format!("{base}/v1/messages/{rid}/record"))
+        .header("authorization", authz(&admin2.access))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rec.status(), 200);
+    assert_eq!(rec.json::<Value>().await.unwrap()["count"], 1);
+}
+
+/// version-39 老备份（CSVs 缺 record / record_message_id 两列）照常恢复，
+/// 新列一律 NULL。
+#[tokio::test]
+async fn mf1_restore_accepts_v39_backup() {
+    let (_guard, base, st, _files_dir) = spawn_backup_env("v39").await;
+    let admin = register(&base, &format!("mf1va_{}", uniq())).await;
+    let bob = register(&base, &format!("mf1vb_{}", uniq())).await;
+    befriend(&base, &admin, &bob).await;
+    let dm = dm_conv(&base, &admin).await;
+    let mut sa = tokio_tungstenite::connect_async(ws_url(&base, &admin).await)
+        .await
+        .unwrap()
+        .0;
+    next_of(&mut sa, "presence_init").await;
+    ws_send(&mut sa, &dm, json!({"client_msg_id": "v39", "content": "old rows"})).await;
+
+    let name = create_and_wait_backup(&base, &admin.access).await;
+    let bytes = download_backup(&base, &admin.access, &name).await;
+
+    let mut entries = read_backup(&bytes);
+    let mut manifest: Value = serde_json::from_slice(&entries["manifest.json"]).unwrap();
+    assert!(manifest["migration_version"].as_i64().unwrap() >= 40);
+    manifest["migration_version"] = json!(39);
+    entries.insert("manifest.json".into(), serde_json::to_vec(&manifest).unwrap());
+    let mcsv = String::from_utf8(entries["db/messages.csv"].clone()).unwrap();
+    assert!(mcsv.lines().next().unwrap().contains("record"));
+    entries.insert(
+        "db/messages.csv".into(),
+        csv_drop_column(&mcsv, "record").into_bytes(),
+    );
+    let acsv = String::from_utf8(entries["db/attachments.csv"].clone()).unwrap();
+    if acsv.lines().next().unwrap().contains("record_message_id") {
+        entries.insert(
+            "db/attachments.csv".into(),
+            csv_drop_column(&acsv, "record_message_id").into_bytes(),
+        );
+    }
+    let tweaked = write_backup(&entries);
+
+    let r = restore_upload(&base, &admin.access, tweaked, Some("RESTORE")).await;
+    assert_eq!(r.status(), 200, "v39 备份应可恢复");
+
+    // 新列全部 NULL（缺列由库默认补齐）
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE record IS NOT NULL")
+        .fetch_one(&st.pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "老备份恢复后 record 应全 NULL");
+    let n: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM attachments WHERE record_message_id IS NOT NULL")
+            .fetch_one(&st.pool)
+            .await
+            .unwrap();
+    assert_eq!(n, 0, "老备份恢复后 record_message_id 应全 NULL");
 }

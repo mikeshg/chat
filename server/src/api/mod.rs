@@ -117,8 +117,10 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
         )
         .route(
             "/messages/{id}",
-            axum::routing::patch(edit_message).delete(delete_message),
+            // DELETE 保留为旧客户端的撤回别名，语义与 POST recall 完全一致
+            axum::routing::patch(edit_message).delete(recall_message),
         )
+        .route("/messages/{id}/recall", post(recall_message))
         .route(
             "/messages/{id}/reactions/{emoji}",
             put(reaction_add).delete(reaction_remove),
@@ -127,6 +129,12 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
         .route("/messages/{id}/poll/votes", put(vote_poll))
         .route("/messages/{id}/poll/close", post(close_poll))
         .route("/messages/{id}/forward", post(forward_message))
+        // MF1：记录完整快照 + 批量/合并转发（64KiB 上限：100 uuid + 10 target + 外壳足够）
+        .route("/messages/{id}/record", get(get_record))
+        .route(
+            "/messages/forward-batch",
+            post(forward_batch).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
         .route("/conversations/{id}/members", post(add_members))
         .route("/conversations/{id}/members/me", delete(leave_conversation))
         .route("/conversations/{id}/members/{uid}", delete(kick_member))
@@ -144,6 +152,8 @@ pub fn router(cfg: &crate::config::Config) -> Router<SharedState> {
             )),
         )
         .route("/files/{id}", get(download_file))
+        // 撤回附件取回：仅上传者本人、Bearer 认证、TTL 内；no-store
+        .route("/files/{id}/recalled", get(download_recalled))
         .route("/ws/ticket", get(ws_ticket))
         .route("/ws", get(ws::ws_handler))
         .route("/server-info", get(settings::server_info))
@@ -228,26 +238,18 @@ fn post_err(e: domain::PostError) -> AppError {
             "forbidden" | "not_friends" => AppError::forbidden(message),
             "not_found" => AppError::not_found(message),
             "conflict" => AppError::conflict(message),
+            // 撤回超时仍是 403，但带稳定 code 让客户端区分「无权」与「过期」
+            "recall_expired" => {
+                AppError::coded(StatusCode::FORBIDDEN, "recall_expired", message)
+            }
+            // 附件撤回期已过/已清扫/不存在：410 Gone + code
+            "attachment_expired" => {
+                AppError::coded(StatusCode::GONE, "attachment_expired", message)
+            }
             _ => AppError::bad_request(message),
         },
         domain::PostError::Db(e) => e.into(),
     }
-}
-
-/// 软删除后异步清理已无引用的附件物理文件（失败只记日志：行已删，下载已失效）。
-pub fn spawn_file_cleanup(st: &SharedState, paths: Vec<String>) {
-    if paths.is_empty() {
-        return;
-    }
-    let files_dir = st.cfg.files_dir.clone();
-    tokio::spawn(async move {
-        for p in paths {
-            let fp = stored_file_path(&files_dir, &p);
-            if let Err(e) = tokio::fs::remove_file(&fp).await {
-                tracing::warn!(path = %fp.display(), error = %e, "orphan attachment cleanup failed");
-            }
-        }
-    });
 }
 
 /// 关系建立后补发 presence：to 立刻看到 from 的真实在线状态

@@ -19,3 +19,8 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+
+# MM4 下载插件：tauri 经反射实例化插件并调用 @Command 方法，@InvokeArg 参数类由 Jackson 填充
+-keep class com.chat.app.DownloadPlugin { *; }
+-keep class com.chat.app.DownloadArgs { *; }
+-keepattributes RuntimeVisibleAnnotations

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { fmtBytes, imageBubbleSize, storageText } from "./mediaFormat";
+import { attImgSrc, fmtBytes, imageBubbleSize, storageText } from "./mediaFormat";
 
 describe("imageBubbleSize", () => {
   it("最长边缩到 240，比例保持", () => {
@@ -18,6 +18,23 @@ describe("imageBubbleSize", () => {
   it("非法输入返回 0 尺寸", () => {
     expect(imageBubbleSize(0, 0)).toEqual({ width: 0, height: 0 });
     expect(imageBubbleSize(-5, 100)).toEqual({ width: 0, height: 0 });
+  });
+});
+
+describe("attImgSrc（MM2 fix3：复用发送的乐观附件不闪破图）", () => {
+  const PUBLIC = "https://srv/v1/files/att1?thumb=1";
+  const OBJ = "blob:obj-url";
+
+  it("普通附件走公共能力 URL", () => {
+    expect(attImgSrc({ recalled: false }, OBJ, PUBLIC)).toBe(PUBLIC);
+    expect(attImgSrc({}, undefined, PUBLIC)).toBe(PUBLIC);
+  });
+
+  it("撤回件复用的乐观附件：只用已取回的 objectURL，永不回退公共 URL", () => {
+    expect(attImgSrc({ recalled: true }, OBJ, PUBLIC)).toBe(OBJ);
+    // objectURL 还没取回 → null（调用方画中性占位），绝不返回公共 URL
+    expect(attImgSrc({ recalled: true }, undefined, PUBLIC)).toBeNull();
+    expect(attImgSrc({ recalled: true }, null, PUBLIC)).toBeNull();
   });
 });
 

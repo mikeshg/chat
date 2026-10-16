@@ -10,6 +10,8 @@ import {
   wsBase,
 } from "./api";
 import { notifyIncoming } from "./notify";
+import { RECORD_TITLE_MAX, recordLabel } from "./ui/chat/chatRecord";
+import { clearReuseOnAck, failReuseSend } from "./drafts";
 import { kickReasonKey } from "./servers";
 import {
   absorbAvatarUsers,
@@ -30,6 +32,7 @@ import {
   resolveAck,
   setState,
   shouldNotify,
+  updateDrafts,
   upsertMessage,
 } from "./store";
 import type { AttachmentView, MessageView, WsOut } from "./types";
@@ -51,6 +54,8 @@ type Outgoing = {
   clientMsgId: string;
   content: string;
   attachment?: AttachmentView;
+  /** MM2：true 时发 reuse_attachment_id（撤回重编辑的附件复用），而不是 attachment_id */
+  reuse?: boolean;
   replyToId?: string;
   /** 乐观消息原样存：刷新/重启后照它放回列表 */
   optimistic: MessageView;
@@ -100,7 +105,9 @@ const SEND_ERROR_TEXT: Record<string, string> = {
   forbidden: "没有权限",
   not_friends: "对方已不是你的好友",
   bad_attachment: "附件无效",
+  attachment_expired: "附件已过期",
   not_found: "会话不存在",
+  bad_request: "内容不合法（1–4000 字）",
   bad_frame: "客户端版本过旧",
 };
 
@@ -109,9 +116,14 @@ const PERMANENT_SEND_ERRORS = new Set([
   "forbidden",
   "not_friends",
   "bad_attachment",
+  "attachment_expired",
   "not_found",
+  "bad_request",
   "bad_frame",
 ]);
+
+/** MM2：复用发送被服务端拒收时按这些码走「退回草稿 + chip 过期」路径 */
+const REUSE_FAIL_CODES = new Set(["attachment_expired", "forbidden", "bad_request"]);
 
 export function stopWs() {
   stopped = true;
@@ -374,8 +386,10 @@ function dispatch(f: WsOut) {
       onMessage(f.message);
       trackIncomingSeq(f.message.conversation_id, f.message.seq);
       break;
-    case "message_ack":
-      takeOutbox(f.client_msg_id);
+    case "message_ack": {
+      const acked = takeOutbox(f.client_msg_id);
+      // MM2：复用发送成功 → 摘掉草稿上的「复用附件」chip（一次成功发送才算消耗）
+      if (acked?.reuse) updateDrafts((d) => clearReuseOnAck(d, acked.convId, acked.attachment?.id));
       setState((cur) => {
         const merged = { ...cur, ...applySyncMessages(cur, f.message.conversation_id, [f.message]) };
         return { ...merged, messages: { ...merged.messages,
@@ -384,6 +398,7 @@ function dispatch(f: WsOut) {
       });
       trackIncomingSeq(f.message.conversation_id, f.message.seq);
       break;
+    }
     case "sync_messages": {
       setState((cur) => applySyncMessages(cur, f.conversation_id, f.messages));
       // 服务端按 last_seq 之后连续有序返回 → 本页末尾即新水位
@@ -461,12 +476,25 @@ function dispatch(f: WsOut) {
       window.dispatchEvent(new Event("chat:logout"));
       break;
     }
-    case "error":
-      if (f.client_msg_id && PERMANENT_SEND_ERRORS.has(f.code)) {
+    case "error": {
+      // MM2：复用发送被拒（attachment_expired/forbidden/bad_request）→
+      // 撤乐观气泡、文字退回草稿、chip 标「附件已过期」，由用户手动重发，绝不自动重发。
+      const item = f.client_msg_id ? outbox.find((x) => x.clientMsgId === f.client_msg_id) : undefined;
+      if (item?.reuse && REUSE_FAIL_CODES.has(f.code)) {
+        takeOutbox(item.clientMsgId);
+        const convId = item.convId;
+        const content = item.content;
+        const attachmentId = item.attachment?.id;
+        setState((cur) => dropOptimistic(cur, convId, item.clientMsgId));
+        updateDrafts((d) => failReuseSend(d, convId, attachmentId, content));
+        // 打开着的会话需要同步 composer 文本态（draft 已改，组件据此回填）
+        window.dispatchEvent(new CustomEvent("chat:composer-restore", { detail: { convId } }));
+      } else if (f.client_msg_id && PERMANENT_SEND_ERRORS.has(f.code)) {
         markFailed(f.client_msg_id, SEND_ERROR_TEXT[f.code] ?? f.message);
       }
       console.warn("ws error", f.code, f.message);
       break;
+    }
   }
 }
 
@@ -507,7 +535,9 @@ function onMessage(m: MessageView) {
         : m.kind === "audio" || m.attachment.duration_ms != null
           ? "[语音]"
           : `[文件] ${m.attachment.file_name}`
-      : m.content.slice(0, 80);
+      : m.kind === "chat_record"
+        ? recordLabel(m, RECORD_TITLE_MAX)
+        : m.content.slice(0, 80);
     const tag = cur.me && m.mentions.includes(cur.me.id) ? "[有人@我] " : "";
     pushToast({
       convId: m.conversation_id,
@@ -587,7 +617,9 @@ function flushOutbox() {
         conversation_id: item.convId,
         client_msg_id: item.clientMsgId,
         content: item.content,
-        attachment_id: item.attachment?.id,
+        ...(item.reuse
+          ? { reuse_attachment_id: item.attachment?.id } // MM2：撤回件复用（服务端校验上传者/TTL）
+          : { attachment_id: item.attachment?.id }),
         reply_to_id: item.replyToId,
       }),
     );
@@ -605,10 +637,15 @@ export function sendChat(
   content: string,
   attachment?: AttachmentView,
   replyTo?: MessageView,
-) {
+  reuse?: boolean,
+): string | undefined {
   const clientMsgId = crypto.randomUUID();
   const me = getState().me;
-  if (!me) return;
+  if (!me) return undefined;
+  // MM2 fix3：复用发送的乐观附件打上 recalled 标——id 是撤回保留原件，
+  // 公共 /v1/files/{id} 已 404，气泡只能渲染 chip 已取回的 object URL。
+  const optimisticAtt =
+    attachment && reuse ? { ...attachment, recalled: true } : attachment;
   const optimistic: MessageView = {
     id: `client:${clientMsgId}`,
     conversation_id: convId,
@@ -618,21 +655,21 @@ export function sendChat(
     sender_name: me.display_name,
     content:
       content ||
-      (attachment
-        ? attachment.duration_ms != null
+      (optimisticAtt
+        ? optimisticAtt.duration_ms != null
           ? "[语音]"
-          : attachment.mime.startsWith("image/")
+          : optimisticAtt.mime.startsWith("image/")
             ? "[图片]"
-            : `[文件] ${attachment.file_name}`
+            : `[文件] ${optimisticAtt.file_name}`
         : ""),
-    kind: attachment
-      ? attachment.duration_ms != null
+    kind: optimisticAtt
+      ? optimisticAtt.duration_ms != null
         ? "audio"
-        : attachment.mime.startsWith("image/")
+        : optimisticAtt.mime.startsWith("image/")
           ? "image"
           : "file"
       : "text",
-    attachment: attachment ?? null,
+    attachment: optimisticAtt ?? null,
     mentions: [],
     reply_to_id: replyTo?.id ?? null,
     reply_to_preview: replyTo ? replyPreview(replyTo) : null,
@@ -647,6 +684,7 @@ export function sendChat(
     clientMsgId,
     content,
     attachment,
+    reuse,
     replyToId: replyTo?.id,
     optimistic,
   });
@@ -658,6 +696,7 @@ export function sendChat(
     },
   }));
   flushOutbox();
+  return clientMsgId;
 }
 
 export function sendTyping(convId: string) {

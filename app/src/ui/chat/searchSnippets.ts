@@ -1,4 +1,5 @@
 import { convTitle } from "../../store";
+import { RECORD_TITLE_MAX, recordLabel } from "./chatRecord";
 import type { ConversationView, FriendView, MessageView, UserPublic } from "../../types";
 
 // ===== V2 P3-1 =====
@@ -32,6 +33,8 @@ export function highlightParts(text: string, q: string): HiPart[] {
 
 /** 搜索结果行摘要：附件消息显示占位文字（与气泡口径一致），不暴露文件元数据之外的原文 */
 export function snippetOf(m: MessageView): string {
+  // MF2：聊天记录恒显示「[聊天记录] {title}」，不带 content 里的逐行摘要
+  if (m.kind === "chat_record") return recordLabel(m, RECORD_TITLE_MAX);
   if (!m.attachment) return m.content;
   if (m.kind === "image") return "[图片]";
   if (m.kind === "audio" || m.attachment.duration_ms != null) return "[语音]";

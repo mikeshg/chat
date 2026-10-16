@@ -157,6 +157,22 @@ pub struct AttachmentView {
     pub duration_ms: Option<i32>,
 }
 
+/// 聊天记录卡片预览（MF1）：列表/WS 帧里只带这个摘要，完整快照走 GET /messages/{id}/record。
+/// items 最多前 4 条，每条 text 截 60 字；永不含附件 id。
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordPreviewItem {
+    pub sender_name: String,
+    pub kind: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordPreview {
+    pub title: String,
+    pub count: i64,
+    pub items: Vec<RecordPreviewItem>,
+}
+
 /// 回复引用预览：只展开一层。deleted=true 时 excerpt 为空，仍保留 id/seq 供跳转。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplyPreview {
@@ -166,6 +182,9 @@ pub struct ReplyPreview {
     pub excerpt: String,
     pub kind: String,
     pub deleted: bool,
+    /// 被撤回消息的撤回者展示名（渲染「X 撤回了一条消息」）；旧数据无此键 → null
+    #[serde(default)]
+    pub recalled_by_name: Option<String>,
 }
 
 /// 单个 emoji 的聚合视图；reacted_by_me 按观看者个性化，广播时逐成员计算。
@@ -214,7 +233,7 @@ pub struct MessageView {
     pub sender_username: String,
     pub sender_name: String,
     pub content: String,
-    pub kind: String, // "text" | "image" | "file" | "audio" | "poll"
+    pub kind: String, // "text" | "image" | "file" | "audio" | "poll" | "chat_record"
     pub attachment: Option<AttachmentView>,
     pub mentions: Vec<Uuid>, // 被 @ 的用户 id（群聊）
     pub reply_to_id: Option<Uuid>,
@@ -227,12 +246,25 @@ pub struct MessageView {
     pub reactions: Vec<ReactionView>,
     /// kind='poll' 时的投票卡片数据（个性化字段按观看者计算）；旧客户端忽略，看 content 占位
     pub poll: Option<PollView>,
+    /// kind='chat_record' 时的卡片摘要（前 4 条、每条 60 字）；撤回后为 null
+    pub record_preview: Option<RecordPreview>,
     pub created_at: DateTime<Utc>,
     /// 发送者当前头像版本 / 是否有头像（消息行头像用，免得客户端逐人查）
     pub sender_avatar_version: i32,
     pub sender_has_avatar: bool,
     /// 转发消息：原发送者展示名快照
     pub forwarded_from: Option<String>,
+    /// 是否已撤回（= deleted_at 非空）。旧客户端只看 deleted_at。
+    pub recalled: bool,
+    /// 撤回发起者（= deleted_by）：本人撤回或群主撤群内消息；无 deleted_by 的历史墓碑为 null
+    pub recalled_by: Option<Uuid>,
+    /// 撤回者展示名；deleted_by 为 NULL 时为 null
+    pub recalled_by_name: Option<String>,
+    /// 仅 REST 撤回响应、且发起者是该附件上传者时携带：
+    /// 客户端凭它走 GET /files/{id}/recalled 取回或按 reuse_attachment_id 重发。
+    /// 广播帧与普通视图永为 null（不序列化）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recalled_attachment_id: Option<Uuid>,
 }
 
 /// 群公告（会话列表随 ConversationView 下发；清空时整字段为 null）。
@@ -350,6 +382,9 @@ pub enum WsIn {
         kind: Option<String>,
         #[serde(default)]
         attachment_id: Option<Uuid>,
+        /// 撤回附件重发：引用自己已撤回消息上的附件（TTL 内），服务端克隆出新行
+        #[serde(default)]
+        reuse_attachment_id: Option<Uuid>,
         /// 回复目标：必须是同会话消息
         #[serde(default)]
         reply_to_id: Option<Uuid>,
@@ -410,7 +445,8 @@ pub enum WsOut {
         message: MessageView,
         edit_version: i32,
     },
-    /// 软删除广播：携带完整墓碑视图（id/seq 保留，正文/附件/reaction 已被读模型掩去），
+    /// 撤回广播（帧名保留 message_deleted 兼容旧客户端）：携带完整墓碑视图
+    /// （id/seq 保留，正文/附件/reaction 已被读模型掩去），
     /// 与 message_updated/reaction_update 一样整视图按 (id, edit_version) 合并——
     /// 部分字段帧会因全局版本互相吞掉更新（反序交付丢正文）。
     MessageDeleted {
@@ -504,6 +540,11 @@ pub struct ForwardReq {
     pub conversation_ids: Vec<Uuid>,
     /// 必填：发起者幂等键（同 op+同目标重试返回同一条消息，不重复广播）
     pub client_op_id: Uuid,
+    /// 可选（MF1）：转发聊天记录内的单个附件条目。
+    /// 指向一条 attachments 行（其 record_message_id 必须等于路径上的 {id}）；
+    /// 命中后按快照条目的 kind/署名转发为普通附件消息。
+    #[serde(default)]
+    pub record_attachment_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize)]
@@ -525,6 +566,57 @@ pub struct ForwardResultItem {
 pub struct ForwardResp {
     /// 与请求目标顺序一一对应；逐条独立成败（HTTP 恒 200，除非源侧统一被拒）
     pub results: Vec<ForwardResultItem>,
+}
+
+// ---------- 批量转发 / 合并转发（MF1） ----------
+
+/// POST /messages/forward-batch：同一源会话选 1..=100 条消息，逐条或合并转发到 1..=10 个目标。
+#[derive(Debug, Deserialize)]
+pub struct ForwardBatchReq {
+    /// 源会话 id：所有 message_ids 必须属于它
+    pub conversation_id: Uuid,
+    /// 源消息 id 列表：1..=100（服务端去重保序）；不属该会话/已撤回/投票按原因跳过
+    pub message_ids: Vec<Uuid>,
+    /// 目标会话 id 列表：1..=10（服务端去重保序）
+    pub targets: Vec<Uuid>,
+    /// "merged" = 每目标一条 chat_record；"separate" = 按 seq 逐条转发
+    pub mode: String,
+    /// 必填：发起者幂等键
+    pub client_op_id: Uuid,
+}
+
+/// 跳过原因计数（闭集：unavailable / recalled / poll / too_deep）。
+/// 请求级算一次，顶层与各 target 结果中原样拷贝；计数为 0 的键不出现。
+pub type SkipMap = std::collections::BTreeMap<String, i64>;
+
+#[derive(Debug, Serialize)]
+pub struct ForwardBatchTarget {
+    pub conversation_id: Uuid,
+    pub ok: bool,
+    /// 本会话成功写入的消息数（merged=1；separate=实际写入条数；幂等重放也算）
+    pub forwarded: i64,
+    /// ok=true：写入消息 id 列表（按 seq 序）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_ids: Option<Vec<Uuid>>,
+    /// ok=false：稳定错误码 + 面向用户的中文原因
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ForwardBatchError>,
+    /// 与顶层 skipped 相同（每目标一份拷贝）
+    pub skipped: SkipMap,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ForwardBatchError {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ForwardBatchResp {
+    /// 与请求目标顺序一一对应
+    pub results: Vec<ForwardBatchTarget>,
+    /// 源侧一次计算的跳过汇总（对全部目标相同）
+    pub skipped: SkipMap,
 }
 
 // 软删除/reaction 的 REST 响应均为发起者视角的完整 MessageView：

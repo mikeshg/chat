@@ -3,24 +3,17 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::str::FromStr;
 use uuid::Uuid;
 
+// MM5：所有测试库经 TempDb 守卫创建（作用域结束含 panic 即删库）。
+#[path = "common/testdb.rs"]
+mod testdb;
+
 #[tokio::test]
 async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://chat:chat@localhost:15432/postgres".into());
-    let options = PgConnectOptions::from_str(&database_url).unwrap();
-    let admin = PgPoolOptions::new()
-        .max_connections(1)
-        .connect_with(options.clone())
-        .await
-        .unwrap();
-    let name = format!("chat_migration_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE DATABASE {name}"))
-        .execute(&admin)
-        .await
-        .unwrap();
+    let db = testdb::TempDb::create(&format!("chat_t_mig_{}", Uuid::new_v4().simple())).await;
+    let options = PgConnectOptions::from_str(&testdb::admin_db_url()).unwrap();
     let pool = PgPoolOptions::new()
         .max_connections(3)
-        .connect_with(options.database(&name))
+        .connect_with(options.database(db.name()))
         .await
         .unwrap();
     for script in [
@@ -85,9 +78,19 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
         include_str!("../migrations/0033_agent_workspaces.sql"),
         include_str!("../migrations/0034_agent_scratch_workspace.sql"),
         include_str!("../migrations/0035_drop_agents.sql"),
+        include_str!("../migrations/0036_bots.sql"),
+        include_str!("../migrations/0037_bot_tokens.sql"),
+        include_str!("../migrations/0038_push_devices.sql"),
+        include_str!("../migrations/0039_message_recall.sql"),
+        include_str!("../migrations/0040_chat_record.sql"),
     ] {
         sqlx::raw_sql(script).execute(&pool).await.unwrap();
     }
+    // 0039 起发送者撤回限 24h（库 now() 判定）：把夹具消息拨到当下使其可撤回
+    sqlx::query("UPDATE messages SET created_at = now()")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let references = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
         "SELECT id,attachment_id FROM messages ORDER BY seq",
@@ -123,21 +126,86 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
             .unwrap();
     assert_eq!(visible, 3);
 
+    // 0039 撤回语义：附件行不删，标 recalled_at 并在读模型掩去；物理文件由清扫按引用计数删
+    let att_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT attachment_id FROM messages ORDER BY seq",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(att_ids.len(), 3);
+    let files_dir =
+        std::env::temp_dir().join(format!("chat-migration-files-{}", Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&files_dir).unwrap();
+    std::fs::write(files_dir.join("migration-shared-path"), b"shared").unwrap();
+
     for (index, id) in ids.iter().enumerate() {
-        let deleted = domain::delete_message(&pool, *id, user).await.unwrap();
-        if index < 2 {
-            assert!(deleted.orphan_files.is_empty());
-            let remaining = sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM message_views WHERE att_id IS NOT NULL",
-            )
+        let recalled = domain::recall_message(&pool, *id, user, 86400)
+            .await
+            .unwrap();
+        // 发起者是上传者 → REST 响应带撤回附件 id
+        assert_eq!(recalled.recalled_attachment_id, Some(att_ids[index]));
+        let remaining = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM message_views WHERE att_id IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 2 - index as i64);
+    }
+    let marked = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM attachments WHERE recalled_at IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(marked, 3, "撤回只打 recalled_at，不删附件行");
+
+    // 前两行先过期清扫：行删、messages 引用摘掉，但物理文件被第三行引用而保留
+    sqlx::query(
+        "UPDATE attachments SET recalled_at = now() - interval '2 days' WHERE id = ANY($1)",
+    )
+    .bind(&att_ids[..2])
+    .execute(&pool)
+    .await
+    .unwrap();
+    let n = domain::sweep_recalled_attachments(
+        &pool,
+        files_dir.to_str().unwrap(),
+        std::time::Duration::from_secs(86400),
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 2);
+    assert!(
+        files_dir.join("migration-shared-path").exists(),
+        "仍有行引用 storage_path 时文件不得删除"
+    );
+
+    // 第三行过期：最后一个引用消失，物理文件删除
+    sqlx::query(
+        "UPDATE attachments SET recalled_at = now() - interval '2 days' WHERE id = $1",
+    )
+    .bind(att_ids[2])
+    .execute(&pool)
+    .await
+    .unwrap();
+    let n = domain::sweep_recalled_attachments(
+        &pool,
+        files_dir.to_str().unwrap(),
+        std::time::Duration::from_secs(86400),
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 1);
+    assert!(!files_dir.join("migration-shared-path").exists());
+    let dangling =
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM messages WHERE attachment_id IS NOT NULL")
             .fetch_one(&pool)
             .await
             .unwrap();
-            assert_eq!(remaining, 2 - index as i64);
-        } else {
-            assert_eq!(deleted.orphan_files, vec!["migration-shared-path"]);
-        }
-    }
+    assert_eq!(dangling, 0, "清扫后消息上的附件引用必须置空");
+    std::fs::remove_dir_all(&files_dir).unwrap();
     // 0035 把 Agent 的表、列和设置全部拿掉
     let leftovers = sqlx::query_scalar::<_, i64>(
         "SELECT (SELECT count(*) FROM information_schema.tables WHERE table_name LIKE 'agent%')
@@ -154,32 +222,17 @@ async fn upgrade_preserves_shared_attachment_references_and_cleanup() {
     );
 
     pool.close().await;
-    sqlx::query(&format!("DROP DATABASE {name}"))
-        .execute(&admin)
-        .await
-        .unwrap();
 }
 
 /// V2 P2-4：0015 为 0015 之前已存在的用户回填 type='self' 会话与 owner 成员；
 /// 重复执行幂等（uq_self_conversation 部分唯一索引 + memberships PK 兜底）。
 #[tokio::test]
 async fn upgrade_backfills_self_conversations() {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://chat:chat@localhost:15432/postgres".into());
-    let options = PgConnectOptions::from_str(&database_url).unwrap();
-    let admin = PgPoolOptions::new()
-        .max_connections(1)
-        .connect_with(options.clone())
-        .await
-        .unwrap();
-    let name = format!("chat_migration_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE DATABASE {name}"))
-        .execute(&admin)
-        .await
-        .unwrap();
+    let db = testdb::TempDb::create(&format!("chat_t_mig_{}", Uuid::new_v4().simple())).await;
+    let options = PgConnectOptions::from_str(&testdb::admin_db_url()).unwrap();
     let pool = PgPoolOptions::new()
         .max_connections(3)
-        .connect_with(options.database(&name))
+        .connect_with(options.database(db.name()))
         .await
         .unwrap();
     for script in [
@@ -270,31 +323,16 @@ async fn upgrade_backfills_self_conversations() {
         .unwrap();
 
     pool.close().await;
-    sqlx::query(&format!("DROP DATABASE {name}"))
-        .execute(&admin)
-        .await
-        .unwrap();
 }
 
 /// V2 P3-1：0016 在已有数据上创建 pg_trgm 扩展与 messages.content 部分 GIN 索引。
 #[tokio::test]
 async fn upgrade_creates_search_trgm_index() {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://chat:chat@localhost:15432/postgres".into());
-    let options = PgConnectOptions::from_str(&database_url).unwrap();
-    let admin = PgPoolOptions::new()
-        .max_connections(1)
-        .connect_with(options.clone())
-        .await
-        .unwrap();
-    let name = format!("chat_migration_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE DATABASE {name}"))
-        .execute(&admin)
-        .await
-        .unwrap();
+    let db = testdb::TempDb::create(&format!("chat_t_mig_{}", Uuid::new_v4().simple())).await;
+    let options = PgConnectOptions::from_str(&testdb::admin_db_url()).unwrap();
     let pool = PgPoolOptions::new()
         .max_connections(3)
-        .connect_with(options.database(&name))
+        .connect_with(options.database(db.name()))
         .await
         .unwrap();
     for script in [
@@ -369,31 +407,95 @@ async fn upgrade_creates_search_trgm_index() {
     assert_eq!(hits, 1);
 
     pool.close().await;
-    sqlx::query(&format!("DROP DATABASE {name}"))
-        .execute(&admin)
+}
+
+/// MF1 0040：messages.record jsonb、attachments.record_message_id + 部分索引、
+/// client_msg_id 上限放宽到 120、message_views 追加末尾列 record（墓碑掩 NULL）。
+#[tokio::test]
+async fn upgrade_0040_chat_record() {
+    let db = testdb::TempDb::create(&format!("chat_t_mig_{}", Uuid::new_v4().simple())).await;
+    let options = PgConnectOptions::from_str(&testdb::admin_db_url()).unwrap();
+    let pool = PgPoolOptions::new()
+        .max_connections(3)
+        .connect_with(options.database(db.name()))
         .await
         .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+    // 列与索引
+    let cols: Vec<(String, String)> = sqlx::query_as(
+        "SELECT column_name, data_type FROM information_schema.columns
+          WHERE table_name IN ('messages','attachments')
+            AND column_name IN ('record','record_message_id')",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(cols.contains(&("record".into(), "jsonb".into())), "{cols:?}");
+    assert!(cols.contains(&("record_message_id".into(), "uuid".into())));
+    let idx = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM pg_indexes
+          WHERE tablename = 'attachments' AND indexname = 'idx_attachments_record_message'
+            AND indexdef LIKE '%WHERE%record_message_id%')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(idx, "record_message_id 需要部分索引");
+
+    // message_views 最后一列必须是 record（只允许追加）
+    let last_col: String = sqlx::query_scalar(
+        "SELECT column_name FROM information_schema.columns
+          WHERE table_name = 'message_views'
+          ORDER BY ordinal_position DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(last_col, "record");
+
+    // client_msg_id 上限 120：120 通过、121 被拒
+    let u = Uuid::new_v4();
+    let conv = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id,username,display_name,password_hash) VALUES ($1,'mig40','Mig40','x')")
+        .bind(u).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO conversations (id,type,name,owner_id,last_seq) VALUES ($1,'group','G',$2,0)")
+        .bind(conv).bind(u).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO memberships (conversation_id,user_id,role) VALUES ($1,$2,'owner')")
+        .bind(conv).bind(u).execute(&pool).await.unwrap();
+    let k120 = "k".repeat(120);
+    sqlx::query("INSERT INTO messages (conversation_id,seq,sender_id,content,client_msg_id) VALUES ($1,1,$2,'x',$3)")
+        .bind(conv).bind(u).bind(&k120).execute(&pool).await.unwrap();
+    let too_long = "k".repeat(121);
+    let e = sqlx::query("INSERT INTO messages (conversation_id,seq,sender_id,content,client_msg_id) VALUES ($1,2,$2,'x',$3)")
+        .bind(conv).bind(u).bind(&too_long).execute(&pool).await;
+    assert!(e.is_err(), "121 字符的 client_msg_id 必须被 CHECK 拒掉");
+
+    // 墓碑掩 record：deleted_at 非空时视图里 record 为 NULL
+    sqlx::query(
+        "UPDATE messages SET record = '{\"v\":1}'::jsonb, deleted_at = now() WHERE seq = 1",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let rec: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT record FROM message_views WHERE seq = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(rec.is_none(), "墓碑消息的 record 必须掩去");
+
+    pool.close().await;
 }
 
 /// 0035：Agent 专属会话整个删掉；Agent 在群里发的消息删掉，人发的留下。
 #[tokio::test]
 async fn drop_agents_removes_agent_messages_and_conversations() {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://chat:chat@localhost:15432/postgres".into());
-    let options = PgConnectOptions::from_str(&database_url).unwrap();
-    let admin = PgPoolOptions::new()
-        .max_connections(1)
-        .connect_with(options.clone())
-        .await
-        .unwrap();
-    let name = format!("chat_migration_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE DATABASE {name}"))
-        .execute(&admin)
-        .await
-        .unwrap();
+    let db = testdb::TempDb::create(&format!("chat_t_mig_{}", Uuid::new_v4().simple())).await;
+    let options = PgConnectOptions::from_str(&testdb::admin_db_url()).unwrap();
     let pool = PgPoolOptions::new()
         .max_connections(3)
-        .connect_with(options.database(&name))
+        .connect_with(options.database(db.name()))
         .await
         .unwrap();
     let mut files: Vec<_> = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
@@ -481,8 +583,4 @@ async fn drop_agents_removes_agent_messages_and_conversations() {
     assert_eq!(agent_convs, 0);
 
     pool.close().await;
-    sqlx::query(&format!("DROP DATABASE {name}"))
-        .execute(&admin)
-        .await
-        .unwrap();
 }

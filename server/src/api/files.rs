@@ -4,7 +4,7 @@ use super::*;
 
 /// 新附件只存 uuid 文件名；历史行是 "{FILES_DIR}/{uuid}"，文件始终平铺在 FILES_DIR 里。
 /// 只取最后的文件名：库里的路径不可信（恢复的备份可以篡改），不能让它指到 FILES_DIR 外面去读或删。
-pub(super) fn stored_file_path(files_dir: &str, stored: &str) -> std::path::PathBuf {
+pub(crate) fn stored_file_path(files_dir: &str, stored: &str) -> std::path::PathBuf {
     let name = std::path::Path::new(stored).file_name().unwrap_or_default();
     std::path::Path::new(files_dir).join(name)
 }
@@ -367,6 +367,55 @@ pub(super) fn inline_safe(mime: &str) -> bool {
         || m == "application/pdf"
 }
 
+/// 公开下载的缓存策略（能力 URL 可长期缓存）。
+const PUBLIC_CACHE: &str = "private, max-age=31536000, immutable";
+/// 撤回件强制不走缓存扩散（与公开下载刻意相反）。
+const NO_STORE: &str = "private, no-store";
+
+/// 按 ?thumb/?dl 选响应体后交给 serve_stored：两条下载路径共用，
+/// 区别只在 Cache-Control——公开 immutable、撤回件 no-store。
+async fn serve_attachment(
+    st: &SharedState,
+    q: &FileQuery,
+    file_name: &str,
+    mime: &str,
+    stored: &str,
+    thumb_stored: Option<&str>,
+    cache_control: &'static str,
+    req: axum::extract::Request,
+) -> AppResult<axum::response::Response> {
+    // ?thumb=1：有缩略图返回 JPEG 缩略图（缓存头与原图一致）；没有/读取失败回退原图。dl=1 忽略 thumb。
+    if q.thumb == Some(1) && q.dl != Some(1) {
+        if let Some(tp) = thumb_stored {
+            let path = stored_file_path(&st.cfg.files_dir, tp);
+            if tokio::fs::metadata(&path).await.is_ok() {
+                let dispo = format!(
+                    "inline; filename*=UTF-8''{}",
+                    pct_encode(&format!("{file_name}.thumb.jpg"))
+                );
+                return serve_stored(path, req, "image/jpeg", &dispo, cache_control).await;
+            }
+        }
+    }
+    // dl=1 → attachment 触发下载；inline 只留给安全媒体白名单（防 Stored XSS）
+    let mode = if q.dl != Some(1) && inline_safe(mime) {
+        "inline"
+    } else {
+        "attachment"
+    };
+    let dispo = format!("{}; filename*=UTF-8''{}", mode, pct_encode(file_name));
+    serve_stored(
+        stored_file_path(&st.cfg.files_dir, stored),
+        req,
+        mime,
+        &dispo,
+        cache_control,
+    )
+    .await
+}
+
+/// 公开下载（能力 URL）。撤回中的附件对所有人一律 404：
+/// 行还在、物理文件还在（上传者可在 TTL 内走 /files/{id}/recalled），但这条路径彻底封口。
 pub(super) async fn download_file(
     State(st): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -375,48 +424,78 @@ pub(super) async fn download_file(
 ) -> AppResult<axum::response::Response> {
     let (file_name, mime, stored, thumb_stored) =
         sqlx::query_as::<_, (String, String, String, Option<String>)>(
-            "SELECT file_name, mime, storage_path, thumb_path FROM attachments WHERE id = $1",
+            "SELECT file_name, mime, storage_path, thumb_path FROM attachments
+             WHERE id = $1 AND recalled_at IS NULL",
         )
         .bind(id)
         .fetch_optional(&st.pool)
         .await?
         .ok_or_else(|| AppError::not_found("file not found"))?;
-    // ?thumb=1：有缩略图返回 JPEG 缩略图（缓存头与原图一致）；没有/读取失败回退原图。dl=1 忽略 thumb。
-    if q.thumb == Some(1) && q.dl != Some(1) {
-        if let Some(tp) = &thumb_stored {
-            let path = stored_file_path(&st.cfg.files_dir, tp);
-            if tokio::fs::metadata(&path).await.is_ok() {
-                let dispo = format!(
-                    "inline; filename*=UTF-8''{}",
-                    pct_encode(&format!("{file_name}.thumb.jpg"))
-                );
-                return serve_stored(path, req, "image/jpeg", &dispo).await;
-            }
-        }
-    }
-    // dl=1 → attachment 触发下载；inline 只留给安全媒体白名单（防 Stored XSS）
-    let mode = if q.dl != Some(1) && inline_safe(&mime) {
-        "inline"
-    } else {
-        "attachment"
-    };
-    let dispo = format!("{}; filename*=UTF-8''{}", mode, pct_encode(&file_name));
-    serve_stored(
-        stored_file_path(&st.cfg.files_dir, &stored),
-        req,
+    serve_attachment(
+        &st,
+        &q,
+        &file_name,
         &mime,
-        &dispo,
+        &stored,
+        thumb_stored.as_deref(),
+        PUBLIC_CACHE,
+        req,
+    )
+    .await
+}
+
+/// 撤回附件取回：GET /files/{id}/recalled，仅 Bearer + 上传者本人 + 保留期内。
+/// 不满足一律 404（不泄露行是否存在）；无 Bearer → 401。
+/// 记录内克隆行（record_message_id 非空）恒 404——它们没有重发语义，
+/// 记录撤回后走这条取回路径不该再拿到内容（MF1）。
+/// ?thumb=1 / ?dl=1 语义与公开下载一致，但强制 Cache-Control: private, no-store——
+/// 撤回件不应再被缓存扩散（与公开下载的 immutable 缓存策略刻意相反）。
+pub(super) async fn download_recalled(
+    State(st): State<SharedState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Query(q): Query<FileQuery>,
+    req: axum::extract::Request,
+) -> AppResult<axum::response::Response> {
+    let uid = uid_of(&headers, &st).await?;
+    let ttl = st.cfg.recall_attachment_ttl_secs as f64;
+    #[allow(clippy::type_complexity)]
+    let row = sqlx::query_as::<_, (Uuid, String, String, String, Option<String>, bool)>(
+        "SELECT uploader_id, file_name, mime, storage_path, thumb_path,
+                recalled_at IS NOT NULL AND recalled_at + make_interval(secs => $2) > now()
+           FROM attachments WHERE id = $1 AND record_message_id IS NULL",
+    )
+    .bind(id)
+    .bind(ttl)
+    .fetch_optional(&st.pool)
+    .await?
+    .ok_or_else(|| AppError::not_found("file not found"))?;
+    let (uploader, file_name, mime, stored, thumb_stored, fresh) = row;
+    if uploader != uid || !fresh {
+        return Err(AppError::not_found("file not found"));
+    }
+    serve_attachment(
+        &st,
+        &q,
+        &file_name,
+        &mime,
+        &stored,
+        thumb_stored.as_deref(),
+        NO_STORE,
+        req,
     )
     .await
 }
 
 /// 流式发文件（不整个读进内存），支持 Range（音视频拖动、iOS 播放要用）和条件请求。
-/// 类型、下载方式、缓存头用库里记的，不用按扩展名猜的。
+/// 类型、下载方式、缓存头用库里记的，不用按扩展名猜的；缓存策略由调用方给定
+/// （公开下载 immutable；撤回取回 no-store）。
 pub(super) async fn serve_stored(
     path: std::path::PathBuf,
     req: axum::extract::Request,
     mime: &str,
     dispo: &str,
+    cache_control: &'static str,
 ) -> AppResult<axum::response::Response> {
     use tower::ServiceExt;
     let res = tower_http::services::ServeFile::new(path)
@@ -442,7 +521,7 @@ pub(super) async fn serve_stored(
     );
     h.insert(
         header::CACHE_CONTROL,
-        header::HeaderValue::from_static("private, max-age=31536000, immutable"),
+        header::HeaderValue::from_static(cache_control),
     );
     Ok(res)
 }

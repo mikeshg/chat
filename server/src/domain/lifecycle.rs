@@ -9,6 +9,8 @@ use super::*;
 
 /// 编辑窗口：发送后 15 分钟（以数据库时间判定，测试可回拨 created_at 覆盖）
 pub(super) const EDIT_WINDOW: &str = "15 minutes";
+/// 撤回窗口：发送后 24 小时（以数据库时间判定）。群主撤他人消息不受此限。
+pub(super) const RECALL_WINDOW: &str = "24 hours";
 /// 同一用户对单条消息的不同 emoji 上限
 pub(super) const MAX_REACTION_KINDS: i64 = 20;
 
@@ -23,6 +25,7 @@ pub(super) struct LockedMessage {
     pub(super) edit_op_id: Option<String>,
     pub(super) attachment_id: Option<Uuid>,
     pub(super) edit_expired: bool,
+    pub(super) recall_expired: bool,
 }
 
 /// 定位消息 → 锁会话行 → 校验成员/可写 → 锁消息行。
@@ -53,6 +56,7 @@ pub(super) async fn lock_message_for_mutation(
         return Err(PostError::deny("not_friends", "好友关系已解除，会话只读").into());
     }
 
+    #[allow(clippy::type_complexity)]
     let row = sqlx::query_as::<
         _,
         (
@@ -63,14 +67,17 @@ pub(super) async fn lock_message_for_mutation(
             Option<String>,
             Option<Uuid>,
             bool,
+            bool,
         ),
     >(
         "SELECT sender_id, kind, deleted_at, edit_version, edit_op_id, attachment_id,
-                created_at + $2::interval <= now() AS edit_expired
+                created_at + $2::interval <= now() AS edit_expired,
+                created_at + $3::interval <= now() AS recall_expired
            FROM messages WHERE id = $1 FOR UPDATE",
     )
     .bind(message_id)
     .bind(EDIT_WINDOW)
+    .bind(RECALL_WINDOW)
     .fetch_one(&mut **tx)
     .await?;
 
@@ -85,6 +92,7 @@ pub(super) async fn lock_message_for_mutation(
         edit_op_id: row.4,
         attachment_id: row.5,
         edit_expired: row.6,
+        recall_expired: row.7,
     })
 }
 
@@ -217,77 +225,118 @@ pub(super) async fn finish_edit(
     })
 }
 
-/// 用户已用附件存储（V2 P2-1）：其上传的附件按 storage_path 去重求和，
-/// 转发产生的副本共享同一 storage_path，不重复计。
+/// 用户已用附件存储（V2 P2-1，MF1 修订）：其上传的附件按 storage_path 去重求和，
+/// 转发/记录克隆副本共享同一 storage_path 且不重复计。
+/// 克隆行 uploader_id 现已记为转发者：同一 storage_path 只归「最早那行的上传者」
+/// （created_at,id 最小的行）计费——克隆行更晚，转发不会推高转发者配额；
+/// 最早行被清扫删除后，存活的最早引用自然接手计费。
 pub async fn storage_used(pool: &PgPool, uid: Uuid) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar::<_, i64>(
         "SELECT COALESCE(SUM(size), 0)::bigint
-           FROM (SELECT DISTINCT storage_path, size
-                   FROM attachments WHERE uploader_id = $1) d",
+           FROM (SELECT DISTINCT a.storage_path, a.size
+                   FROM attachments a
+                  WHERE a.uploader_id = $1
+                    AND NOT EXISTS (SELECT 1 FROM attachments o
+                                     WHERE o.storage_path = a.storage_path
+                                       AND (o.created_at, o.id) < (a.created_at, a.id))) d",
     )
     .bind(uid)
     .fetch_one(pool)
     .await
 }
 
-pub struct Deleted {
+pub struct Recalled {
     pub conversation_id: Uuid,
     /// 墓碑完整读模型行：广播/响应方按成员逐一再 into_view
     pub row: MsgViewRow,
     pub member_ids: Vec<Uuid>,
-    /// 已无其他 attachments 行引用的物理文件（storage_path），提交后由调用方异步删除
-    pub orphan_files: Vec<String>,
-    /// 这次删除摘掉了置顶行。软删除不删 messages 行，外键不会级联，调用方据此发 pins_updated。
+    /// 这次撤回摘掉了置顶行。软删除不删 messages 行，外键不会级联，调用方据此发 pins_updated。
     pub pins_dropped: bool,
+    /// 发起者恰好是该附件的上传者时给出附件 id：客户端可凭它走
+    /// GET /files/{id}/recalled 取回、或按 reuse_attachment_id 重发。
+    /// 广播墓碑永远不带这个字段（只在 REST 响应、且仅上传者可见）。
+    pub recalled_attachment_id: Option<Uuid>,
 }
 
-/// 软删除：本人可删自己的；群主可删群内任意消息；DM 只能删自己的。
-/// 重复删除幂等返回现状。seq/last_seq/read cursor 不动；reactions、mentions 随删除清空。
-/// 附件行删除使下载立即失效；物理文件只在无其他 attachment 共享同一 storage_path 时清理。
-pub async fn delete_message(
+/// 撤回（原软删除改名，语义收紧）：
+/// - 发送者可撤回自己的消息，限 created_at 起 24 小时内（RECALL_WINDOW）；
+/// - 群主（撤回当下的 role）可撤回群内其他成员的任意消息，不限时；群主自己的消息仍按 24h；
+/// - DM/self 会话只有发送者本人；站点 admin（users.role）无额外权力；
+/// - 检查顺序：无权 → forbidden；超时 → recall_expired。
+///
+/// 重复撤回幂等返回现状。seq/last_seq/read cursor 不动；reactions、mentions、pins 随撤回清空。
+/// 附件不删行不删文件：置 attachments.recalled_at 隐藏公开下载（视图/列表均掩去），
+/// 上传者在 TTL 内可取回重发，过期由 sweep_recalled_attachments 清行并按引用计数删文件。
+pub async fn recall_message(
     pool: &PgPool,
     message_id: Uuid,
     uid: Uuid,
-) -> Result<Deleted, PostError> {
+    ttl_secs: u64,
+) -> Result<Recalled, PostError> {
     let mut tx = pool.begin().await.map_err(PostError::Db)?;
-    let d = delete_in_tx(&mut tx, message_id, uid).await?;
+    let d = recall_in_tx(&mut tx, message_id, uid, ttl_secs).await?;
     tx.commit().await?;
     Ok(d)
 }
 
-pub(super) async fn delete_in_tx(
+pub(super) async fn recall_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     message_id: Uuid,
     uid: Uuid,
-) -> Result<Deleted, PostError> {
+    ttl_secs: u64,
+) -> Result<Recalled, PostError> {
     let m = lock_message_for_mutation(tx, message_id, uid).await?;
     let member_ids = member_ids(&mut **tx, m.conversation_id).await?;
 
-    // 幂等：已删再删返回现状（重试/重复帧安全）
+    // 权限先于幂等：无权者（非发送者、非群主）对已撤回消息也只能得到 forbidden，
+    // 否则任何人都能借重复撤回在别人墓碑上反复触发广播。
+    let is_sender = m.sender_id == uid;
+    let allowed = is_sender || (m.conv_type == "group" && m.my_role == "owner");
+    if !allowed {
+        return Err(PostError::deny("forbidden", "无权撤回这条消息"));
+    }
+
+    // 幂等：已撤回再撤回返回现状（重试/重复帧安全，不再校验 24h——撤回早已生效）。
+    // 附件仍在保留期且发起者是上传者时照常给出 recalled_attachment_id——
+    // 客户端可拿它补齐首次响应丢失的取回能力；已过期/被清扫的行不给（给了也 404）。
     if m.deleted_at.is_some() {
         let row = sqlx::query_as::<_, MsgViewRow>("SELECT * FROM message_views WHERE id = $1")
             .bind(message_id)
             .fetch_one(&mut **tx)
             .await?;
-        return Ok(Deleted {
+        let recalled_attachment_id = match m.attachment_id {
+            Some(att) => sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM attachments
+                  WHERE id = $1 AND uploader_id = $2 AND recalled_at IS NOT NULL
+                    AND recalled_at + make_interval(secs => $3) > now()",
+            )
+            .bind(att)
+            .bind(uid)
+            .bind(ttl_secs as f64)
+            .fetch_optional(&mut **tx)
+            .await?,
+            None => None,
+        };
+        return Ok(Recalled {
             conversation_id: m.conversation_id,
             row,
             member_ids,
-            orphan_files: vec![],
             pins_dropped: false,
+            recalled_attachment_id,
         });
     }
 
-    let allowed = m.sender_id == uid || (m.conv_type == "group" && m.my_role == "owner");
-    if !allowed {
-        return Err(PostError::deny("forbidden", "no permission to delete this message").into());
+    // 仅发送者本人撤回受 24h 限制；群主撤他人消息不限时
+    if is_sender && m.recall_expired {
+        return Err(PostError::deny("recall_expired", "超过 24 小时的消息不能撤回"));
     }
 
-    // content 物理清空为占位文本（视图同样掩去，双保险；CHECK 要求非空）
+    // content 物理清空为占位文本（视图同样掩去，双保险；CHECK 要求非空）。
+    // 原文不留在任何地方：无 tsvector/编辑历史表，回复预览与会话摘要均实时计算自动掩去。
     sqlx::query(
         "UPDATE messages
             SET deleted_at = now(), deleted_by = $2, edit_version = edit_version + 1,
-                content = '消息已删除'
+                content = '消息已撤回'
           WHERE id = $1",
     )
     .bind(message_id)
@@ -311,45 +360,106 @@ pub(super) async fn delete_in_tx(
         .await?;
     let pins_dropped = dropped.rows_affected() > 0;
 
-    // 附件：删行使下载立即 404。历史重复引用可能共享同一 storage_path，
-    // 仍有其他有效 attachment 引用时不得删物理文件（转发副本共享 storage_path
-    // 与 thumb_path，同一引用计数规则覆盖两者，不会误删）。
-    let mut orphan_files = Vec::new();
+    // 附件保留：行与物理文件都不删，置 recalled_at 隐藏所有公开下载路径（墓碑视图不暴露附件）。
+    // 上传者由此获知可重发的附件 id；非上传者发起（群主撤别人）不泄露。
+    let mut recalled_attachment_id = None;
     if let Some(att) = m.attachment_id {
-        let row = sqlx::query_as::<_, (String, Option<String>)>(
-            "DELETE FROM attachments WHERE id = $1 RETURNING storage_path, thumb_path",
+        let uploader = sqlx::query_scalar::<_, Uuid>(
+            "UPDATE attachments SET recalled_at = now() WHERE id = $1 RETURNING uploader_id",
         )
         .bind(att)
         .fetch_optional(&mut **tx)
         .await?;
-        if let Some((path, thumb)) = row {
-            let still_used = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM attachments WHERE storage_path = $1)",
-            )
-            .bind(&path)
-            .fetch_one(&mut **tx)
-            .await?;
-            if !still_used {
-                orphan_files.push(path);
-                // 清理原文件时同名的缩略图一并删（共享 storage_path 时上面已跳过）
-                if let Some(t) = thumb {
-                    orphan_files.push(t);
-                }
-            }
+        if uploader == Some(uid) {
+            recalled_attachment_id = Some(att);
         }
+    }
+
+    // 聊天记录级联（MF1）：记录内全部克隆附件（含嵌套，克隆行一律挂最外层记录 id）
+    // 随消息同事务标记撤回——公开下载立即 404；行与文件由清扫按 TTL/引用计数处理。
+    // 墓碑响应不带 recalled_attachment_id（记录消息 attachment_id 恒 NULL，天然满足）。
+    if m.kind == "chat_record" {
+        sqlx::query(
+            "UPDATE attachments SET recalled_at = now()
+              WHERE record_message_id = $1 AND recalled_at IS NULL",
+        )
+        .bind(message_id)
+        .execute(&mut **tx)
+        .await?;
     }
 
     let row = sqlx::query_as::<_, MsgViewRow>("SELECT * FROM message_views WHERE id = $1")
         .bind(message_id)
         .fetch_one(&mut **tx)
         .await?;
-    Ok(Deleted {
+    Ok(Recalled {
         conversation_id: m.conversation_id,
         row,
         member_ids,
-        orphan_files,
         pins_dropped,
+        recalled_attachment_id,
     })
+}
+
+/// 撤回附件清扫：删掉 recalled_at 超过 TTL 的附件行，物理文件（与缩略图分别判定）
+/// 在提交后按最新引用计数删除——仍有其他 attachment 行引用同一 storage_path 就保留。
+/// 单事务内 FOR UPDATE 锁候选行 → messages.attachment_id 显式置 NULL → 删行 → 提交。
+/// 重发克隆出的行 recalled_at 为 NULL，永不进清扫集。
+/// 返回删除的附件行数。
+pub async fn sweep_recalled_attachments(
+    pool: &PgPool,
+    files_dir: &str,
+    ttl: std::time::Duration,
+) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let expired = sqlx::query_as::<_, (Uuid, String, Option<String>)>(
+        "SELECT id, storage_path, thumb_path FROM attachments
+          WHERE recalled_at IS NOT NULL AND recalled_at <= now() - make_interval(secs => $1)
+          FOR UPDATE",
+    )
+    .bind(ttl.as_secs_f64())
+    .fetch_all(&mut *tx)
+    .await?;
+    if expired.is_empty() {
+        tx.rollback().await?;
+        return Ok(0);
+    }
+    let ids: Vec<Uuid> = expired.iter().map(|r| r.0).collect();
+    // 显式摘掉 messages 引用（不依赖 FK ON DELETE SET NULL 是否就位）
+    sqlx::query("UPDATE messages SET attachment_id = NULL WHERE attachment_id = ANY($1)")
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?;
+    let n = sqlx::query("DELETE FROM attachments WHERE id = ANY($1)")
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    tx.commit().await?;
+
+    // 提交后逐个路径重查引用计数再删文件：行删除与新克隆行插入可能交错。
+    // storage_path 与 thumb_path 分开判定（克隆行共享两者，各自独立计数）。
+    for (_, path, thumb) in &expired {
+        for stored in [Some(path), thumb.as_ref()].into_iter().flatten() {
+            let still_used = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM attachments
+                  WHERE storage_path = $1 OR thumb_path = $1)",
+            )
+            .bind(stored)
+            .fetch_one(pool)
+            .await?;
+            if !still_used {
+                let fp = crate::api::stored_file_path(files_dir, stored);
+                if let Err(e) = tokio::fs::remove_file(&fp).await {
+                    // 文件不存在不算错（可能已被上一轮删过）
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(path = %fp.display(), error = %e, "recalled attachment cleanup failed");
+                    }
+                }
+            }
+        }
+    }
+    Ok(n)
 }
 
 pub(super) const PIN_CAP: i64 = 20;

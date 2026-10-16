@@ -39,7 +39,7 @@
 
 ## 7. postgresql + sqlx 编译期嵌入迁移
 
-`sqlx::migrate!("./migrations")` 在编译期把 SQL 打进二进制，容器镜像无需拷贝 SQL 目录。开发库与测试库分离（`chat` / `chat_test`，测试自动建库）。
+`sqlx::migrate!("./migrations")` 在编译期把 SQL 打进二进制，容器镜像无需拷贝 SQL 目录。开发库与测试库分离（开发库 `chat`；测试库自 MM5 起为每次运行自动建删的 `chat_it_run_<pid>_<rand>`，或 `TEST_DATABASE_NAME` 指定的用户自有库；`chat_t_*`/`chat_it_*` 每测试独立库由守卫自动删除）。
 
 ## 8. 多设备在线模型
 
@@ -49,7 +49,7 @@
 
 **决策**：附件二进制存服务端文件系统（`FILES_DIR`），元数据在 `attachments` 表（uploader/conv/mime/size/path）；消息经 `messages.kind` + `attachment_id` 引用；下载走 `GET /v1/files/{id}` 不鉴权。
 
-**理由**：`GET /v1/files/{uuid}` 必须能用于 `<img>`/`<a>`（无法带 Authorization 头）；UUID 不可枚举，链接只在会话内流转——能力 URL 模型与主流 IM 的 CDN 链接一致。上传时校验「上传者是目标会话成员」+ 发送时校验「附件属本人、绑本会话、未被复用」，闭合权限边界。风险与升级路径：链接外泄即失密 → 公网部署可换签名 URL 或短时效 ticket。本地测试库与运行库共用 `chat_test`/`chat` 与 `./data/files`。
+**理由**：`GET /v1/files/{uuid}` 必须能用于 `<img>`/`<a>`（无法带 Authorization 头）；UUID 不可枚举，链接只在会话内流转——能力 URL 模型与主流 IM 的 CDN 链接一致。上传时校验「上传者是目标会话成员」+ 发送时校验「附件属本人、绑本会话、未被复用」，闭合权限边界。风险与升级路径：链接外泄即失密 → 公网部署可换签名 URL 或短时效 ticket。本地运行库为 `chat` + `./data/files`；测试库按上节自动建删（历史遗留的 `chat_test` 不再使用）。
 
 ## 10. @提及持久化 + 会话内搜索
 

@@ -18,6 +18,27 @@ pub struct PostMessage<'a> {
     /// 转发专用「已校验附件」：源消息上的 attachment id，事务内在目标会话克隆一行。
     /// 与 attachment_id 互斥——attachment_id 仍要求 uploader=发送者，此路径不可达普通发送。
     pub forward_attachment: Option<Uuid>,
+    /// 撤回附件重发（reuse_attachment_id）：引用发送者自己已撤回消息上的附件行，
+    /// 事务内校验归属/撤回期/会话后克隆出新行（与 attachment_id 互斥）。
+    pub reuse_attachment_id: Option<Uuid>,
+    /// 撤回附件保留期（秒）：reuse 校验用它判定 recalled_at 是否过期。
+    /// WS 发送路径从 Config 注入；构造器默认取 config 模块的公共缺省。
+    pub recall_attachment_ttl_secs: u64,
+    /// 聊天记录负载（仅服务端合并/记录转发路径）：Some 时本条为 kind='chat_record'，
+    /// 事务内克隆记录内全部附件行（record_message_id → 新消息）并改写快照 id。
+    pub record: Option<RecordPost>,
+    /// 转发路径统一置 true：转发的正文/附件 caption/兜底文本一律不解析 @，
+    /// 不产生 message_mentions 行，也不触发提及解归档与提及优先推送。
+    pub no_mentions: bool,
+}
+
+/// 聊天记录写入负载：json 里的 attachment.id 仍是源侧 id，
+/// write_message 按 attachments 列出的源行逐一克隆后整体改写。
+#[derive(Clone)]
+pub struct RecordPost {
+    pub json: serde_json::Value,
+    /// 需克隆的源附件 id（快照各层摊平、已去重）
+    pub attachments: Vec<Uuid>,
 }
 
 impl<'a> PostMessage<'a> {
@@ -34,6 +55,10 @@ impl<'a> PostMessage<'a> {
             poll: None,
             forwarded_from: None,
             forward_attachment: None,
+            reuse_attachment_id: None,
+            recall_attachment_ttl_secs: crate::config::DEFAULT_RECALL_ATTACHMENT_TTL_SECS,
+            record: None,
+            no_mentions: false,
         }
     }
 }
@@ -82,7 +107,8 @@ pub(super) fn normalize_client_msg_id(raw: Option<&str>) -> Result<Option<String
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
-    if raw.chars().count() > 80 {
+    // 上限与 messages_client_msg_id_check 一致（0040 起 120，批量幂等键要 115）
+    if raw.chars().count() > 120 {
         return Err(PostError::deny("bad_message", "client_msg_id too long"));
     }
     Ok(Some(raw.to_string()))
@@ -178,7 +204,7 @@ pub(super) async fn write_message(
                 PostError::deny("bad_request", "polls are only supported in groups").into(),
             );
         }
-        if msg.attachment_id.is_some() {
+        if msg.attachment_id.is_some() || msg.reuse_attachment_id.is_some() {
             return Err(PostError::deny("bad_request", "poll cannot carry attachments").into());
         }
         if let Some(exp) = spec.expires_at {
@@ -196,18 +222,44 @@ pub(super) async fn write_message(
         }
     }
 
+    if msg.attachment_id.is_some() && msg.reuse_attachment_id.is_some() {
+        return Err(PostError::deny(
+            "bad_request",
+            "attachment_id and reuse_attachment_id are mutually exclusive",
+        )
+        .into());
+    }
     let attachment = match msg.forward_attachment {
-        // 转发路径：调用方已校验源消息可读；在目标会话克隆附件行（共享物理文件）
-        Some(src) => clone_attachment(tx, src, msg.conversation_id).await?,
-        None => load_attachment(tx, msg).await?,
+        // 转发路径：调用方已校验源消息可读；在目标会话克隆附件行（共享物理文件）。
+        // 克隆行 uploader = 转发者本人（MF1 修复 ②：撤回后取回/重发才说得通；
+        // storage_used 按「他者同路径」豁免，转发副本仍不占配额）。
+        Some(src) => clone_attachment(tx, src, msg.conversation_id, msg.sender_id).await?,
+        None => match msg.reuse_attachment_id {
+            // 撤回附件重发：锁内校验归属/保留期/会话后克隆新行
+            Some(src) => {
+                reuse_recalled_attachment(
+                    tx,
+                    src,
+                    msg.sender_id,
+                    msg.conversation_id,
+                    msg.recall_attachment_ttl_secs,
+                )
+                .await?
+            }
+            None => load_attachment(tx, msg).await?,
+        },
     };
     let (content, kind) = match &msg.poll {
         // 旧客户端 fallback：content 里始终有 '[投票] 问题' 可读文本
         Some(spec) => (format!("[投票] {}", spec.question), "poll"),
+        // 聊天记录正文 = 服务端组好的兜底文本；kind 只能由这条路径产生（客户端无字段可伪造）
+        None if msg.record.is_some() => {
+            (normalize_body(msg.content, attachment.as_ref())?.0, "chat_record")
+        }
         None => normalize_body(msg.content, attachment.as_ref())?,
     };
 
-    let mentions = if kind_name == "group" {
+    let mentions = if kind_name == "group" && !msg.no_mentions {
         let members = sqlx::query_as::<_, (Uuid, String)>(
             "SELECT m.user_id, u.username::text FROM memberships m
              JOIN users u ON u.id = m.user_id WHERE m.conversation_id = $1",
@@ -227,13 +279,17 @@ pub(super) async fn write_message(
     .fetch_one(&mut **tx)
     .await?;
 
-    let message_id = sqlx::query_scalar::<_, Uuid>(
+    // id 一律在 Rust 生成：记录路径要先拿它做克隆行的 record_message_id
+    // （attachments.record_message_id → messages(id) 是即刻校验的 FK，
+    //   所以消息行先落库、克隆后至、record 再 UPDATE 回填）。
+    let message_id = Uuid::new_v4();
+    sqlx::query(
         "INSERT INTO messages
-            (conversation_id, seq, sender_id, content, kind, attachment_id,
+            (id, conversation_id, seq, sender_id, content, kind, attachment_id,
              client_msg_id, reply_to_id, forwarded_from)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-         RETURNING id",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
+    .bind(message_id)
     .bind(msg.conversation_id)
     .bind(seq)
     .bind(msg.sender_id)
@@ -243,8 +299,33 @@ pub(super) async fn write_message(
     .bind(client_msg_id)
     .bind(msg.reply_to_id)
     .bind(msg.forwarded_from)
-    .fetch_one(&mut **tx)
+    .execute(&mut **tx)
     .await?;
+
+    // 聊天记录：克隆快照内全部附件（含嵌套；克隆行 record_message_id = 本消息 id、
+    // uploader = 写入者），按 旧id→新id 改写 jsonb 后回填。克隆与消息同事务——
+    // 撞幂等键回滚时克隆行一并消失，不留孤儿。
+    if let Some(rec) = &msg.record {
+        let mut map = std::collections::HashMap::with_capacity(rec.attachments.len());
+        for src in &rec.attachments {
+            let new_id = clone_record_attachment(
+                tx,
+                *src,
+                msg.conversation_id,
+                msg.sender_id,
+                message_id,
+            )
+            .await?;
+            map.insert(*src, new_id);
+        }
+        let mut json = rec.json.clone();
+        rewrite_attachment_ids(&mut json, &map);
+        sqlx::query("UPDATE messages SET record = $2 WHERE id = $1")
+            .bind(message_id)
+            .bind(&json)
+            .execute(&mut **tx)
+            .await?;
+    }
 
     // 发言即读到这里：自己的消息不算未读（否则刷新/换设备后自己发的消息显示成未读）。
     sqlx::query(
@@ -335,7 +416,7 @@ pub(super) async fn load_attachment(
     >(
         "SELECT id, file_name, mime, size, conv_id, width, height, thumb_path IS NOT NULL, duration_ms
            FROM attachments
-          WHERE id = $1 AND uploader_id = $2
+          WHERE id = $1 AND uploader_id = $2 AND recalled_at IS NULL
           FOR UPDATE",
     )
     .bind(att_id)
@@ -371,17 +452,65 @@ pub(super) async fn load_attachment(
     }))
 }
 
+/// 撤回附件重发复用（write_message 事务内调用，client_msg_id 幂等判定之后）：
+/// - FOR SHARE 锁源行后复查：行不存在/已被清扫 → attachment_expired；
+///   uploader ≠ 发送者 → forbidden；recalled_at 为空或已过期 → attachment_expired；
+/// - 目标会话由 reuse_conv_allowed 判定（当前仅同源会话），通过后 clone_attachment
+///   生成新行（recalled_at NULL，不再进清扫集）；TTL 内同一源可重复利用多次。
+///
+/// 新行 kind/宽高/时长全部来自源行，客户端传的值不采信。
+pub(super) async fn reuse_recalled_attachment(
+    tx: &mut Transaction<'_, Postgres>,
+    src_id: Uuid,
+    sender: Uuid,
+    conv: Uuid,
+    ttl_secs: u64,
+) -> Result<Option<AttachmentView>, WriteError> {
+    let row = sqlx::query_as::<_, (Uuid, Uuid, Option<DateTime<Utc>>, bool)>(
+        "SELECT uploader_id, conv_id, recalled_at,
+                recalled_at IS NOT NULL
+                  AND recalled_at + make_interval(secs => $2) > now() AS fresh
+           FROM attachments WHERE id = $1
+          FOR SHARE",
+    )
+    .bind(src_id)
+    .bind(ttl_secs as f64)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| PostError::deny("attachment_expired", "附件已过期或不存在"))?;
+    let (uploader, src_conv, recalled_at, fresh) = row;
+    if uploader != sender {
+        return Err(PostError::deny("forbidden", "无权使用该附件").into());
+    }
+    if recalled_at.is_none() || !fresh {
+        return Err(PostError::deny("attachment_expired", "附件已过期或不存在").into());
+    }
+    if !reuse_conv_allowed(src_conv, conv) {
+        return Err(PostError::deny("forbidden", "无权在该会话使用该附件").into());
+    }
+    clone_attachment(tx, src_id, conv, sender).await
+}
+
+/// 撤回附件允许重发到哪个会话：当前仅允许原会话（src_conv == 目标）。
+/// 有意收成独立小函数：以后要放宽（如同用户任意会话）只改这里。
+fn reuse_conv_allowed(src_conv: Uuid, target_conv: Uuid) -> bool {
+    src_conv == target_conv
+}
+
 /// 转发专用附件克隆（write_message 事务内调用）：
 /// - 在目标会话新 INSERT 一行（新 id），本消息的 attachment_id 指向它——每条消息仍
 ///   独占一个 attachment 行，「一消息一附件」不变量不破坏；
 /// - storage_path/thumb_path 与源共享物理文件——孤儿清理按「还有谁引用该 path」计数，
 ///   源删除不影响目标、最后一个引用删除时文件才被清；
-/// - uploader 保持原上传者（能力 URL 下载不校验归属，只验证行存在）。
+/// - uploader = 转发者（MF1 修复 ②：撤回转发副本后，取回/重发归属转发者本人）；
+///   共享路径副本由 storage_used 的「他者同路径」豁免兜住，不占转发者配额。
+///
 /// 只在转发路径可达：attachment_id 的 uploader=发送者 检查拦掉了一切普通借用。
 pub(super) async fn clone_attachment(
     tx: &mut Transaction<'_, Postgres>,
     src_id: Uuid,
     conv: Uuid,
+    uploader: Uuid,
 ) -> Result<Option<AttachmentView>, WriteError> {
     let row = sqlx::query_as::<
         _,
@@ -399,7 +528,7 @@ pub(super) async fn clone_attachment(
         "INSERT INTO attachments
             (conv_id, uploader_id, file_name, mime, size, storage_path,
              width, height, thumb_path, duration_ms)
-         SELECT $2, uploader_id, file_name, mime, size, storage_path,
+         SELECT $2, $3, file_name, mime, size, storage_path,
                 width, height, thumb_path, duration_ms
            FROM attachments WHERE id = $1
          RETURNING id, file_name, mime, size, width, height,
@@ -407,6 +536,7 @@ pub(super) async fn clone_attachment(
     )
     .bind(src_id)
     .bind(conv)
+    .bind(uploader)
     .fetch_optional(&mut **tx)
     .await?
     .ok_or_else(|| PostError::deny("bad_message", "source attachment gone"))?;
@@ -420,6 +550,35 @@ pub(super) async fn clone_attachment(
         has_thumb: row.6,
         duration_ms: row.7,
     }))
+}
+
+/// 记录内附件克隆（MF1）：与 clone_attachment 同源同事务，差异是
+/// record_message_id 指向宿主 chat_record 消息（撤回级联、清扫引用计数、
+/// /files/{id}/recalled 一律 404 都靠它识别）。源行在组装快照到落库之间被撤回的，
+/// 直接拒掉这条目标写入（竞态罕见，宁可失败也不给接收方看已撤回的文件）。
+pub(super) async fn clone_record_attachment(
+    tx: &mut Transaction<'_, Postgres>,
+    src_id: Uuid,
+    conv: Uuid,
+    uploader: Uuid,
+    record_msg: Uuid,
+) -> Result<Uuid, WriteError> {
+    sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO attachments
+            (conv_id, uploader_id, file_name, mime, size, storage_path,
+             width, height, thumb_path, duration_ms, record_message_id)
+         SELECT $2, $3, file_name, mime, size, storage_path,
+                width, height, thumb_path, duration_ms, $4
+           FROM attachments WHERE id = $1 AND recalled_at IS NULL
+         RETURNING id",
+    )
+    .bind(src_id)
+    .bind(conv)
+    .bind(uploader)
+    .bind(record_msg)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| PostError::deny("bad_message", "源附件已撤回").into())
 }
 
 pub(super) fn normalize_body(

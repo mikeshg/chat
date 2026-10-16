@@ -4,6 +4,20 @@
 export const BUBBLE_EDGE = 240;
 
 /**
+ * 附件图片的 <img> src（MM2 fix3）：
+ * - att.recalled（撤回件复用的乐观附件）：公共 /v1/files/{id} 已随撤回 404，
+ *   只能用已取回的 object URL；还没取回返回 null（调用方画中性占位，不请求公共 URL）。
+ * - 普通附件 → 公共能力 URL。
+ */
+export function attImgSrc(
+  att: { recalled?: boolean },
+  objectUrl: string | null | undefined,
+  publicUrl: string,
+): string | null {
+  return att.recalled ? (objectUrl ?? null) : publicUrl;
+}
+
+/**
  * 原始像素尺寸 → 气泡展示尺寸。最长边缩到 BUBBLE_EDGE，比例保持；
  * 小图不放大；非法输入返回 0 尺寸（调用方回退无尺寸渲染）。
  */

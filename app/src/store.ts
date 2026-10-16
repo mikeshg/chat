@@ -1,7 +1,8 @@
 import { useSyncExternalStore } from "react";
 import { loadSession, serverScope } from "./api";
-import { writeDrafts } from "./drafts";
+import { writeDrafts, type DraftEntry, type DraftReuse } from "./drafts";
 import { cacheKey, getRecent, touchRecent, writeLocalCache } from "./localCache";
+import { recordLabel } from "./ui/chat/chatRecord";
 import type {
   ConversationPref,
   ConversationView,
@@ -14,10 +15,15 @@ import type {
 /** 应用内新消息提示（最小通知出口；点击打开会话） */
 export interface Toast {
   id: string;
-  convId: string;
+  /** 点击后打开的会话；下载结果等非会话 toast 为空 */
+  convId?: string;
   title: string;
   text: string;
   ts: number;
+  /** MM4：下载成功 toast 点击「在文件夹中显示」（仅桌面端设置） */
+  filePath?: string;
+  /** MF2：失败操作的重试入口（如批量转发网络错误后同 client_op_id 重发） */
+  action?: { label: string; run: () => void };
 }
 
 export interface AppState {
@@ -44,8 +50,8 @@ export interface AppState {
   reactionPending: Record<string, boolean>;
   /** 应用内通知栈（新消息提示，自动过期） */
   toasts: Toast[];
-  /** conv_id -> 输入框草稿（V2 P1-3；持久化到 localStorage，按用户隔离） */
-  drafts: Record<string, string>;
+  /** conv_id -> 输入框草稿（V2 P1-3；持久化到 localStorage，按用户隔离。MM2 起含复用附件 chip） */
+  drafts: Record<string, DraftEntry>;
   /** user_id -> 已知最新头像版本。只增不减；404 回落时把 has 记为 false。 */
   avatars: Record<string, AvatarInfo>;
   /** 全局搜索跳转目标（V2 P3-1）：打开会话后由 ChatView 消费并清空 */
@@ -225,7 +231,10 @@ export function replyPreview(m: MessageView) {
     message_id: m.id,
     seq: m.seq,
     sender_name: m.sender_name,
-    excerpt: m.deleted_at ? "" : m.attachment
+    // MF2：回复聊天记录引用「[聊天记录] {title}」首行（与服务端 preview 同口径），不带逐行摘要
+    excerpt: m.deleted_at ? "" : m.kind === "chat_record"
+      ? recordLabel(m)
+      : m.attachment
       ? m.kind === "image"
         ? "[图片]"
         : m.kind === "audio" || m.attachment.duration_ms != null
@@ -234,6 +243,8 @@ export function replyPreview(m: MessageView) {
       : Array.from(m.content).slice(0, 120).join(""),
     kind: m.kind,
     deleted: !!m.deleted_at,
+    // MM2：撤回者名随预览走，引用块据此区分「原消息已撤回/已删除」
+    recalled_by_name: m.recalled_by_name ?? null,
   };
 }
 
@@ -343,10 +354,21 @@ export function shouldNotify(s: AppState, m: MessageView): boolean {
   return true;
 }
 
-export function pushToast(t: Omit<Toast, "id" | "ts">) {
+/** timeoutMs 传 0 = 常驻不自动消失（MM4「下载中…」在途提示，由结果 toast 接替） */
+export function pushToast(t: Omit<Toast, "id" | "ts">, opts?: { timeoutMs?: number }): string {
   const id = crypto.randomUUID();
   setState((s) => ({
     toasts: [...s.toasts.slice(-3), { ...t, id, ts: Date.now() }],
+  }));
+  const ms = opts?.timeoutMs ?? 5000;
+  if (ms > 0) setTimeout(() => dismissToast(id), ms);
+  return id;
+}
+
+/** MM4：更新已弹出的 toast（下载中 → 结果）；结果重新计 5s 消失 */
+export function updateToast(id: string, patch: Partial<Omit<Toast, "id" | "ts">>) {
+  setState((s) => ({
+    toasts: s.toasts.map((t) => (t.id === id ? { ...t, ...patch } : t)),
   }));
   setTimeout(() => dismissToast(id), 5000);
 }
@@ -359,16 +381,35 @@ export function dismissToast(id: string) {
 
 let draftTimer: ReturnType<typeof setTimeout> | null = null;
 
-/** 更新某会话草稿；空串删除该键。localStorage 写入防抖 300ms */
-export function setDraft(convId: string, text: string) {
-  setState((s) => {
-    const drafts = { ...s.drafts };
-    if (text) drafts[convId] = text;
-    else delete drafts[convId];
-    return { drafts };
-  });
+/** 草稿表更新统一入口：state 立即生效 + localStorage 防抖 300ms 落盘 */
+export function updateDrafts(fn: (d: Record<string, DraftEntry>) => Record<string, DraftEntry>) {
+  setState((s) => ({ drafts: fn(s.drafts) }));
   if (draftTimer != null) clearTimeout(draftTimer);
   draftTimer = setTimeout(flushDrafts, 300);
+}
+
+/** 更新某会话草稿文本；空串清文本但保留复用附件 chip（MM2：清文字不摘 chip） */
+export function setDraft(convId: string, text: string) {
+  updateDrafts((d) => {
+    const next = { ...d };
+    const cur = next[convId];
+    if (text) next[convId] = { text, ...(cur?.reuse ? { reuse: cur.reuse } : {}) };
+    else if (cur?.reuse) next[convId] = { text: "", reuse: cur.reuse };
+    else delete next[convId];
+    return next;
+  });
+}
+
+/** 挂上/摘掉某会话的「复用附件」chip；chip 独立存在（文字可为空） */
+export function setDraftReuse(convId: string, reuse: DraftReuse | null) {
+  updateDrafts((d) => {
+    const next = { ...d };
+    const cur = next[convId] ?? { text: "" };
+    if (reuse) next[convId] = { ...cur, reuse };
+    else if (cur.text) next[convId] = { text: cur.text };
+    else delete next[convId];
+    return next;
+  });
 }
 
 /** 立即把当前草稿表落盘（pagehide 时调用，堵住防抖窗口丢草稿） */

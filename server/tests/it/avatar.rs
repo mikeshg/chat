@@ -32,6 +32,8 @@ pub(crate) async fn spawn_avatar() -> (String, std::path::PathBuf) {
         files_dir: files_dir.to_string_lossy().into(),
         upload_max_bytes: 25 * 1024 * 1024,
         trust_proxy: false,
+        recall_attachment_ttl_secs: 86400,
+        recall_sweep_interval_secs: 3600,
     };
     std::fs::create_dir_all(&cfg.files_dir).unwrap();
     let state = AppState::new(pool, cfg.clone());

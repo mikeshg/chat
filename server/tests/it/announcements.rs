@@ -326,7 +326,7 @@ async fn p32_unfriended_dm_rejects_pin() {
 /// meeting_base_url：默认出现在 server-info；管理员可改；非法值 400；非管理员 403；空串关闭。
 #[tokio::test]
 async fn p32_meeting_base_url_settings() {
-    let base = spawn_named_db(&format!("chat_t_p32_{}", uniq())).await;
+    let (_guard, base) = spawn_named_db(&format!("chat_t_p32_{}", uniq())).await;
     let c = http();
     let info: Value = c
         .get(format!("{base}/v1/server-info"))

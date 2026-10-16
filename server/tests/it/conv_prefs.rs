@@ -170,7 +170,7 @@ async fn prefs_crud_and_order() {
 
 #[tokio::test]
 async fn preferences_advance_after_waited_conversation_lock() {
-    let (base, st) = spawn_named_state(&format!("chat_t_prefclock_{}", uniq())).await;
+    let (_guard, base, st) = spawn_named_state(&format!("chat_t_prefclock_{}", uniq())).await;
     let a = register(&base, &format!("pca_{}", uniq())).await;
     let b = register(&base, &format!("pcb_{}", uniq())).await;
     befriend(&base, &a, &b).await;

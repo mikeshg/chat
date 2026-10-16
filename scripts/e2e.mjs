@@ -298,6 +298,52 @@ E2E 停止（退出码 2）：未设置 E2E_ADMIN_USER，且当前库还没有�
     ok('non-member search rejected', bad.status === 403 || bad.status === 404, `got ${bad.status}`);
   }
 
+  // --- 消息撤回（MM1） ---
+  {
+    // B 发群消息，群主 A 撤回（群主可撤群内他人消息、不受 24h 限）
+    wsb.send({ type: 'send_message', conversation_id: gid, client_msg_id: 'rc1', content: '撤回我' });
+    const bsent = await wsb.waitType('message_ack', (m) => m.client_msg_id === 'rc1');
+    const rec = await api(A.access_token, 'POST', `/messages/${bsent.message.id}/recall`);
+    ok('owner recalls member msg', rec.status === 200 && rec.json?.recalled === true
+      && rec.json?.content === '消息已撤回' && rec.json?.recalled_by === A.user.id,
+      `got ${rec.status} ${JSON.stringify(rec.json)?.slice(0, 180)}`);
+    const rf = await wsa.waitType('message_deleted', (m) => m.message.id === bsent.message.id);
+    ok('message_deleted carries recall fields', rf.message.recalled === true
+      && rf.message.recalled_by === A.user.id && rf.message.recalled_by_name === 'AliceA'
+      && rf.message.recalled_attachment_id === undefined, JSON.stringify(rf.message).slice(0, 200));
+    // 发送者本人 24h 内撤回（DELETE 别名同语义；重复撤回幂等）
+    wsb.send({ type: 'send_message', conversation_id: gid, client_msg_id: 'rc2', content: '我自己撤' });
+    const bsent2 = await wsb.waitType('message_ack', (m) => m.client_msg_id === 'rc2');
+    const d = await api(B.access_token, 'DELETE', `/messages/${bsent2.message.id}`);
+    ok('sender recalls own via DELETE alias', d.status === 200 && d.json?.recalled === true
+      && d.json?.recalled_by === B.user.id, `got ${d.status}`);
+    const d2 = await api(B.access_token, 'DELETE', `/messages/${bsent2.message.id}`);
+    ok('re-recall idempotent', d2.status === 200 && d2.json?.edit_version === d.json?.edit_version,
+      `v=${d2.json?.edit_version}`);
+    // 附件撤回：公开下载封口，上传者 Bearer 取回，复用重发克隆新行
+    const fd = new FormData();
+    fd.append('conversation_id', gid);
+    fd.append('file', new Blob(['rc-bytes'], { type: 'text/plain' }), 'rc.txt');
+    const up = await fetch(`${BASE}/files`, { method: 'POST', headers: { authorization: `Bearer ${A.access_token}` }, body: fd });
+    const att = (await up.json()).id;
+    wsa.send({ type: 'send_message', conversation_id: gid, client_msg_id: 'rc3', content: '', attachment_id: att });
+    const asent = await wsa.waitType('message_ack', (m) => m.client_msg_id === 'rc3');
+    const rec3 = await api(A.access_token, 'POST', `/messages/${asent.message.id}/recall`);
+    ok('recall response carries recalled_attachment_id for uploader', rec3.status === 200
+      && rec3.json?.recalled_attachment_id === att, `got ${rec3.status} ${JSON.stringify(rec3.json)?.slice(0, 180)}`);
+    const gone = await fetch(`${BASE}/files/${att}`);
+    ok('recalled attachment hidden (404)', gone.status === 404);
+    const back = await fetch(`${BASE}/files/${att}/recalled`, { headers: { authorization: `Bearer ${A.access_token}` } });
+    ok('uploader fetches recalled blob', back.status === 200 && (await back.text()) === 'rc-bytes'
+      && (back.headers.get('cache-control') || '').includes('no-store'), `got ${back.status}`);
+    wsa.send({ type: 'send_message', conversation_id: gid, client_msg_id: 'rc4', content: '', reuse_attachment_id: att });
+    const resent = await wsa.waitType('message_ack', (m) => m.client_msg_id === 'rc4');
+    const newAtt = resent.message?.attachment?.id;
+    ok('reuse_attachment_id resends clone', !!newAtt && newAtt !== att, JSON.stringify(resent.message?.attachment));
+    const dl = await fetch(`${BASE}/files/${newAtt}`);
+    ok('reused attachment downloads', dl.status === 200 && (await dl.text()) === 'rc-bytes');
+  }
+
   // --- 离线补发 ---
   wsb.close();
   await new Promise((r) => setTimeout(r, 300));
@@ -502,6 +548,70 @@ async function phase2() {
     ok('bot message persisted', hit);
     const again = await api(b.token, 'POST', '/hooks', { content: 'after restart' });
     ok('bot hook works after restart', again.status === 200, `got ${again.status}`);
+  }
+
+  console.log('== MF1 合并转发（聊天记录）==');
+  {
+    // 一对新用户：m1 合并转发 m2 的两条私聊消息回同一会话
+    const M1 = mk('m1'), M2 = mk('m2'), M3 = mk('m3');
+    for (const u of [M1, M2, M3]) {
+      const r = await api(null, 'POST', '/auth/register', { username: u.username, password: u.password });
+      Object.assign(u, r.json);
+    }
+    const freq = await api(M1.access_token, 'POST', '/friends/requests', { username: M2.username, message: 'mf1' });
+    ok('mf1 friend request', freq.status === 200 || freq.status === 201, `got ${freq.status}`);
+    const inbox = await api(M2.access_token, 'GET', '/friends/requests');
+    const fr = (inbox.json?.incoming || []).find((x) => x.user?.username === M1.username);
+    const acc = await api(M2.access_token, 'POST', `/friends/requests/${fr?.id}/accept`);
+    ok('mf1 friend accepted', acc.status === 200 || acc.status === 204, `got ${acc.status}`);
+    const m1convs = await api(M1.access_token, 'GET', '/conversations');
+    const dm = (m1convs.json || []).find((c) => c.kind === 'dm' && c.peer?.username === M2.username);
+    ok('mf1 dm exists', !!dm?.id);
+
+    const w = new Ws();
+    await w.connect(M2.access_token);
+    await w.waitType('presence_init');
+    const texts = [`mf1-one-${rid}`, `mf1-two-${rid}`];
+    const ids = [];
+    for (const [i, text] of texts.entries()) {
+      w.send({ type: 'send_message', conversation_id: dm.id, client_msg_id: `mf1s${i}`, content: text });
+      const ack = await w.waitType('message_ack', (m) => m.client_msg_id === `mf1s${i}`);
+      ids.push(ack.message?.id);
+    }
+
+    const fb = await api(M1.access_token, 'POST', '/messages/forward-batch', {
+      conversation_id: dm.id, message_ids: ids, targets: [dm.id],
+      mode: 'merged', client_op_id: randomUUID(),
+    });
+    const t = fb.json?.results?.[0];
+    ok('merged forward ok', fb.status === 200 && t?.ok === true && t.forwarded === 1 &&
+      t.message_ids?.length === 1 && Object.keys(t.skipped || {}).length === 0,
+      `got ${fb.status} ${JSON.stringify(fb.json)?.slice(0, 200)}`);
+    const rid2 = t?.message_ids?.[0];
+
+    // 接收方视角：WS 帧与历史都只带 record_preview，不带完整快照
+    const frame = await w.waitType('message', (m) => m.message?.kind === 'chat_record');
+    ok('ws frame is chat_record with preview', frame.message?.id === rid2 &&
+      frame.message?.record_preview?.count === 2 &&
+      frame.message?.record === undefined, JSON.stringify(frame.message?.record_preview));
+    const hist = await api(M2.access_token, 'GET', `/conversations/${dm.id}/messages`);
+    const rec = (hist.json?.messages || []).find((m) => m.id === rid2);
+    ok('recipient sees record_preview', rec?.kind === 'chat_record' &&
+      rec.record_preview?.title === `${M1.user.display_name} 和 ${M2.user.display_name} 的聊天记录` &&
+      rec.record_preview?.items?.length === 2 && rec.record === undefined,
+      JSON.stringify({ title: rec?.record_preview?.title, n: rec?.record_preview?.items?.length }));
+    ok('fallback content first line', (rec?.content || '').startsWith('[聊天记录] '),
+      `got ${(rec?.content || '').slice(0, 40)}`);
+
+    // GET record：成员拿全量，非成员同形 403
+    const full = await api(M1.access_token, 'GET', `/messages/${rid2}/record`);
+    ok('member GET record 200', full.status === 200 && full.json?.v === 1 &&
+      full.json?.count === 2 && full.json?.items?.[0]?.content === texts[0] &&
+      full.json?.items?.[0]?.sender_name === M2.user.display_name,
+      `got ${full.status} ${JSON.stringify(full.json)?.slice(0, 200)}`);
+    const denied = await api(M3.access_token, 'GET', `/messages/${rid2}/record`);
+    ok('non-member GET record 403', denied.status === 403, `got ${denied.status}`);
+    w.close();
   }
 }
 

@@ -36,7 +36,7 @@ type Message struct {
 	SenderUsername string   `json:"sender_username"`
 	SenderName     string   `json:"sender_name"`
 	Content        string   `json:"content"`
-	Kind           string   `json:"kind"` // text / image / file / audio / poll
+	Kind           string   `json:"kind"` // text / image / file / audio / poll / chat_record
 	Mentions       []string `json:"mentions"`
 	ReplyToID      *string  `json:"reply_to_id"`
 	CreatedAt      string   `json:"created_at"`

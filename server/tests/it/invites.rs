@@ -54,7 +54,7 @@ async fn create_invite(base: &str, admin: &TestUser, body: Value) -> Value {
 /// server-info 无需登录可访问，默认 open
 #[tokio::test]
 async fn p12_server_info_public() {
-    let base = spawn_named_db(&format!("chat_t_p12a_{}", uniq())).await;
+    let (_guard, base) = spawn_named_db(&format!("chat_t_p12a_{}", uniq())).await;
     let c = http();
     let r: Value = c
         .get(format!("{base}/v1/server-info"))
@@ -84,7 +84,7 @@ async fn p12_server_info_public() {
 /// 非管理员访问 settings / invites → 403；未登录 → 401
 #[tokio::test]
 async fn p12_admin_endpoints_require_admin() {
-    let base = spawn_named_db(&format!("chat_t_p12b_{}", uniq())).await;
+    let (_guard, base) = spawn_named_db(&format!("chat_t_p12b_{}", uniq())).await;
     let c = http();
     let _admin = register(&base, &format!("p12b_{}", uniq())).await;
     let u = register(&base, &format!("p12c_{}", uniq())).await;
@@ -116,7 +116,7 @@ async fn p12_admin_endpoints_require_admin() {
 /// closed：空库时首个用户仍放行（引导例外），之后一律 403
 #[tokio::test]
 async fn p12_closed_mode_bootstrap() {
-    let (base, st) = spawn_named_state(&format!("chat_t_p12d_{}", uniq())).await;
+    let (_guard, base, st) = spawn_named_state(&format!("chat_t_p12d_{}", uniq())).await;
     // 空库直接 SQL 置 closed——等价于部署后没注册过人就关了注册
     set_mode_sql(&st.pool, "closed").await;
 
@@ -136,7 +136,7 @@ async fn p12_closed_mode_bootstrap() {
 /// invite 模式：无码/错码 403；有效码 200 且 uses+1、users.invite_id 写入；撤销/过期 403
 #[tokio::test]
 async fn p12_invite_mode() {
-    let (base, st) = spawn_named_state(&format!("chat_t_p12f_{}", uniq())).await;
+    let (_guard, base, st) = spawn_named_state(&format!("chat_t_p12f_{}", uniq())).await;
     let c = http();
     let admin = register(&base, &format!("p12f_{}", uniq())).await;
     assert_eq!(put_mode(&base, &admin, "invite").await.status(), 200);
@@ -236,7 +236,7 @@ async fn p12_invite_mode() {
 /// max_uses=1：两个请求并发用同一码注册，恰一个 200、一个 403
 #[tokio::test]
 async fn p12_invite_max_uses_race() {
-    let (base, st) = spawn_named_state(&format!("chat_t_p12j_{}", uniq())).await;
+    let (_guard, base, st) = spawn_named_state(&format!("chat_t_p12j_{}", uniq())).await;
     let admin = register(&base, &format!("p12j_{}", uniq())).await;
     assert_eq!(put_mode(&base, &admin, "invite").await.status(), 200);
     let inv = create_invite(&base, &admin, json!({"max_uses": 1})).await;
@@ -262,7 +262,7 @@ async fn p12_invite_max_uses_race() {
 /// 注册因用户名冲突失败时事务回滚，邀请次数不消耗
 #[tokio::test]
 async fn p12_invite_rollback_on_conflict() {
-    let (base, st) = spawn_named_state(&format!("chat_t_p12m_{}", uniq())).await;
+    let (_guard, base, st) = spawn_named_state(&format!("chat_t_p12m_{}", uniq())).await;
     let admin = register(&base, &format!("p12m_{}", uniq())).await;
     assert_eq!(put_mode(&base, &admin, "invite").await.status(), 200);
     let inv = create_invite(&base, &admin, json!({})).await;
@@ -289,7 +289,7 @@ async fn p12_invite_rollback_on_conflict() {
 /// open（默认）忽略 invite_code：带错误码也能注册
 #[tokio::test]
 async fn p12_open_ignores_invite() {
-    let base = spawn_named_db(&format!("chat_t_p12o_{}", uniq())).await;
+    let (_guard, base) = spawn_named_db(&format!("chat_t_p12o_{}", uniq())).await;
     let _admin = register(&base, &format!("p12o_{}", uniq())).await;
     let r = register_invite(&base, &format!("p12p_{}", uniq()), Some("BADCODE123")).await;
     assert_eq!(r.status(), 200);
@@ -298,7 +298,7 @@ async fn p12_open_ignores_invite() {
 /// PUT /admin/settings 未知模式 → 400；合法值返回完整设置
 #[tokio::test]
 async fn p12_settings_validation() {
-    let base = spawn_named_db(&format!("chat_t_p12q_{}", uniq())).await;
+    let (_guard, base) = spawn_named_db(&format!("chat_t_p12q_{}", uniq())).await;
     let admin = register(&base, &format!("p12q_{}", uniq())).await;
 
     let r = put_mode(&base, &admin, "bogus").await;

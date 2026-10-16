@@ -1,9 +1,12 @@
 import { useEffect, useState } from "react";
 import type { MessageView, PinEntry } from "../../types";
+import { RECORD_TITLE_MAX, recordLabel } from "./chatRecord";
 
 /** 置顶条摘要：有正文用第一行，否则用类型占位。 */
 export function pinExcerpt(m: MessageView): string {
   if (m.deleted_at) return "消息已删除";
+  // MF2：聊天记录恒显示「[聊天记录] {title}」（标题 >30 字截断）
+  if (m.kind === "chat_record") return recordLabel(m, RECORD_TITLE_MAX);
   const line = m.content.split("\n", 1)[0].trim();
   if (line) return line;
   if (m.kind === "image") return "[图片]";

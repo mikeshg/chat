@@ -1,7 +1,7 @@
 use crate::error::{AppError, AppResult};
 use crate::model::{
     AttachmentView, ConversationPref, CreatePollReq, MessageView, PollOptionView, PollView,
-    PrefUpdateReq, ReactionView, ReplyPreview,
+    PrefUpdateReq, ReactionView, ReplyPreview, SkipMap,
 };
 use chrono::{DateTime, Utc};
 use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
@@ -11,12 +11,14 @@ mod forward;
 mod lifecycle;
 mod polls;
 mod preferences;
+mod record;
 mod send;
 
 pub use forward::*;
 pub use lifecycle::*;
 pub use polls::*;
 pub use preferences::*;
+pub use record::*;
 pub use send::*;
 
 pub fn canonical_pair(a: Uuid, b: Uuid) -> (Uuid, Uuid) {
@@ -221,6 +223,11 @@ pub struct MsgViewRow {
     pub sender_avatar_version: i32,
     pub sender_has_avatar: bool,
     pub forwarded_from: Option<String>,
+    // 撤回（0039）：撤回者 id 与展示名（deleted_by 的 JOIN 展开）
+    pub recalled_by: Option<Uuid>,
+    pub recalled_by_name: Option<String>,
+    // 聊天记录（0040）：完整 jsonb 快照（墓碑为 NULL）；REST/WS 只暴露 into_view 派的 preview
+    pub record: Option<sqlx::types::Json<serde_json::Value>>,
 }
 
 impl MsgViewRow {
@@ -247,7 +254,14 @@ impl MsgViewRow {
             }),
             mentions: self.mentions.unwrap_or_default(),
             reply_to_id: self.reply_to_id,
-            reply_to_preview: self.reply_to.map(|j| j.0),
+            reply_to_preview: self.reply_to.map(|j| {
+                let mut p = j.0;
+                // 回复目标是聊天记录：预览固定为首行「[聊天记录] 标题」，不带后续摘要行
+                if p.kind == "chat_record" && !p.deleted {
+                    p.excerpt = p.excerpt.lines().next().unwrap_or_default().to_string();
+                }
+                p
+            }),
             edited_at: self.edited_at,
             edit_version: self.edit_version,
             deleted_at: self.deleted_at,
@@ -262,10 +276,16 @@ impl MsgViewRow {
                 })
                 .collect(),
             poll: self.poll.map(|j| j.0.into_view(viewer)),
+            record_preview: self.record.and_then(|j| record_preview(&j.0)),
             created_at: self.created_at,
             sender_avatar_version: self.sender_avatar_version,
             sender_has_avatar: self.sender_has_avatar,
             forwarded_from: self.forwarded_from,
+            recalled: self.deleted_at.is_some(),
+            recalled_by: self.recalled_by,
+            recalled_by_name: self.recalled_by_name,
+            // 只有 REST 撤回响应的上传者视角才填；普通视图/广播恒 None
+            recalled_attachment_id: None,
         }
     }
 }
@@ -341,7 +361,7 @@ fn like_escape(s: &str) -> String {
 }
 
 /// 会话内搜索（V2 P3-1 改为两阶段）：先在 messages 表取候选 id
-/// （deleted_at IS NULL 排除墓碑——搜「消息已删除」不再命中占位文本；
+/// （deleted_at IS NULL 排除墓碑——搜「消息已撤回」不再命中占位文本；
 /// 正文上的 trgm 部分索引可用），再按 id 回读 message_views 组装视图。
 pub async fn search_messages(
     pool: &PgPool,

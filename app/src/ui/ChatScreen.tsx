@@ -1,5 +1,7 @@
 import { useEffect } from "react";
 import { dismissToast, setState, useApp } from "../store";
+import { consumeBack } from "./chat/backStack";
+import { revealDownloaded } from "../download";
 import { openConversation, refreshCatalogs } from "../ws";
 import ConvList from "./chat/ConvList";
 import ChatView from "./chat/ChatView";
@@ -21,7 +23,13 @@ export default function ChatScreen() {
     else if (!s.activeConv && history.state?.chat) history.back();
   }, [s.activeConv]);
   useEffect(() => {
-    const onPop = () => !history.state?.chat && setState({ activeConv: null });
+    const onPop = () => {
+      if (history.state?.chat) return;
+      // MF2：返回键先关 ChatView 里最上层的覆盖物（转发弹窗 → 预览 → 记录查看页 → 多选），
+      // 消费掉就补回 {chat:1} 让会话保持打开；没有覆盖层才退回会话列表
+      if (consumeBack()) history.pushState({ chat: 1 }, "");
+      else setState({ activeConv: null });
+    };
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
   }, []);
@@ -87,7 +95,7 @@ export default function ChatScreen() {
       {s.tab === "me" && <MePanel />}
       {s.tab === "admin" && s.me?.role === "admin" && <AdminPanel />}
 
-      {/* 最小应用内提示：新消息 toast，点击打开会话；静音会话已被抑制（@我除外） */}
+      {/* 最小应用内提示：新消息 toast 点击打开会话；下载完成 toast（桌面）点击在文件夹中显示 */}
       <div className="toasts" aria-live="polite">
         {s.toasts.map((t) => (
           <button
@@ -95,11 +103,26 @@ export default function ChatScreen() {
             className="toast"
             onClick={() => {
               dismissToast(t.id);
-              openConversation(t.convId);
+              if (t.filePath) void revealDownloaded(t.filePath);
+              else if (t.convId) openConversation(t.convId);
             }}
           >
             <b>{t.title}</b>
-            <span>{t.text}</span>
+            {t.text && <span>{t.text}</span>}
+            {/* MF2：结果未确认类的操作重试（同一 client_op_id 幂等重发） */}
+            {t.action && (
+              <span
+                className="toast-act"
+                role="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  dismissToast(t.id);
+                  t.action!.run();
+                }}
+              >
+                {t.action.label}
+              </span>
+            )}
           </button>
         ))}
       </div>

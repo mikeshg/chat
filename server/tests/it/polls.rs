@@ -534,7 +534,7 @@ async fn poll_expire_and_tombstone() {
         .iter()
         .find(|x| x["id"] == mid2)
         .unwrap();
-    assert_eq!(tm["content"], "消息已删除");
+    assert_eq!(tm["content"], "消息已撤回");
     assert!(tm["poll"].is_null()); // 墓碑掩去 poll（与正文/附件同口径）
 }
 

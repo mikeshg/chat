@@ -1,5 +1,6 @@
-import { useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { menuPos } from "./menuPos";
+import { escClose } from "./msgMenu";
 
 /**
  * 右键菜单容器：遮罩 + 浮层。先按点击点渲染，useLayoutEffect 里量出真实尺寸后
@@ -15,6 +16,13 @@ export default function CtxMenu(props: {
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState({ x: props.x, y: props.y });
+  // Esc 关闭（MM2 fix3）：捕获阶段拦下 Escape——事件不再下沉到 textarea，
+  // composer 的 Esc 处理（取消回复/编辑等）不会连发。菜单开着才挂。
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => escClose(e, props.onClose);
+    document.addEventListener("keydown", onKey, true);
+    return () => document.removeEventListener("keydown", onKey, true);
+  }, [props.onClose]);
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
