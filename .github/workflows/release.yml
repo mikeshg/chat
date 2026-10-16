@@ -1,4 +1,11 @@
-# 推 v* 标签：先复用 ci.yml 的 test job → 建草稿 Release →
+# 发版两条入口，同一条链，天然防重复：
+#   1) 推 main 且 app/src-tauri/tauri.conf.json 有变化：gate 读 version，v<version>
+#      还没发过版就由 tag job 自动建注解标签（说明 = 合并 PR 标题+正文，否则 commit
+#      message），并在同一个 run 里发完——GITHUB_TOKEN 推的 tag 不会再触发任何工作流，
+#      所以打 tag、发版必须同 run 完成，不能靠 tag 触发的接力。
+#   2) 手动推 v* 标签：沿用老路径，标签必须等于 v+version，标签注解就是更新说明。
+# 去重：tag 已存在或 Release 已发布 → 不发版；已发布的 Release 绝不再被上传覆盖。
+# 链路：gate → test（复用 ci.yml）→ tag（仅自动路径）→ draft 建草稿 →
 # windows 打 NSIS+签名、ubuntu 打 Android APK、ubuntu-22.04 打 deb+AppImage，
 # 都传到草稿上 → publish 验齐 7 个产物后把草稿转公开（客户端只看 /releases/latest，
 # 草稿对外不可见，半成品不会发出去）。
@@ -7,45 +14,234 @@ name: release
 
 on:
   push:
+    branches: [main]
+    # paths 只在分支 push 时评估：version 不在这条文件里改就不会触发。
+    # 推 v* tag 不评估 paths，照常触发。
+    paths: ["app/src-tauri/tauri.conf.json"]
     tags: ["v*"]
 
 permissions:
   contents: read
 
+# 发版串行：所有入口共用一个 concurrency 组，在跑的 run 绝不取消。
+# 注意 GitHub 每组只留一个排队 run：连续触发时先排队的那一个会被后到的顶掉，
+# 发现排队 run 被取消就重推/重跑（见 docs/release-runners.md）。
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
+  gate:
+    runs-on: ubuntu-latest
+    # 草稿 Release 对有推送权限的 token 才可见，contents:read 查不到会误判成“不存在”
+    permissions:
+      contents: write
+    env:
+      # fork 默认关自动发版（推 v* tag 不受影响）；fork 测试时在仓库变量里设 AUTO_RELEASE=true
+      AUTO_RELEASE: ${{ vars.AUTO_RELEASE }}
+    outputs:
+      release: ${{ steps.decide.outputs.release }}
+      tag: ${{ steps.decide.outputs.tag }}
+      create_tag: ${{ steps.decide.outputs.create_tag }}
+      sha: ${{ steps.decide.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 决定要不要发版
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ver=$(python3 -c 'import json;print(json.load(open("app/src-tauri/tauri.conf.json"))["version"])')
+
+          # 决策输出 + run 页摘要
+          emit() {
+            {
+              echo "release=$1"
+              echo "tag=$TAG"
+              echo "create_tag=$2"
+              echo "sha=$3"
+            } >> "$GITHUB_OUTPUT"
+            {
+              echo "### 发版闸门（gate）"
+              echo "- 触发 ref：\`$GITHUB_REF\`"
+              echo "- TAG：\`$TAG\`（tauri.conf.json version：$ver）"
+              echo "- release=\`$1\`，create_tag=\`$2\`"
+              echo "- 构建 commit：\`$3\`"
+              echo ""
+              echo "$4"
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          # TAG 名下“已发布”（非草稿）的 Release 数；API 出错直接让本步红掉，不猜
+          published_count() {
+            gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases" \
+              --jq '[flatten | .[] | select(.tag_name == env.TAG) | select(.draft == false)] | length'
+          }
+
+          # origin 上 TAG 最终指向的 commit：注解 tag 读剥离行 refs/tags/TAG^{}，
+          # 轻量 tag 没有剥离行、本体就是 commit；tag 不存在 → 空
+          tag_commit() {
+            local lines peeled
+            lines=$(git ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}")
+            peeled=$(awk -v t="refs/tags/$TAG^{}" '$2 == t {print $1}' <<< "$lines")
+            [ -n "$peeled" ] || peeled=$(awk -v t="refs/tags/$TAG" '$2 == t {print $1}' <<< "$lines")
+            printf '%s' "$peeled"
+          }
+
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            # ===== 手动 tag 路径：和老逻辑一致 =====
+            TAG="$GITHUB_REF_NAME"
+            export TAG
+            [ "$TAG" = "v$ver" ] || { echo "::error::标签 $TAG 与 app/src-tauri/tauri.conf.json 的 version $ver 不一致"; exit 1; }
+            # checkout 拿到的不是 tag 对象本体，抓下来才能剥离到 commit
+            git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+            SHA=$(git rev-parse "$TAG^{commit}")
+            [ "$SHA" = "$GITHUB_SHA" ] || { echo "::error::$TAG 剥离到 $SHA，与本次 push 的 $GITHUB_SHA 不一致（tag 被推后移动过？）"; exit 1; }
+            if [ "$(published_count)" -gt 0 ]; then
+              echo "::notice::Release $TAG 已发布（重推同名 tag / 重跑旧 run），不再发版"
+              emit false false "$SHA" "**Release $TAG 已发布**——重复触发，发版跳过。"
+            else
+              emit true false "$SHA" "手动 tag 触发，正常发版（草稿已存在则沿用）。"
+            fi
+          else
+            # ===== 自动路径：任何非 tag 的 push（main，或 fork 的测试分支）=====
+            TAG="v$ver"
+            export TAG
+            if [ "$GITHUB_REPOSITORY" != "xie-fan/chat" ] && [ "$AUTO_RELEASE" != "true" ]; then
+              echo "::notice::非 xie-fan/chat 且未设 vars.AUTO_RELEASE=true：自动发版关闭（推 v* tag 仍可手动发版）"
+              emit false false "$GITHUB_SHA" "本仓库未开启自动发版（fork 测试见 docs/release-runners.md）；手动推 \`v*\` tag 不受影响。"
+              exit 0
+            fi
+            if [ "$(published_count)" -gt 0 ]; then
+              echo "::notice::$TAG 已发布，版本未变，不发版"
+              emit false false "$GITHUB_SHA" "**$TAG 已发布**——version 没变，不发版。"
+              exit 0
+            fi
+            peeled=$(tag_commit)
+            if [ -z "$peeled" ]; then
+              emit true true "$GITHUB_SHA" "发现新版本 **$TAG**：test 通过后自动建注解 tag，并在本 run 发版。"
+            elif [ "$peeled" = "$GITHUB_SHA" ]; then
+              echo "::warning::$TAG 已存在且指向本 commit，但 Release 未发布：续跑未完成的发版"
+              emit true false "$GITHUB_SHA" "$TAG 已存在（指向本 commit）但 Release 没发完——**续跑**，不再重复建 tag。"
+            else
+              echo "::warning::$TAG 已存在但指向 $peeled ≠ 本 commit（应是手动 tag）：不发版；要发完那次请到原 run Re-run failed jobs"
+              emit false false "$GITHUB_SHA" "$TAG 指向另一个 commit \`$peeled\`（疑似手动 tag）。想发完那次发版请到对应 run **Re-run failed jobs**，本 run 退出。"
+            fi
+          fi
+
   test:
+    needs: gate
+    if: ${{ needs.gate.outputs.release == 'true' }}
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
 
-  draft:
-    needs: test
+  tag:
+    needs: [gate, test]
+    if: ${{ !cancelled() && needs.gate.result == 'success' && needs.gate.outputs.create_tag == 'true' && needs.test.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: read
     env:
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ needs.gate.outputs.tag }}
+      SHA: ${{ needs.gate.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          fetch-depth: 0
+      - name: 自动建注解标签并推 origin
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 更新说明：优先取本 commit 关联的「已合入默认分支」的 PR（标题+正文，
+          # merge_commit_sha 正好是本提交的排最前）；找不到就用完整 commit message。
+          # PR 内容直接经 --jq 落盘，不走 ${{ }} 插值——标题里塞脚本也不会被执行。
+          default_branch=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.default_branch')
+          DEFAULT_BRANCH="$default_branch" gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/pulls" \
+            --jq 'if length == 0 then empty
+                  else ([.[] | select(.merged_at != null) | select(.base.ref == env.DEFAULT_BRANCH)]
+                        | sort_by(if .merge_commit_sha == env.SHA then 0 else 1 end)
+                        | (.[0] // empty)
+                        | .title + "\n\n" + (.body // ""))
+                  end' \
+            | tr -d '\r' > notes.md
+          [ -s notes.md ] || git log -1 --format=%B "$SHA" | tr -d '\r' > notes.md
+          [ -s notes.md ] || echo "Release $TAG" > notes.md
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git tag -a --cleanup=verbatim -F notes.md "$TAG" "$SHA"
+          if git push origin "refs/tags/$TAG"; then
+            exit 0
+          fi
+          # 推失败先别红：看 origin 上现在 tag 指哪——并发 run / 手动抢建的按去重规则走
+          remote=$(git ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}" \
+            | awk -v t="refs/tags/$TAG^{}" '$2 == t {print $1}')
+          if [ -z "$remote" ]; then
+            remote=$(git ls-remote origin "refs/tags/$TAG" | awk -v t="refs/tags/$TAG" '$2 == t {print $1}')
+          fi
+          if [ "$remote" = "$SHA" ]; then
+            echo "::notice::$TAG 已被推到 origin 且指向同一 commit（并发 run/手动抢建），继续发版"
+          elif [ -n "$remote" ]; then
+            echo "::error::$TAG 已存在于 origin 但指向 $remote ≠ $SHA：疑似人工移动了标签，确认后重跑"
+            exit 1
+          else
+            echo "::error::推 $TAG 失败且 origin 上查无此 tag：检查仓库 tag ruleset 是否放行 github-actions"
+            exit 1
+          fi
+
+  draft:
+    needs: [gate, test, tag]
+    if: ${{ !cancelled() && needs.gate.result == 'success' && needs.gate.outputs.release == 'true' && needs.test.result == 'success' && (needs.tag.result == 'success' || needs.tag.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      proceed: ${{ steps.draft.outputs.proceed }}
+    env:
+      TAG: ${{ needs.gate.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
       - name: 标签与 tauri.conf.json 版本一致
         run: |
           ver=$(python3 -c 'import json;print(json.load(open("app/src-tauri/tauri.conf.json"))["version"])')
           [ "v$ver" = "$TAG" ] || { echo "::error::标签 $TAG 与 app/src-tauri/tauri.conf.json 的 version $ver 不一致"; exit 1; }
       - name: 建草稿 Release（标签说明 = 更新说明）
+        id: draft
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           # checkout 只取到轻量引用；重取标签对象才能读到注解内容
           git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
           git tag -l --format='%(contents)' "$TAG" > notes.md
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "release $TAG 已存在（重跑场景），沿用现有草稿"
+          # 同名 tag_name 的 Release 状态：","分隔的多值 = 异常；已发布 = 别的 run 抢先发完
+          states=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases" \
+            --jq '[flatten | .[] | select(.tag_name == env.TAG) | .draft] | join(",")')
+          if [[ "$states" == *,* ]]; then
+            echo "::error::tag_name=$TAG 的 Release 对象不止一个（draft 状态：$states），状态异常请人工清理"
+            exit 1
+          elif [ "$states" = "false" ]; then
+            echo "::notice::Release $TAG 已发布，本 run 不再上传/发布"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          elif [ "$states" = "true" ]; then
+            echo "release $TAG 的草稿已存在（重跑/续跑场景），沿用现有草稿"
           else
             gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes-file notes.md
           fi
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
 
   windows:
-    needs: draft
+    needs: [gate, draft]
+    if: ${{ !cancelled() && needs.draft.result == 'success' && needs.draft.outputs.proceed == 'true' }}
     runs-on: windows-latest
     permissions:
       contents: write
@@ -53,9 +249,11 @@ jobs:
       run:
         shell: pwsh
     env:
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ needs.gate.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
       - name: 检查签名密钥
         env:
           SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -85,19 +283,26 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # 并发去重：另一 run 若已把 Release 转公开，本 run 不再往里塞
+          if ((gh release view $env:TAG --json isDraft --jq .isDraft) -ne "true") {
+            Write-Host "::notice::Release $env:TAG 已发布，跳过上传"; exit 0
+          }
           $ver = $env:TAG.TrimStart('v')
           $b = "app/src-tauri/target/release/bundle/nsis"
           gh release upload $env:TAG "$b/Chat_${ver}_x64-setup.exe" "$b/Chat_${ver}_x64-setup.exe.sig" --clobber
 
   android:
-    needs: draft
+    needs: [gate, draft]
+    if: ${{ !cancelled() && needs.draft.result == 'success' && needs.draft.outputs.proceed == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ needs.gate.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
       - uses: pnpm/action-setup@v4
         with:
           version: 10
@@ -136,6 +341,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          if [ "$(gh release view "$TAG" --json isDraft --jq '.isDraft')" != "true" ]; then
+            echo "::notice::Release $TAG 已发布，跳过上传"
+            exit 0
+          fi
           ver=${TAG#v}
           # 输出目录随 Gradle 配置变（universal / arm64），按扩展名找
           apk=$(find app/src-tauri/gen/android/app/build/outputs/apk -name '*.apk' | head -1)
@@ -144,16 +353,19 @@ jobs:
           gh release upload "$TAG" "Chat_${ver}_arm64.apk" --clobber
 
   linux:
-    needs: draft
+    needs: [gate, draft]
+    if: ${{ !cancelled() && needs.draft.result == 'success' && needs.draft.outputs.proceed == 'true' }}
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     env:
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ needs.gate.outputs.tag }}
       # linuxdeploy 本身是 AppImage，解开运行就不依赖 FUSE
       APPIMAGE_EXTRACT_AND_RUN: "1"
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
       - name: 检查签名密钥
         env:
           SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -186,16 +398,21 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          if [ "$(gh release view "$TAG" --json isDraft --jq '.isDraft')" != "true" ]; then
+            echo "::notice::Release $TAG 已发布，跳过上传"
+            exit 0
+          fi
           b=app/src-tauri/target/release/bundle
           gh release upload "$TAG" $b/deb/*.deb $b/deb/*.deb.sig $b/appimage/*.AppImage $b/appimage/*.AppImage.sig --clobber
 
   publish:
-    needs: [windows, android, linux]
+    needs: [gate, draft, windows, android, linux]
+    if: ${{ !cancelled() && needs.draft.result == 'success' && needs.draft.outputs.proceed == 'true' && needs.windows.result == 'success' && needs.android.result == 'success' && needs.linux.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ needs.gate.outputs.tag }}
       # 本 job 不 checkout，gh 需要显式指定仓库
       GH_REPO: ${{ github.repository }}
     steps:
@@ -203,6 +420,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
+          # 并发场景另一 run 可能已发完：已发布就安静退出，什么都不做
+          if [ "$(gh release view "$TAG" --json isDraft --jq '.isDraft')" != "true" ]; then
+            echo "::notice::Release $TAG 已被发布（其它 run 抢先发完），本 run 无需再操作"
+            exit 0
+          fi
           ver=${TAG#v}
           have=$(gh release view "$TAG" --json assets --jq '.assets[].name' | sort)
           want=$(printf '%s\n' \
@@ -215,4 +438,13 @@ jobs:
             "Chat_${ver}_amd64.AppImage.sig" | sort)
           missing=$(comm -23 <(echo "$want") <(echo "$have"))
           [ -z "$missing" ] || { echo "::error::Release 还缺这些文件：$missing"; exit 1; }
-          gh release edit "$TAG" --draft=false --latest
+          # --latest 只给版本号最高的 Release；旧线 hotfix 发版不抢 latest
+          highest=$({ gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases" \
+              --jq 'flatten | .[] | select(.draft == false) | .tag_name'; echo "$TAG"; } \
+            | sed 's/^v//' | sort -V | tail -1)
+          if [ "$highest" = "$ver" ]; then
+            gh release edit "$TAG" --draft=false --latest
+          else
+            echo "::notice::v$highest 高于 $TAG：照常发布但不设为 latest"
+            gh release edit "$TAG" --draft=false --latest=false
+          fi
