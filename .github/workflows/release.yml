@@ -166,7 +166,7 @@ jobs:
           shopt -s inherit_errexit
           # 更新说明：优先取本 commit 关联的「已合入默认分支」的 PR（标题+正文，
           # merge_commit_sha 正好是本提交的排最前）；找不到就用完整 commit message。
-          # PR 内容直接经 --jq 落盘，不走 ${{ }} 插值——标题里塞脚本也不会被执行。
+          # PR 内容直接经 --jq 落盘，不走表达式插值——标题里塞脚本也不会被执行。
           default_branch=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.default_branch')
           DEFAULT_BRANCH="$default_branch" gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/pulls" \
             --jq 'if length == 0 then empty
@@ -289,10 +289,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 并发去重：另一 run 若已把 Release 转公开，本 run 不再往里塞
-          if ((gh release view $env:TAG --json isDraft --jq .isDraft) -ne "true") {
-            Write-Host "::notice::Release $env:TAG 已发布，跳过上传"; exit 0
-          }
+          # 并发去重：另一 run 若已把 Release 转公开，本 run 不再往里塞；
+          # 查询失败或返回异常值一律报错退出（fail closed），不猜状态
+          $isDraft = gh release view $env:TAG --json isDraft --jq .isDraft
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::查询 Release $env:TAG 失败"; exit 1 }
+          if ($isDraft -eq "false") { Write-Host "::notice::Release $env:TAG 已发布，跳过上传"; exit 0 }
+          if ($isDraft -ne "true") { Write-Host "::error::isDraft 返回异常值：$isDraft"; exit 1 }
           $ver = $env:TAG.TrimStart('v')
           $b = "app/src-tauri/target/release/bundle/nsis"
           gh release upload $env:TAG "$b/Chat_${ver}_x64-setup.exe" "$b/Chat_${ver}_x64-setup.exe.sig" --clobber
@@ -347,13 +349,16 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ "$(gh release view "$TAG" --json isDraft --jq '.isDraft')" != "true" ]; then
-            echo "::notice::Release $TAG 已发布，跳过上传"
-            exit 0
-          fi
+          set -euo pipefail
+          is_draft=$(gh release view "$TAG" --json isDraft --jq '.isDraft')
+          case "$is_draft" in
+            true) ;;
+            false) echo "::notice::Release $TAG 已发布，跳过上传"; exit 0 ;;
+            *) echo "::error::isDraft 返回异常值：$is_draft"; exit 1 ;;
+          esac
           ver=${TAG#v}
           # 输出目录随 Gradle 配置变（universal / arm64），按扩展名找
-          apk=$(find app/src-tauri/gen/android/app/build/outputs/apk -name '*.apk' | head -1)
+          apk=$(find app/src-tauri/gen/android/app/build/outputs/apk -name '*.apk' 2>/dev/null | head -1) || true
           [ -n "$apk" ] || { echo "::error::找不到 APK 产物"; exit 1; }
           cp "$apk" "Chat_${ver}_arm64.apk"
           gh release upload "$TAG" "Chat_${ver}_arm64.apk" --clobber
@@ -404,10 +409,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ "$(gh release view "$TAG" --json isDraft --jq '.isDraft')" != "true" ]; then
-            echo "::notice::Release $TAG 已发布，跳过上传"
-            exit 0
-          fi
+          set -euo pipefail
+          is_draft=$(gh release view "$TAG" --json isDraft --jq '.isDraft')
+          case "$is_draft" in
+            true) ;;
+            false) echo "::notice::Release $TAG 已发布，跳过上传"; exit 0 ;;
+            *) echo "::error::isDraft 返回异常值：$is_draft"; exit 1 ;;
+          esac
           b=app/src-tauri/target/release/bundle
           gh release upload "$TAG" $b/deb/*.deb $b/deb/*.deb.sig $b/appimage/*.AppImage $b/appimage/*.AppImage.sig --clobber
 
@@ -428,11 +436,14 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s inherit_errexit
-          # 并发场景另一 run 可能已发完：已发布就安静退出，什么都不做
-          if [ "$(gh release view "$TAG" --json isDraft --jq '.isDraft')" != "true" ]; then
-            echo "::notice::Release $TAG 已被发布（其它 run 抢先发完），本 run 无需再操作"
-            exit 0
-          fi
+          # 并发场景另一 run 可能已发完：已发布就安静退出，什么都不做；
+          # 查询失败或返回异常值一律报错退出（fail closed），不猜状态
+          is_draft=$(gh release view "$TAG" --json isDraft --jq '.isDraft')
+          case "$is_draft" in
+            true) ;;
+            false) echo "::notice::Release $TAG 已被发布（其它 run 抢先发完），本 run 无需再操作"; exit 0 ;;
+            *) echo "::error::isDraft 返回异常值：$is_draft"; exit 1 ;;
+          esac
           ver=${TAG#v}
           have=$(gh release view "$TAG" --json assets --jq '.assets[].name' | sort)
           want=$(printf '%s\n' \
