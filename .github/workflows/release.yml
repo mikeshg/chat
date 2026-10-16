@@ -54,6 +54,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          shopt -s inherit_errexit
           ver=$(python3 -c 'import json;print(json.load(open("app/src-tauri/tauri.conf.json"))["version"])')
 
           # 决策输出 + run 页摘要
@@ -77,8 +78,9 @@ jobs:
 
           # TAG 名下“已发布”（非草稿）的 Release 数；API 出错直接让本步红掉，不猜
           published_count() {
-            gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases" \
-              --jq '[flatten | .[] | select(.tag_name == env.TAG) | select(.draft == false)] | length'
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+              --jq '.[] | select(.tag_name == env.TAG and .draft == false) | .id' \
+              | wc -l
           }
 
           # origin 上 TAG 最终指向的 commit：注解 tag 读剥离行 refs/tags/TAG^{}，
@@ -100,7 +102,8 @@ jobs:
             git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
             SHA=$(git rev-parse "$TAG^{commit}")
             [ "$SHA" = "$GITHUB_SHA" ] || { echo "::error::$TAG 剥离到 $SHA，与本次 push 的 $GITHUB_SHA 不一致（tag 被推后移动过？）"; exit 1; }
-            if [ "$(published_count)" -gt 0 ]; then
+            n=$(published_count)
+            if [ "$n" -gt 0 ]; then
               echo "::notice::Release $TAG 已发布（重推同名 tag / 重跑旧 run），不再发版"
               emit false false "$SHA" "**Release $TAG 已发布**——重复触发，发版跳过。"
             else
@@ -115,7 +118,8 @@ jobs:
               emit false false "$GITHUB_SHA" "本仓库未开启自动发版（fork 测试见 docs/release-runners.md）；手动推 \`v*\` tag 不受影响。"
               exit 0
             fi
-            if [ "$(published_count)" -gt 0 ]; then
+            n=$(published_count)
+            if [ "$n" -gt 0 ]; then
               echo "::notice::$TAG 已发布，版本未变，不发版"
               emit false false "$GITHUB_SHA" "**$TAG 已发布**——version 没变，不发版。"
               exit 0
@@ -159,6 +163,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          shopt -s inherit_errexit
           # 更新说明：优先取本 commit 关联的「已合入默认分支」的 PR（标题+正文，
           # merge_commit_sha 正好是本提交的排最前）；找不到就用完整 commit message。
           # PR 内容直接经 --jq 落盘，不走 ${{ }} 插值——标题里塞脚本也不会被执行。
@@ -219,12 +224,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          shopt -s inherit_errexit
           # checkout 只取到轻量引用；重取标签对象才能读到注解内容
           git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
           git tag -l --format='%(contents)' "$TAG" > notes.md
           # 同名 tag_name 的 Release 状态：","分隔的多值 = 异常；已发布 = 别的 run 抢先发完
-          states=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases" \
-            --jq '[flatten | .[] | select(.tag_name == env.TAG) | .draft] | join(",")')
+          states=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+            --jq '.[] | select(.tag_name == env.TAG) | .draft' | paste -sd, -)
           if [[ "$states" == *,* ]]; then
             echo "::error::tag_name=$TAG 的 Release 对象不止一个（draft 状态：$states），状态异常请人工清理"
             exit 1
@@ -421,6 +427,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          shopt -s inherit_errexit
           # 并发场景另一 run 可能已发完：已发布就安静退出，什么都不做
           if [ "$(gh release view "$TAG" --json isDraft --jq '.isDraft')" != "true" ]; then
             echo "::notice::Release $TAG 已被发布（其它 run 抢先发完），本 run 无需再操作"
@@ -439,8 +446,8 @@ jobs:
           missing=$(comm -23 <(echo "$want") <(echo "$have"))
           [ -z "$missing" ] || { echo "::error::Release 还缺这些文件：$missing"; exit 1; }
           # --latest 只给版本号最高的 Release；旧线 hotfix 发版不抢 latest
-          highest=$({ gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases" \
-              --jq 'flatten | .[] | select(.draft == false) | .tag_name'; echo "$TAG"; } \
+          highest=$({ gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+              --jq '.[] | select(.draft == false) | .tag_name'; echo "$TAG"; } \
             | sed 's/^v//' | sort -V | tail -1)
           if [ "$highest" = "$ver" ]; then
             gh release edit "$TAG" --draft=false --latest
