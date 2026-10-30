@@ -280,7 +280,7 @@ export function clearSession() {
 
 export class ApiError extends Error {
   status: number;
-  /** 服务端附带的稳定机器码（如 recall_expired / attachment_expired）；无则 undefined */
+  /** 稳定机器码：服务端附带（recall_expired / attachment_expired）或为已知服务端文案补的客户端码（not_member）；无则 undefined */
   code?: string;
   /** 响应体是否是带 "error" 字段的 JSON（区分业务 404 与路由不存在的裸 404） */
   hasErrorField?: boolean;
@@ -496,6 +496,11 @@ async function call<T>(path: string, init?: RequestInit, opts?: { timeoutMs?: nu
     // 账号被禁用：服务端对本会话一切 API 一律 403——与 refresh 被拒同等对待，踢回登录页
     if (res.status === 403 && msg === REFRESH_DENIED_403 && !NO_REFRESH_PATHS.has(path)) {
       denySession(403, LOGOUT_DISABLED, srv);
+    }
+    // 成员资格错误统一中文（服务端原文是英文，不能直接弹给用户）；补稳定码便于客户端分支
+    if (msg === "not a member of this conversation") {
+      msg = "你已不在该群";
+      code ??= "not_member";
     }
     // 登录失败统一口语文案（服务端报文是英文代号 invalid credentials）
     if (path === "/auth/login" && res.status === 401) msg = "用户名或密码错误";
