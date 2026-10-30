@@ -35,20 +35,23 @@
 - 桌面端：关掉窗口留在系统托盘继续收消息；开机自启在「我」页打开，默认关
 - 机器人（webhook bot）：任何人可在「我」页建 bot，给它加一个或多个令牌。外部程序带令牌往入站地址 POST 就以 bot 身份发消息；填了回调地址，私聊 bot 或在群里 @ 它时服务器把消息 POST 过去，回复的文字发回原会话
 - 实时：WebSocket（一次性 ticket 鉴权）、多设备同时在线、在线状态、正在输入、未读数、已读同步
-- 部署：`docker compose up -d` 一条命令（Postgres + 服务端托管前端，主机端口 28080）
+- 部署：`./scripts/run.sh` 一条命令（Postgres + 服务端托管前端，主机端口 28080）
 
 ## 快速开始（服务端）
 
 ```bash
-echo "JWT_SECRET=$(openssl rand -hex 32)" > .env   # 只做一次；没有它服务端拒绝启动
-docker compose up -d          # WSL/任意有 Docker 的环境
+./scripts/run.sh              # 一条命令：缺 .env 时自动生成 JWT_SECRET，然后构建启动
 # 浏览器打开 http://localhost:28080
 ```
 
-更新代码后必须带 `--build`，否则 compose 会继续用旧镜像：
+更新代码后跑同一个脚本：检测到已有容器时会先校验当前在 `main` 分支且工作区干净，然后 `git pull --ff-only origin main` 再重建（必须带 `--build`，否则 compose 会继续用旧镜像）。
+
+脚本等价于手动跑这几条，仍然可以这样部署/更新：
 
 ```bash
-git pull && docker compose up -d --build
+echo "JWT_SECRET=$(openssl rand -hex 32)" > .env   # 只做一次；没有它服务端拒绝启动
+docker compose up -d --build                     # 首次启动
+git pull --ff-only && docker compose up -d --build  # 更新
 ```
 
 环境变量（compose 自动读本目录 `.env`，全部字段见 [.env.example](.env.example)）：`DATABASE_URL`、`JWT_SECRET`（必填，至少 32 个字符；不设置服务端拒绝启动。换掉后已登录的设备会自动刷新凭据，不用重新登录）、`PORT`、`BIND`、`APP_DIST`、`FILES_DIR`（附件存储目录，compose 挂 `chat-files` 卷）、`UPLOAD_MAX_MB`（单文件上限，默认 25）。挂在 nginx / Caddy 等反向代理后面时设 `TRUST_PROXY=1`，登录 / 注册限流按 `X-Forwarded-For` 认客户端 IP；直接对外时不要设，否则谁都能伪造这个头绕过限流。
