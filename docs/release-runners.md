@@ -103,5 +103,6 @@ docker-compose 部署的话这几个变量写在 `docker-compose.yml` 的 enviro
 | APK 有但手机装不上 / 签名冲突 | `ANDROID_DEBUG_KEYSTORE` 不是以前打包那台电脑的 keystore |
 | publish 红：缺资产 | 某个上传没成功；看对应 job 日志，修好 Re-run failed jobs |
 | 客户端查不到新版本 | Release 还是草稿（publish 没跑完），或服务端 `update_repo_url` 指错仓库；服务端日志看「更新源」报错 |
+| `/v1/client/latest` 返回 Cloudflare 纯文本 `error code: 502`、无 CORS | 源站对更新源失败曾回 HTTP 502，被 CF Error Pages 换成纯文本（丢 JSON/CORS）；已改为回 503。若仍失败看服务端日志「更新源不可达」，并配置 `CLIENT_UPDATE_PROXY`（国内机访问 GitHub 常需要） |
 | 装的是 deb，更新时要输入密码 | 正常现象：deb 更新要用 root 权限执行 `dpkg -i`。用 AppImage 装的不需要密码 |
 | fork 上想试跑 | 手动推 `v*` tag 即可走全流程（签名校验会明确报错，把 `TAURI_SIGNING_PRIVATE_KEY` 填任意值可看流程走通，产物不能用于真实更新）。想试**自动路径**：fork 仓库 Settings → Variables → Actions 加 `AUTO_RELEASE=true`，再在某个测试分支的临时 commit 里把该分支名加进 `release.yml` 的 `on.push.branches`（用完丢弃、别合回 main），推这个分支就会触发 gate 的自动路径 |

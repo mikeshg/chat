@@ -589,7 +589,7 @@ async fn p33_ws_idle_timeout() {
     assert_eq!(m["content"], "still here");
 }
 
-/// 10. 推送发送失败（连接拒绝）不影响消息正常送达；test 端点失败 502 带原因。
+/// 10. 推送发送失败（连接拒绝）不影响消息正常送达；test 端点失败 503 带原因。
 #[tokio::test]
 async fn p33_push_failure_isolated() {
     let (_guard, base, _st) = spawn_named_state(&format!("chat_it_p33j_{}", uniq())).await;
@@ -633,9 +633,9 @@ async fn p33_push_failure_isolated() {
         .unwrap();
     assert_eq!(page["messages"].as_array().unwrap().len(), 1);
 
-    // test 端点：投递失败 → 502 带原因
+    // test 端点：投递失败 → 503 带原因
     let r = test_device(&base, &b, &dev).await;
-    assert_eq!(r.status(), 502);
+    assert_eq!(r.status(), 503);
     assert!(r.json::<Value>().await.unwrap()["error"]
         .as_str()
         .unwrap()

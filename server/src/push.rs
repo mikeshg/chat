@@ -213,7 +213,7 @@ pub async fn delete_device(
     view_of(&st, uid).await
 }
 
-/// POST /users/me/push/devices/{id}/test：给这台手机立即发一条测试推送，失败 502 带原因
+/// POST /users/me/push/devices/{id}/test：给这台手机立即发一条测试推送，失败 503 带原因
 pub async fn test_device(
     State(st): State<SharedState>,
     headers: HeaderMap,
@@ -276,7 +276,7 @@ fn client() -> &'static reqwest::Client {
     })
 }
 
-/// 发请求（带管理员配置的令牌）；失败返回原因串（调用方记日志或转 502），不重试。
+/// 发请求（带管理员配置的令牌）；失败返回原因串（调用方记日志或转 503），不重试。
 async fn deliver(s: &ServerSettings, mut req: reqwest::RequestBuilder) -> Result<(), String> {
     if !s.push_ntfy_token.is_empty() {
         req = req.bearer_auth(&s.push_ntfy_token);

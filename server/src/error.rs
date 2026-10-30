@@ -15,7 +15,9 @@ pub enum AppError {
     NotFound(String),
     Conflict(String),
     PayloadTooLarge(String),
-    /// 上游服务（如 ntfy）不可达/拒绝——推送测试端点用
+    /// 上游服务（如 ntfy、GitHub 更新源）不可达/拒绝——推送测试端点用。
+    /// 注意对外回 503 而非 502：Cloudflare Error Pages 会把源站 502 的 body
+    /// 换成纯文本 "error code: 502"（丢 JSON、丢 CORS）；503 不在其替换列表内。
     BadGateway(String),
     /// 带稳定机器码的错误：响应体多一个 "code" 字段，客户端按码分支
     /// （如撤回超时 recall_expired / 附件过期 attachment_expired）。旧客户端只读 error。
@@ -71,7 +73,8 @@ impl IntoResponse for AppError {
             Self::NotFound(m) => (StatusCode::NOT_FOUND, m),
             Self::Conflict(m) => (StatusCode::CONFLICT, m),
             Self::PayloadTooLarge(m) => (StatusCode::PAYLOAD_TOO_LARGE, m),
-            Self::BadGateway(m) => (StatusCode::BAD_GATEWAY, m),
+            // 503 是故意的，见上：避免 Cloudflare 用错误页吞掉 JSON body
+            Self::BadGateway(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
             Self::Coded {
                 status,
                 code,
