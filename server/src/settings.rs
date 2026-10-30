@@ -42,7 +42,8 @@ pub struct ServerSettings {
     #[serde(skip_serializing)]
     pub push_ntfy_token: String,
     pub push_ntfy_token_set: bool,
-    /// 本服务对外地址，用于推送通知的 Click 跳转；空 = 不带
+    /// 本服务对外地址：推送通知 Click 跳转 + 客户端更新下载地址前缀。
+    /// 默认公网实例 https://chat.287152.xyz；显式置空 = 更新下载按请求 Host 拼、推送不带 Click
     pub public_url: String,
     /// 视频会议地址前缀；空字符串 = 关闭会议按钮
     pub meeting_base_url: String,
@@ -59,7 +60,7 @@ impl Default for ServerSettings {
             push_ntfy_base: String::new(),
             push_ntfy_token: String::new(),
             push_ntfy_token_set: false,
-            public_url: String::new(),
+            public_url: "https://chat.287152.xyz".into(),
             meeting_base_url: DEFAULT_MEETING_BASE_URL.into(),
             update_repo_url: String::new(),
         }
@@ -155,7 +156,8 @@ pub struct UpdateSettingsReq {
     pub push_ntfy_base: Option<String>,
     /// ntfy 访问令牌（只写不读）；空字符串 = 清除
     pub push_ntfy_token: Option<String>,
-    /// 本服务对外地址（同 push_ntfy_base 的校验规则）；空 = 通知不带 Click
+    /// 本服务对外地址（同 push_ntfy_base 的校验规则）；缺省不改，
+    /// 显式空串 = 更新下载按请求 Host 拼、推送不带 Click
     pub public_url: Option<String>,
     /// 在线更新的安装包仓库（GitHub owner/repo 或 Gitea 地址）；"off" 关闭；
     /// 空 = 用 CLIENT_UPDATE_REPO（默认 xie-fan/chat）。缺省不改
@@ -453,4 +455,17 @@ pub async fn revoke_invite(
         .execute(&st.pool)
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_point_at_public_instance() {
+        let s = ServerSettings::default();
+        assert_eq!(s.public_url, "https://chat.287152.xyz");
+        assert_eq!(s.update_repo_url, "");
+        assert_eq!(s.registration_mode, MODE_OPEN);
+    }
 }

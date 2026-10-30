@@ -93,7 +93,7 @@ node scripts/e2e.mjs phase2   # phase2：验证数据持久化（含头像、文
 - 版本号改 `app/src-tauri/tauri.conf.json` 的 `version`，安装包文件名和 Android 的 versionName 都跟着它变。
 - 图标已生成在 `app/src-tauri/icons/`。换图标后在 `app/` 下执行 `node gen-icon.cjs`。
 
-下面的打包命令都在 `app/` 目录执行。装好后在客户端登录页填服务器地址（如 `http://192.168.1.5:28080`）。
+下面的打包命令都在 `app/` 目录执行。装好后在客户端登录页填服务器地址（如 `https://chat.287152.xyz`）。
 
 ### Windows
 
