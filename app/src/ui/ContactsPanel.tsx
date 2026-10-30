@@ -4,6 +4,7 @@ import { setState, useApp } from "../store";
 import type { UserPublic } from "../types";
 import { openConversation } from "../ws";
 import Avatar from "./Avatar";
+import { confirmDialog } from "./Modal";
 
 export default function ContactsPanel() {
   const s = useApp();
@@ -55,7 +56,13 @@ export default function ContactsPanel() {
   };
 
   const removeFriend = async (u: UserPublic) => {
-    if (!confirm(`删除好友 ${u.display_name}？会话将变为只读。`)) return;
+    if (
+      !(await confirmDialog(`删除好友 ${u.display_name}？会话将变为只读。`, {
+        danger: true,
+        okText: "删除",
+      }))
+    )
+      return;
     await friends.remove(u.id);
     await reload();
   };

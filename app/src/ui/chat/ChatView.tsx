@@ -37,6 +37,7 @@ import type {
   ReplyPreview,
 } from "../../types";
 import { discardSend, retrySend, sendChat, sendTyping } from "../../ws";
+import { confirmDialog } from "../Modal";
 import RichText from "../../richText";
 import AnnouncementBar from "./AnnouncementBar";
 import AudioBubble from "./AudioBubble";
@@ -751,7 +752,7 @@ export default function ChatView() {
     setMsgMenu(null);
     setSheet(null);
     if (mutBusy) return;
-    if (!window.confirm("撤回这条消息？所有人将看到“消息已撤回”")) return;
+    if (!(await confirmDialog("撤回这条消息？所有人将看到“消息已撤回”", { danger: true }))) return;
     const mine = m.sender_id === s.me?.id;
     const meId = s.me?.id;
     const canReedit =
@@ -811,7 +812,7 @@ export default function ChatView() {
   };
 
   /** 「重新编辑」：原文回填 composer；带过附件则挂「复用附件」chip。用过即删。 */
-  const reeditMsg = (entry: ReeditEntry) => {
+  const reeditMsg = async (entry: ReeditEntry) => {
     const meId = s.me?.id;
     if (!meId) return;
     removeReedit(localStorage, serverScope(), meId, entry.message_id);
@@ -821,7 +822,7 @@ export default function ChatView() {
     if (entry.text) {
       let next = text;
       if (next) {
-        next = window.confirm("替换当前输入？")
+        next = (await confirmDialog("替换当前输入？"))
           ? entry.text
           : `${next}\n${entry.text}`;
       } else {
@@ -1774,7 +1775,7 @@ export default function ChatView() {
                               type="button"
                               className="reedit-link"
                               data-testid="msg-reedit"
-                              onClick={() => reeditMsg(entry)}
+                              onClick={() => void reeditMsg(entry)}
                             >
                               重新编辑
                             </button>

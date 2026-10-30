@@ -6,6 +6,7 @@ import type { AttachmentView, ConversationDetail, ConversationView } from "../..
 import AnnouncementEditor from "./AnnouncementEditor";
 import Avatar from "../Avatar";
 import ConvMedia from "./ConvMedia";
+import { alertDialog, confirmDialog } from "../Modal";
 
 export default function GroupInfo({
   conv,
@@ -47,12 +48,23 @@ export default function GroupInfo({
   }, [conv.id]);
 
   const act = (p: Promise<unknown>) =>
-    p.then(reload).catch((e) => alert(e instanceof Error ? e.message : "操作失败"));
+    p.then(reload).catch((e) => void alertDialog(e instanceof Error ? e.message : "操作失败"));
 
   const leave = async () => {
-    if (!confirm(isOwner ? "你是群主，退出后将自动转让；确定退出？" : "退出该群？")) return;
-    await convs.leave(conv.id);
-    await act(Promise.resolve());
+    if (
+      !(await confirmDialog(
+        isOwner ? "你是群主，退出后将自动转让；确定退出？" : "退出该群？",
+        { danger: true, okText: "退出" },
+      ))
+    )
+      return;
+    try {
+      await convs.leave(conv.id);
+      await reload();
+    } catch (e) {
+      void alertDialog(e instanceof Error ? e.message : "操作失败");
+      return;
+    }
     setState({ activeConv: null });
     onClose();
   };
@@ -227,8 +239,13 @@ export default function GroupInfo({
             {isOwner && (
               <button
                 className="danger"
-                onClick={() => {
-                  if (confirm("解散后所有成员将被移出，消息记录保留但不可再发言。确定？"))
+                onClick={async () => {
+                  if (
+                    await confirmDialog(
+                      "解散后所有成员将被移出，消息记录保留但不可再发言。确定？",
+                      { danger: true, okText: "解散" },
+                    )
+                  )
                     act(convs.dissolve(conv.id)).then(() => {
                       setState({ activeConv: null });
                       onClose();

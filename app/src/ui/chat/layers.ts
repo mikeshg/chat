@@ -19,4 +19,6 @@ export const Z = {
   toast: 300,
   /** 轻量操作反馈（已复制/撤回提示） */
   hint: 400,
+  /** 应用内确认/提示弹窗（DialogHost，替代 native confirm/alert）：最上层，压住一切浮层 */
+  dialog: 500,
 } as const;
