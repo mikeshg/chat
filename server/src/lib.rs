@@ -41,7 +41,7 @@ pub fn build_router(state: SharedState, cfg: &Config) -> Router {
         .nest("/v1", v1)
         // panic 也回 JSON 500：放在 CORS 内侧，响应穿过 CORS 层照常补头。
         // （500 不在 CF Error Pages 替换列表内，body 能透传给客户端。）
-        .layer(CatchPanicLayer::custom(|err| {
+        .layer(CatchPanicLayer::custom(|err: Box<dyn std::any::Any + Send>| {
             let msg = err
                 .downcast_ref::<&str>()
                 .copied()
