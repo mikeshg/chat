@@ -37,6 +37,9 @@ services:
       CLIENT_UPDATE_PROXY: ${CLIENT_UPDATE_PROXY:-}
       # 测试/GHE 才用：GitHub API 地址，默认 https://api.github.com
       GITHUB_API_BASE: ${GITHUB_API_BASE:-}
+      # 服务器对外地址（public_url）不走环境变量，在客户端「管理」后台设置；
+      # 默认 https://chat.287152.xyz，是推送 Click 与客户端更新下载地址的前缀
+      # （显式设为空 = 更新下载地址按请求 Host 拼）
     volumes:
       - chat-files:/data/files
     ports:

@@ -51,7 +51,7 @@ docker compose up -d          # WSL/任意有 Docker 的环境
 git pull && docker compose up -d --build
 ```
 
-环境变量：`DATABASE_URL`、`JWT_SECRET`（必填，至少 32 个字符；不设置服务端拒绝启动。换掉后已登录的设备会自动刷新凭据，不用重新登录）、`PORT`、`BIND`、`APP_DIST`、`FILES_DIR`（附件存储目录，compose 挂 `chat-files` 卷）、`UPLOAD_MAX_MB`（单文件上限，默认 25）。挂在 nginx / Caddy 等反向代理后面时设 `TRUST_PROXY=1`，登录 / 注册限流按 `X-Forwarded-For` 认客户端 IP；直接对外时不要设，否则谁都能伪造这个头绕过限流。
+环境变量（compose 自动读本目录 `.env`，全部字段见 [.env.example](.env.example)）：`DATABASE_URL`、`JWT_SECRET`（必填，至少 32 个字符；不设置服务端拒绝启动。换掉后已登录的设备会自动刷新凭据，不用重新登录）、`PORT`、`BIND`、`APP_DIST`、`FILES_DIR`（附件存储目录，compose 挂 `chat-files` 卷）、`UPLOAD_MAX_MB`（单文件上限，默认 25）。挂在 nginx / Caddy 等反向代理后面时设 `TRUST_PROXY=1`，登录 / 注册限流按 `X-Forwarded-For` 认客户端 IP；直接对外时不要设，否则谁都能伪造这个头绕过限流。
 
 ## 开发
 
@@ -93,7 +93,7 @@ node scripts/e2e.mjs phase2   # phase2：验证数据持久化（含头像、文
 - 版本号改 `app/src-tauri/tauri.conf.json` 的 `version`，安装包文件名和 Android 的 versionName 都跟着它变。
 - 图标已生成在 `app/src-tauri/icons/`。换图标后在 `app/` 下执行 `node gen-icon.cjs`。
 
-下面的打包命令都在 `app/` 目录执行。装好后在客户端登录页填服务器地址（如 `http://192.168.1.5:28080`）。
+下面的打包命令都在 `app/` 目录执行。装好后在客户端登录页填服务器地址（如 `https://chat.287152.xyz`）。
 
 ### Windows
 
