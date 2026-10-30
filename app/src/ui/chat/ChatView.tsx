@@ -48,7 +48,7 @@ import { meetingMessage } from "./meeting";
 import PinnedBar from "./PinnedBar";
 import NewPollModal from "./NewPollModal";
 import PollCard from "./PollCard";
-import ChatRecordView, { ChatRecordCard, type RecordViewState } from "./ChatRecord";
+import ChatRecordView, { ChatRecordCard, type RecordViewState } from "./ChatRecordView";
 import { attImgSrc, imageBubbleSize } from "../mediaFormat";
 import Avatar from "../Avatar";
 import VoiceRecorder from "./VoiceRecorder";
