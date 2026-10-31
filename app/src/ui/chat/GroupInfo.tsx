@@ -70,7 +70,7 @@ export default function GroupInfo({
   };
 
   return (
-    <aside className="group-info">
+    <aside className="group-info" data-testid="slide-over">
       <div className="gi-head">
         <h3>群聊信息</h3>
         <button className="icon-btn" onClick={onClose}>

@@ -9,6 +9,7 @@ import ContactsPanel from "./ContactsPanel";
 import MePanel from "./me/MePanel";
 import AdminPanel from "./admin/AdminPanel";
 import Avatar from "./Avatar";
+import { ChatBubbleIcon, ContactsIcon, GearIcon, ShieldIcon } from "./icons";
 
 export default function ChatScreen() {
   const s = useApp();
@@ -52,7 +53,9 @@ export default function ChatScreen() {
           className={`rail-btn ${s.tab === "chats" ? "on" : ""}`}
           onClick={() => setState({ tab: "chats" })}
           title="聊天"
+          data-testid="rail-chats"
         >
+          <ChatBubbleIcon />
           会话
           {totalUnread > 0 && <i className="badge">{totalUnread > 99 ? "99+" : totalUnread}</i>}
         </button>
@@ -60,7 +63,9 @@ export default function ChatScreen() {
           className={`rail-btn ${s.tab === "contacts" ? "on" : ""}`}
           onClick={() => setState({ tab: "contacts" })}
           title="联系人"
+          data-testid="rail-contacts"
         >
+          <ContactsIcon />
           联系人
           {pendingCount > 0 && <i className="badge">{pendingCount}</i>}
         </button>
@@ -68,7 +73,9 @@ export default function ChatScreen() {
           className={`rail-btn ${s.tab === "me" ? "on" : ""}`}
           onClick={() => setState({ tab: "me" })}
           title="我"
+          data-testid="rail-me"
         >
+          <GearIcon />
           我
         </button>
         {s.me?.role === "admin" && (
@@ -76,7 +83,9 @@ export default function ChatScreen() {
             className={`rail-btn ${s.tab === "admin" ? "on" : ""}`}
             onClick={() => setState({ tab: "admin" })}
             title="后台管理"
+            data-testid="rail-admin"
           >
+            <ShieldIcon />
             管理
           </button>
         )}
