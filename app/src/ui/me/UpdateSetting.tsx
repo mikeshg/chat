@@ -1,13 +1,23 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getServer, osOfUa } from "../../api";
 import {
+  apkProgressPercent,
+  apkProgressText,
   apkUrl,
   assetFor,
   hasInstaller,
   assetLabel,
+  checkInstallPermission,
   downloadUrl,
+  downloadUpdateApk,
+  apkDownloadProgress,
+  errText,
   fetchLatest,
+  installUpdateApk,
+  isApkPermissionDenied,
+  isApkSignatureError,
   isNewer,
+  openInstallPermissionSettings,
   type ClientLatest,
 } from "../../update";
 import SetRow from "./SetRow";
@@ -59,16 +69,30 @@ function DownloadClient() {
   );
 }
 
+/** In-app APK Installer 阶段：下载中（带进度）→ ready（已缓存，可反复拉起系统安装器）；
+ *  ready.denied = Install Permission 被拒，先引导去系统设置 */
+type ApkFlow =
+  | { phase: "idle" }
+  | { phase: "downloading"; received: number; total: number }
+  | { phase: "ready"; name: string; denied: boolean };
+
+/** 常驻一次性卸载提示：0.6.2 / 签名不一致的 0.7.0 设备 Overlay Install 装不上，只能卸一次旧版 */
+const UNINSTALL_ONCE = "若安装失败请先卸载旧版再装（仅此一次）";
+const OR_BROWSER = "；可重试，或用浏览器下载";
+
 function ShellUpdate() {
   const android = /Android/i.test(navigator.userAgent);
   const [current, setCurrent] = useState("");
   const [latest, setLatest] = useState<ClientLatest | null>(null);
   const [busy, setBusy] = useState(false);
   const [hint, setHint] = useState("");
+  const [flow, setFlow] = useState<ApkFlow>({ phase: "idle" });
+  const pollRef = useRef<number | undefined>(undefined);
 
   useEffect(() => {
     void import("@tauri-apps/api/app").then((m) => m.getVersion()).then(setCurrent);
     void fetchLatest().then(setLatest);
+    return () => window.clearInterval(pollRef.current);
   }, []);
 
   if (!current) return null;
@@ -82,31 +106,105 @@ function ShellUpdate() {
   // tag 说明第一行常就是版本号，不重复显示
   const notes = latest?.notes.replace(new RegExp(`^v?${latest.version}\\s*\\n`), "").trim();
 
-  const install = async () => {
-    if (!latest || busy) return;
+  /** Browser Download Fallback：同一个 APK 地址交给系统浏览器 */
+  const openInBrowser = async () => {
+    if (!latest) return;
+    const url = apkUrl(latest);
+    if (!url) return;
+    const { openUrl } = await import("@tauri-apps/plugin-opener");
+    await openUrl(url);
+    setHint("下载完成后点开安装包即可覆盖安装");
+  };
+
+  /** 拉起系统安装器。用户在系统界面取消不算失败：缓存文件还在，「安装」按钮可再次拉起 */
+  const launchInstall = async (name: string) => {
     setBusy(true);
-    setHint("");
     try {
-      if (android) {
-        const url = apkUrl(latest);
-        if (!url) throw new Error("这个版本没有 Android 安装包");
-        const { openUrl } = await import("@tauri-apps/plugin-opener");
-        await openUrl(url);
-        setHint("下载完成后点开安装包即可覆盖安装");
-      } else {
-        setHint("正在下载，完成后会自动安装并重启…");
-        const { invoke } = await import("@tauri-apps/api/core");
-        const updated = await invoke<boolean>("install_update", {
-          server: getServer(),
-        });
-        if (!updated) setHint("这个平台暂时没有可用的安装包");
-      }
+      await installUpdateApk(name);
+      setFlow({ phase: "ready", name, denied: false });
+      setHint("已打开系统安装器，按提示完成安装；若取消了可再点「安装」");
     } catch (e) {
-      setHint(e instanceof Error ? e.message : String(e));
+      if (isApkPermissionDenied(e)) {
+        setFlow({ phase: "ready", name, denied: true });
+        setHint("");
+      } else if (isApkSignatureError(e)) {
+        // Signature Mismatch（-7）：只有卸载旧版一次才能装上
+        setFlow({ phase: "ready", name, denied: false });
+        setHint(`签名不一致：${UNINSTALL_ONCE}`);
+      } else {
+        const msg = errText(e);
+        // 缓存安装包被清掉（Kotlin 文案含「不存在」）→ 回到可重新下载的状态
+        setFlow(
+          msg.includes("不存在")
+            ? { phase: "idle" }
+            : { phase: "ready", name, denied: false },
+        );
+        setHint(`${msg}${OR_BROWSER}`);
+      }
     } finally {
       setBusy(false);
     }
   };
+
+  /** 应用内下载（轮询进度）→ 完成后自动拉起系统安装器 */
+  const startApkUpdate = async () => {
+    if (!latest || busy) return;
+    const url = apkUrl(latest);
+    if (!url) {
+      setHint("这个版本没有 Android 安装包");
+      return;
+    }
+    setBusy(true);
+    setHint("");
+    setFlow({ phase: "downloading", received: 0, total: -1 });
+    pollRef.current = window.setInterval(() => {
+      void apkDownloadProgress()
+        .then((p) =>
+          setFlow((f) =>
+            f.phase === "downloading"
+              ? { phase: "downloading", received: p.receivedBytes, total: p.totalBytes }
+              : f,
+          ),
+        )
+        .catch(() => {});
+    }, 300);
+    try {
+      const dl = await downloadUpdateApk(url);
+      // 权限先问一次：被拒直接给引导，省得 install 白拒一次（查询失败就当有权限，走 install 自己判）
+      if (!(await checkInstallPermission().catch(() => true))) {
+        setFlow({ phase: "ready", name: dl.name, denied: true });
+        return;
+      }
+      await launchInstall(dl.name);
+    } catch (e) {
+      setFlow({ phase: "idle" });
+      setHint(`${errText(e)}${OR_BROWSER}`);
+    } finally {
+      window.clearInterval(pollRef.current);
+      setBusy(false);
+    }
+  };
+
+  /** 桌面：tauri-plugin-updater 下载 → 校验签名 → 安装重启 */
+  const installDesktop = async () => {
+    if (!latest || busy) return;
+    setBusy(true);
+    setHint("");
+    try {
+      setHint("正在下载，完成后会自动安装并重启…");
+      const { invoke } = await import("@tauri-apps/api/core");
+      const updated = await invoke<boolean>("install_update", {
+        server: getServer(),
+      });
+      if (!updated) setHint("这个平台暂时没有可用的安装包");
+    } catch (e) {
+      setHint(errText(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const pct = flow.phase === "downloading" ? apkProgressPercent(flow.received, flow.total) : null;
 
   return (
     <SetRow
@@ -117,15 +215,82 @@ function ShellUpdate() {
           {/* 安装包还没传完的版本不算「有」 */}
           {latest && ` · 最新版本 ${hasNew ? latest.version : current}`}
           {hasNew && notes && <div style={{ whiteSpace: "pre-wrap" }}>{notes}</div>}
+          {android && flow.phase === "downloading" && (
+            <div>
+              {pct !== null && (
+                <div className="bk-progress">
+                  <div className="bk-progress-bar" style={{ width: `${pct}%` }} />
+                </div>
+              )}
+              {apkProgressText(flow.received, flow.total)}
+            </div>
+          )}
           {hint && <div>{hint}</div>}
+          {android && flow.phase === "ready" && flow.denied && (
+            <div>
+              未开启「安装未知应用」权限：
+              <button onClick={() => void openInstallPermissionSettings().catch((e) => setHint(errText(e)))}>
+                去开启
+              </button>
+              ，在系统设置中允许本应用安装应用，返回后点「安装」继续。
+            </div>
+          )}
+          {/* 一次性卸载提示常驻（0.6.2 / 签名不一致的 0.7.0 设备要用）；浏览器下载是兜底 */}
+          {android && hasNew && (
+            <div>
+              <a
+                href="#"
+                onClick={(e) => {
+                  e.preventDefault();
+                  void openInBrowser();
+                }}
+              >
+                用浏览器下载
+              </a>
+              {flow.phase === "ready" && (
+                <>
+                  {" · "}
+                  <a
+                    href="#"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      void startApkUpdate();
+                    }}
+                  >
+                    重新下载
+                  </a>
+                </>
+              )}
+              <span>{` · ${UNINSTALL_ONCE}`}</span>
+            </div>
+          )}
         </>
       }
     >
-      {hasNew && (
-        <button className="primary" disabled={busy} onClick={() => void install()}>
-          {android ? "下载新版" : "更新并重启"}
-        </button>
-      )}
+      {hasNew &&
+        (android ? (
+          flow.phase === "downloading" ? (
+            <button className="primary" disabled>
+              下载中{pct === null ? "…" : ` ${pct}%`}
+            </button>
+          ) : flow.phase === "ready" ? (
+            <button
+              className="primary"
+              disabled={busy}
+              onClick={() => void launchInstall(flow.name)}
+            >
+              安装
+            </button>
+          ) : (
+            <button className="primary" disabled={busy} onClick={() => void startApkUpdate()}>
+              下载安装
+            </button>
+          )
+        ) : (
+          <button className="primary" disabled={busy} onClick={() => void installDesktop()}>
+            更新并重启
+          </button>
+        ))}
     </SetRow>
   );
 }
