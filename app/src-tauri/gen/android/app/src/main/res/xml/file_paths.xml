@@ -2,4 +2,6 @@
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
   <external-path name="my_images" path="." />
   <cache-path name="my_cache_images" path="." />
+  <!-- AS2：应用内 APK 安装器的私有缓存目录 -->
+  <cache-path name="apk_update" path="apk-update/" />
 </paths>
