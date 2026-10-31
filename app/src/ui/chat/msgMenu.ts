@@ -97,7 +97,7 @@ export function canAct(m: MessageView, ctx: MenuCtx): boolean {
 
 /** 转发：非投票、非墓碑、非乐观消息；只读会话仍可转出 */
 export function canForward(m: MessageView): boolean {
-  return !isTombstone(m) && !isPending(m) && m.kind !== "poll";
+  return !isTombstone(m) && !isPending(m) && m.kind !== "poll" && m.kind !== "system";
 }
 
 /**
@@ -107,7 +107,7 @@ export function canForward(m: MessageView): boolean {
  * 多选在 FEATURE_MULTI_SELECT 后：MM3 暂缓，等合并转发设计定稿再接回。
  */
 export function menuItems(m: MessageView, ctx: MenuCtx): MenuItem[] {
-  if (isTombstone(m) || isPending(m)) return [];
+  if (isTombstone(m) || isPending(m) || m.kind === "system") return [];
   const items: MenuItem[] = [];
   if (m.attachment) {
     items.push({ action: "preview", label: m.kind === "image" ? "查看大图" : "预览" });
@@ -262,6 +262,20 @@ export function tombstoneText(m: MessageView, ctx: TombstoneCtx): string | null 
 /** 回复引用块里被撤/被删原消息的文案（预览只有 deleted + recalled_by_name） */
 export function quoteDeletedText(p: ReplyPreview): string {
   return p.recalled_by_name != null ? "原消息已撤回" : "原消息已删除";
+}
+
+/** 引用块正文：缺失 →「原消息不可用」；转发且原消息已删/不可见 →「原消息不可用」；
+ *  普通同会话回复保留「已撤回/已删除」。有 excerpt 时优先展示（转发跨会话仍可见引用内容）。 */
+export function quoteBodyText(
+  p: ReplyPreview | null | undefined,
+  opts?: { forwarded?: boolean; kindFallback?: string },
+): string {
+  if (!p) return "原消息不可用";
+  if (p.deleted) {
+    return opts?.forwarded ? "原消息不可用" : quoteDeletedText(p);
+  }
+  const body = (p.excerpt || "").trim() || (opts?.kindFallback ?? "");
+  return body || "原消息不可用";
 }
 
 /** 消息级版本：composer 回复横幅等持有完整 MessageView 时用 */

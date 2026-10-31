@@ -297,12 +297,21 @@ async fn dissolve_keeps_messages() {
 
     let pool = PgPoolOptions::new().connect(&test_db_url()).await.unwrap();
     let gid_uuid = uuid::Uuid::parse_str(gid).unwrap();
+    // UI3：建群 + 解散各写一条 system，另加一条用户文本 → 共 3
     let n: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE conversation_id = $1")
         .bind(gid_uuid)
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(n, 1);
+    assert_eq!(n, 3);
+    let sys: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM messages WHERE conversation_id = $1 AND kind = 'system'",
+    )
+    .bind(gid_uuid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(sys, 2);
     let dissolved: bool =
         sqlx::query_scalar("SELECT dissolved_at IS NOT NULL FROM conversations WHERE id = $1")
             .bind(gid_uuid)

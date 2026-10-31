@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { meetingMessage, randomRoomId } from "./meeting";
+import { meetingMessage, meetingUrl, parseMeetingUrl, randomRoomId } from "./meeting";
 
 // ===== V2 P3-2 =====
 const ROOM = /^[a-z0-9]{12}$/;
@@ -36,5 +36,18 @@ describe("meetingMessage", () => {
     expect(text).toMatch(
       /^📹 发起了视频会议，点击加入：https:\/\/meet\.jit\.si\/chat-[a-z0-9]{12}$/,
     );
+  });
+});
+
+describe("meeting card helpers", () => {
+  it("meetingUrl builds absolute room link", () => {
+    expect(meetingUrl("https://meet.example/", () => "abcdefghijkl")).toBe(
+      "https://meet.example/chat-abcdefghijkl",
+    );
+  });
+  it("parseMeetingUrl accepts http(s) only", () => {
+    expect(parseMeetingUrl("https://x/y")).toBe("https://x/y");
+    expect(parseMeetingUrl("ftp://x")).toBeNull();
+    expect(parseMeetingUrl("not a url")).toBeNull();
   });
 });
