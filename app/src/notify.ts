@@ -1,5 +1,6 @@
 import { convTitle, isMuted, isOwnMessage, type AppState } from "./store";
 import { RECORD_TITLE_MAX, recordLabel } from "./ui/chat/chatRecord";
+import { systemBarText } from "./ui/chat/systemMessage";
 import type { ConversationView, MessageView } from "./types";
 
 /**
@@ -133,6 +134,7 @@ function kindLabel(kind: string): string {
   if (kind === "audio") return "[语音]";
   if (kind === "poll") return "[投票]";
   if (kind === "chat_record") return "[聊天记录]";
+  if (kind === "system") return "[系统消息]";
   return "";
 }
 
@@ -153,7 +155,9 @@ export function notificationBody(
         : `[文件] ${m.attachment.file_name}`
     : m.kind === "chat_record"
       ? recordLabel(m, RECORD_TITLE_MAX)
-      : kindLabel(m.kind) || m.content.slice(0, 80);
+      : m.kind === "system"
+        ? systemBarText(m.content)
+        : kindLabel(m.kind) || m.content.slice(0, 80);
   return `${o.mentioned ? "[有人@我] " : ""}${m.sender_name}: ${excerpt}`;
 }
 
