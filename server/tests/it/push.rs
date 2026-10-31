@@ -279,7 +279,7 @@ async fn p33_push_always_and_clear_on_read() {
 /// 3. B 静音群会话 → 普通消息不推；@B 的消息推（priority=4，标题=群名+未读数）。
 #[tokio::test]
 async fn p33_push_mute_and_mention() {
-    let (_guard, base, _st) = spawn_named_state(&format!("chat_it_p33c_{}", uniq())).await;
+    let (_guard, base, st) = spawn_named_state(&format!("chat_it_p33c_{}", uniq())).await;
     let ntfy = fake_ntfy().await;
     let (_admin, a, b, _dm) = p33_setup(&base, &ntfy, "c").await;
     push_on(&base, &b, json!({"enabled": true})).await;
@@ -288,6 +288,11 @@ async fn p33_push_mute_and_mention() {
     // B 永久静音该群
     let r = put_pref(&base, &b, &gid, json!({"mute": {"mode": "forever"}})).await;
     assert_eq!(r.status(), 200);
+    // mk_group 的 group_created 可能已在静音前推过；之后只看增量
+    let baseline = ntfy.hit_count();
+    // group_created 已占默认 30s 合并窗口，关掉以免吞掉后续 @我 突破静音的推送
+    st.push_coalesce_ms
+        .store(0, std::sync::atomic::Ordering::Relaxed);
 
     let mut sa = ws_of(&base, &a).await;
     ws_send(
@@ -297,7 +302,7 @@ async fn p33_push_mute_and_mention() {
     )
     .await;
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-    assert_eq!(ntfy.hit_count(), 0, "静音会话普通消息不推");
+    assert_eq!(ntfy.hit_count(), baseline, "静音会话普通消息不推");
 
     ws_send(
         &mut sa,
@@ -305,12 +310,13 @@ async fn p33_push_mute_and_mention() {
         json!({"client_msg_id": "gm2", "content": format!("@{} 看这里", b.username)}),
     )
     .await;
-    let hits = ntfy.wait_hits(1, 3000).await;
-    assert_eq!(hits.len(), 1, "@我 应突破静音推送");
-    assert_eq!(hits[0]["priority"], 4, "@我 推送 priority=high");
-    let title = hits[0]["title"].as_str().unwrap();
+    let hits = ntfy.wait_hits(baseline + 1, 3000).await;
+    assert_eq!(hits.len(), baseline + 1, "@我 应突破静音推送");
+    let mention = &hits[hits.len() - 1];
+    assert_eq!(mention["priority"], 4, "@我 推送 priority=high");
+    let title = mention["title"].as_str().unwrap();
     assert!(title.starts_with("g ("), "群聊推送标题为群名 + 未读数: {title}");
-    assert_eq!(hits[0]["message"], "有人@了你");
+    assert_eq!(mention["message"], "有人@了你");
 }
 
 /// 4. 合并：窗口内连发 3 条只推 1 条；窗口外照推，标题带累计未读数，sequence_id 不变。
