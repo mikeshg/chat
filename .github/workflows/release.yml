@@ -329,22 +329,64 @@ jobs:
             app/src-tauri
             server
       - run: pnpm install --frozen-lockfile
-      - name: debug.keystore（覆盖安装必须同一个签名）
+      - name: Fixed Debug Keystore（覆盖安装必须同一个签名）
+        id: keystore
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_DEBUG_KEYSTORE }}
         run: |
-          mkdir -p "$HOME/.android"
-          if [ -n "$KEYSTORE_B64" ]; then
-            echo "$KEYSTORE_B64" | base64 -d > "$HOME/.android/debug.keystore"
-          else
-            echo "::warning::ANDROID_DEBUG_KEYSTORE 未设置：改用自动生成的 debug key 签名，仅供 fork 测试，覆盖不了已装的正式包"
+          set -euo pipefail
+          shopt -s inherit_errexit
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::secrets.ANDROID_DEBUG_KEYSTORE 未配置：正式 APK 必须用 Fixed Debug Keystore 签名，否则覆盖安装报签名冲突(-7)；fork 测试见 docs/release-runners.md"
+            exit 1
           fi
+          # AGP 在 GHA runner 上认 $XDG_CONFIG_HOME/.android/debug.keystore，
+          # 只写 $HOME 会被忽略 → AGP 每次自签新 key（0.5.0~0.7.0 指纹全不同的根因）。
+          # 两处都写：XDG 优先保证 AGP 读到，$HOME 兜底兼容本地/旧行为。
+          for d in "$HOME/.android" ${XDG_CONFIG_HOME:+"$XDG_CONFIG_HOME/.android"}; do
+            mkdir -p "$d"
+            printf '%s' "$KEYSTORE_B64" | base64 -d > "$d/debug.keystore"
+          done
+          # AGP 实际读的文件（XDG 优先）；keytool 顺带验证它是标准 debug keystore
+          # （alias androiddebugkey / 口令 android——AGP 只认这套默认值，读不了也会自签）
+          ks="${XDG_CONFIG_HOME:-$HOME}/.android/debug.keystore"
+          ks_fp=$(keytool -exportcert -rfc -alias androiddebugkey -keystore "$ks" -storepass android \
+            | openssl x509 -outform der | sha256sum | awk '{print $1}')
+          echo "keystore_sha256=$ks_fp" >> "$GITHUB_OUTPUT"
+          echo "Fixed Debug Keystore 证书 SHA-256：$ks_fp（可钉成 vars.EXPECTED_ANDROID_DEBUG_CERT_SHA256）"
       - name: Android APK
         working-directory: app
         # runner 预装 NDK：ANDROID_NDK_LATEST_HOME → NDK_HOME；SDK 在 ANDROID_HOME
         run: |
           export NDK_HOME="$ANDROID_NDK_LATEST_HOME"
           pnpm tauri android build --apk --debug --target aarch64
+      - name: 校验 APK 签名指纹（与写入的 keystore 一致才上传）
+        env:
+          WRITTEN_KS_SHA256: ${{ steps.keystore.outputs.keystore_sha256 }}
+          EXPECTED_ANDROID_DEBUG_CERT_SHA256: ${{ vars.EXPECTED_ANDROID_DEBUG_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+          apk=$(find app/src-tauri/gen/android/app/build/outputs/apk -name '*.apk' 2>/dev/null | head -1) || true
+          [ -n "$apk" ] || { echo "::error::找不到 APK 产物"; exit 1; }
+          # 构建后再读一次 AGP 实际位置的 keystore：若构建期文件被改动/重生成，指纹会对不上
+          ks="${XDG_CONFIG_HOME:-$HOME}/.android/debug.keystore"
+          ks_fp=$(keytool -exportcert -rfc -alias androiddebugkey -keystore "$ks" -storepass android \
+            | openssl x509 -outform der | sha256sum | awk '{print $1}')
+          [ "$ks_fp" = "$WRITTEN_KS_SHA256" ] || { echo "::error::build 后 $ks 指纹 ($ks_fp) ≠ 写入时 ($WRITTEN_KS_SHA256)：keystore 被改动（AGP 重新生成？）"; exit 1; }
+          apksigner=$(command -v apksigner || { ls -d "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1; } || true)
+          [ -n "$apksigner" ] || { echo "::error::找不到 apksigner（ANDROID_HOME=${ANDROID_HOME:-unset}）"; exit 1; }
+          apk_fp=$("$apksigner" verify --print-certs "$apk" | awk '/certificate SHA-256 digest:/{print $NF; exit}' | tr 'A-F' 'a-f')
+          [ -n "$apk_fp" ] || { echo "::error::apksigner 未输出证书 SHA-256 指纹"; exit 1; }
+          echo "APK Signature Fingerprint (SHA-256)：$apk_fp"
+          [ "$apk_fp" = "$ks_fp" ] || { echo "::error::APK 证书指纹 ($apk_fp) ≠ debug.keystore 指纹 ($ks_fp)：AGP 没用写入的 Fixed Debug Keystore 签名，禁止上传"; exit 1; }
+          if [ -n "${EXPECTED_ANDROID_DEBUG_CERT_SHA256:-}" ]; then
+            exp=$(printf '%s' "$EXPECTED_ANDROID_DEBUG_CERT_SHA256" | tr -d ': ' | tr 'A-F' 'a-f')
+            [ "$apk_fp" = "$exp" ] || { echo "::error::APK 指纹 ($apk_fp) ≠ EXPECTED_ANDROID_DEBUG_CERT_SHA256 ($exp)"; exit 1; }
+            echo "APK 指纹与 EXPECTED_ANDROID_DEBUG_CERT_SHA256 一致"
+          else
+            echo "::notice::未配置 vars.EXPECTED_ANDROID_DEBUG_CERT_SHA256：已校验 keystore↔APK 一致；可把上面的指纹钉成仓库变量再叠一层"
+          fi
       - name: 上传 APK
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

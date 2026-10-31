@@ -20,7 +20,7 @@
 | tag | ubuntu-latest | 仅自动路径：建注解 tag `v<version>` 并推 origin（说明 = 合并 PR 标题+正文） |
 | draft | ubuntu-latest | 校验标签 == `v`+version，按标签注解建草稿 Release（已存在则沿用；已发布则干净收队） |
 | windows | windows-latest | `Chat_X_x64-setup.exe` + `.sig`（NSIS，Tauri 签名） |
-| android | ubuntu-latest | `Chat_X_arm64.apk`（debug 签名，覆盖安装要求同一个 keystore） |
+| android | ubuntu-latest | `Chat_X_arm64.apk`（Fixed Debug Keystore 签名；缺 secret 直接红，签名指纹对不上不上传） |
 | linux | ubuntu-22.04 | `Chat_X_amd64.deb` + `.sig`、`Chat_X_amd64.AppImage` + `.sig` |
 | publish | ubuntu-latest | 7 个产物齐了才 `gh release edit --draft=false`；仅最高版本带 `--latest` |
 
@@ -40,11 +40,34 @@ GitHub 每个组只保留**一个**排队中的 run：一个 release run 正在�
 |---|---|---|
 | `TAURI_SIGNING_PRIVATE_KEY` | 是 | 开发机上 `~/.tauri/chat-updater.key` 的全部文本。为空时 windows/linux job 直接报错：没有它产不出 `.sig`，在线更新装不上 |
 | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | 否 | 私钥口令；没设过就留空 |
-| `ANDROID_DEBUG_KEYSTORE` | 否（正式发版要） | 以前打 APK 那台电脑上 debug keystore 的 base64：<br>`base64 -w0 ~/.android/debug.keystore`（Linux）<br>`[Convert]::ToBase64String([IO.File]::ReadAllBytes("$HOME\.android\debug.keystore"))`（PowerShell）<br>不设会改用自动生成的 debug key，仅供 fork 测试，**覆盖不了已装的正式包**（Android 会报签名冲突） |
+| `ANDROID_DEBUG_KEYSTORE` | 是 | Fixed Debug Keystore 的 base64——一个标准 debug keystore（alias `androiddebugkey`、口令 `android`，AGP 只认这套默认值）：<br>`base64 -w0 ~/.android/debug.keystore`（Linux）<br>`[Convert]::ToBase64String([IO.File]::ReadAllBytes("$HOME\.android\debug.keystore"))`（PowerShell）<br>**未设置 android job 直接红**：宁可不发 APK，也不发一个自动签名、装了也覆盖不了的包 |
 
 把 `chat-updater.key`（与 `app/src-tauri/tauri.conf.json` 里的 updater pubkey 配对）和
 `debug.keystore` 备份到安全的地方。丢了私钥就再也推不了在线更新，只能让大家手动重装；
 丢了 keystore，Android 用户必须卸载重装。
+
+### Android：Fixed Debug Keystore 与签名指纹闸
+
+正式 APK 用 secret 里同一个 debug keystore（Fixed Debug Keystore）签名，覆盖安装才不会报
+签名冲突。**坑在路径**：AGP 在 GitHub runner 上按 `XDG_CONFIG_HOME` 找
+`$XDG_CONFIG_HOME/.android/debug.keystore`；以前只写 `$HOME/.android/`，AGP 找不到就
+每次自签一个新 debug key——0.5.0 / 0.6.1 / 0.6.2 / 0.7.0 官方 APK 的签名指纹因此个个不同，
+互相覆盖安装全部报 -7（Signature Mismatch）。
+
+现在 android job 的行为：
+
+1. `ANDROID_DEBUG_KEYSTORE` 为空 → 直接红（fail-fast）。不会再出现「软警告 + 自动签名
+   照样发版」的写法，别把它改回去。
+2. keystore 同时写 `$XDG_CONFIG_HOME/.android/debug.keystore`（变量设了的话）和
+   `$HOME/.android/debug.keystore`（本地/旧行为兜底），并用 keytool 验证它是标准
+   debug keystore——AGP 读不了的文件写了也白写，这一步提前炸在构建前。
+3. APK 打完做**指纹闸**：`apksigner verify --print-certs` 取 APK 证书 SHA-256，与写入时
+   记录的 keystore 指纹比对，不一致直接红、不上传。构建后还会重读一次磁盘上的 keystore，
+   连「AGP 中途把文件重新生成」也能抓出来。
+4. 可选再叠一层：仓库 Variable `EXPECTED_ANDROID_DEBUG_CERT_SHA256`（Settings →
+   Secrets and variables → Actions → **Variables**）。设了就必须等于 APK 指纹；没设不挡
+   发版，日志会打出本次 APK 指纹供抄过去钉死。指纹是公开信息——任何人都能从已发布
+   的 APK 算出来——不是 secret，可以明文写。
 
 ## 1. 发一个版本
 
@@ -101,9 +124,11 @@ docker-compose 部署的话这几个变量写在 `docker-compose.yml` 的 enviro
 | tag job 红：推 tag 失败 | 并发/手动抢建了同名 tag 且指向别的 commit（日志里会给出两边 sha），或仓库 tag ruleset 没放行 github-actions |
 | 排队中的 release run 变 cancelled | concurrency 组只留一个排队 run，被后到的触发顶掉了；重推或 Re-run，正在跑的 run 不受影响 |
 | windows/linux job 红：密钥未配置 | 没加 `TAURI_SIGNING_PRIVATE_KEY`，或加错名字；空值也会失败（不允许静默跳过 `.sig`） |
-| APK 有但手机装不上 / 签名冲突 | `ANDROID_DEBUG_KEYSTORE` 不是以前打包那台电脑的 keystore |
+| android job 红：`ANDROID_DEBUG_KEYSTORE` 未配置 | secret 缺失是**硬失败**（故意的：宁可不发 APK 也不发错签名的）。到仓库 Settings → Secrets 补标准 debug keystore 的 base64；fork 见下 |
+| android job 红：`签名指纹` / `keystore 指纹` 不一致 | AGP 没用写入的 keystore（路径规则又变了？），或 secret 内容不是标准 debug keystore（alias `androiddebugkey` + 口令 `android`），或设了 `EXPECTED_ANDROID_DEBUG_CERT_SHA256` 但对不上；日志会打出两边指纹对比 |
+| APK 有但手机装不上：签名冲突 / 安装失败 `-7` | 手机里的旧包与新 APK 签名指纹不同（0.5.0~0.7.0 各版指纹互不相同的历史坑）。**卸载旧 App 一次**再装新 APK 即可；这版起指纹固定，之后覆盖安装恢复正常 |
 | publish 红：缺资产 | 某个上传没成功；看对应 job 日志，修好 Re-run failed jobs |
 | 客户端查不到新版本 | Release 还是草稿（publish 没跑完），或服务端 `update_repo_url` 指错仓库；服务端日志看「更新源」报错 |
 | `/v1/client/latest` 返回 Cloudflare 纯文本 `error code: 502`、无 CORS | 源站对更新源失败曾回 HTTP 502，被 CF Error Pages 换成纯文本（丢 JSON/CORS）；已改为回 503。若仍失败看服务端日志「更新源不可达」，并配置 `CLIENT_UPDATE_PROXY`（国内机访问 GitHub 常需要） |
 | 装的是 deb，更新时要输入密码 | 正常现象：deb 更新要用 root 权限执行 `dpkg -i`。用 AppImage 装的不需要密码 |
-| fork 上想试跑 | 手动推 `v*` tag 即可走全流程（签名校验会明确报错，把 `TAURI_SIGNING_PRIVATE_KEY` 填任意值可看流程走通，产物不能用于真实更新）。想试**自动路径**：fork 仓库 Settings → Variables → Actions 加 `AUTO_RELEASE=true`，再在某个测试分支的临时 commit 里把该分支名加进 `release.yml` 的 `on.push.branches`（用完丢弃、别合回 main），推这个分支就会触发 gate 的自动路径 |
+| fork 上想试跑 | 手动推 `v*` tag 即可走全流程（签名校验会明确报错，把 `TAURI_SIGNING_PRIVATE_KEY` 填任意值可看流程走通，产物不能用于真实更新）。android job 需要 `ANDROID_DEBUG_KEYSTORE`：没有自己的就本地生成一个标准 debug keystore 再 base64 填进去（`keytool -genkeypair -alias androiddebugkey -keystore debug.keystore -storepass android -keypass android -keyalg RSA -dname "CN=Android Debug,O=Android,C=US"`）。想试**自动路径**：fork 仓库 Settings → Variables → Actions 加 `AUTO_RELEASE=true`，再在某个测试分支的临时 commit 里把该分支名加进 `release.yml` 的 `on.push.branches`（用完丢弃、别合回 main），推这个分支就会触发 gate 的自动路径 |
