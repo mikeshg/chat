@@ -358,7 +358,7 @@ async fn prefs_archive_and_mute_semantics() {
         pref_of(&list, &gid)["archived_at"].is_string(),
         "plain message must not unarchive"
     );
-    // 未读数仍照常累计
+    // 未读数仍照常累计：UI3 建群写 group_created（seq 1）+ 本条 plain → unread=2
     assert_eq!(
         list.as_array()
             .unwrap()
@@ -367,7 +367,7 @@ async fn prefs_archive_and_mute_semantics() {
             .unwrap()["unread_count"]
             .as_i64()
             .unwrap(),
-        1
+        2
     );
 
     // @本人 → 解除归档，b 收到 preference_updated（archived_at=null）

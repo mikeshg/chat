@@ -228,9 +228,9 @@ async fn p24_forward_text_to_dm_and_group() {
     assert_eq!(g_res["message"]["forwarded_from"], b.username);
     assert_eq!(dm_res["message"]["forwarded_from"], b.username);
     assert_eq!(g_res["message"]["content"], "link https://x");
-    // seq 各自递增：DM 已有源消息，群是首条
+    // seq 各自递增：DM 已有源消息；群在 UI3 group_created（seq 1）之后，转发为 seq 2
     assert_eq!(dm_res["message"]["seq"], src_seq + 1);
-    assert_eq!(g_res["message"]["seq"], 1);
+    assert_eq!(g_res["message"]["seq"], 2);
 
     // 目标成员 b 实时收到两条广播
     let f1 = next_of(&mut sb, "message").await;

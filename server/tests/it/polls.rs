@@ -72,7 +72,8 @@ async fn poll_create_validate() {
     let m: Value = r.json().await.unwrap();
     assert_eq!(m["kind"], "poll");
     assert_eq!(m["content"], "[投票] 午饭去哪"); // 问题 trim 后入占位文本
-    assert_eq!(m["seq"].as_i64().unwrap(), 1);
+    // UI3：建群已占 seq 1（group_created），本条 poll 为 seq 2
+    assert_eq!(m["seq"].as_i64().unwrap(), 2);
     let p = &m["poll"];
     assert_eq!(p["question"], "午饭去哪");
     assert_eq!(p["allow_multiple"], false);
@@ -98,8 +99,14 @@ async fn poll_create_validate() {
     let m2: Value = r.json().await.unwrap();
     assert_eq!(m2["id"], m["id"]);
     let page = history(&base, &a.access, &gid).await;
-    assert_eq!(page["messages"].as_array().unwrap().len(), 1);
-    assert!(page["messages"][0]["poll"].is_object()); // 历史读模型含 poll
+    let msgs = page["messages"].as_array().unwrap();
+    // system group_created + poll（history 按 seq DESC，[0] 为最新 poll）
+    assert_eq!(msgs.len(), 2);
+    assert!(
+        msgs.iter().any(|x| x["kind"] == "system")
+            && msgs.iter().any(|x| x["kind"] == "poll" && x["poll"].is_object()),
+        "history must contain one system and one poll: {msgs:?}"
+    );
 
     // DM 拒绝（poll 仅群聊）
     let dm = dm_conv(&base, &a).await;
@@ -385,7 +392,7 @@ async fn poll_vote_replace() {
         .iter()
         .find(|x| x["id"] == gid)
         .unwrap();
-    assert_eq!(item["last_seq"].as_i64().unwrap(), 4); // 3 poll + 1 text
+    assert_eq!(item["last_seq"].as_i64().unwrap(), 5); // 1 system + 3 poll + 1 text
 }
 
 /// 关闭：创建者/群主权限、幂等、关后拒投；投票行与消息版本同步
@@ -734,8 +741,14 @@ async fn poll_creation_replay_is_private_over_rest_and_ws() {
         })
         .await
         .expect("sync fence timed out");
-        assert_eq!(sync["messages"], json!([b_view]));
-        for option in sync["messages"][0]["poll"]["options"].as_array().unwrap() {
+        // sync 从 last_seq=0 会带上 UI3 group_created；只断言其中的 poll 视图
+        let sync_msgs = sync["messages"].as_array().unwrap();
+        let poll_msg = sync_msgs
+            .iter()
+            .find(|x| x["id"] == mid)
+            .unwrap_or_else(|| panic!("sync missing poll {mid}: {sync_msgs:?}"));
+        assert_eq!(poll_msg, &b_view);
+        for option in poll_msg["poll"]["options"].as_array().unwrap() {
             assert_eq!(option["voters"], json!([]));
         }
     }
