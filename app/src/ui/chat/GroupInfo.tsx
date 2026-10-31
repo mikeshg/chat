@@ -59,7 +59,9 @@ export default function GroupInfo({
     )
       return;
     try {
-      if ((await leaveGroup(conv.id)) === "already_left") void alertDialog("你已不在该群");
+      if ((await leaveGroup(conv.id)) === "already_left") {
+        void alertDialog("你已不在该群");
+      }
     } catch (e) {
       showErr(e);
       return;

@@ -621,3 +621,61 @@ async fn p24_forward_rejections() {
     let err = next_of(&mut sa, "error").await;
     assert_eq!(err["code"], "not_found");
 }
+
+/// UI2 / ADR-forward-keep-quote：转发保留 reply_to（可跨会话），预览仍展开一层。
+#[tokio::test]
+async fn ui2_forward_keeps_reply_to() {
+    let base = spawn().await;
+    let a = register(&base, &format!("ui2a_{}", uniq())).await;
+    let b = register(&base, &format!("ui2b_{}", uniq())).await;
+    befriend(&base, &a, &b).await;
+    let dm = dm_conv(&base, &a).await;
+    let gid = mk_group(&base, &a, &[b.id.clone()]).await;
+
+    let (mut sb, _) = tokio_tungstenite::connect_async(ws_url(&base, &b).await)
+        .await
+        .unwrap();
+    next_of(&mut sb, "presence_init").await;
+
+    // b 在 DM：原消息 → 回复；a 转发回复到群
+    let orig = ws_send(
+        &mut sb,
+        &dm,
+        json!({"client_msg_id": "ui2-orig", "content": "被引用的原文"}),
+    )
+    .await;
+    let orig_id = orig["id"].as_str().unwrap().to_string();
+    let reply = ws_send(
+        &mut sb,
+        &dm,
+        json!({
+            "client_msg_id": "ui2-reply",
+            "content": "这是回复",
+            "reply_to_id": orig_id,
+        }),
+    )
+    .await;
+    let reply_id = reply["id"].as_str().unwrap().to_string();
+    assert_eq!(reply["reply_to_id"], orig_id);
+    assert_eq!(reply["reply_to_preview"]["excerpt"], "被引用的原文");
+
+    let r = post_forward(
+        &base,
+        &a,
+        &reply_id,
+        &[gid.clone()],
+        &uuid::Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(r.status(), 200, "{}", r.text().await.unwrap_or_default());
+    let body: Value = r.json().await.unwrap();
+    let res = body["results"].as_array().unwrap()[0].clone();
+    assert_eq!(res["ok"], true, "{res}");
+    let msg = &res["message"];
+    assert_eq!(msg["reply_to_id"], orig_id, "转发须保留 reply_to_id");
+    assert_eq!(msg["reply_to_preview"]["message_id"], orig_id);
+    assert_eq!(msg["reply_to_preview"]["excerpt"], "被引用的原文");
+    assert_eq!(msg["reply_to_preview"]["deleted"], false);
+    assert_eq!(msg["content"], "这是回复");
+    assert_eq!(msg["forwarded_from"], b.username);
+}

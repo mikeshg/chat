@@ -84,7 +84,7 @@ import {
   isTombstone,
   menuItems,
   msgDeletedText,
-  quoteDeletedText,
+  quoteBodyText,
   reeditTextFor,
   shouldOpenMenuOnClick,
   shouldOpenMenuOnContextMenu,
@@ -1810,18 +1810,22 @@ export default function ChatView() {
                         {m.forwarded_from && (
                           <div className="fwd-from">转发自 {m.forwarded_from}</div>
                         )}
-                        {m.reply_to_preview && (
+                        {(m.reply_to_preview || m.reply_to_id) && (
                           <button
                             type="button"
                             className="reply-quote"
-                            onClick={() => jumpPreview(m.reply_to_preview!)}
+                            onClick={() => m.reply_to_preview && jumpPreview(m.reply_to_preview)}
                           >
-                            <span className="rq-name">{m.reply_to_preview.sender_name}</span>
+                            <span className="rq-name">
+                              {m.reply_to_preview?.sender_name || "回复"}
+                            </span>
                             <span className="rq-text">
-                              {m.reply_to_preview.deleted
-                                ? quoteDeletedText(m.reply_to_preview)
-                                : m.reply_to_preview.excerpt ||
-                                  kindLabel(m.reply_to_preview.kind)}
+                              {quoteBodyText(m.reply_to_preview, {
+                                forwarded: !!m.forwarded_from,
+                                kindFallback: m.reply_to_preview
+                                  ? kindLabel(m.reply_to_preview.kind)
+                                  : undefined,
+                              })}
                             </span>
                           </button>
                         )}
