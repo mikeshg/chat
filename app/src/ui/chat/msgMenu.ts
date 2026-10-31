@@ -264,6 +264,20 @@ export function quoteDeletedText(p: ReplyPreview): string {
   return p.recalled_by_name != null ? "原消息已撤回" : "原消息已删除";
 }
 
+/** 引用块正文：缺失 →「原消息不可用」；转发且原消息已删/不可见 →「原消息不可用」；
+ *  普通同会话回复保留「已撤回/已删除」。有 excerpt 时优先展示（转发跨会话仍可见引用内容）。 */
+export function quoteBodyText(
+  p: ReplyPreview | null | undefined,
+  opts?: { forwarded?: boolean; kindFallback?: string },
+): string {
+  if (!p) return "原消息不可用";
+  if (p.deleted) {
+    return opts?.forwarded ? "原消息不可用" : quoteDeletedText(p);
+  }
+  const body = (p.excerpt || "").trim() || (opts?.kindFallback ?? "");
+  return body || "原消息不可用";
+}
+
 /** 消息级版本：composer 回复横幅等持有完整 MessageView 时用 */
 export function msgDeletedText(m: MessageView): string {
   return m.recalled_by != null ? "原消息已撤回" : "原消息已删除";
