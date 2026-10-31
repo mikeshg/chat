@@ -127,6 +127,10 @@ export function wsBase(): string {
 export function listServers(): ServerEntry[] {
   return typeof localStorage === "undefined" ? [] : listServersIn(localStorage);
 }
+/** Rust 侧下载/安装命令的 origin 白名单：当前服务器 + 服务器列表（T5 多服务器） */
+export function allowedOrigins(): string[] {
+  return [...new Set([getServer(), ...listServers().map((s) => s.url)])];
+}
 /** 该服务器是否已有登录凭据（切过去不用重新登录） */
 export function hasServerAuth(url: string): boolean {
   const n = normalizeServerUrl(url);

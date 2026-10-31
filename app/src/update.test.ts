@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { assetFor, assetLabel, hasInstaller, isNewer } from "./update";
+import {
+  assetFor,
+  assetLabel,
+  hasInstaller,
+  isApkPermissionDenied,
+  isNewer,
+} from "./update";
 
 describe("isNewer", () => {
   it.each([
@@ -49,5 +55,19 @@ describe("hasInstaller", () => {
     expect(hasInstaller("Windows", linuxOnly)).toBe(false);
     expect(hasInstaller("Windows", ["Chat_0.2.1_x64-setup.exe"])).toBe(false);
     expect(hasInstaller("Android", ["Chat_0.2.1.apk"])).toBe(true);
+  });
+});
+
+describe("isApkPermissionDenied", () => {
+  it.each([
+    ["PERMISSION_DENIED:未允许安装未知来源应用", true],
+    [new Error("PERMISSION_DENIED:x"), true],
+    ["下载失败（HTTP 500）", false],
+    ["INSTALL_FAILED:系统没有可用的安装器", false],
+    [new Error("网络错误"), false],
+    [null, false],
+    [undefined, false],
+  ])("%j → %s", (e, want) => {
+    expect(isApkPermissionDenied(e)).toBe(want);
   });
 });

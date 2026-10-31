@@ -2,7 +2,7 @@
 // Tauri 壳（桌面 + Android）：invoke Rust 命令 download_to_downloads 直存系统下载目录，
 // 桌面端点击成功 toast 在文件管理器中显示文件；Android 走 MediaStore（无点击动作）。
 // Web：保持 <a download> 浏览器自带下载。
-import { files, getServer, inTauri, isDesktopShell, listServers } from "./api";
+import { allowedOrigins, files, inTauri, isDesktopShell } from "./api";
 import { pushToast, updateToast } from "./store";
 import type { AttachmentView } from "./types";
 
@@ -20,11 +20,6 @@ export interface SaveAttachmentDeps {
   desktop?: boolean;
   invoke?: Invoke;
   anchor?: AnchorFn;
-}
-
-/** Rust 侧下载命令的 origin 白名单：当前服务器 + 服务器列表（T5 多服务器） */
-function allowedOrigins(): string[] {
-  return [...new Set([getServer(), ...listServers().map((s) => s.url)])];
 }
 
 function browserAnchor(url: string, name: string) {
