@@ -47,6 +47,9 @@ export const UsersIcon = () =>
 export const ServerIcon = () => svg("M2 3h20v7H2zM2 14h20v7H2zM6 6.5h.01M6 17.5h.01");
 export const ArchiveIcon = () => svg("M21 8v13H3V8M1 3h22v5H1zM10 12h4");
 
+export const WarningIcon = () =>
+  svg("M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4M12 17h.01");
+export const DatabaseIcon = () => svg("M12 2C6.5 2 2 3.79 2 6v12c0 2.21 4.5 4 10 4s10-1.79 10-4V6c0-2.21-4.5-4-10-4zM2 12c0 2.21 4.5 4 10 4s10-1.79 10-4");
 // 左侧 icon rail
 export const ChatBubbleIcon = () =>
   svg("M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z");
