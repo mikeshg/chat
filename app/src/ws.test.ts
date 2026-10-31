@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearSession, saveSession } from "./api";
 import { getState, setState } from "./store";
 import type { ConversationView, MessageView } from "./types";
-import { discardSend, kickReasonText, retrySend, sendChat, startWs, stopWs } from "./ws";
+import { discardSend, kickReasonText, leaveGroup, retrySend, sendChat, startWs, stopWs } from "./ws";
 
 const me = { id: "me", username: "me", display_name: "Me", role: "user" as const, last_seen_at: null };
 const message = (seq: number, mentions: string[] = []): MessageView => ({ id: `m${seq}`, seq, conversation_id: "c", sender_id: "other", sender_username: "other", sender_name: "Other", content: "hello", kind: "text", attachment: null, mentions, created_at: "2026-01-01T00:00:00Z" });
@@ -175,6 +175,48 @@ describe("WebSocket delivery", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(getState().messages.c).toEqual([message(1)]);
     expect(getState().historyLoaded.c).toBe(true);
+  });
+});
+
+// ===== P0-1：退群后列表更新 + 错误中文化 =====
+describe("leaveGroup", () => {
+  it("removes the group locally without re-fetching its detail and clears the selection", async () => {
+    setState({ conversations: [conversation(), { ...conversation(), id: "d" }], activeConv: "c" });
+    const fetcher = vi.fn(async (_url: string, _init?: RequestInit) => new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetcher);
+    await expect(leaveGroup("c")).resolves.toBe("left");
+    expect(getState().conversations.map((c) => c.id)).toEqual(["d"]);
+    expect(getState().activeConv).toBeNull();
+    // 退群成功后不得再回拉 detail/list：已非成员只会 403，把整次刷新拖垮
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(String(fetcher.mock.calls[0][0])).toContain("/conversations/c/members/me");
+    expect(fetcher.mock.calls[0][1]?.method).toBe("DELETE");
+  });
+
+  it("keeps the selection when a different conversation is open", async () => {
+    setState({ conversations: [conversation(), { ...conversation(), id: "d" }], activeConv: "d" });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 204 })));
+    await expect(leaveGroup("c")).resolves.toBe("left");
+    expect(getState().conversations.map((c) => c.id)).toEqual(["d"]);
+    expect(getState().activeConv).toBe("d");
+  });
+
+  it("treats a not-member 403 as already gone: still removes locally and reports it", async () => {
+    setState({ conversations: [conversation()], activeConv: "c" });
+    vi.stubGlobal("fetch", vi.fn(async () =>
+      Response.json({ error: "not a member of this conversation" }, { status: 403 })));
+    await expect(leaveGroup("c")).resolves.toBe("already_left");
+    expect(getState().conversations).toEqual([]);
+    expect(getState().activeConv).toBeNull();
+  });
+
+  it("propagates other failures and keeps the list untouched", async () => {
+    setState({ conversations: [conversation()], activeConv: "c" });
+    vi.stubGlobal("fetch", vi.fn(async () =>
+      Response.json({ error: "boom" }, { status: 500 })));
+    await expect(leaveGroup("c")).rejects.toMatchObject({ status: 500 });
+    expect(getState().conversations).toHaveLength(1);
+    expect(getState().activeConv).toBe("c");
   });
 });
 

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { convs } from "../../api";
-import { refreshCatalogs } from "../../ws";
-import { absorbAvatarUsers, setState, useApp } from "../../store";
+import { leaveGroup, refreshCatalogs } from "../../ws";
+import { absorbAvatarUsers, applyGroupLeft, setState, useApp } from "../../store";
 import type { AttachmentView, ConversationDetail, ConversationView } from "../../types";
 import AnnouncementEditor from "./AnnouncementEditor";
 import Avatar from "../Avatar";
@@ -46,14 +46,29 @@ export default function GroupInfo({
     reload().catch(console.warn);
   }, [conv.id]);
 
-  const act = (p: Promise<unknown>) =>
-    p.then(reload).catch((e) => alert(e instanceof Error ? e.message : "操作失败"));
+  const showErr = (e: unknown) => alert(e instanceof Error ? e.message : "操作失败");
+  const act = (p: Promise<unknown>) => p.then(reload).catch(showErr);
 
   const leave = async () => {
     if (!confirm(isOwner ? "你是群主，退出后将自动转让；确定退出？" : "退出该群？")) return;
-    await convs.leave(conv.id);
-    await act(Promise.resolve());
-    setState({ activeConv: null });
+    try {
+      if ((await leaveGroup(conv.id)) === "already_left") alert("你已不在该群");
+    } catch (e) {
+      showErr(e);
+      return;
+    }
+    onClose();
+  };
+
+  const dissolve = async () => {
+    if (!confirm("解散后所有成员将被移出，消息记录保留但不可再发言。确定？")) return;
+    try {
+      await convs.dissolve(conv.id);
+    } catch (e) {
+      showErr(e);
+      return;
+    }
+    setState((s) => applyGroupLeft(s, conv.id));
     onClose();
   };
 
@@ -225,16 +240,7 @@ export default function GroupInfo({
               退出群聊
             </button>
             {isOwner && (
-              <button
-                className="danger"
-                onClick={() => {
-                  if (confirm("解散后所有成员将被移出，消息记录保留但不可再发言。确定？"))
-                    act(convs.dissolve(conv.id)).then(() => {
-                      setState({ activeConv: null });
-                      onClose();
-                    });
-                }}
-              >
+              <button className="danger" onClick={dissolve}>
                 解散群聊
               </button>
             )}
