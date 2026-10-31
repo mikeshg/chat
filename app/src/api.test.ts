@@ -479,6 +479,7 @@ describe("login/register errors", () => {
   });
 });
 
+
 // ===== P0-1：成员资格错误中文化 =====
 describe("membership error mapping", () => {
   it("maps a 「not a member」403 to a Chinese message with a stable not_member code", async () => {

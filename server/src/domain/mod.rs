@@ -13,6 +13,7 @@ mod polls;
 mod preferences;
 mod record;
 mod send;
+mod system;
 
 pub use forward::*;
 pub use lifecycle::*;
@@ -20,6 +21,7 @@ pub use polls::*;
 pub use preferences::*;
 pub use record::*;
 pub use send::*;
+pub use system::*;
 
 pub fn canonical_pair(a: Uuid, b: Uuid) -> (Uuid, Uuid) {
     if a < b {
@@ -568,7 +570,7 @@ impl PostError {
 }
 
 /// 仅发消息路径用：client_msg_id 冲突需回滚后读已提交行，其余操作直接用 PostError。
-enum WriteError {
+pub(crate) enum WriteError {
     Fail(PostError),
     /// 并发插入撞上同一 client_msg_id，事务已失败，需要回滚后读取已提交行。
     IdempotentHit,

@@ -318,6 +318,13 @@ fn excerpt(msg: &MessageView) -> String {
             .as_ref()
             .map(|p| format!("[投票] {}", p.question))
             .unwrap_or_else(|| msg.content.chars().take(100).collect()),
+        "system" => {
+            // content 是 JSON；尽量取 text 字段作推送摘要
+            serde_json::from_str::<serde_json::Value>(&msg.content)
+                .ok()
+                .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()))
+                .unwrap_or_else(|| "群系统消息".into())
+        }
         _ => msg.content.chars().take(100).collect(),
     }
 }

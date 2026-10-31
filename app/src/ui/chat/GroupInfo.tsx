@@ -47,8 +47,8 @@ export default function GroupInfo({
     reload().catch(console.warn);
   }, [conv.id]);
 
-  const act = (p: Promise<unknown>) =>
-    p.then(reload).catch((e) => void alertDialog(e instanceof Error ? e.message : "操作失败"));
+  const showErr = (e: unknown) => void alertDialog(e instanceof Error ? e.message : "操作失败");
+  const act = (p: Promise<unknown>) => p.then(reload).catch(showErr);
 
   const leave = async () => {
     if (
@@ -63,7 +63,7 @@ export default function GroupInfo({
         void alertDialog("你已不在该群");
       }
     } catch (e) {
-      void alertDialog(e instanceof Error ? e.message : "操作失败");
+      showErr(e);
       return;
     }
     onClose();
@@ -80,7 +80,7 @@ export default function GroupInfo({
     try {
       await convs.dissolve(conv.id);
     } catch (e) {
-      void alertDialog(e instanceof Error ? e.message : "操作失败");
+      showErr(e);
       return;
     }
     setState((s) => applyGroupLeft(s, conv.id));

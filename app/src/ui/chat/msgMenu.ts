@@ -97,7 +97,7 @@ export function canAct(m: MessageView, ctx: MenuCtx): boolean {
 
 /** 转发：非投票、非墓碑、非乐观消息；只读会话仍可转出 */
 export function canForward(m: MessageView): boolean {
-  return !isTombstone(m) && !isPending(m) && m.kind !== "poll";
+  return !isTombstone(m) && !isPending(m) && m.kind !== "poll" && m.kind !== "system";
 }
 
 /**
@@ -107,7 +107,7 @@ export function canForward(m: MessageView): boolean {
  * 多选在 FEATURE_MULTI_SELECT 后：MM3 暂缓，等合并转发设计定稿再接回。
  */
 export function menuItems(m: MessageView, ctx: MenuCtx): MenuItem[] {
-  if (isTombstone(m) || isPending(m)) return [];
+  if (isTombstone(m) || isPending(m) || m.kind === "system") return [];
   const items: MenuItem[] = [];
   if (m.attachment) {
     items.push({ action: "preview", label: m.kind === "image" ? "查看大图" : "预览" });

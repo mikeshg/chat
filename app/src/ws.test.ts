@@ -178,6 +178,7 @@ describe("WebSocket delivery", () => {
   });
 });
 
+
 // ===== P0-1：退群后列表更新 + 错误中文化 =====
 describe("leaveGroup", () => {
   it("removes the group locally without re-fetching its detail and clears the selection", async () => {
