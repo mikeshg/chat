@@ -330,9 +330,30 @@ pub(super) async fn create_group(
     .bind(&ids)
     .execute(&mut *tx)
     .await?;
+    // UI3：建群系统消息（同事务；不回填历史）
+    let actor_name = domain::display_name(&mut *tx, uid).await?;
+    let text = format!("{actor_name} 创建了群聊");
+    let content = domain::system_content(
+        domain::CODE_CREATED,
+        &text,
+        domain::params_actor_group(&actor_name, &name),
+    );
+    let sys_msg = domain::insert_system_in_tx(&mut tx, conv_id, uid, &content).await?;
+    let all = domain::member_ids(&mut *tx, conv_id).await?;
     tx.commit().await?;
 
-    notify(&st, &ids, "conversations");
+    ws::broadcast_posted(
+        &st,
+        conv_id,
+        &domain::Posted {
+            message: sys_msg,
+            inserted: true,
+            member_ids: all.clone(),
+            unarchived: Vec::new(),
+        },
+    )
+    .await;
+    notify(&st, &all, "conversations");
     conversation_detail(&st, conv_id).await.map(Json)
 }
 
@@ -442,6 +463,7 @@ pub(super) async fn add_members(
     domain::membership(&mut *tx, conv, uid)
         .await?
         .ok_or_else(|| AppError::forbidden("not a member of this conversation"))?;
+    let before = domain::member_ids(&mut *tx, conv).await?;
     sqlx::query(
         "INSERT INTO memberships (conversation_id, user_id, role)
          SELECT $1, unnest($2::uuid[]), 'member' ON CONFLICT DO NOTHING",
@@ -451,8 +473,31 @@ pub(super) async fn add_members(
     .execute(&mut *tx)
     .await?;
     let all = domain::member_ids(&mut *tx, conv).await?;
+    let newly: Vec<Uuid> = all.iter().copied().filter(|id| !before.contains(id)).collect();
+    let mut sys_posted = None;
+    if !newly.is_empty() {
+        let invitee_names = domain::display_names(&mut *tx, &newly).await?;
+        let actor_name = domain::display_name(&mut *tx, uid).await?;
+        let joined = invitee_names.join("、");
+        let text = format!("{actor_name} 邀请 {joined} 加入了群聊");
+        let content = domain::system_content(
+            domain::CODE_INVITED,
+            &text,
+            domain::params_invite(&actor_name, &invitee_names),
+        );
+        let msg = domain::insert_system_in_tx(&mut tx, conv, uid, &content).await?;
+        sys_posted = Some(domain::Posted {
+            message: msg,
+            inserted: true,
+            member_ids: all.clone(),
+            unarchived: Vec::new(),
+        });
+    }
     tx.commit().await?;
 
+    if let Some(posted) = sys_posted {
+        ws::broadcast_posted(&st, conv, &posted).await;
+    }
     notify(&st, &all, "conversations");
     // 新成员与既有成员互推在线状态
     for nid in &ids {
@@ -495,6 +540,27 @@ pub(super) async fn leave_conversation(
     .fetch_all(&mut *tx)
     .await?;
 
+    // 最后一人退出会删会话：无系统消息可挂。否则先写 group_left，再摘成员。
+    let mut sys_posted = None;
+    let deleting = me.role == "owner" && others.is_empty();
+    if !deleting {
+        let actor_name = domain::display_name(&mut *tx, uid).await?;
+        let text = format!("{actor_name} 退出了群聊");
+        let content = domain::system_content(
+            domain::CODE_LEFT,
+            &text,
+            domain::params_actor(&actor_name),
+        );
+        let msg = domain::insert_system_in_tx(&mut tx, conv, uid, &content).await?;
+        // 广播给剩余成员（不含即将离开的自己）
+        sys_posted = Some(domain::Posted {
+            message: msg,
+            inserted: true,
+            member_ids: others.clone(),
+            unarchived: Vec::new(),
+        });
+    }
+
     if me.role == "owner" {
         if others.is_empty() {
             sqlx::query("DELETE FROM conversations WHERE id = $1")
@@ -535,6 +601,9 @@ pub(super) async fn leave_conversation(
     }
     tx.commit().await?;
 
+    if let Some(posted) = sys_posted {
+        ws::broadcast_posted(&st, conv, &posted).await;
+    }
     notify(&st, &others, "conversations");
     notify(&st, &[uid], "conversations");
     Ok(StatusCode::NO_CONTENT)
@@ -612,6 +681,16 @@ pub(super) async fn rename_conversation(
         .bind(name)
         .execute(&st.pool)
         .await?;
+    let actor_name = domain::display_name(&st.pool, uid).await?;
+    let text = format!("{actor_name} 将群名改为「{name}」");
+    let content = domain::system_content(
+        domain::CODE_RENAMED,
+        &text,
+        domain::params_actor_group(&actor_name, name),
+    );
+    if let Ok(posted) = domain::post_system(&st.pool, conv, uid, &content).await {
+        ws::broadcast_posted(&st, conv, &posted).await;
+    }
     let members = domain::member_ids(&st.pool, conv).await?;
     notify(&st, &members, "conversations");
     Ok(StatusCode::NO_CONTENT)
@@ -656,6 +735,19 @@ pub(super) async fn put_announcement(
     .bind(text.as_ref().map(|_| uid))
     .execute(&st.pool)
     .await?;
+    // 发布/更新公告写系统条；清空不写
+    if text.is_some() {
+        let actor_name = domain::display_name(&st.pool, uid).await?;
+        let bar = format!("{actor_name} 更新了群公告");
+        let content = domain::system_content(
+            domain::CODE_ANNOUNCEMENT,
+            &bar,
+            domain::params_actor(&actor_name),
+        );
+        if let Ok(posted) = domain::post_system(&st.pool, conv, uid, &content).await {
+            ws::broadcast_posted(&st, conv, &posted).await;
+        }
+    }
     let members = domain::member_ids(&st.pool, conv).await?;
     notify(&st, &members, "conversations");
     let view = announcement_of(&st, conv).await?;
@@ -779,7 +871,21 @@ pub(super) async fn dissolve_conversation(
     if me.role != "owner" {
         return Err(AppError::forbidden("only the owner can dissolve"));
     }
-    // 解散保留消息：标记解散、移出全部成员。最后一人退群仍删除会话。
+    // 可测解散路径：先插 group_dissolved（仍有成员、未标解散），再 dissolved_at + 清空成员；
+    // 提交后按捕获的 member_ids 广播系统条，再 invalidate conversations 清列表。
+    let members =
+        sqlx::query_scalar::<_, Uuid>("SELECT user_id FROM memberships WHERE conversation_id = $1")
+            .bind(conv)
+            .fetch_all(&mut *tx)
+            .await?;
+    let actor_name = domain::display_name(&mut *tx, uid).await?;
+    let text = format!("{actor_name} 解散了群聊");
+    let content = domain::system_content(
+        domain::CODE_DISSOLVED,
+        &text,
+        domain::params_actor(&actor_name),
+    );
+    let sys_msg = domain::insert_system_in_tx(&mut tx, conv, uid, &content).await?;
     let res = sqlx::query(
         "UPDATE conversations SET dissolved_at = now() WHERE id = $1 AND dissolved_at IS NULL",
     )
@@ -789,16 +895,22 @@ pub(super) async fn dissolve_conversation(
     if res.rows_affected() == 0 {
         return Err(AppError::conflict("group already dissolved"));
     }
-    let members =
-        sqlx::query_scalar::<_, Uuid>("SELECT user_id FROM memberships WHERE conversation_id = $1")
-            .bind(conv)
-            .fetch_all(&mut *tx)
-            .await?;
     sqlx::query("DELETE FROM memberships WHERE conversation_id = $1")
         .bind(conv)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    ws::broadcast_posted(
+        &st,
+        conv,
+        &domain::Posted {
+            message: sys_msg,
+            inserted: true,
+            member_ids: members.clone(),
+            unarchived: Vec::new(),
+        },
+    )
+    .await;
     notify(&st, &members, "conversations");
     Ok(StatusCode::NO_CONTENT)
 }

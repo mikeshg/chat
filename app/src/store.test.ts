@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  applyGroupLeft,
   applyLiveMessage,
   applyPrefUpdate,
   applyRefreshed,
@@ -541,5 +542,30 @@ describe("跳转补齐：fetchForward 拉到缓存最早一条为止", () => {
   it("没有更多时停止（补到最新）", async () => {
     const got = await fetchForward(page, 0, Infinity);
     expect(got.length).toBe(1000);
+  });
+});
+
+
+describe("退群本地收口（applyGroupLeft）", () => {
+  const u = { id: "u1", username: "u1", display_name: "U1", role: "user" as const, last_seen_at: null };
+
+  it("摘掉会话、清空选中、丢弃消息与滚动缓存；其他会话不受影响", () => {
+    const s = state({
+      conversations: [conv("g"), conv("dm")],
+      messages: { g: [msg({ conversation_id: "g" })], dm: [msg({ conversation_id: "dm" })] },
+      hasMore: { g: true, dm: false },
+      historyLoaded: { g: true, dm: true },
+      typing: { g: { user: u, ts: 1 }, dm: { user: u, ts: 2 } },
+      activeConv: "g",
+      pendingJump: { convId: "g", messageId: "m", seq: 1 },
+    });
+    const next = { ...s, ...applyGroupLeft(s, "g") };
+    expect(next.conversations.map((c) => c.id)).toEqual(["dm"]);
+    expect(next.activeConv).toBeNull();
+    expect(next.messages).toEqual({ dm: s.messages.dm });
+    expect(next.hasMore).toEqual({ dm: false });
+    expect(next.historyLoaded).toEqual({ dm: true });
+    expect(next.typing).toEqual({ dm: { user: u, ts: 2 } });
+    expect(next.pendingJump).toBeNull();
   });
 });

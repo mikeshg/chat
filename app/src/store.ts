@@ -577,6 +577,16 @@ export function applyRefreshed(
 }
 
 /** 会话不再可访问（refresh 403/404）：丢弃本地消息缓存与滚动状态 */
+/** 退群/解散成功：从列表摘除并清选中与本地缓存 */
+export function applyGroupLeft(s: AppState, convId: string): Partial<AppState> {
+  return {
+    ...dropConversationCache(s, convId),
+    conversations: s.conversations.filter((c) => c.id !== convId),
+    ...(s.activeConv === convId ? { activeConv: null } : {}),
+    ...(s.pendingJump?.convId === convId ? { pendingJump: null } : {}),
+  };
+}
+
 export function dropConversationCache(s: AppState, convId: string): Partial<AppState> {
   const messages = { ...s.messages };
   delete messages[convId];

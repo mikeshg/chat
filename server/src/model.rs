@@ -233,7 +233,7 @@ pub struct MessageView {
     pub sender_username: String,
     pub sender_name: String,
     pub content: String,
-    pub kind: String, // "text" | "image" | "file" | "audio" | "poll" | "chat_record"
+    pub kind: String, // "text" | "image" | "file" | "audio" | "poll" | "chat_record" | "system"
     pub attachment: Option<AttachmentView>,
     pub mentions: Vec<Uuid>, // 被 @ 的用户 id（群聊）
     pub reply_to_id: Option<Uuid>,

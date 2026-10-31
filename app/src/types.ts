@@ -154,7 +154,7 @@ export interface MessageView {
   sender_username: string;
   sender_name: string;
   content: string;
-  kind: string; // "text" | "image" | "file" | "audio" | "poll"
+  kind: string; // "text" | "image" | "file" | "audio" | "poll" | "system"
   attachment: AttachmentView | null;
   mentions: string[]; // 被 @ 的用户 id（群聊）
   /** 生命周期字段（旧服务端缺省；无版本字段按 0 处理） */

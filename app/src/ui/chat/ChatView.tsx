@@ -46,6 +46,7 @@ import CtxMenu from "./CtxMenu";
 import ForwardModal from "./ForwardModal";
 import GroupInfo from "./GroupInfo";
 import { meetingMessage } from "./meeting";
+import { parseSystemPayload, systemBarText } from "./systemMessage";
 import PinnedBar from "./PinnedBar";
 import NewPollModal from "./NewPollModal";
 import PollCard from "./PollCard";
@@ -694,11 +695,11 @@ export default function ChatView() {
     m.kind === "text" &&
     withinEditWindow(m);
   const canActMsg = (m: MessageView) =>
-    !m.id.startsWith("client:") && !m.deleted_at && !readonly;
+    !m.id.startsWith("client:") && !m.deleted_at && !readonly && m.kind !== "system";
   // V2 P2-4 转发/收藏入口：非乐观消息、非墓碑、非投票。只读会话仍允许（
   // 成员读得到就能转出去；目标侧权限由服务端逐条判定）
   const canForwardMsg = (m: MessageView) =>
-    !m.id.startsWith("client:") && !m.deleted_at && m.kind !== "poll";
+    !m.id.startsWith("client:") && !m.deleted_at && m.kind !== "poll" && m.kind !== "system";
   // 投票可置顶；已删除、乐观消息、只读会话不显示入口
   const canPinMsg = (m: MessageView) => canActMsg(m);
 
@@ -1611,6 +1612,24 @@ export default function ChatView() {
           const showTime =
             !prev || new Date(m.created_at).getTime() - new Date(prev.created_at).getTime() > 300000;
           const msSelected = msMode && ms!.ids.has(m.id);
+          // UI3：系统消息居中灰条（无头像/气泡/菜单）
+          if (m.kind === "system" && !isTombstone(m)) {
+            const code = parseSystemPayload(m.content)?.code;
+            return (
+              <div key={m.id}>
+                {showTime && (
+                  <div className="msg-sys">{new Date(m.created_at).toLocaleString()}</div>
+                )}
+                <div
+                  className="system-bar"
+                  data-testid="system-bar"
+                  data-code={code ?? ""}
+                >
+                  {systemBarText(m.content)}
+                </div>
+              </div>
+            );
+          }
           return (
             <div key={m.id}>
               {showTime && (

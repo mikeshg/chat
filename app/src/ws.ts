@@ -15,6 +15,7 @@ import { clearReuseOnAck, failReuseSend } from "./drafts";
 import { kickReasonKey } from "./servers";
 import {
   absorbAvatarUsers,
+  applyGroupLeft,
   applyLiveMessage,
   applyPrefUpdate,
   applyRefreshed,
@@ -705,6 +706,25 @@ export function sendTyping(convId: string) {
 
 export function sendRead(convId: string, seq: number) {
   wsSend({ type: "read", conversation_id: convId, seq });
+}
+
+/**
+ * 退出群聊：成功后本地立刻摘除该会话（不回拉 detail——已非成员只会 403）。
+ * 「已非成员」错误（重复退出/别处已退）同样收口，返回 "already_left" 让界面给中文提示。
+ */
+export async function leaveGroup(convId: string): Promise<"left" | "already_left"> {
+  let already = false;
+  try {
+    await convs.leave(convId);
+  } catch (e) {
+    if (!(e instanceof ApiError && e.code === "not_member")) throw e;
+    already = true;
+  }
+  syncedSeq.delete(convId);
+  readSeq.delete(convId);
+  syncInflight.delete(convId);
+  setState((s) => applyGroupLeft(s, convId));
+  return already ? "already_left" : "left";
 }
 
 /**
