@@ -105,6 +105,51 @@ describe("WebSocket delivery", () => {
     expect(getState().messages.c).toEqual([]); // 删掉的不会被恢复
   });
 
+  it("marks a sent-but-unacked message as failed after the ack timeout and recovers on retry", async () => {
+    const sock = await open();
+    sendChat("c", "lost-ack");
+    const [frame] = sock.sent.filter((f) => f.type === "send_message");
+    const cid = frame.client_msg_id as string;
+    // ack 丢失（服务端回包通道满等）：连接还在，什么帧都不回 → 不能永远「发送中」
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(getState().messages.c[0].send_error).toBe("发送超时，请检查网络后重试");
+    // 重试仍用同一 client_msg_id（服务端幂等），ack 到达后收敛为真身
+    retrySend(cid);
+    expect(getState().messages.c[0].send_error).toBeUndefined();
+    expect(sock.sent.filter((f) => f.type === "send_message").map((f) => f.client_msg_id)).toEqual([cid, cid]);
+    sock.frame({ type: "message_ack", client_msg_id: cid, message: { ...message(1), sender_id: "me", sender_name: "Me" } });
+    expect(getState().messages.c.map((m) => m.id)).toEqual(["m1"]);
+  });
+
+  it("resolves the optimistic bubble when the ack is lost but the message echoes via broadcast", async () => {
+    const sock = await open();
+    sendChat("c", "echo me");
+    const [frame] = sock.sent.filter((f) => f.type === "send_message");
+    // 消息本体经广播到达、ack 帧丢失：乐观气泡应按 ack 语义收敛，不与真身并存
+    sock.frame({ type: "message", message: { ...message(1), sender_id: "me", sender_username: "me", sender_name: "Me", content: "echo me" } });
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(getState().messages.c.map((m) => m.id)).toEqual(["m1"]);
+    // 已入库的消息不得再重放：重连 flush 不重发，不产生第二条
+    sock.close();
+    await vi.advanceTimersByTimeAsync(1000);
+    const second = Socket.all[Socket.all.length - 1];
+    second.onopen?.();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(second.sent.filter((f) => f.type === "send_message").map((f) => f.client_msg_id)).not.toContain(frame.client_msg_id);
+  });
+
+  it("keeps an unsent offline message pending for the reconnect flush instead of failing it", async () => {
+    const sock = await open();
+    sock.close(); // 断网后才写：从没上过任何 socket
+    sendChat("c", "queued");
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(getState().messages.c[0].send_error).toBeUndefined();
+    const second = Socket.all[Socket.all.length - 1];
+    second.onopen?.();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(second.sent.filter((f) => f.type === "send_message")).toHaveLength(1);
+  });
+
   it("does not toast or count a duplicate message twice", async () => {
     const sock = await open();
     sock.frame({ type: "message", message: message(1) });
