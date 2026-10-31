@@ -6,7 +6,8 @@ import AdminSettings from "./AdminSettings";
 import Avatar from "../Avatar";
 import BackupPanel from "./BackupPanel";
 import SettingsShell from "../SettingsShell";
-import { ArchiveIcon, PollIcon, ServerIcon, UsersIcon } from "../icons";
+import { ArchiveIcon, DatabaseIcon, PollIcon, ServerIcon, UsersIcon, WarningIcon } from "../icons";
+import { alertDialog, confirmDialog } from "../Modal";
 
 const PAGE = 50;
 
@@ -49,7 +50,7 @@ export default function AdminPanel() {
       await fn();
       await load();
     } catch (e) {
-      alert(e instanceof Error ? e.message : "操作失败");
+      void alertDialog(e instanceof Error ? e.message : "操作失败");
     }
   };
 
@@ -140,8 +141,15 @@ export default function AdminPanel() {
                     ) : (
                       <button
                         onClick={() => {
-                          if (confirm(`撤销 ${u.display_name} 的管理员权限？`))
-                            void act(() => admin.setRole(u.id, "user"));
+                          void (async () => {
+                            if (
+                              await confirmDialog(`撤销 ${u.display_name} 的管理员权限？`, {
+                                danger: true,
+                                okText: "撤销",
+                              })
+                            )
+                              void act(() => admin.setRole(u.id, "user"));
+                          })();
                         }}
                       >
                         撤销管理员
@@ -154,8 +162,15 @@ export default function AdminPanel() {
                         <button
                           className="danger"
                           onClick={() => {
-                            if (confirm(`禁用 ${u.display_name}？其将被立即踢下线且无法登录`))
-                              void act(() => admin.disable(u.id));
+                            void (async () => {
+                              if (
+                                await confirmDialog(
+                                  `禁用 ${u.display_name}？其将被立即踢下线且无法登录`,
+                                  { danger: true, okText: "禁用" },
+                                )
+                              )
+                                void act(() => admin.disable(u.id));
+                            })();
                           }}
                         >
                           禁用
@@ -183,13 +198,31 @@ export default function AdminPanel() {
     </>
   );
 
+  const dangerZone = (
+    <div className="ad-danger-zone" data-testid="admin-danger-zone">
+      <div className="ad-danger-banner">
+        <strong>危险操作区</strong>
+        <p>以下操作可能立即踢下线用户或覆盖全部数据，请确认后再执行。</p>
+      </div>
+      <div className="card ad-danger-card">
+        <h3>禁用用户</h3>
+        <p className="muted">在「人员与准入 → 用户列表」中对目标用户点击「禁用」；确认框为中文应用内弹窗。</p>
+      </div>
+      <div className="card ad-danger-card">
+        <h3>恢复备份</h3>
+        <p className="muted">恢复会覆盖当前数据并强制全员重新登录。请在「数据」中选择备份文件并输入确认词后执行。</p>
+        <BackupPanel />
+      </div>
+    </div>
+  );
+
   return (
     <SettingsShell
       sections={[
         { id: "overview", label: "概览", icon: PollIcon, render: () => overview },
         {
-          id: "user-mgmt",
-          label: "用户管理",
+          id: "people",
+          label: "人员与准入",
           icon: UsersIcon,
           children: [
             { id: "users", label: "用户列表", wide: true, render: () => userList },
@@ -203,17 +236,23 @@ export default function AdminPanel() {
           ],
         },
         {
-          id: "server",
-          label: "服务器设置",
+          id: "services",
+          label: "服务与集成",
           icon: ServerIcon,
           children: [
-            { id: "quota", label: "存储配额", render: () => <AdminSettings part="quota" /> },
-            { id: "push", label: "推送服务（ntfy）", render: () => <AdminSettings part="push" /> },
+            { id: "push", label: "推送 ntfy", render: () => <AdminSettings part="push" /> },
             { id: "meeting", label: "视频会议", render: () => <AdminSettings part="meeting" /> },
-            { id: "update", label: "客户端在线更新", render: () => <AdminSettings part="update" /> },
+            { id: "update", label: "客户端更新", render: () => <AdminSettings part="update" /> },
+            { id: "quota", label: "存储配额", render: () => <AdminSettings part="quota" /> },
           ],
         },
-        { id: "backup", label: "备份与恢复", icon: ArchiveIcon, render: () => <BackupPanel /> },
+        { id: "data", label: "数据", icon: DatabaseIcon, render: () => <BackupPanel /> },
+        {
+          id: "danger",
+          label: "危险操作区",
+          icon: WarningIcon,
+          render: () => dangerZone,
+        },
       ]}
     />
   );

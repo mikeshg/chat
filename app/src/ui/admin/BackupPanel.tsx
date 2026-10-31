@@ -8,6 +8,7 @@ import { getState } from "../../store";
 import { stopWs } from "../../ws";
 import { fmtBytes } from "../mediaFormat";
 import type { BackupItem } from "../../types";
+import { confirmDialog } from "../Modal";
 
 /** 恢复确认词：必须与服务端 confirm 语义一致 —— 精确 RESTORE，不 trim */
 export function restoreConfirmed(input: string): boolean {
@@ -84,7 +85,10 @@ export default function BackupPanel() {
   };
 
   const doDelete = async (name: string) => {
-    if (!window.confirm(`删除备份 ${name}？`)) return;
+    if (
+      !(await confirmDialog(`删除备份 ${name}？`, { danger: true, okText: "删除" }))
+    )
+      return;
     setBusy(name);
     setErr("");
     try {
