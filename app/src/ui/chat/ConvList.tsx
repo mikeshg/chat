@@ -18,6 +18,8 @@ import { fmtTime } from "./fmtTime";
 import NewGroupModal from "./NewGroupModal";
 import SearchPanel from "./SearchPanel";
 import Avatar from "../Avatar";
+import EmptyState from "../EmptyState";
+import Skeleton from "../Skeleton";
 
 
 /** 静音状态的悬浮说明 */
@@ -135,18 +137,15 @@ export default function ConvList() {
         <SearchPanel q={q} />
       ) : (
       <div className="conv-scroll">
-        {list.length === 0 && (
-          <div className="empty-hint">
-            {tab === "archived" ? (
-              "没有归档会话。"
-            ) : (
-              <>
-                还没有会话。
-                <br />
-                去「联系人」加好友开始聊天吧。
-              </>
-            )}
-          </div>
+        {list.length === 0 && !s.wsReady && tab === "chats" && !q.trim() && (
+          <Skeleton rows={5} />
+        )}
+        {list.length === 0 && (s.wsReady || tab === "archived" || !!q.trim()) && (
+          <EmptyState
+            title={tab === "archived" ? "没有归档会话" : "还没有会话"}
+            detail={tab === "archived" ? undefined : "去「联系人」加好友开始聊天吧"}
+            testId="conv-list-empty"
+          />
         )}
         {list.map((c) => {
           const title = convTitle(c, s.me?.id);

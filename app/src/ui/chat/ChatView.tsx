@@ -54,6 +54,8 @@ import NewPollModal from "./NewPollModal";
 import PollCard from "./PollCard";
 import ChatRecordView, { ChatRecordCard, type RecordViewState } from "./ChatRecordView";
 import { attImgSrc, imageBubbleSize } from "../mediaFormat";
+import EmptyState from "../EmptyState";
+import Skeleton from "../Skeleton";
 import Avatar from "../Avatar";
 import VoiceRecorder from "./VoiceRecorder";
 import { FEATURE_HOVER_TOOLBAR } from "./features";
@@ -679,7 +681,7 @@ export default function ChatView() {
   if (!conv) {
     return (
       <main className="chat-view empty">
-        <div className="empty-hint">选择一个会话开始聊天</div>
+        <EmptyState title="选择一个会话开始聊天" detail="从左侧列表打开会话，或去联系人发起聊天" testId="chat-empty" />
       </main>
     );
   }
@@ -1608,7 +1610,7 @@ export default function ChatView() {
       )}
 
       <div className="msg-scroll" ref={scrollRef} onScroll={onScroll}>
-        {loadingMore && <div className="msg-sys">加载历史…</div>}
+        {loadingMore && (<><div className="msg-sys">加载历史…</div><Skeleton rows={2} /></>)}
         {!hasMore && msgs.length > 0 && <div className="msg-sys">— 没有更多了 —</div>}
         {msgs.map((m, i) => {
           const mine = isOwnMessage(m, s.me?.id);
