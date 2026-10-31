@@ -15,6 +15,7 @@ import { clearReuseOnAck, failReuseSend } from "./drafts";
 import { kickReasonKey } from "./servers";
 import {
   absorbAvatarUsers,
+  applyGroupLeft,
   applyLiveMessage,
   applyPrefUpdate,
   applyRefreshed,
@@ -62,7 +63,15 @@ type Outgoing = {
   /** 永久失败的原因：不再自动重发，等用户重试或删除 */
   error?: string;
   sentOn?: WebSocket;
+  /** 最近一次写入 socket 的时间（不持久化）：ack 看门狗据此判超时 */
+  sentAt?: number;
 };
+
+/** ack 看门狗：发出 ACK_TIMEOUT_MS 未确认即判超时失败（可重试/删除），
+ * 期间每 ACK_WATCHDOG_MS 扫一次——ack 丢了但消息本体已回显的，直接按 ack 收敛。 */
+const ACK_TIMEOUT_MS = 10_000;
+const ACK_WATCHDOG_MS = 3_000;
+let ackWatchdog: number | null = null;
 
 /** 未收到 ack 的发送。重连后按原 client_msg_id 重放，服务端幂等。
  * 持久化到 localStorage（按服务器 + 账号），刷新、退出、手机杀进程都不丢。 */
@@ -74,7 +83,7 @@ function saveOutbox() {
   if (!outboxKey) return;
   try {
     if (outbox.length === 0) localStorage.removeItem(outboxKey);
-    else localStorage.setItem(outboxKey, JSON.stringify(outbox.map(({ sentOn: _, ...item }) => item)));
+    else localStorage.setItem(outboxKey, JSON.stringify(outbox.map(({ sentOn: _s, sentAt: _t, ...item }) => item)));
   } catch {}
 }
 
@@ -141,6 +150,10 @@ export function stopWs() {
   syncedSeq.clear();
   syncInflight.clear();
   readSeq.clear();
+  if (ackWatchdog != null) {
+    clearTimeout(ackWatchdog);
+    ackWatchdog = null;
+  }
   if (ws) {
     ws.onclose = null;
     ws.close();
@@ -153,6 +166,7 @@ export async function startWs() {
   stopped = false;
   wsGen = session(); // P1-10：绑定当前登录会话
   restoreOutbox();
+  scheduleAckWatchdog();
   await connect();
 }
 
@@ -387,16 +401,7 @@ function dispatch(f: WsOut) {
       trackIncomingSeq(f.message.conversation_id, f.message.seq);
       break;
     case "message_ack": {
-      const acked = takeOutbox(f.client_msg_id);
-      // MM2：复用发送成功 → 摘掉草稿上的「复用附件」chip（一次成功发送才算消耗）
-      if (acked?.reuse) updateDrafts((d) => clearReuseOnAck(d, acked.convId, acked.attachment?.id));
-      setState((cur) => {
-        const merged = { ...cur, ...applySyncMessages(cur, f.message.conversation_id, [f.message]) };
-        return { ...merged, messages: { ...merged.messages,
-          [f.message.conversation_id]: resolveAck(merged.messages[f.message.conversation_id] ?? [], f.client_msg_id, f.message),
-        } };
-      });
-      trackIncomingSeq(f.message.conversation_id, f.message.seq);
+      resolveSend(f.client_msg_id, f.message);
       break;
     }
     case "sync_messages": {
@@ -561,6 +566,77 @@ async function refreshByWhat(what: string) {
   }
 }
 
+/** 服务端真身到手（message_ack，或 ack 丢失后经广播/sync 回显匹配）：
+ * 移出待发队列、按 ack 语义用真身替换乐观气泡。ack 对应条目已不在队列里
+ * （如另一标签页清过）也照常并入真身，不丢消息。 */
+function resolveSend(clientMsgId: string | null, real: MessageView) {
+  const item = takeOutbox(clientMsgId);
+  // MM2：复用发送成功 → 摘掉草稿上的「复用附件」chip（一次成功发送才算消耗）
+  if (item?.reuse) updateDrafts((d) => clearReuseOnAck(d, item.convId, item.attachment?.id));
+  setState((cur) => {
+    const merged = { ...cur, ...applySyncMessages(cur, real.conversation_id, [real]) };
+    return { ...merged, messages: { ...merged.messages,
+      [real.conversation_id]: resolveAck(merged.messages[real.conversation_id] ?? [], clientMsgId, real),
+    } };
+  });
+  trackIncomingSeq(real.conversation_id, real.seq);
+}
+
+function scheduleAckWatchdog() {
+  if (stopped || ackWatchdog != null) return;
+  ackWatchdog = window.setTimeout(() => {
+    ackWatchdog = null;
+    checkOutboxAcks();
+    scheduleAckWatchdog();
+  }, ACK_WATCHDOG_MS);
+}
+
+/**
+ * P0-3：「发送中」兜底。flushOutbox 跳过 sentOn===当前连接 的条目——消息已发出
+ * 而 message_ack 单帧丢失（服务端回包通道满、半开连接等）时，没有重连触发就
+ * 永远卡在「发送中」。看门狗两路兜底：
+ * 1. 真身已从广播/sync 回显（同会话、本人、同正文/附件）→ 按 ack 语义收敛；
+ * 2. 在当前存活连接上发出且超时未确认 → 标失败气泡（重试/删除，不自动重发）。
+ * 死连接上的待发项交给重连 flushOutbox 重放，不在此判失败；
+ * 从没上过 socket 的离线待发项同理（无 sentAt，直接跳过）。
+ */
+function checkOutboxAcks() {
+  const consumed = new Set<string>(); // 本轮已认领的真身：一条真身只收敛一条待发
+  for (const item of [...outbox]) {
+    if (item.sentAt == null) continue;
+    const echoed = findEchoedMessage(item, consumed);
+    if (echoed) {
+      consumed.add(echoed.id);
+      resolveSend(item.clientMsgId, echoed);
+    } else if (
+      !item.error &&
+      ws != null &&
+      item.sentOn === ws &&
+      ws.readyState === WebSocket.OPEN &&
+      Date.now() - item.sentAt >= ACK_TIMEOUT_MS
+    ) {
+      markFailed(item.clientMsgId, "发送超时，请检查网络后重试");
+    }
+  }
+}
+
+/** 在会话缓存里找「这条已发消息」的服务端真身：ack 丢了但广播/sync 已送达。
+ * 匹配同会话、本人所发、落库正文（服务端 trim + 附件占位符与乐观文案同规则）、
+ * 附件同名；本轮已被认领的真身不再复用。 */
+function findEchoedMessage(item: Outgoing, consumed: Set<string>): MessageView | undefined {
+  const me = getState().me;
+  if (!me) return undefined;
+  const content = item.optimistic.content.trim();
+  return (getState().messages[item.convId] ?? []).find(
+    (m) =>
+      !m.id.startsWith("client:") &&
+      !consumed.has(m.id) &&
+      m.sender_id === me.id &&
+      m.content === content &&
+      (m.attachment?.file_name ?? null) === (item.attachment?.file_name ?? null),
+  );
+}
+
 function takeOutbox(clientMsgId: string | null): Outgoing | undefined {
   if (!clientMsgId) return;
   const i = outbox.findIndex((item) => item.clientMsgId === clientMsgId);
@@ -624,6 +700,7 @@ function flushOutbox() {
       }),
     );
     item.sentOn = ws;
+    item.sentAt = Date.now();
   }
 }
 
@@ -705,6 +782,26 @@ export function sendTyping(convId: string) {
 
 export function sendRead(convId: string, seq: number) {
   wsSend({ type: "read", conversation_id: convId, seq });
+}
+
+/**
+ * 退出群聊：成功后本地立刻摘除该会话（不回拉 detail——已非成员只会 403）。
+ * 「已非成员」错误（重复退出/别处已退）同样收口，返回 "already_left" 让界面给中文提示。
+ */
+export async function leaveGroup(convId: string): Promise<"left" | "already_left"> {
+  let already = false;
+  try {
+    await convs.leave(convId);
+  } catch (e) {
+    if (!(e instanceof ApiError && e.code === "not_member")) throw e;
+    already = true;
+  }
+  // 已退出的会话不再参与 seq 同步/回刷：水位与在途 sync 一并作废
+  syncedSeq.delete(convId);
+  readSeq.delete(convId);
+  syncInflight.delete(convId);
+  setState((s) => applyGroupLeft(s, convId));
+  return already ? "already_left" : "left";
 }
 
 /**

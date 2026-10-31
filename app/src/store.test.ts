@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  applyGroupLeft,
   applyLiveMessage,
   applyPrefUpdate,
   applyRefreshed,
@@ -500,6 +501,37 @@ describe("isOwnMessage", () => {
     expect(isOwnMessage(msg({ sender_id: "u-b" }), me)).toBe(false);
     expect(isOwnMessage(msg({ sender_id: me }), null)).toBe(false);
     expect(isOwnMessage(msg({ sender_id: me }), undefined)).toBe(false);
+  });
+});
+
+describe("退群本地收口（applyGroupLeft）", () => {
+  const u = { id: "u1", username: "u1", display_name: "U1", role: "user" as const, last_seen_at: null };
+
+  it("摘掉会话、清空选中、丢弃消息与滚动缓存；其他会话不受影响", () => {
+    const s = state({
+      conversations: [conv("g"), conv("dm")],
+      messages: { g: [msg({ conversation_id: "g" })], dm: [msg({ conversation_id: "dm" })] },
+      hasMore: { g: true, dm: false },
+      historyLoaded: { g: true, dm: true },
+      typing: { g: { user: u, ts: 1 }, dm: { user: u, ts: 2 } },
+      activeConv: "g",
+      pendingJump: { convId: "g", messageId: "m", seq: 1 },
+    });
+    const next = { ...s, ...applyGroupLeft(s, "g") };
+    expect(next.conversations.map((c) => c.id)).toEqual(["dm"]);
+    expect(next.activeConv).toBeNull();
+    expect(next.messages).toEqual({ dm: s.messages.dm });
+    expect(next.hasMore).toEqual({ dm: false });
+    expect(next.historyLoaded).toEqual({ dm: true });
+    expect(next.typing).toEqual({ dm: s.typing.dm });
+    expect(next.pendingJump).toBeNull();
+  });
+
+  it("选中的是别的会话：仅摘列表，选中态不动", () => {
+    const s = state({ conversations: [conv("g"), conv("dm")], activeConv: "dm" });
+    const next = { ...s, ...applyGroupLeft(s, "g") };
+    expect(next.conversations.map((c) => c.id)).toEqual(["dm"]);
+    expect(next.activeConv).toBe("dm");
   });
 });
 

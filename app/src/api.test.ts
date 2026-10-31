@@ -479,6 +479,28 @@ describe("login/register errors", () => {
   });
 });
 
+// ===== P0-1：成员资格错误中文化 =====
+describe("membership error mapping", () => {
+  it("maps a 「not a member」403 to a Chinese message with a stable not_member code", async () => {
+    vi.stubGlobal("fetch", vi.fn(() =>
+      Promise.resolve(Response.json({ error: "not a member of this conversation" }, { status: 403 }))));
+    await expect(convs.leave("g1")).rejects.toMatchObject({
+      status: 403,
+      code: "not_member",
+      message: "你已不在该群",
+    });
+  });
+
+  it("leaves other error bodies untouched", async () => {
+    vi.stubGlobal("fetch", vi.fn(() =>
+      Promise.resolve(Response.json({ error: "only the owner can dissolve" }, { status: 403 }))));
+    await expect(convs.dissolve("g1")).rejects.toMatchObject({
+      status: 403,
+      message: "only the owner can dissolve",
+    });
+  });
+});
+
 // ===== T1：请求超时，不可达时不挂在「加载中…」 =====
 describe("request timeout", () => {
   it("aborts a hanging request and rejects as transient (status 0)", async () => {
