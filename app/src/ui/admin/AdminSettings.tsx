@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { admin, getServer } from "../../api";
 import { inviteLink } from "../../invite";
 import type { InviteView, RegistrationMode } from "../../types";
+import { confirmDialog } from "../Modal";
 
 const MODES: { v: RegistrationMode; label: string }[] = [
   { v: "open", label: "开放注册" },
@@ -140,7 +141,13 @@ export default function AdminSettings({ part }: { part: AdminPart }) {
   };
 
   const clearPushToken = async () => {
-    if (!confirm("清除 ntfy 访问令牌？自建服务器开了鉴权时推送会失败")) return;
+    if (
+      !(await confirmDialog("清除 ntfy 访问令牌？自建服务器开了鉴权时推送会失败", {
+        danger: true,
+        okText: "清除",
+      }))
+    )
+      return;
     setPushSaving(true);
     setErr("");
     try {
@@ -226,7 +233,13 @@ export default function AdminSettings({ part }: { part: AdminPart }) {
   };
 
   const revoke = async (i: InviteView) => {
-    if (!confirm(`撤销邀请码 ${i.code}？已注册用户不受影响`)) return;
+    if (
+      !(await confirmDialog(`撤销邀请码 ${i.code}？已注册用户不受影响`, {
+        danger: true,
+        okText: "撤销",
+      }))
+    )
+      return;
     try {
       await admin.revokeInvite(i.id);
       await load();
