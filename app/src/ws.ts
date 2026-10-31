@@ -58,6 +58,8 @@ type Outgoing = {
   /** MM2：true 时发 reuse_attachment_id（撤回重编辑的附件复用），而不是 attachment_id */
   reuse?: boolean;
   replyToId?: string;
+  /** UI4：kind=meeting 时服务端落 Meeting Card */
+  kind?: string;
   /** 乐观消息原样存：刷新/重启后照它放回列表 */
   optimistic: MessageView;
   /** 永久失败的原因：不再自动重发，等用户重试或删除 */
@@ -542,7 +544,9 @@ function onMessage(m: MessageView) {
           : `[文件] ${m.attachment.file_name}`
       : m.kind === "chat_record"
         ? recordLabel(m, RECORD_TITLE_MAX)
-        : m.content.slice(0, 80);
+        : m.kind === "meeting"
+          ? "[视频会议]"
+          : m.content.slice(0, 80);
     const tag = cur.me && m.mentions.includes(cur.me.id) ? "[有人@我] " : "";
     pushToast({
       convId: m.conversation_id,
@@ -697,6 +701,7 @@ function flushOutbox() {
           ? { reuse_attachment_id: item.attachment?.id } // MM2：撤回件复用（服务端校验上传者/TTL）
           : { attachment_id: item.attachment?.id }),
         reply_to_id: item.replyToId,
+        ...(item.kind ? { kind: item.kind } : {}),
       }),
     );
     item.sentOn = ws;
@@ -763,6 +768,48 @@ export function sendChat(
     attachment,
     reuse,
     replyToId: replyTo?.id,
+    optimistic,
+  });
+  saveOutbox();
+  setState((s) => ({
+    messages: {
+      ...s.messages,
+      [convId]: [...(s.messages[convId] ?? []), optimistic],
+    },
+  }));
+  flushOutbox();
+  return clientMsgId;
+}
+
+/** 发送 Meeting Card（kind=meeting）；content 为可加入的绝对 URL。遗留纯文本会议链接仍走 sendChat。 */
+export function sendMeeting(convId: string, url: string): string | undefined {
+  const clientMsgId = crypto.randomUUID();
+  const me = getState().me;
+  if (!me) return undefined;
+  const optimistic: MessageView = {
+    id: `client:${clientMsgId}`,
+    conversation_id: convId,
+    seq: Number.MAX_SAFE_INTEGER - Math.floor(Math.random() * 1e6),
+    sender_id: me.id,
+    sender_username: me.username,
+    sender_name: me.display_name,
+    content: url,
+    kind: "meeting",
+    attachment: null,
+    mentions: [],
+    reply_to_id: null,
+    reply_to_preview: null,
+    edited_at: null,
+    edit_version: 0,
+    deleted_at: null,
+    reactions: [],
+    created_at: new Date().toISOString(),
+  };
+  outbox.push({
+    convId,
+    clientMsgId,
+    content: url,
+    kind: "meeting",
     optimistic,
   });
   saveOutbox();
