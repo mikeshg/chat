@@ -37,6 +37,7 @@ mod recall;
 mod regressions;
 mod search;
 mod sessions;
+mod system_messages;
 mod voice;
 
 // MM5：测试库生命周期助手（与 tests/migrations.rs 共用同一文件）

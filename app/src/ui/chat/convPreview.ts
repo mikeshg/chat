@@ -2,6 +2,7 @@ import type { ConversationView } from "../../types";
 import type { DraftEntry } from "../../drafts";
 import { tombstoneText } from "./msgMenu";
 import { RECORD_TITLE_MAX, recordLabel } from "./chatRecord";
+import { systemPreviewText } from "./systemMessage";
 
 // ===== V2 P1-3 =====
 // 会话列表副标题预览：typing > 草稿 > 最后一条消息 > 空。
@@ -42,6 +43,9 @@ export function convPreview(c: ConversationView, o: ConvPreviewInput): ConvPrevi
   // 不回落到含逐行摘要的 content 兜底文本；群聊保留发送者前缀
   if (m.kind === "chat_record") {
     return { kind: "message", text: `${who}${recordLabel(m, RECORD_TITLE_MAX)}` };
+  }
+  if (m.kind === "system") {
+    return { kind: "message", text: systemPreviewText(m.content) };
   }
   return { kind: "message", text: `${who}${m.content}` };
 }

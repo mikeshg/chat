@@ -30,6 +30,11 @@ pub struct PostMessage<'a> {
     /// 转发路径统一置 true：转发的正文/附件 caption/兜底文本一律不解析 @，
     /// 不产生 message_mentions 行，也不触发提及解归档与提及优先推送。
     pub no_mentions: bool,
+    /// 系统条：Some 时 kind='system'，content 为含 code 的 JSON（仅服务端生命周期路径）。
+    pub system: bool,
+    /// 转发保留 Reply Quote：允许 reply_to_id 指向其他会话的消息（仍须存在）。
+    /// 普通发送保持同会话校验。
+    pub allow_foreign_reply: bool,
 }
 
 /// 聊天记录写入负载：json 里的 attachment.id 仍是源侧 id，
@@ -59,6 +64,8 @@ impl<'a> PostMessage<'a> {
             recall_attachment_ttl_secs: crate::config::DEFAULT_RECALL_ATTACHMENT_TTL_SECS,
             record: None,
             no_mentions: false,
+            system: false,
+            allow_foreign_reply: false,
         }
     }
 }
@@ -114,7 +121,7 @@ pub(super) fn normalize_client_msg_id(raw: Option<&str>) -> Result<Option<String
     Ok(Some(raw.to_string()))
 }
 
-pub(super) async fn write_message(
+pub(crate) async fn write_message(
     tx: &mut Transaction<'_, Postgres>,
     msg: &PostMessage<'_>,
     client_msg_id: Option<&str>,
@@ -182,15 +189,22 @@ pub(super) async fn write_message(
         }
     }
 
-    // 回复目标必须是同会话内的消息（行锁内校验，防跨会话引用）
+    // 回复目标：普通发送必须同会话；转发保留 Quote 时允许跨会话（消息仍须存在）
     if let Some(rt) = msg.reply_to_id {
-        let ok = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM messages WHERE id = $1 AND conversation_id = $2)",
-        )
-        .bind(rt)
-        .bind(msg.conversation_id)
-        .fetch_one(&mut **tx)
-        .await?;
+        let ok = if msg.allow_foreign_reply {
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM messages WHERE id = $1)")
+                .bind(rt)
+                .fetch_one(&mut **tx)
+                .await?
+        } else {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE id = $1 AND conversation_id = $2)",
+            )
+            .bind(rt)
+            .bind(msg.conversation_id)
+            .fetch_one(&mut **tx)
+            .await?
+        };
         if !ok {
             return Err(PostError::deny("bad_message", "reply target not found").into());
         }
@@ -255,6 +269,16 @@ pub(super) async fn write_message(
         // 聊天记录正文 = 服务端组好的兜底文本；kind 只能由这条路径产生（客户端无字段可伪造）
         None if msg.record.is_some() => {
             (normalize_body(msg.content, attachment.as_ref())?.0, "chat_record")
+        }
+        None if msg.system => {
+            let c = msg.content.trim();
+            if c.is_empty() || c.chars().count() > 4000 {
+                return Err(PostError::deny("bad_message", "invalid system payload").into());
+            }
+            if attachment.is_some() {
+                return Err(PostError::deny("bad_request", "system cannot carry attachments").into());
+            }
+            (c.to_string(), "system")
         }
         None => normalize_body(msg.content, attachment.as_ref())?,
     };
@@ -644,7 +668,7 @@ pub(super) async fn load_posted(
 }
 
 /// 新消息的 reactions 恒为空，view 对任何 viewer 等价；viewer 只影响 reacted_by_me。
-pub(super) async fn view_by_id(
+pub(crate) async fn view_by_id(
     executor: impl PgExecutor<'_>,
     viewer: Uuid,
     id: Uuid,

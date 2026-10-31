@@ -11,6 +11,7 @@ import {
   menuItems,
   msgDeletedText,
   quoteDeletedText,
+  quoteBodyText,
   reeditTextFor,
   shouldOpenMenuOnClick,
   shouldOpenMenuOnContextMenu,
@@ -342,6 +343,54 @@ describe("引用/横幅文案与复制文本", () => {
     expect(
       quoteDeletedText({ message_id: "m", seq: 1, sender_name: "B", excerpt: "", kind: "text", deleted: true }),
     ).toBe("原消息已删除");
+  });
+
+  it("quoteBodyText：缺失/转发已删 → 原消息不可用；普通已删保留；有 excerpt 优先", () => {
+    expect(quoteBodyText(null)).toBe("原消息不可用");
+    expect(quoteBodyText(undefined)).toBe("原消息不可用");
+    const del = {
+      message_id: "m",
+      seq: 1,
+      sender_name: "B",
+      excerpt: "",
+      kind: "text",
+      deleted: true,
+    };
+    expect(quoteBodyText(del, { forwarded: true })).toBe("原消息不可用");
+    expect(quoteBodyText(del)).toBe("原消息已删除");
+    expect(
+      quoteBodyText({
+        message_id: "m",
+        seq: 1,
+        sender_name: "B",
+        excerpt: "hi",
+        kind: "text",
+        deleted: false,
+      }),
+    ).toBe("hi");
+    expect(
+      quoteBodyText(
+        {
+          message_id: "m",
+          seq: 1,
+          sender_name: "B",
+          excerpt: "",
+          kind: "image",
+          deleted: false,
+        },
+        { kindFallback: "[图片]" },
+      ),
+    ).toBe("[图片]");
+    expect(
+      quoteBodyText({
+        message_id: "m",
+        seq: 1,
+        sender_name: "B",
+        excerpt: "",
+        kind: "text",
+        deleted: false,
+      }),
+    ).toBe("原消息不可用");
   });
 
   it("copyTextFor：文本→正文；附件→文件名；投票→标题", () => {
