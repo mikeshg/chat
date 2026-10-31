@@ -285,10 +285,15 @@ async fn p33_push_mute_and_mention() {
     push_on(&base, &b, json!({"enabled": true})).await;
 
     let gid = mk_group(&base, &a, std::slice::from_ref(&b.id)).await;
+    // group_created 的 push::schedule 是异步的：dispatch 可能在静音前已读到「未静音」
+    // 但 HTTP 打到 fake ntfy 更晚。先排空在途推送，再静音+取 baseline，避免把迟到的
+    // group_created 误判成「静音后普通消息仍推」。
+    let _ = ntfy.wait_hits(1, 2000).await;
     // B 永久静音该群
     let r = put_pref(&base, &b, &gid, json!({"mute": {"mode": "forever"}})).await;
     assert_eq!(r.status(), 200);
-    // mk_group 的 group_created 可能已在静音前推过；之后只看增量
+    // 再短等一拍：若有「已读 prefs 未静音、尚未写入 hits」的尾巴，归入 baseline
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let baseline = ntfy.hit_count();
     // group_created 已占默认 30s 合并窗口，关掉以免吞掉后续 @我 突破静音的推送
     st.push_coalesce_ms
