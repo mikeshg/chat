@@ -287,6 +287,7 @@ pub(crate) async fn write_message(
                 return Err(PostError::deny("bad_request", "meeting cannot carry attachments").into());
             }
             (url.to_string(), "meeting")
+        }
         None if msg.system => {
             let c = msg.content.trim();
             if c.is_empty() || c.chars().count() > 4000 {
