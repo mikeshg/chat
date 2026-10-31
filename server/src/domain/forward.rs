@@ -57,6 +57,7 @@ struct SourceRow {
     content: String,
     deleted: bool,
     record: Option<Value>,
+    reply_to_id: Option<Uuid>,
     att_id: Option<Uuid>,
     att_name: Option<String>,
     att_mime: Option<String>,
@@ -161,7 +162,7 @@ pub async fn forward_message(
             pool,
             // 视图里的 content 已含附件占位文本（'[图片]'/'[文件] x'），
             // 重发同名附件时 normalize_body 不会重复拼装。
-            // 转发不保留回复指向（task：strip reply_to）
+            // ADR-forward-keep-quote：保留 reply_to（可跨会话；不可见时客户端显示「原消息不可用」）
             PostMessage {
                 client_msg_id: Some(&key),
                 // 聊天记录自带逐条署名，外层不再加「转发自」
@@ -169,6 +170,8 @@ pub async fn forward_message(
                 forward_attachment: if has_record { None } else { src.att_id },
                 record: record_post.clone(),
                 no_mentions: true,
+                reply_to_id: src.reply_to_id,
+                allow_foreign_reply: src.reply_to_id.is_some(),
                 ..PostMessage::text(*conv, uid, &src.content)
             },
         )
@@ -374,6 +377,7 @@ pub async fn forward_batch_prepare(
                 u.avatar_path IS NOT NULL AS has_avatar, u.avatar_version,
                 m.created_at, m.kind, m.content, m.deleted_at IS NOT NULL AS deleted,
                 CASE WHEN m.deleted_at IS NULL THEN m.record END AS record,
+                m.reply_to_id,
                 a.id AS att_id, a.file_name AS att_name, a.mime AS att_mime,
                 a.size AS att_size, a.width AS att_width, a.height AS att_height,
                 a.thumb_path IS NOT NULL AS att_has_thumb, a.duration_ms AS att_duration_ms,
@@ -742,6 +746,8 @@ fn post_for_source<'a>(s: &'a SourceRow, conv: Uuid, uid: Uuid) -> PostMessage<'
             }),
             forwarded_from: None,
             no_mentions: true,
+            reply_to_id: s.reply_to_id,
+            allow_foreign_reply: s.reply_to_id.is_some(),
             ..PostMessage::text(conv, uid, &s.content)
         }
     } else {
@@ -749,6 +755,8 @@ fn post_for_source<'a>(s: &'a SourceRow, conv: Uuid, uid: Uuid) -> PostMessage<'
             forwarded_from: Some(&s.sender_name),
             forward_attachment: s.att().filter(|a| !a.recalled).map(|a| a.id),
             no_mentions: true,
+            reply_to_id: s.reply_to_id,
+            allow_foreign_reply: s.reply_to_id.is_some(),
             ..PostMessage::text(conv, uid, &s.content)
         }
     }

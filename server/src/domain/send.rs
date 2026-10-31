@@ -30,6 +30,9 @@ pub struct PostMessage<'a> {
     /// 转发路径统一置 true：转发的正文/附件 caption/兜底文本一律不解析 @，
     /// 不产生 message_mentions 行，也不触发提及解归档与提及优先推送。
     pub no_mentions: bool,
+    /// 转发保留 Reply Quote：允许 reply_to_id 指向其他会话的消息（仍须存在）。
+    /// 普通发送保持同会话校验。
+    pub allow_foreign_reply: bool,
 }
 
 /// 聊天记录写入负载：json 里的 attachment.id 仍是源侧 id，
@@ -59,6 +62,7 @@ impl<'a> PostMessage<'a> {
             recall_attachment_ttl_secs: crate::config::DEFAULT_RECALL_ATTACHMENT_TTL_SECS,
             record: None,
             no_mentions: false,
+            allow_foreign_reply: false,
         }
     }
 }
@@ -182,15 +186,22 @@ pub(super) async fn write_message(
         }
     }
 
-    // 回复目标必须是同会话内的消息（行锁内校验，防跨会话引用）
+    // 回复目标：普通发送必须同会话；转发保留 Quote 时允许跨会话（消息仍须存在）
     if let Some(rt) = msg.reply_to_id {
-        let ok = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM messages WHERE id = $1 AND conversation_id = $2)",
-        )
-        .bind(rt)
-        .bind(msg.conversation_id)
-        .fetch_one(&mut **tx)
-        .await?;
+        let ok = if msg.allow_foreign_reply {
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM messages WHERE id = $1)")
+                .bind(rt)
+                .fetch_one(&mut **tx)
+                .await?
+        } else {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE id = $1 AND conversation_id = $2)",
+            )
+            .bind(rt)
+            .bind(msg.conversation_id)
+            .fetch_one(&mut **tx)
+            .await?
+        };
         if !ok {
             return Err(PostError::deny("bad_message", "reply target not found").into());
         }
