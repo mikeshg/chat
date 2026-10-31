@@ -4,6 +4,7 @@ import { setState, useApp } from "../store";
 import type { FriendView, UserPublic } from "../types";
 import { openConversation } from "../ws";
 import Avatar from "./Avatar";
+import { confirmDialog } from "./Modal";
 
 /** 搜索结果行：已是好友的给「发消息」，非好友走加好友流程 */
 export function FoundUserRow({
@@ -111,7 +112,13 @@ export default function ContactsPanel() {
   };
 
   const removeFriend = async (u: UserPublic) => {
-    if (!confirm(`删除好友 ${u.display_name}？会话将变为只读。`)) return;
+    if (
+      !(await confirmDialog(`删除好友 ${u.display_name}？会话将变为只读。`, {
+        danger: true,
+        okText: "删除",
+      }))
+    )
+      return;
     await friends.remove(u.id);
     await reload();
   };

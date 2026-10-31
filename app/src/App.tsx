@@ -8,6 +8,7 @@ import { flushDrafts, getState, setState, useApp } from "./store";
 import { startWs, stopWs } from "./ws";
 import AuthScreen from "./ui/AuthScreen";
 import ChatScreen from "./ui/ChatScreen";
+import { DialogHost, dismissAllDialogs } from "./ui/Modal";
 
 export default function App() {
   const s = useApp();
@@ -36,6 +37,7 @@ export default function App() {
         );
       }
       clearRecent(); // MRU 是账号数据：别让下一个登录的用户继承
+      dismissAllDialogs(); // 挂起的确认框按取消处理，别留到下一个会话
       stopWs();
       setState({
         me: null,
@@ -96,7 +98,10 @@ export default function App() {
     syncWindowTitle(unreadTitle(s.conversations));
   }, [s.conversations]);
 
-  if (booting) return <div className="boot">加载中…</div>;
-  if (!s.me) return <AuthScreen />;
-  return <ChatScreen />;
+  return (
+    <>
+      {booting ? <div className="boot">加载中…</div> : s.me ? <ChatScreen /> : <AuthScreen />}
+      <DialogHost />
+    </>
+  );
 }

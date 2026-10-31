@@ -11,11 +11,13 @@
   --line: light-dark(#e5e5e5, #343434);
   --text: light-dark(#1a1a1a, #e8e8e8);
   --muted: light-dark(#8a8a8a, #909090);
-  --green: #07c160;
-  --green-dk: light-dark(#06ad56, #2bc56e);
+  /* Accent（GLOSSARY）：主品牌色，靛蓝；--green* 仅作旧别名保留，新代码用 --accent* */
+  --accent: light-dark(#4F46E5, #6366F1);
+  --accent-dk: light-dark(#4338CA, #818CF8);
+  --green: var(--accent);
+  --green-dk: var(--accent-dk);
   --danger: #fa5151;
   --ok: light-dark(#1a7f37, #4ac26b);
-  --accent: var(--green);
   --on-accent: #ffffff;
   --hover: light-dark(#f0f0f0, #2c2c2c);
   --selected: light-dark(#e9e9e9, #373737);
@@ -428,6 +430,23 @@ button.ctx-item:hover { background: var(--bg); }
 .ctx-item { padding: 8px 14px; border-radius: 5px; cursor: pointer; font-size: 13px; }
 .ctx-item:hover { background: var(--bg); }
 
+/* ---------- 应用内 Modal（GLOSSARY: In-app Modal，替代 window.confirm/alert） ---------- */
+/* 类名用 .dlg-* 与旧 .modal 弹窗区分；z-index 与 layers.ts 的 Z.dialog 一致 */
+.dlg-mask {
+  position: fixed; inset: 0; z-index: 500;
+  background: var(--overlay);
+  display: flex; align-items: center; justify-content: center;
+}
+.dlg {
+  background: var(--panel); border-radius: 8px;
+  box-shadow: 0 8px 30px var(--shadow);
+  min-width: 280px; max-width: 420px; padding: 18px 20px 14px;
+}
+.dlg-title { font-size: 15px; font-weight: 600; margin-bottom: 8px; }
+.dlg-msg { font-size: 14px; white-space: pre-wrap; word-break: break-word; }
+.dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+button.danger-fill { background: var(--danger); border-color: var(--danger); color: var(--on-accent); }
+
 /* ---------- 待发附件区 ---------- */
 .pending-files {
   display: flex; flex-wrap: wrap; gap: 6px;
@@ -515,7 +534,7 @@ button.ctx-item:hover { background: var(--bg); }
 /* 回复引用块（气泡内顶部，点击跳转原消息） */
 .reply-quote {
   display: block; width: 100%; text-align: left; cursor: pointer;
-  border: none; border-left: 3px solid var(--accent, var(--green));
+  border: none; border-left: 3px solid var(--accent);
   background: var(--quote-bg); border-radius: 4px;
   padding: 4px 8px; margin-bottom: 5px; font-size: 12px;
 }
@@ -536,7 +555,7 @@ button.ctx-item:hover { background: var(--bg); }
   border-radius: 12px; padding: 2px 8px; font-size: 12px; cursor: pointer;
 }
 .rx-chip:hover { background: var(--bg); }
-.rx-chip.me { border-color: var(--accent, var(--green)); background: var(--chip-me-bg); }
+.rx-chip.me { border-color: var(--accent); background: var(--chip-me-bg); }
 .rx-chip:disabled { opacity: 0.55; cursor: default; }
 .rx-count { color: var(--muted); font-size: 11px; }
 .rx-chip.me .rx-count { color: inherit; }
@@ -544,7 +563,7 @@ button.ctx-item:hover { background: var(--bg); }
 /* composer 回复/编辑横幅与 mutation 错误 */
 .composer-banner {
   display: flex; align-items: center; gap: 8px;
-  border-left: 3px solid var(--accent, var(--green));
+  border-left: 3px solid var(--accent);
   background: var(--bg); border-radius: 4px; padding: 6px 10px; font-size: 12px;
 }
 .composer-banner.editing { border-left-color: var(--warn-fg); }
@@ -656,7 +675,8 @@ button.ctx-item:hover { background: var(--bg); }
     --line: #e5e5e5;
     --text: #1a1a1a;
     --muted: #8a8a8a;
-    --green-dk: #06ad56;
+    --accent: #4F46E5;
+    --accent-dk: #4338CA;
     --ok: #1a7f37;
     --hover: #f0f0f0;
     --selected: #e9e9e9;
@@ -1111,7 +1131,7 @@ input.switch:focus-visible { outline: 2px solid var(--green); outline-offset: 2p
 /* 墓碑里的「重新编辑」入口 */
 .reedit-link {
   border: none; background: transparent; padding: 0 0 0 8px;
-  color: var(--accent, var(--green)); font-style: normal; font-size: 12px;
+  color: var(--accent); font-style: normal; font-size: 12px;
   cursor: pointer; text-decoration: underline;
 }
 

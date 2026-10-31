@@ -6,6 +6,7 @@ import type { AttachmentView, ConversationDetail, ConversationView } from "../..
 import AnnouncementEditor from "./AnnouncementEditor";
 import Avatar from "../Avatar";
 import ConvMedia from "./ConvMedia";
+import { alertDialog, confirmDialog } from "../Modal";
 
 export default function GroupInfo({
   conv,
@@ -46,26 +47,40 @@ export default function GroupInfo({
     reload().catch(console.warn);
   }, [conv.id]);
 
-  const showErr = (e: unknown) => alert(e instanceof Error ? e.message : "操作失败");
-  const act = (p: Promise<unknown>) => p.then(reload).catch(showErr);
+  const act = (p: Promise<unknown>) =>
+    p.then(reload).catch((e) => void alertDialog(e instanceof Error ? e.message : "操作失败"));
 
   const leave = async () => {
-    if (!confirm(isOwner ? "你是群主，退出后将自动转让；确定退出？" : "退出该群？")) return;
+    if (
+      !(await confirmDialog(
+        isOwner ? "你是群主，退出后将自动转让；确定退出？" : "退出该群？",
+        { danger: true, okText: "退出" },
+      ))
+    )
+      return;
     try {
-      if ((await leaveGroup(conv.id)) === "already_left") alert("你已不在该群");
+      if ((await leaveGroup(conv.id)) === "already_left") {
+        void alertDialog("你已不在该群");
+      }
     } catch (e) {
-      showErr(e);
+      void alertDialog(e instanceof Error ? e.message : "操作失败");
       return;
     }
     onClose();
   };
 
   const dissolve = async () => {
-    if (!confirm("解散后所有成员将被移出，消息记录保留但不可再发言。确定？")) return;
+    if (
+      !(await confirmDialog(
+        "解散后所有成员将被移出，消息记录保留但不可再发言。确定？",
+        { danger: true, okText: "解散" },
+      ))
+    )
+      return;
     try {
       await convs.dissolve(conv.id);
     } catch (e) {
-      showErr(e);
+      void alertDialog(e instanceof Error ? e.message : "操作失败");
       return;
     }
     setState((s) => applyGroupLeft(s, conv.id));
