@@ -1317,6 +1317,95 @@ input.switch:focus-visible { outline: 2px solid var(--green); outline-offset: 2p
 /* toast 里的操作按钮（MF2 转发重试） */
 .toast-act { color: var(--green); font-weight: 600; align-self: flex-end; padding: 2px 4px; }
 
+/* UI7: contacts A–Z, skeleton, empty state */
+.friends-az-layout { display: flex; gap: 8px; align-items: flex-start; }
+.friends-az-list { flex: 1; min-width: 0; }
+.friends-az-heading {
+  position: sticky; top: 0; z-index: 1;
+  font-size: 12px; font-weight: 600; color: var(--muted);
+  background: var(--card, var(--bg));
+  padding: 6px 0; margin-top: 4px;
+  border-bottom: 1px solid var(--border, rgba(127,127,127,.2));
+}
+.friends-az-index {
+  display: flex; flex-direction: column; gap: 0;
+  padding: 4px 0; user-select: none;
+  position: sticky; top: 8px;
+}
+.friends-az-index .az-letter {
+  border: 0; background: transparent; color: var(--muted);
+  font-size: 10px; line-height: 1.15; padding: 1px 4px; cursor: pointer;
+  border-radius: 4px;
+}
+.friends-az-index .az-letter.on { color: var(--accent, var(--green)); font-weight: 600; }
+.friends-az-index .az-letter:disabled { opacity: 0.35; cursor: default; }
+
+.skeleton { display: flex; flex-direction: column; gap: 12px; padding: 8px 0; }
+.skeleton-row { display: flex; gap: 12px; align-items: center; }
+.skeleton-avatar {
+  width: 40px; height: 40px; border-radius: 50%;
+  background: linear-gradient(90deg, rgba(127,127,127,.12), rgba(127,127,127,.22), rgba(127,127,127,.12));
+  background-size: 200% 100%; animation: sk-pulse 1.2s ease-in-out infinite;
+}
+.skeleton-lines { flex: 1; display: flex; flex-direction: column; gap: 8px; }
+.skeleton-line {
+  display: block; height: 10px; border-radius: 6px;
+  background: linear-gradient(90deg, rgba(127,127,127,.12), rgba(127,127,127,.22), rgba(127,127,127,.12));
+  background-size: 200% 100%; animation: sk-pulse 1.2s ease-in-out infinite;
+}
+.skeleton-line.w60 { width: 60%; }
+.skeleton-line.w40 { width: 40%; }
+@keyframes sk-pulse { 0% { background-position: 100% 0; } 100% { background-position: -100% 0; } }
+
+.empty-state {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 8px; padding: 28px 12px; color: var(--muted); text-align: center;
+}
+.empty-state-svg { color: var(--muted); }
+.empty-state-title { font-size: 14px; color: var(--fg, inherit); }
+.empty-state-detail { font-size: 12px; line-height: 1.5; max-width: 240px; }
+
+/* UI7 contacts / skeleton / empty */
+.contacts { position: relative; }
+.contacts-layout { display: flex; gap: 0; align-items: stretch; }
+.contacts-main { flex: 1; min-width: 0; }
+.az-index {
+  position: sticky; top: 12px; align-self: flex-start;
+  display: flex; flex-direction: column; align-items: center;
+  gap: 0; padding: 4px 6px; margin-left: 8px;
+  font-size: 10px; line-height: 1.35; color: var(--muted); user-select: none;
+}
+.az-index button {
+  border: none; background: transparent; color: inherit;
+  padding: 0 2px; font-size: 10px; min-width: 14px; cursor: pointer;
+}
+.az-index button:hover, .az-index button.on { color: var(--green); font-weight: 700; }
+.contact-letter {
+  font-size: 12px; font-weight: 700; color: var(--muted);
+  padding: 8px 4px 4px; scroll-margin-top: 8px;
+}
+.sk-list { padding: 8px 0; }
+.sk-row { display: flex; gap: 10px; align-items: center; padding: 10px 4px; }
+.sk-avatar {
+  width: 40px; height: 40px; border-radius: 50%;
+  background: linear-gradient(90deg, var(--line), var(--hover), var(--line));
+  background-size: 200% 100%; animation: sk-shine 1.2s linear infinite;
+}
+.sk-mid { flex: 1; display: flex; flex-direction: column; gap: 8px; }
+.sk-line {
+  height: 10px; border-radius: 6px; width: 80%;
+  background: linear-gradient(90deg, var(--line), var(--hover), var(--line));
+  background-size: 200% 100%; animation: sk-shine 1.2s linear infinite;
+}
+.sk-line.short { width: 40%; }
+@keyframes sk-shine { 0% { background-position: 100% 0; } 100% { background-position: -100% 0; } }
+.empty-state {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 8px; padding: 40px 16px; color: var(--muted); text-align: center;
+}
+.empty-svg { color: var(--muted); }
+.empty-title { font-size: 14px; color: var(--text); }
+.empty-hint-sm { font-size: 12px; line-height: 1.5; }
 
 /* UI4 Meeting Card */
 .meeting-card {
