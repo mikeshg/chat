@@ -251,11 +251,18 @@ button.ctx-item:hover { background: var(--bg); }
 .msg-sys { text-align: center; color: var(--muted); font-size: 11px; margin: 12px 0; }
 .msg-row { display: flex; gap: 8px; margin: 10px 0; align-items: flex-start; }
 .msg-row.mine { flex-direction: row-reverse; }
+.msg-row.grouped { margin-top: 2px; }
+.msg-row.grouped .msg-sender { display: none; }
 .msg-body { max-width: 65%; }
-.msg-sender { color: var(--muted); font-size: 11px; margin-bottom: 3px; }
+.msg-sender { color: var(--muted); font-size: 12px; margin-bottom: 3px; font-weight: 500; }
+.msg-time {
+  display: none; font-size: 11px; color: var(--muted); margin-top: 4px;
+}
+.bubble-wrap:hover .msg-time, .msg-row:hover .msg-time { display: block; }
+.msg-avatar-spacer { width: 30px; flex-shrink: 0; }
 .bubble {
-  background: var(--bubble-other); border-radius: 6px; padding: 9px 12px;
-  line-height: 1.5; word-break: break-word; white-space: pre-wrap;
+  background: var(--bubble-other); border-radius: 16px; padding: 9px 12px;
+  line-height: 1.5; font-size: 14px; word-break: break-word; white-space: pre-wrap;
   box-shadow: 0 1px 1px var(--shadow-soft); display: inline-block;
 }
 .msg-row.mine .bubble { background: var(--bubble-mine); }
@@ -278,13 +285,14 @@ button.ctx-item:hover { background: var(--bg); }
 .msg-file .file-meta b { font-size: 14px; word-break: break-all; }
 .msg-file .file-meta i { color: var(--muted); font-size: 12px; font-style: normal; }
 .composer {
-  border-top: 1px solid var(--line); background: var(--panel);
-  padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; flex-shrink: 0;
+  border-top: none; background: transparent;
+  padding: 8px 16px 14px; display: flex; flex-direction: column; gap: 8px; flex-shrink: 0;
 }
-/* 微信式：输入框和工具栏同在一个框里 */
+/* 浮动输入卡 */
 .composer-box {
-  display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 8px;
-  background: var(--input-bg);
+  display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 16px;
+  background: var(--panel);
+  box-shadow: 0 4px 18px var(--shadow-soft);
 }
 .composer-box:focus-within { border-color: var(--green); }
 .composer-box textarea { border: none; background: transparent; resize: none; padding: 10px 12px 4px; }
@@ -1287,3 +1295,10 @@ input.switch:focus-visible { outline: 2px solid var(--green); outline-offset: 2p
 
 /* toast 里的操作按钮（MF2 转发重试） */
 .toast-act { color: var(--green); font-weight: 600; align-self: flex-end; padding: 2px 4px; }
+
+/* UI6 typography */
+.msg-scroll { font-size: 14px; line-height: 1.5; }
+.chat-title { font-size: 15px; font-weight: 600; }
+.conv-title { font-size: 14px; }
+.conv-sub { font-size: 12px; line-height: 1.4; }
+.conv-time { font-size: 11px; }

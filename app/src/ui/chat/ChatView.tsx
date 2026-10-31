@@ -54,6 +54,7 @@ import { attImgSrc, imageBubbleSize } from "../mediaFormat";
 import Avatar from "../Avatar";
 import VoiceRecorder from "./VoiceRecorder";
 import { FEATURE_HOVER_TOOLBAR } from "./features";
+import { inBubbleGroup } from "./bubbleGroup";
 import { pushBackLayer, resetBackLayers } from "./backStack";
 import { Z } from "./layers";
 import { recordLabel } from "./chatRecord";
@@ -1608,6 +1609,7 @@ export default function ChatView() {
           const mine = isOwnMessage(m, s.me?.id);
           const pending = m.id.startsWith("client:");
           const prev = msgs[i - 1];
+          const grouped = inBubbleGroup(m, prev);
           const showTime =
             !prev || new Date(m.created_at).getTime() - new Date(prev.created_at).getTime() > 300000;
           const msSelected = msMode && ms!.ids.has(m.id);
@@ -1645,17 +1647,22 @@ export default function ChatView() {
                   </span>
                 )}
                 <div
-                  className={`msg-row ${mine ? "mine" : ""} ${msSelected ? "ms-sel" : ""}`}
+                  className={`msg-row ${mine ? "mine" : ""} ${grouped ? "grouped" : ""} ${msSelected ? "ms-sel" : ""}`}
                   data-mid={m.id}
+                  data-grouped={grouped ? "1" : "0"}
                 >
                 {!mine && (
-                  <Avatar
-                    userId={m.sender_id}
-                    name={m.sender_name}
-                    avatarVersion={m.sender_avatar_version}
-                    hasAvatar={m.sender_has_avatar}
-                    size="sm"
-                  />
+                  grouped ? (
+                    <div className="msg-avatar-spacer" aria-hidden />
+                  ) : (
+                    <Avatar
+                      userId={m.sender_id}
+                      name={m.sender_name}
+                      avatarVersion={m.sender_avatar_version}
+                      hasAvatar={m.sender_has_avatar}
+                      size="sm"
+                    />
+                  )
                 )}
                 <div
                   className="msg-body"
@@ -1664,10 +1671,31 @@ export default function ChatView() {
                   onClick={onBubbleClick(m)}
                   onContextMenu={onMsgContextMenu(m)}
                 >
-                  {!mine && conv.kind === "group" && (
+                  {!mine && conv.kind === "group" && !grouped && (
                     <div className="msg-sender">{m.sender_name}</div>
                   )}
                   <div className="bubble-wrap">
+                    {/* UI6：悬停显示时间 + 回复/复制/转发/更多 */}
+                    {!FEATURE_HOVER_TOOLBAR && !isTombstone(m) && (
+                      <div className="msg-actions" data-testid="msg-hover-actions">
+                        <button type="button" title="回复" aria-label="回复" onClick={() => startReply(m)}>↩</button>
+                        <button type="button" title="复制" aria-label="复制" onClick={() => void doCopy(m)}>复制</button>
+                        {canForwardMsg(m) && (
+                          <button type="button" title="转发" aria-label="转发" onClick={() => setFwdMsg(m)}>➦</button>
+                        )}
+                        <button
+                          type="button"
+                          title="更多"
+                          aria-label="更多"
+                          onClick={(e) => openMenu(m, e.clientX, e.clientY)}
+                        >
+                          ···
+                        </button>
+                      </div>
+                    )}
+                    <div className="msg-time" data-testid="msg-hover-time">
+                      {new Date(m.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                    </div>
                     {/* MM2：悬停工具栏已下线（FEATURE_HOVER_TOOLBAR），代码保留 */}
                     {FEATURE_HOVER_TOOLBAR && (canActMsg(m) || canForwardMsg(m) || canPinMsg(m)) && (
                       <div className={`msg-actions ${emojiPick === m.id ? "open" : ""}`}>
