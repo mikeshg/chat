@@ -350,11 +350,13 @@ async fn on_text(
             conversation_id,
             client_msg_id,
             content,
+            kind,
             attachment_id,
             reuse_attachment_id,
             reply_to_id,
             ..
         }) => {
+            let meeting = kind.as_deref() == Some("meeting");
             let res = send_message(
                 st,
                 uid,
@@ -365,6 +367,7 @@ async fn on_text(
                 attachment_id,
                 reuse_attachment_id,
                 reply_to_id,
+                meeting,
             )
             .await;
             (res, client_msg_id)
@@ -405,8 +408,9 @@ async fn send_message(
     attachment_id: Option<Uuid>,
     reuse_attachment_id: Option<Uuid>,
     reply_to_id: Option<Uuid>,
+    meeting: bool,
 ) -> WsResult {
-    // 投票、转发字段保持 text() 的空值：用户 WS 不能伪造这些负载
+    // 投票、转发字段保持 text() 的空值；meeting 仅当 WS kind=meeting 时打开
     let posted = post_and_broadcast(
         st,
         domain::PostMessage {
@@ -415,6 +419,7 @@ async fn send_message(
             reuse_attachment_id,
             recall_attachment_ttl_secs: st.cfg.recall_attachment_ttl_secs,
             reply_to_id,
+            meeting,
             ..domain::PostMessage::text(conv, uid, content)
         },
     )

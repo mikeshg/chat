@@ -36,7 +36,8 @@ import type {
   PinEntry,
   ReplyPreview,
 } from "../../types";
-import { discardSend, retrySend, sendChat, sendTyping } from "../../ws";
+import { discardSend, retrySend, sendChat,
+  sendMeeting, sendTyping } from "../../ws";
 import { confirmDialog } from "../Modal";
 import RichText from "../../richText";
 import AnnouncementBar from "./AnnouncementBar";
@@ -45,7 +46,8 @@ import ConvMedia from "./ConvMedia";
 import CtxMenu from "./CtxMenu";
 import ForwardModal from "./ForwardModal";
 import GroupInfo from "./GroupInfo";
-import { meetingMessage } from "./meeting";
+import { meetingUrl, parseMeetingUrl } from "./meeting";
+import { openExternal } from "../../richText";
 import PinnedBar from "./PinnedBar";
 import NewPollModal from "./NewPollModal";
 import PollCard from "./PollCard";
@@ -117,6 +119,7 @@ function fmtSize(n: number): string {
 
 /** 附件消息的 content 是服务端占位文本时不再重复渲染 */
 function showText(m: MessageView): boolean {
+  if (m.kind === "meeting" || m.kind === "system") return false;
   if (!m.attachment) return true;
   return (
     m.content !== "[图片]" &&
@@ -1127,10 +1130,11 @@ export default function ChatView() {
     }
   };
 
-  const startMeeting = () => {
+  const startMeeting = async () => {
     if (!meetingBase || readonly) return;
-    if (!confirm("发起视频会议？将在本会话发送一条会议链接。")) return;
-    sendChat(conv.id, meetingMessage(meetingBase));
+    if (!(await confirmDialog("发起视频会议？将在本会话发送一条会议卡片。", { okText: "发起" })))
+      return;
+    sendMeeting(conv.id, meetingUrl(meetingBase));
   };
 
   const onScroll = () => {
@@ -1865,6 +1869,33 @@ export default function ChatView() {
                             onOpen={() => openRecord(m)}
                             onMore={() => openSheet(m)}
                           />
+                        ) : m.kind === "meeting" ? (
+                          <div className="meeting-card" data-testid="meeting-card">
+                            <div className="meeting-card-title">视频会议</div>
+                            <div className="meeting-card-link" title={m.content}>
+                              {parseMeetingUrl(m.content) ?? m.content}
+                            </div>
+                            <div className="meeting-card-actions">
+                              <button
+                                type="button"
+                                className="primary"
+                                data-testid="meeting-join"
+                                onClick={() => {
+                                  const u = parseMeetingUrl(m.content);
+                                  if (u) openExternal(u);
+                                }}
+                              >
+                                加入
+                              </button>
+                              <button
+                                type="button"
+                                data-testid="meeting-copy"
+                                onClick={() => void copyPlainText(m.content)}
+                              >
+                                复制链接
+                              </button>
+                            </div>
+                          </div>
                         ) : m.kind === "poll" && m.poll ? (
                           <PollCard
                             m={m}

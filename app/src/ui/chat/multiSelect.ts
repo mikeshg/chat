@@ -10,7 +10,7 @@ export const MS_CAP_TOAST = `最多选择 ${MULTI_SELECT_MAX} 条`;
 
 /** 某条消息在多选模式下能否勾选（墓碑/乐观/投票置灰，点击无反应、不提示） */
 export function selectable(m: MessageView): boolean {
-  return !isTombstone(m) && !isPending(m) && m.kind !== "poll" && m.kind !== "system";
+  return !isTombstone(m) && !isPending(m) && m.kind !== "poll" && m.kind !== "system" && m.kind !== "meeting";
 }
 
 export interface MultiSelect {

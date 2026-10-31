@@ -30,6 +30,9 @@ pub struct PostMessage<'a> {
     /// 转发路径统一置 true：转发的正文/附件 caption/兜底文本一律不解析 @，
     /// 不产生 message_mentions 行，也不触发提及解归档与提及优先推送。
     pub no_mentions: bool,
+    /// 会议卡片：Some 时 kind='meeting'，content 为可加入的 URL（可选标题用换行第二行）。
+    /// 仅服务端/受信路径设置；WS 在 kind=meeting 时注入。
+    pub meeting: bool,
 }
 
 /// 聊天记录写入负载：json 里的 attachment.id 仍是源侧 id，
@@ -59,6 +62,7 @@ impl<'a> PostMessage<'a> {
             recall_attachment_ttl_secs: crate::config::DEFAULT_RECALL_ATTACHMENT_TTL_SECS,
             record: None,
             no_mentions: false,
+            meeting: false,
         }
     }
 }
@@ -255,6 +259,20 @@ pub(super) async fn write_message(
         // 聊天记录正文 = 服务端组好的兜底文本；kind 只能由这条路径产生（客户端无字段可伪造）
         None if msg.record.is_some() => {
             (normalize_body(msg.content, attachment.as_ref())?.0, "chat_record")
+        }
+        // 会议卡片：content 必须是 http(s) URL；不走附件
+        None if msg.meeting => {
+            let url = msg.content.trim();
+            if !(url.starts_with("https://") || url.starts_with("http://")) {
+                return Err(PostError::deny("bad_message", "meeting url must be http(s)").into());
+            }
+            if url.chars().count() > 4000 {
+                return Err(PostError::deny("bad_message", "message too long (max 4000 chars)").into());
+            }
+            if attachment.is_some() {
+                return Err(PostError::deny("bad_request", "meeting cannot carry attachments").into());
+            }
+            (url.to_string(), "meeting")
         }
         None => normalize_body(msg.content, attachment.as_ref())?,
     };
