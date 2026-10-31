@@ -279,7 +279,7 @@ async fn p33_push_always_and_clear_on_read() {
 /// 3. B 静音群会话 → 普通消息不推；@B 的消息推（priority=4，标题=群名+未读数）。
 #[tokio::test]
 async fn p33_push_mute_and_mention() {
-    let (_guard, base, _st) = spawn_named_state(&format!("chat_it_p33c_{}", uniq())).await;
+    let (_guard, base, st) = spawn_named_state(&format!("chat_it_p33c_{}", uniq())).await;
     let ntfy = fake_ntfy().await;
     let (_admin, a, b, _dm) = p33_setup(&base, &ntfy, "c").await;
     push_on(&base, &b, json!({"enabled": true})).await;
@@ -290,6 +290,9 @@ async fn p33_push_mute_and_mention() {
     assert_eq!(r.status(), 200);
     // mk_group 的 group_created 可能已在静音前推过；之后只看增量
     let baseline = ntfy.hit_count();
+    // group_created 已占默认 30s 合并窗口，关掉以免吞掉后续 @我 突破静音的推送
+    st.push_coalesce_ms
+        .store(0, std::sync::atomic::Ordering::Relaxed);
 
     let mut sa = ws_of(&base, &a).await;
     ws_send(
