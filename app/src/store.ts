@@ -576,6 +576,19 @@ export function applyRefreshed(
   };
 }
 
+/**
+ * 退群/解散后的本地收口：列表摘掉该会话，正在看它则切走，本地消息缓存一并丢弃。
+ * 不能再回拉 detail——已非成员只会 403，会把整次刷新拖垮。
+ */
+export function applyGroupLeft(s: AppState, convId: string): Partial<AppState> {
+  return {
+    ...dropConversationCache(s, convId),
+    conversations: s.conversations.filter((c) => c.id !== convId),
+    ...(s.activeConv === convId ? { activeConv: null } : {}),
+    ...(s.pendingJump?.convId === convId ? { pendingJump: null } : {}),
+  };
+}
+
 /** 会话不再可访问（refresh 403/404）：丢弃本地消息缓存与滚动状态 */
 export function dropConversationCache(s: AppState, convId: string): Partial<AppState> {
   const messages = { ...s.messages };

@@ -36,7 +36,8 @@ import type {
   PinEntry,
   ReplyPreview,
 } from "../../types";
-import { discardSend, retrySend, sendChat, sendTyping } from "../../ws";
+import { discardSend, retrySend, sendChat,
+  sendMeeting, sendTyping } from "../../ws";
 import { confirmDialog } from "../Modal";
 import RichText from "../../richText";
 import AnnouncementBar from "./AnnouncementBar";
@@ -45,7 +46,9 @@ import ConvMedia from "./ConvMedia";
 import CtxMenu from "./CtxMenu";
 import ForwardModal from "./ForwardModal";
 import GroupInfo from "./GroupInfo";
-import { meetingMessage } from "./meeting";
+import { meetingUrl, parseMeetingUrl } from "./meeting";
+import { openExternal } from "../../richText";
+import { parseSystemPayload, systemBarText } from "./systemMessage";
 import PinnedBar from "./PinnedBar";
 import NewPollModal from "./NewPollModal";
 import PollCard from "./PollCard";
@@ -54,6 +57,7 @@ import { attImgSrc, imageBubbleSize } from "../mediaFormat";
 import Avatar from "../Avatar";
 import VoiceRecorder from "./VoiceRecorder";
 import { FEATURE_HOVER_TOOLBAR } from "./features";
+import { inBubbleGroup } from "./bubbleGroup";
 import { pushBackLayer, resetBackLayers } from "./backStack";
 import { Z } from "./layers";
 import { recordLabel } from "./chatRecord";
@@ -83,7 +87,7 @@ import {
   isTombstone,
   menuItems,
   msgDeletedText,
-  quoteDeletedText,
+  quoteBodyText,
   reeditTextFor,
   shouldOpenMenuOnClick,
   shouldOpenMenuOnContextMenu,
@@ -117,6 +121,7 @@ function fmtSize(n: number): string {
 
 /** 附件消息的 content 是服务端占位文本时不再重复渲染 */
 function showText(m: MessageView): boolean {
+  if (m.kind === "meeting" || m.kind === "system") return false;
   if (!m.attachment) return true;
   return (
     m.content !== "[图片]" &&
@@ -694,11 +699,11 @@ export default function ChatView() {
     m.kind === "text" &&
     withinEditWindow(m);
   const canActMsg = (m: MessageView) =>
-    !m.id.startsWith("client:") && !m.deleted_at && !readonly;
+    !m.id.startsWith("client:") && !m.deleted_at && !readonly && m.kind !== "system";
   // V2 P2-4 转发/收藏入口：非乐观消息、非墓碑、非投票。只读会话仍允许（
   // 成员读得到就能转出去；目标侧权限由服务端逐条判定）
   const canForwardMsg = (m: MessageView) =>
-    !m.id.startsWith("client:") && !m.deleted_at && m.kind !== "poll";
+    !m.id.startsWith("client:") && !m.deleted_at && m.kind !== "poll" && m.kind !== "system";
   // 投票可置顶；已删除、乐观消息、只读会话不显示入口
   const canPinMsg = (m: MessageView) => canActMsg(m);
 
@@ -1127,10 +1132,11 @@ export default function ChatView() {
     }
   };
 
-  const startMeeting = () => {
+  const startMeeting = async () => {
     if (!meetingBase || readonly) return;
-    if (!confirm("发起视频会议？将在本会话发送一条会议链接。")) return;
-    sendChat(conv.id, meetingMessage(meetingBase));
+    if (!(await confirmDialog("发起视频会议？将在本会话发送一条会议卡片。", { okText: "发起" })))
+      return;
+    sendMeeting(conv.id, meetingUrl(meetingBase));
   };
 
   const onScroll = () => {
@@ -1608,9 +1614,28 @@ export default function ChatView() {
           const mine = isOwnMessage(m, s.me?.id);
           const pending = m.id.startsWith("client:");
           const prev = msgs[i - 1];
+          const grouped = inBubbleGroup(m, prev);
           const showTime =
             !prev || new Date(m.created_at).getTime() - new Date(prev.created_at).getTime() > 300000;
           const msSelected = msMode && ms!.ids.has(m.id);
+          // UI3：系统消息居中灰条（无头像/气泡/菜单）
+          if (m.kind === "system" && !isTombstone(m)) {
+            const code = parseSystemPayload(m.content)?.code;
+            return (
+              <div key={m.id}>
+                {showTime && (
+                  <div className="msg-sys">{new Date(m.created_at).toLocaleString()}</div>
+                )}
+                <div
+                  className="system-bar"
+                  data-testid="system-bar"
+                  data-code={code ?? ""}
+                >
+                  {systemBarText(m.content)}
+                </div>
+              </div>
+            );
+          }
           return (
             <div key={m.id}>
               {showTime && (
@@ -1645,17 +1670,22 @@ export default function ChatView() {
                   </span>
                 )}
                 <div
-                  className={`msg-row ${mine ? "mine" : ""} ${msSelected ? "ms-sel" : ""}`}
+                  className={`msg-row ${mine ? "mine" : ""} ${grouped ? "grouped" : ""} ${msSelected ? "ms-sel" : ""}`}
                   data-mid={m.id}
+                  data-grouped={grouped ? "1" : "0"}
                 >
                 {!mine && (
-                  <Avatar
-                    userId={m.sender_id}
-                    name={m.sender_name}
-                    avatarVersion={m.sender_avatar_version}
-                    hasAvatar={m.sender_has_avatar}
-                    size="sm"
-                  />
+                  grouped ? (
+                    <div className="msg-avatar-spacer" aria-hidden />
+                  ) : (
+                    <Avatar
+                      userId={m.sender_id}
+                      name={m.sender_name}
+                      avatarVersion={m.sender_avatar_version}
+                      hasAvatar={m.sender_has_avatar}
+                      size="sm"
+                    />
+                  )
                 )}
                 <div
                   className="msg-body"
@@ -1664,10 +1694,31 @@ export default function ChatView() {
                   onClick={onBubbleClick(m)}
                   onContextMenu={onMsgContextMenu(m)}
                 >
-                  {!mine && conv.kind === "group" && (
+                  {!mine && conv.kind === "group" && !grouped && (
                     <div className="msg-sender">{m.sender_name}</div>
                   )}
                   <div className="bubble-wrap">
+                    {/* UI6：悬停显示时间 + 回复/复制/转发/更多 */}
+                    {!FEATURE_HOVER_TOOLBAR && !isTombstone(m) && (
+                      <div className="msg-actions" data-testid="msg-hover-actions">
+                        <button type="button" title="回复" aria-label="回复" onClick={() => startReply(m)}>↩</button>
+                        <button type="button" title="复制" aria-label="复制" onClick={() => void doCopy(m)}>复制</button>
+                        {canForwardMsg(m) && (
+                          <button type="button" title="转发" aria-label="转发" onClick={() => setFwdMsg(m)}>➦</button>
+                        )}
+                        <button
+                          type="button"
+                          title="更多"
+                          aria-label="更多"
+                          onClick={(e) => openMenu(m, e.clientX, e.clientY)}
+                        >
+                          ···
+                        </button>
+                      </div>
+                    )}
+                    <div className="msg-time" data-testid="msg-hover-time">
+                      {new Date(m.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                    </div>
                     {/* MM2：悬停工具栏已下线（FEATURE_HOVER_TOOLBAR），代码保留 */}
                     {FEATURE_HOVER_TOOLBAR && (canActMsg(m) || canForwardMsg(m) || canPinMsg(m)) && (
                       <div className={`msg-actions ${emojiPick === m.id ? "open" : ""}`}>
@@ -1791,18 +1842,22 @@ export default function ChatView() {
                         {m.forwarded_from && (
                           <div className="fwd-from">转发自 {m.forwarded_from}</div>
                         )}
-                        {m.reply_to_preview && (
+                        {(m.reply_to_preview || m.reply_to_id) && (
                           <button
                             type="button"
                             className="reply-quote"
-                            onClick={() => jumpPreview(m.reply_to_preview!)}
+                            onClick={() => m.reply_to_preview && jumpPreview(m.reply_to_preview)}
                           >
-                            <span className="rq-name">{m.reply_to_preview.sender_name}</span>
+                            <span className="rq-name">
+                              {m.reply_to_preview?.sender_name || "回复"}
+                            </span>
                             <span className="rq-text">
-                              {m.reply_to_preview.deleted
-                                ? quoteDeletedText(m.reply_to_preview)
-                                : m.reply_to_preview.excerpt ||
-                                  kindLabel(m.reply_to_preview.kind)}
+                              {quoteBodyText(m.reply_to_preview, {
+                                forwarded: !!m.forwarded_from,
+                                kindFallback: m.reply_to_preview
+                                  ? kindLabel(m.reply_to_preview.kind)
+                                  : undefined,
+                              })}
                             </span>
                           </button>
                         )}
@@ -1865,6 +1920,33 @@ export default function ChatView() {
                             onOpen={() => openRecord(m)}
                             onMore={() => openSheet(m)}
                           />
+                        ) : m.kind === "meeting" ? (
+                          <div className="meeting-card" data-testid="meeting-card">
+                            <div className="meeting-card-title">视频会议</div>
+                            <div className="meeting-card-link" title={m.content}>
+                              {parseMeetingUrl(m.content) ?? m.content}
+                            </div>
+                            <div className="meeting-card-actions">
+                              <button
+                                type="button"
+                                className="primary"
+                                data-testid="meeting-join"
+                                onClick={() => {
+                                  const u = parseMeetingUrl(m.content);
+                                  if (u) openExternal(u);
+                                }}
+                              >
+                                加入
+                              </button>
+                              <button
+                                type="button"
+                                data-testid="meeting-copy"
+                                onClick={() => void copyPlainText(m.content)}
+                              >
+                                复制链接
+                              </button>
+                            </div>
+                          </div>
                         ) : m.kind === "poll" && m.poll ? (
                           <PollCard
                             m={m}
@@ -2119,23 +2201,33 @@ export default function ChatView() {
         )}
       </footer>
       )}
-      {showInfo && conv.kind === "group" && (
-        <GroupInfo
-          conv={conv}
-          onClose={() => setShowInfo(false)}
-          onPreview={openPreview}
-        />
-      )}
-      {showInfo && conv.kind !== "group" && (
-        <aside className="group-info">
-          <div className="gi-head">
-            <h3>{conv.kind === "self" ? "文件传输助手" : "文件与图片"}</h3>
-            <button className="icon-btn" onClick={() => setShowInfo(false)}>
-              ✕
-            </button>
-          </div>
-          <ConvMedia conv={conv} onPreview={openPreview} />
-        </aside>
+      {showInfo && (
+        <>
+          <button
+            type="button"
+            className="slide-mask"
+            aria-label="关闭面板"
+            data-testid="slide-mask"
+            onClick={() => setShowInfo(false)}
+          />
+          {conv.kind === "group" ? (
+            <GroupInfo
+              conv={conv}
+              onClose={() => setShowInfo(false)}
+              onPreview={openPreview}
+            />
+          ) : (
+            <aside className="group-info" data-testid="slide-over">
+              <div className="gi-head">
+                <h3>{conv.kind === "self" ? "文件传输助手" : "文件与图片"}</h3>
+                <button className="icon-btn" onClick={() => setShowInfo(false)}>
+                  ✕
+                </button>
+              </div>
+              <ConvMedia conv={conv} onPreview={openPreview} />
+            </aside>
+          )}
+        </>
       )}
       {showPoll && conv.kind === "group" && (
         <NewPollModal convId={conv.id} onClose={() => setShowPoll(false)} />

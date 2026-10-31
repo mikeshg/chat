@@ -1,10 +1,66 @@
 import { useState } from "react";
 import { auth, friends } from "../api";
 import { setState, useApp } from "../store";
-import type { UserPublic } from "../types";
+import type { FriendView, UserPublic } from "../types";
 import { openConversation } from "../ws";
 import Avatar from "./Avatar";
 import { confirmDialog } from "./Modal";
+
+/** 搜索结果行：已是好友的给「发消息」，非好友走加好友流程 */
+export function FoundUserRow({
+  u,
+  friendList,
+  picked,
+  msg,
+  onPick,
+  onMsg,
+  onSend,
+  onDm,
+}: {
+  u: UserPublic;
+  friendList: FriendView[];
+  picked: boolean;
+  msg: string;
+  onPick: () => void;
+  onMsg: (v: string) => void;
+  onSend: () => void;
+  onDm: () => void;
+}) {
+  const isFriend = friendList.some((f) => f.user.id === u.id);
+  return (
+    <div className="row found">
+      <Avatar userId={u.id} name={u.display_name} avatarVersion={u.avatar_version} hasAvatar={u.has_avatar} />
+      <div className="grow">
+        <div>{u.display_name}</div>
+        <div className="muted">@{u.username}</div>
+      </div>
+      {isFriend ? (
+        <>
+          <span className="muted">已是好友</span>
+          <button className="primary" onClick={onDm}>
+            发消息
+          </button>
+        </>
+      ) : picked ? (
+        <>
+          <input
+            placeholder="验证消息（可选）"
+            value={msg}
+            onChange={(e) => onMsg(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && onSend()}
+          />
+          <button className="primary" onClick={onSend}>
+            发送
+          </button>
+        </>
+      ) : (
+        <button className="primary" onClick={onPick}>
+          加好友
+        </button>
+      )}
+    </div>
+  );
+}
 
 export default function ContactsPanel() {
   const s = useApp();
@@ -83,30 +139,17 @@ export default function ContactsPanel() {
           <button onClick={search}>搜索</button>
         </div>
         {results?.map((u) => (
-          <div className="row found" key={u.id}>
-            <Avatar userId={u.id} name={u.display_name} avatarVersion={u.avatar_version} hasAvatar={u.has_avatar} />
-            <div className="grow">
-              <div>{u.display_name}</div>
-              <div className="muted">@{u.username}</div>
-            </div>
-            {picked?.id === u.id ? (
-              <>
-                <input
-                  placeholder="验证消息（可选）"
-                  value={msg}
-                  onChange={(e) => setMsg(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && sendReq()}
-                />
-                <button className="primary" onClick={sendReq}>
-                  发送
-                </button>
-              </>
-            ) : (
-              <button className="primary" onClick={() => setPicked(u)}>
-                加好友
-              </button>
-            )}
-          </div>
+          <FoundUserRow
+            key={u.id}
+            u={u}
+            friendList={s.friends}
+            picked={picked?.id === u.id}
+            msg={msg}
+            onPick={() => setPicked(u)}
+            onMsg={setMsg}
+            onSend={sendReq}
+            onDm={() => openDm(u)}
+          />
         ))}
         {hint && <div className="muted">{hint}</div>}
       </section>
