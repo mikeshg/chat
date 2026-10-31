@@ -151,7 +151,7 @@ export function tokenize(text: string, opts: { mentions?: boolean } = {}): Token
 const isTauri = () => "__TAURI_INTERNALS__" in window;
 
 /** Tauri 壳内用系统浏览器打开外链（WebView 不跳转），插件失败再退回 window.open */
-function openExternal(url: string) {
+export function openExternal(url: string) {
   void import("@tauri-apps/plugin-opener")
     .then((m) => m.openUrl(url))
     .catch(() => window.open(url, "_blank", "noopener,noreferrer"));
