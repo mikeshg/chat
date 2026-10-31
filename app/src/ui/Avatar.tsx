@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { getServer } from "../api";
 import { noteAvatarMiss, senderAvatar, useApp } from "../store";
+import { avatarColor } from "./avatarColor";
 
 type Size = "sm" | "md" | "lg";
 
@@ -13,7 +14,7 @@ export function initialOf(name?: string | null): string {
   return ch ? ch.toUpperCase() : "?";
 }
 
-/** 有头像用图片，加载失败或无头像回落首字母。叠加元素（在线点）由调用方放进 children。 */
+/** 有头像用图片，加载失败或无头像回落首字母 + 稳定色。叠加元素（在线点）由调用方放进 children。 */
 export default function Avatar({
   userId,
   name,
@@ -41,9 +42,18 @@ export default function Avatar({
   const [broken, setBroken] = useState<string | null>(null);
   const src = showImg ? avatarUrl(userId, picked.version) : "";
   const failed = broken === src;
+  const fallback = !showImg || failed;
+  const style = fallback
+    ? { backgroundColor: avatarColor(userId || name), color: "#fff" }
+    : undefined;
 
   return (
-    <div className={`avatar ${size === "md" ? "" : size} ${className}`.trim()} title={title}>
+    <div
+      className={`avatar ${size === "md" ? "" : size} ${className}`.trim()}
+      title={title}
+      style={style}
+      data-testid={fallback ? "avatar-initial" : "avatar-img"}
+    >
       {showImg && !failed ? (
         <img
           src={src}

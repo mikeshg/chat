@@ -2123,23 +2123,33 @@ export default function ChatView() {
         )}
       </footer>
       )}
-      {showInfo && conv.kind === "group" && (
-        <GroupInfo
-          conv={conv}
-          onClose={() => setShowInfo(false)}
-          onPreview={openPreview}
-        />
-      )}
-      {showInfo && conv.kind !== "group" && (
-        <aside className="group-info">
-          <div className="gi-head">
-            <h3>{conv.kind === "self" ? "文件传输助手" : "文件与图片"}</h3>
-            <button className="icon-btn" onClick={() => setShowInfo(false)}>
-              ✕
-            </button>
-          </div>
-          <ConvMedia conv={conv} onPreview={openPreview} />
-        </aside>
+      {showInfo && (
+        <>
+          <button
+            type="button"
+            className="slide-mask"
+            aria-label="关闭面板"
+            data-testid="slide-mask"
+            onClick={() => setShowInfo(false)}
+          />
+          {conv.kind === "group" ? (
+            <GroupInfo
+              conv={conv}
+              onClose={() => setShowInfo(false)}
+              onPreview={openPreview}
+            />
+          ) : (
+            <aside className="group-info" data-testid="slide-over">
+              <div className="gi-head">
+                <h3>{conv.kind === "self" ? "文件传输助手" : "文件与图片"}</h3>
+                <button className="icon-btn" onClick={() => setShowInfo(false)}>
+                  ✕
+                </button>
+              </div>
+              <ConvMedia conv={conv} onPreview={openPreview} />
+            </aside>
+          )}
+        </>
       )}
       {showPoll && conv.kind === "group" && (
         <NewPollModal convId={conv.id} onClose={() => setShowPoll(false)} />
